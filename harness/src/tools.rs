@@ -6406,6 +6406,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_planted_token_used_as_an_argument_key_reaches_no_audit_telemetry_or_escalation_output(
+    ) {
+        const KEY: &str = "AKIAFAKEFAKEFAKE0123";
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("action_audit.jsonl");
+        let telemetry_path = dir.path().join("telemetry.jsonl");
+        let exporter = crate::telemetry::JsonlExporter::new(&telemetry_path, 1 << 20);
+        let telemetry =
+            Arc::new(crate::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter)));
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _log) = crate::test_support::escalation::escalator(&sink);
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(EscalatingAuditor),
+            crate::action_auditor::ActionAuditLog::file(&audit_path),
+        ));
+        assert!(
+            gate.set_sink(Arc::new(crate::action_auditor::TelemetrySink::new(
+                Arc::clone(&telemetry)
+            )))
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("msg_send", EffectClass::None));
+        let registry = registry
+            .with_action_gate(gate, subject(EffectClass::Production))
+            .with_action_escalator(escalator);
+        let err = registry
+            .execute("msg_send", json!({ KEY: "v", "body": "hello" }))
+            .await
+            .unwrap_err();
+        telemetry.export_all().await.unwrap();
+        let outputs = [
+            ("audit file", std::fs::read_to_string(&audit_path).unwrap()),
+            (
+                "telemetry",
+                std::fs::read_to_string(&telemetry_path).unwrap(),
+            ),
+            (
+                "escalation evidence",
+                serde_json::to_string(&sink.escalations()).unwrap(),
+            ),
+            ("error returned", format!("{err:?}{err}")),
+            (
+                "in-memory reviews",
+                serde_json::to_string(&registry.action_reviews()).unwrap(),
+            ),
+        ];
+        for (name, text) in outputs {
+            assert!(!text.is_empty(), "{name}");
+            assert!(!text.contains(KEY), "{name} leaked the key name");
+        }
+    }
+
+    #[tokio::test]
     async fn an_auditor_escalating_directly_is_returned_and_logged_as_an_escalation() {
         struct AlwaysEscalates;
 

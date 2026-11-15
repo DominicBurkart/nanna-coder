@@ -46,7 +46,9 @@ pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
 pub use review::ActionReview;
-pub use routing::{is_message_tool, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS};
+pub use routing::{
+    is_message_tool, known_arguments, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS,
+};
 pub(crate) use rules::RUN_COMMAND_TOOL;
 pub use rules::{RuleActionAuditor, RULE_ACTION_AUDITOR_NAME};
 pub use verdict::ActionVerdict;

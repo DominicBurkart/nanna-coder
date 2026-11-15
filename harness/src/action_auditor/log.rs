@@ -6,7 +6,7 @@
 //! [`ActionVerdict`] pair is a different record shape (a tool call, not a
 //! spawn), so it gets its own log type with the same append-only contract.
 
-use super::{is_message_tool, ActionAuditError, ActionReview, ActionVerdict};
+use super::{is_message_tool, known_arguments, ActionAuditError, ActionReview, ActionVerdict};
 use crate::auditor::content_hash;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
@@ -25,15 +25,9 @@ pub struct ActionAuditLogEntry {
 }
 
 const MAX_LOGGED_KEYS: usize = 16;
-const MAX_LOGGED_KEY_CHARS: usize = 32;
 
-fn loggable_key(key: &str) -> String {
-    let plain = !key.is_empty()
-        && key.chars().count() <= MAX_LOGGED_KEY_CHARS
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if plain {
+fn loggable_key(tool: &str, key: &str) -> String {
+    if known_arguments(tool).contains(&key) {
         key.to_string()
     } else {
         "?".to_string()
@@ -45,9 +39,10 @@ fn loggable_key(key: &str) -> String {
 /// The arguments of `msg_send`, `session_set_note` and `sessions_query` are
 /// the message, note or query itself, so writing them to the audit trail
 /// would store in plaintext the very content the audit exists to keep out.
-/// For those tools the result keeps top-level key names (only when they are
-/// short identifiers), the serialized byte length and a content hash; any
-/// other tool's review is returned unchanged.
+/// For those tools the result keeps the top-level key names the tool defines
+/// (any other key, which an agent could have filled with a secret, becomes
+/// `?`), the serialized byte length and a content hash; any other tool's
+/// review is returned unchanged.
 ///
 /// ```
 /// use harness::action_auditor::{redact_for_log, ActionReview};
@@ -78,7 +73,7 @@ pub fn redact_for_log(review: &ActionReview) -> ActionReview {
         serde_json::Value::Object(map) => map
             .keys()
             .take(MAX_LOGGED_KEYS)
-            .map(|k| loggable_key(k))
+            .map(|k| loggable_key(&review.tool, k))
             .collect(),
         _ => Vec::new(),
     };
@@ -375,17 +370,53 @@ mod tests {
     }
 
     #[test]
-    fn redaction_keeps_short_identifier_keys_and_masks_the_rest() {
-        let args = serde_json::json!({"body": "x", "a b": "y", "": "z"});
+    fn redaction_keeps_only_the_tools_own_argument_names_and_masks_the_rest() {
+        let args = serde_json::json!({"body": "x", "to": "y", "a b": "y", "": "z", "bogus": 1});
         let r = redact_for_log(&message_review("msg_send", args));
-        let keys: Vec<&str> = r.args["keys"]
+        let mut keys: Vec<&str> = r.args["keys"]
             .as_array()
             .unwrap()
             .iter()
             .map(|k| k.as_str().unwrap())
             .collect();
-        assert!(keys.contains(&"body"));
-        assert_eq!(keys.iter().filter(|k| **k == "?").count(), 2);
+        keys.sort_unstable();
+        assert_eq!(keys, ["?", "?", "?", "body", "to"]);
+        let args = serde_json::json!({"body": "x"});
+        let r = redact_for_log(&message_review("sessions_query", args));
+        assert_eq!(r.args["keys"], serde_json::json!(["?"]));
+    }
+
+    #[test]
+    fn a_secret_used_as_an_argument_key_never_reaches_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("action_audit.jsonl");
+        let secret_keys = [
+            "AKIAFAKEFAKEFAKE0123",
+            "ghp_FAKEFAKEFAKEFAKE0123",
+            "sk-fakefakefake",
+            PLANTED,
+        ];
+        for log in [ActionAuditLog::file(&path), ActionAuditLog::in_memory()] {
+            for tool in crate::action_auditor::MESSAGE_TOOLS {
+                let mut map = serde_json::Map::new();
+                for k in secret_keys {
+                    map.insert(k.to_string(), serde_json::json!(1));
+                }
+                log.append(
+                    &message_review(tool, serde_json::Value::Object(map)),
+                    &ActionVerdict::Allow,
+                )
+                .unwrap();
+            }
+            let shown = serde_json::to_string(&log.entries().unwrap()).unwrap();
+            for k in secret_keys {
+                assert!(!shown.contains(k), "{k} leaked as a key name");
+            }
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        for k in secret_keys {
+            assert!(!on_disk.contains(k), "{k} leaked to the file");
+        }
     }
 
     #[test]

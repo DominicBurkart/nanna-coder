@@ -18,6 +18,26 @@ use std::sync::{Arc, Weak};
 /// ```
 pub const MESSAGE_TOOLS: [&str; 3] = ["msg_send", "session_set_note", "sessions_query"];
 
+/// The argument names each of the [`MESSAGE_TOOLS`] defines.
+///
+/// Argument key names come from the agent, so a key name can itself be a
+/// secret. Only these fixed names are ever written to an audit record; any
+/// other key is logged as `?`. Pinned by a test next to [`MESSAGE_TOOLS`].
+///
+/// ```
+/// use harness::action_auditor::known_arguments;
+/// assert_eq!(known_arguments("sessions_query"), ["query", "max_results"]);
+/// assert!(known_arguments("write_file").is_empty());
+/// ```
+pub fn known_arguments(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "msg_send" => &["to", "kind", "subject", "body", "in_reply_to"],
+        "session_set_note" => &["note"],
+        "sessions_query" => &["query", "max_results"],
+        _ => &[],
+    }
+}
+
 /// Whether `tool` is one of the [`MESSAGE_TOOLS`].
 ///
 /// ```
@@ -296,6 +316,22 @@ mod tests {
             "msg_send ",
         ] {
             assert!(!is_message_tool(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn the_known_argument_names_are_pinned() {
+        assert_eq!(
+            known_arguments("msg_send"),
+            ["to", "kind", "subject", "body", "in_reply_to"]
+        );
+        assert_eq!(known_arguments("session_set_note"), ["note"]);
+        assert_eq!(known_arguments("sessions_query"), ["query", "max_results"]);
+        for tool in MESSAGE_TOOLS {
+            assert!(!known_arguments(tool).is_empty(), "{tool}");
+        }
+        for tool in ["msg_recv", "write_file", "run_command", ""] {
+            assert!(known_arguments(tool).is_empty(), "{tool}");
         }
     }
 
