@@ -524,6 +524,18 @@ mod tests {
     }
 
     #[test]
+    fn task_id_returns_the_task_the_session_was_built_from() {
+        let first = SessionId::from_task(tid("task-one"));
+        let second = SessionId::from_task(tid("task-two"));
+        assert_eq!(first.task_id(), &tid("task-one"));
+        assert_eq!(second.task_id(), &tid("task-two"));
+        assert_ne!(first.task_id(), second.task_id());
+        assert_eq!(first.task_id().0, first.to_string());
+        assert_eq!(second.task_id().0, second.to_string());
+        assert_ne!(first.to_string(), second.to_string());
+    }
+
+    #[test]
     fn session_id_serializes_as_the_task_id_string() {
         let session = SessionId::from_task(tid("abc"));
         assert_eq!(serde_json::to_string(&session).unwrap(), r#""abc""#);
