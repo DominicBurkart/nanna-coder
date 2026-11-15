@@ -8,7 +8,7 @@ This project uses **Cachix exclusively** for binary caching, providing unlimited
 
 ### Previous Approaches
 
-1. **Magic Nix Cache** (deprecated Feb 2025)
+1. **Magic Nix Cache** (deprecated 2025-02)
    - Automatic caching by DeterminateSystems
    - Deprecated and removed
 
