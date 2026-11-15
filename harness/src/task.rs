@@ -1292,12 +1292,18 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             let tasks = self.runner.tasks.read().await;
             AuditedIdentity::split(allowed, &|id| tasks.get(id).and_then(|t| t.lineage.clone()))
         };
-        queued.lineage = derived
-            .and_then(|derived| reconcile(queued.lineage.take(), derived))
-            .unwrap_or_else(|error| {
-                tracing::warn!(task_id = %queued.id, %error, "Dropping an inconsistent lineage; the task becomes its own root");
-                None
-            });
+        let task_id = queued.id.clone();
+        match derived.and_then(|derived| reconcile(queued.lineage.take(), derived)) {
+            Ok(lineage) => queued.lineage = lineage,
+            Err(error) => {
+                tracing::error!(task_id = %task_id, %error, "Refusing an audited entry whose lineage disagrees with its audit proof");
+                self.runner.register(&queued, Some(provider)).await;
+                self.runner
+                    .fail(&task_id, error.to_string(), "LineageInconsistent")
+                    .await;
+                return task_id;
+            }
+        }
         self.runner
             .bound
             .write()
@@ -7491,6 +7497,33 @@ mod spawn_tests {
             lineage_of(&manager, &id).await.root(),
             &RootId::backlog("example/repo", 42).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_submit_audited_refuses_an_entry_whose_lineage_disagrees_with_the_proof() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(1);
+        let allowed = allowed_with_parent("backlog-example/repo#42").await;
+        let other = Lineage::root_child(RootId::backlog("example/other", 1).unwrap());
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        )
+        .with_lineage(Some(other));
+        let id = manager.submit_audited(queued, allowed, provider()).await;
+        let task = manager.poll(&id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "LineageInconsistent");
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(!manager.dispatcher.is_queued(&id).await);
+        assert!(!manager.dispatcher.is_running(&id).await);
     }
 
     #[tokio::test]

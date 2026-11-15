@@ -590,7 +590,16 @@ pub async fn backlog_sync(
                 report.capped += 1;
                 continue;
             }
-            let lineage = Lineage::root_child(RootId::backlog(source.repo.clone(), issue.number)?);
+            let lineage = match RootId::backlog(source.repo.clone(), issue.number) {
+                Ok(root) => Lineage::root_child(root),
+                Err(error) => {
+                    report.refused.push(RefusedIssue {
+                        origin,
+                        reason: format!("backlog root refused: {error}"),
+                    });
+                    continue;
+                }
+            };
             let description = describe_issue(&source.repo, &issue);
             let request = gate.request(
                 TaskSummary::new(
@@ -1979,19 +1988,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backlog_sync_refuses_a_repository_that_cannot_be_a_root() {
+    async fn backlog_sync_skips_a_repository_that_cannot_be_a_root_and_keeps_the_rest() {
         let github = MockGithub {
-            issues: HashMap::from([("o/n/x".to_string(), vec![issue(2)])]),
+            issues: HashMap::from([
+                ("o/n/x".to_string(), vec![issue(2)]),
+                ("o/n".to_string(), vec![issue(3)]),
+            ]),
             ..Default::default()
         };
         let store = InMemoryQueueStore::default();
         let sink = sink_over(&store);
-        let cfg = config(vec![source("o/n/x", "/repo")], None);
-        let err = backlog_sync(&github, &sink, &cfg, &fixture_gate())
+        let cfg = config(vec![source("o/n/x", "/bad"), source("o/n", "/repo")], None);
+        let report = backlog_sync(&github, &sink, &cfg, &fixture_gate())
             .await
-            .unwrap_err();
-        assert!(matches!(err, BacklogError::Lineage(_)), "{err}");
-        assert!(store.load().unwrap().is_empty());
+            .unwrap();
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].origin.repo, "o/n/x");
+        assert!(report.refused[0].reason.starts_with("backlog root refused"));
+        assert_eq!(report.enqueued.len(), 1);
+        assert_eq!(report.enqueued[0].repo, "o/n");
+        let stored = store.load().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].origin.as_ref().unwrap().repo, "o/n");
     }
 
     #[tokio::test]
