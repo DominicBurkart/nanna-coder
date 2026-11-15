@@ -132,18 +132,21 @@ async fn probe_ollama(url: &str) -> bool {
 const SERIAL_ENV_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
 
 #[cfg(test)]
+fn missing_lock_message(key: &str) -> String {
+    format!(
+        "test thread {:?} reached the bring-up path without serial lock `{}`: it must hold #[serial_test::serial({})]",
+        std::thread::current().name().unwrap_or("<unnamed>"),
+        key,
+        SERIAL_ENV_KEYS.join(", ")
+    )
+}
+
+#[cfg(test)]
 fn require_serial_env_locks(is_locked: impl Fn(&str) -> bool) {
-    if std::thread::current().name() == Some("tokio-runtime-worker") {
-        return;
-    }
+    let on_worker = std::thread::current().name() == Some("tokio-runtime-worker");
     for key in SERIAL_ENV_KEYS {
-        if !is_locked(key) {
-            panic!(
-                "test thread {:?} reached the bring-up path without serial lock `{}`: it must hold #[serial_test::serial({})]",
-                std::thread::current().name().unwrap_or("<unnamed>"),
-                key,
-                SERIAL_ENV_KEYS.join(", ")
-            );
+        if !(on_worker || is_locked(key)) {
+            panic!("{}", missing_lock_message(key));
         }
     }
 }
@@ -934,6 +937,15 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn missing_lock_message_names_the_thread_the_key_and_the_attribute() {
+        let msg = missing_lock_message("nanna_pod_config_env");
+        assert!(msg.contains("missing_lock_message_names_the_thread_the_key_and_the_attribute"));
+        assert!(msg.contains("without serial lock `nanna_pod_config_env`"));
+        assert!(msg
+            .contains("#[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]"));
     }
 
     #[test]
