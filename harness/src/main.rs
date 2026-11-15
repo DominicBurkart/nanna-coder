@@ -583,7 +583,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_per_repo,
             queue_path,
         } => {
-            let audit_model = audit_model.unwrap_or_else(|| model.clone());
+            let audit_model = backlog_audit_model(audit_model, &model);
             run_backlog_sync(
                 harness::backlog::BacklogConfig {
                     sources: vec![harness::backlog::BacklogSource {
@@ -1695,31 +1695,53 @@ fn configured_model(flag: Option<String>) -> Option<model::default_model::ModelC
         .map(|name| model::default_model::ModelConfig { name })
 }
 
+fn explicit_name(name: Option<String>) -> Option<String> {
+    name.filter(|n| !n.trim().is_empty())
+}
+
+fn backlog_audit_model(audit_model: Option<String>, model: &str) -> String {
+    explicit_name(audit_model).unwrap_or_else(|| model.to_string())
+}
+
 async fn startup_model(
     configured: Option<model::default_model::ModelConfig>,
-    probe: impl FnOnce() -> model::ModelResult<model::default_model::DeviceCapacity>,
+    probe: impl FnOnce() -> model::ModelResult<model::default_model::DeviceCapacity> + Send + 'static,
     catalog: &dyn model::default_model::VariantCatalog,
+    provider: &dyn model::ModelProvider,
 ) -> model::ModelResult<model::default_model::DefaultModel> {
-    use model::default_model::{resolve_default_model, DefaultModel};
+    use model::default_model::{ensure_runnable, resolve_default_model, DefaultModel};
     if let Some(config) = configured.filter(|c| !c.name.trim().is_empty()) {
         return Ok(DefaultModel::Configured(config));
     }
-    let capacity = probe().map_err(|e| model::ModelError::InvalidConfig {
+    let refuse = |why: String| {
+        model::ModelError::InvalidConfig {
         message: format!(
-            "no default model is configured and the device could not be probed ({e}); configure one with --model or NANNA_MODEL"
+            "no default model is configured and the device could not be probed ({why}); configure one with --model or NANNA_MODEL"
         ),
-    })?;
-    resolve_default_model(None, &capacity, catalog).await
+    }
+    };
+    let capacity = tokio::task::spawn_blocking(probe)
+        .await
+        .map_err(|e| refuse(e.to_string()))?
+        .map_err(|e| refuse(e.to_string()))?;
+    let resolved = resolve_default_model(None, &capacity, catalog).await?;
+    ensure_runnable(provider, &resolved).await?;
+    Ok(resolved)
 }
 
-async fn resolve_startup_model(
+async fn startup_auditor_model_with(
+    explicit: Option<String>,
     configured: Option<model::default_model::ModelConfig>,
-) -> model::ModelResult<model::default_model::DefaultModel> {
-    use model::default_model::{
-        probe_device, DefaultModel, OllamaRegistryCatalog, DEFAULT_REGISTRY_URL,
-    };
-    let catalog = OllamaRegistryCatalog::new(DEFAULT_REGISTRY_URL);
-    let resolved = startup_model(configured, probe_device, &catalog).await?;
+    probe: impl FnOnce() -> model::ModelResult<model::default_model::DeviceCapacity> + Send + 'static,
+    catalog: &dyn model::default_model::VariantCatalog,
+    provider: &dyn model::ModelProvider,
+) -> model::ModelResult<String> {
+    use model::default_model::DefaultModel;
+    if let Some(name) = explicit_name(explicit) {
+        info!("auditor model: {name} (explicit); the default model is not resolved");
+        return Ok(name);
+    }
+    let resolved = startup_model(configured, probe, catalog, provider).await?;
     match &resolved {
         DefaultModel::Configured(config) => info!("default model: {} (configured)", config.name),
         DefaultModel::AutoGemma4(variant) => info!(
@@ -1727,16 +1749,24 @@ async fn resolve_startup_model(
             variant.tag, variant.params, variant.min_memory_bytes
         ),
     }
-    Ok(resolved)
+    Ok(resolved.name().to_string())
 }
 
-fn auditor_model(
+async fn startup_auditor_model(
     explicit: Option<String>,
-    default_model: &model::default_model::DefaultModel,
-) -> String {
-    explicit
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| default_model.name().to_string())
+    configured: Option<model::default_model::ModelConfig>,
+    provider: &dyn model::ModelProvider,
+    registry_url: &str,
+) -> model::ModelResult<String> {
+    let catalog = model::default_model::OllamaRegistryCatalog::new(registry_url);
+    startup_auditor_model_with(
+        explicit,
+        configured,
+        model::default_model::probe_device,
+        &catalog,
+        provider,
+    )
+    .await
 }
 
 fn queue_spawn_gate(
@@ -2007,11 +2037,15 @@ async fn run_mcp_server(
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
-    let default_model = resolve_startup_model(configured_model(model)).await?;
-    let model = auditor_model(audit_model, &default_model);
-    let model = model.as_str();
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
+    let auditor_name = startup_auditor_model(
+        audit_model,
+        configured_model(model),
+        provider.as_ref(),
+        model::default_model::DEFAULT_REGISTRY_URL,
+    )
+    .await?;
     let queue_path = resolve_queue_path(None)?;
     let lease_path = resolve_lease_path(&queue_path);
     let catalog = load_identities();
@@ -2020,7 +2054,7 @@ async fn run_mcp_server(
     let task_manager = Arc::new(
         build_mcp_task_manager(
             provider.clone(),
-            model,
+            &auditor_name,
             &queue_path,
             &lease_path,
             plane.clone(),
@@ -2037,8 +2071,8 @@ async fn run_mcp_server(
     let flush = spawn_telemetry_flush(Arc::clone(&telemetry), TELEMETRY_FLUSH_EVERY);
 
     info!(
-        "Starting Nanna MCP server (model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
-        model,
+        "Starting Nanna MCP server (auditor model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
+        auditor_name,
         max_iterations,
         queue_path.display(),
         lease_path.display(),
@@ -2046,7 +2080,7 @@ async fn run_mcp_server(
     );
 
     let gate = serve_spawn_gate(
-        model,
+        &auditor_name,
         provider.clone() as Arc<dyn model::ModelProvider>,
         &queue_path,
         &catalog,
@@ -2088,15 +2122,20 @@ async fn run_delegate(
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
-    let default_model = resolve_startup_model(configured_model(model.map(str::to_string))).await?;
-    let audit = auditor_model(audit_model.map(str::to_string), &default_model);
     let config = OllamaConfig::default();
     let provider = Arc::new(OllamaProvider::new(config)?);
+    let auditor_name = startup_auditor_model(
+        audit_model.map(str::to_string),
+        configured_model(model.map(str::to_string)),
+        provider.as_ref(),
+        model::default_model::DEFAULT_REGISTRY_URL,
+    )
+    .await?;
     let queue_path = resolve_queue_path(None)?;
     let plane = resolve_escalation_plane(&queue_path)?;
     let task_manager = Arc::new(build_delegate_task_manager(
         provider.clone(),
-        Some(audit.as_str()),
+        Some(auditor_name.as_str()),
         plane.clone(),
     ));
     let telemetry = export_action_audit(
@@ -2106,7 +2145,7 @@ async fn run_delegate(
     export_budget(&task_manager.cost_accountant(), &telemetry);
     let session = async {
         let gate = delegate_spawn_gate(
-            Some(audit.as_str()),
+            Some(auditor_name.as_str()),
             provider.clone() as Arc<dyn model::ModelProvider>,
             &queue_path,
             &load_identities(),
@@ -2156,10 +2195,53 @@ async fn run_delegate(
 
 #[cfg(test)]
 mod default_model_startup {
-    use crate::{auditor_model, startup_model};
+    use crate::{
+        backlog_audit_model, configured_model, startup_auditor_model, startup_auditor_model_with,
+        startup_model,
+    };
+    use async_trait::async_trait;
     use model::default_model::{
         Accel, DefaultModel, DeviceCapacity, FixtureCatalog, ModelConfig, ModelVariant,
     };
+    use model::{ChatRequest, ChatResponse, ModelError, ModelInfo, ModelProvider, ModelResult};
+    use std::io::{Read, Write};
+
+    struct Runtime(Option<Vec<String>>);
+
+    #[async_trait]
+    impl ModelProvider for Runtime {
+        async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+            Err(ModelError::Unknown {
+                message: "unused".into(),
+            })
+        }
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            match &self.0 {
+                Some(names) => Ok(names
+                    .iter()
+                    .map(|name| ModelInfo {
+                        name: name.clone(),
+                        size: None,
+                        digest: None,
+                        modified_at: None,
+                    })
+                    .collect()),
+                None => Err(ModelError::ServiceUnavailable {
+                    message: "down".into(),
+                }),
+            }
+        }
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    fn pulled(names: &[&str]) -> Runtime {
+        Runtime(Some(names.iter().map(|n| n.to_string()).collect()))
+    }
 
     fn catalog() -> FixtureCatalog {
         FixtureCatalog {
@@ -2190,6 +2272,7 @@ mod default_model_startup {
             named("qwen3:0.6b"),
             || panic!("probe must not run"),
             &catalog(),
+            &Runtime(None),
         )
         .await
         .unwrap();
@@ -2197,8 +2280,8 @@ mod default_model_startup {
     }
 
     #[tokio::test]
-    async fn no_model_and_a_device_that_fits_auto_selects_gemma4() {
-        let resolved = startup_model(None, || device(16), &catalog())
+    async fn no_model_and_a_device_that_fits_auto_selects_a_pulled_gemma4() {
+        let resolved = startup_model(None, || device(16), &catalog(), &pulled(&["gemma4:e4b"]))
             .await
             .unwrap();
         assert!(matches!(resolved, DefaultModel::AutoGemma4(_)));
@@ -2206,8 +2289,29 @@ mod default_model_startup {
     }
 
     #[tokio::test]
+    async fn a_blank_configured_name_is_auto_selected() {
+        let resolved = startup_model(
+            named("  "),
+            || device(16),
+            &catalog(),
+            &pulled(&["gemma4:e4b"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.name(), "gemma4:e4b");
+    }
+
+    #[tokio::test]
+    async fn an_auto_selection_that_is_not_pulled_is_refused_with_the_pull_command() {
+        let err = startup_model(None, || device(16), &catalog(), &pulled(&["qwen3:0.6b"]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ollama pull gemma4:e4b"), "{err}");
+    }
+
+    #[tokio::test]
     async fn startup_refuses_when_no_model_is_configured_and_nothing_fits() {
-        let err = startup_model(None, || device(2), &catalog())
+        let err = startup_model(None, || device(2), &catalog(), &pulled(&["gemma4:e4b"]))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no default model"), "{err}");
@@ -2220,7 +2324,9 @@ mod default_model_startup {
                 message: "no meminfo".into(),
             })
         };
-        let err = startup_model(None, probe, &catalog()).await.unwrap_err();
+        let err = startup_model(None, probe, &catalog(), &pulled(&["gemma4:e4b"]))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("no default model"), "{err}");
         assert!(err.to_string().contains("--model"), "{err}");
     }
@@ -2231,24 +2337,207 @@ mod default_model_startup {
             fail: true,
             ..catalog()
         };
-        assert!(startup_model(None, || device(64), &down).await.is_err());
+        assert!(
+            startup_model(None, || device(64), &down, &pulled(&["gemma4:e4b"]))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_audit_model_needs_neither_the_probe_nor_the_registry() {
+        let down = FixtureCatalog {
+            fail: true,
+            ..catalog()
+        };
+        let name = startup_auditor_model_with(
+            Some("judge:1b".into()),
+            None,
+            || panic!("probe must not run"),
+            &down,
+            &Runtime(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "judge:1b");
+    }
+
+    #[tokio::test]
+    async fn without_an_explicit_audit_model_the_default_model_is_the_auditor() {
+        let configured = startup_auditor_model_with(
+            None,
+            named("qwen3:0.6b"),
+            || panic!("probe must not run"),
+            &catalog(),
+            &Runtime(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(configured, "qwen3:0.6b");
+        let auto = startup_auditor_model_with(
+            Some(" ".into()),
+            None,
+            || device(16),
+            &catalog(),
+            &pulled(&["gemma4:e4b"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auto, "gemma4:e4b");
+    }
+
+    #[tokio::test]
+    async fn no_default_and_no_explicit_audit_model_refuses_startup() {
+        let down = FixtureCatalog {
+            fail: true,
+            ..catalog()
+        };
+        let err = startup_auditor_model_with(None, None, || device(64), &down, &Runtime(None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no default model"), "{err}");
+    }
+
+    fn serve_registry() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let config = r#"{"model_type":"1B"}"#;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = if path.contains("/blobs/") {
+                    config.to_string()
+                } else {
+                    format!(
+                        r#"{{"config":{{"digest":"sha256:ab","size":{}}},"layers":[{{"mediaType":"application/vnd.ollama.image.model","size":1000}}]}}"#,
+                        config.len()
+                    )
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn all_gemma_pulled() -> Runtime {
+        pulled(&[
+            "gemma4:e2b",
+            "gemma4:e4b",
+            "gemma4:12b",
+            "gemma4:26b",
+            "gemma4:31b",
+        ])
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_real_startup_path_selects_from_a_loopback_registry_and_the_real_probe() {
+        let name = startup_auditor_model(None, None, &all_gemma_pulled(), &serve_registry())
+            .await
+            .unwrap();
+        assert!(name.starts_with("gemma4:"), "{name}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_real_startup_path_refuses_when_the_registry_is_unreachable() {
+        let err = startup_auditor_model(None, None, &all_gemma_pulled(), "http://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no default model"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_real_startup_path_refuses_a_selection_the_runtime_has_not_pulled() {
+        let err = startup_auditor_model(None, None, &pulled(&["qwen3:0.6b"]), &serve_registry())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ollama pull gemma4:"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_real_startup_path_with_an_explicit_audit_model_never_touches_the_registry() {
+        let name = startup_auditor_model(
+            Some("judge:1b".into()),
+            None,
+            &Runtime(None),
+            "http://127.0.0.1:1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "judge:1b");
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard(Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var_os("NANNA_MODEL");
+            match value {
+                Some(v) => std::env::set_var("NANNA_MODEL", v),
+                None => std::env::remove_var("NANNA_MODEL"),
+            }
+            EnvGuard(previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("NANNA_MODEL", v),
+                None => std::env::remove_var("NANNA_MODEL"),
+            }
+        }
     }
 
     #[test]
-    fn auditors_default_to_the_default_model_unless_one_is_configured() {
-        let default_model = DefaultModel::AutoGemma4(ModelVariant {
-            tag: "gemma4:e4b".into(),
-            params: 1,
-            min_memory_bytes: 1,
-        });
-        assert_eq!(auditor_model(None, &default_model), "gemma4:e4b");
+    fn the_default_model_comes_from_the_flag_then_nanna_model() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(Some("from-env:1b"));
+        assert_eq!(configured_model(None).unwrap().name, "from-env:1b");
         assert_eq!(
-            auditor_model(Some("judge:1b".into()), &default_model),
-            "judge:1b"
+            configured_model(Some("from-flag:1b".into())).unwrap().name,
+            "from-flag:1b"
+        );
+        drop(_env);
+        let _env = EnvGuard::set(None);
+        assert!(configured_model(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_nanna_model_counts_as_unset() {
+        let name = {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _env = EnvGuard::set(Some("   "));
+            configured_model(None)
+        };
+        let resolved = startup_model(name, || device(16), &catalog(), &pulled(&["gemma4:e4b"]))
+            .await
+            .unwrap();
+        assert_eq!(resolved.name(), "gemma4:e4b");
+    }
+
+    #[test]
+    fn backlog_sync_audits_with_its_model_unless_an_audit_model_is_given() {
+        assert_eq!(backlog_audit_model(None, "qwen3:0.6b"), "qwen3:0.6b");
+        assert_eq!(
+            backlog_audit_model(Some("".into()), "qwen3:0.6b"),
+            "qwen3:0.6b"
         );
         assert_eq!(
-            auditor_model(Some("  ".into()), &default_model),
-            "gemma4:e4b"
+            backlog_audit_model(Some("judge:1b".into()), "qwen3:0.6b"),
+            "judge:1b"
         );
     }
 }
