@@ -4,6 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
+#[path = "support/test_module_files.rs"]
+mod test_module_files;
+use test_module_files::{
+    cfg_test_file_modules, is_exact_test_file_module, path_targets, skipped_files,
+};
+
 const BIND: &str = "bind_workspace";
 
 const CONSTRUCTORS: [&str; 11] = [
@@ -106,6 +112,7 @@ struct Scan {
     binds: BTreeSet<String>,
     shapes: BTreeSet<String>,
     audited_refs: BTreeSet<String>,
+    aliases: BTreeSet<String>,
 }
 
 impl Scan {
@@ -214,9 +221,19 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        syn::visit::visit_item_type(self, node);
+        if type_name(&node.ty) == "AuditedRef" {
+            self.aliases.insert(node.ident.to_string());
+        }
+    }
+
     fn visit_use_rename(&mut self, node: &'ast syn::UseRename) {
         syn::visit::visit_use_rename(self, node);
         let name = plain(&node.ident.to_string()).to_string();
+        if name == "AuditedRef" {
+            self.aliases.insert(node.rename.to_string());
+        }
         if CONSTRUCTORS.contains(&name.as_str()) || name == BIND {
             self.sites
                 .insert(format!("{}: use {name} as {}", self.file, node.rename));
@@ -235,7 +252,9 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
         syn::visit::visit_expr_struct(self, node);
-        if last_segment(&node.path) == "AuditedRef" {
+        let name = last_segment(&node.path);
+        let in_ref = name == "Self" && self.owner.last().is_some_and(|o| o == "AuditedRef");
+        if name == "AuditedRef" || in_ref || self.aliases.contains(&name) {
             self.audited_refs
                 .insert(format!("{}: {}", self.file, self.context()));
         }
@@ -252,38 +271,10 @@ fn scan_source(file: &str, source: &str) -> Scan {
         file: file.to_string(),
         ..Scan::default()
     };
-    for item in &syntax.items {
+    for item in syntax.items.iter().chain(syntax.items.iter()) {
         scan.visit_item(item);
     }
     scan
-}
-
-fn test_only_modules(file: &Path, source: &str) -> Vec<PathBuf> {
-    let syntax = syn::parse_file(source).unwrap();
-    let dir = file.parent().unwrap();
-    let stem = file.file_stem().unwrap().to_string_lossy().into_owned();
-    let home = if matches!(stem.as_str(), "mod" | "lib" | "main") {
-        dir.to_path_buf()
-    } else {
-        dir.join(&stem)
-    };
-    syntax
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(module) if module.content.is_none() && is_cfg_test(&module.attrs) => {
-                Some(module.ident.to_string())
-            }
-            _ => None,
-        })
-        .flat_map(|name| module_files(&home, &name))
-        .collect()
-}
-
-fn module_files(home: &Path, name: &str) -> Vec<PathBuf> {
-    let flat = home.join(format!("{name}.rs"));
-    let nested = home.join(name).join("mod.rs");
-    vec![flat, nested]
 }
 
 fn scan_all() -> Vec<Scan> {
@@ -291,24 +282,18 @@ fn scan_all() -> Vec<Scan> {
     let mut files = Vec::new();
     rust_files(&root, &mut files);
     files.sort();
-    let sources: Vec<(PathBuf, String)> = files
+    let sources: Vec<(String, String)> = files
         .into_iter()
         .map(|path| {
-            let source = fs::read_to_string(&path).unwrap();
-            (path, source)
+            let text = path.strip_prefix(&root).unwrap().to_string_lossy();
+            (text.replace('\\', "/"), fs::read_to_string(&path).unwrap())
         })
         .collect();
-    let skipped: BTreeSet<PathBuf> = sources
-        .iter()
-        .flat_map(|(path, source)| test_only_modules(path, source))
-        .collect();
+    let skipped = skipped_files(&sources);
     sources
         .iter()
-        .filter(|(path, _)| !skipped.contains(path))
-        .map(|(path, source)| {
-            let text = path.strip_prefix(&root).unwrap().to_string_lossy();
-            scan_source(&text.replace('\\', "/"), source)
-        })
+        .filter(|(file, _)| !skipped.contains(file))
+        .map(|(file, source)| scan_source(file, source))
         .collect()
 }
 
@@ -384,6 +369,17 @@ fn the_audited_reference_bind_workspace_requires_is_minted_only_by_require_audit
     assert_eq!(
         scan.audited_refs.iter().collect::<Vec<_>>(),
         vec!["x.rs: sneak"]
+    );
+    let hidden = scanned(
+        "impl AuditedRef<'_> { fn again(identity: &I) -> Self { Self { identity } } } fn via_alias() { let _ = Alias { identity }; } fn via_rename() { let _ = Renamed { identity }; } type Alias = AuditedRef<'static>; use crate::AuditedRef as Renamed;",
+    );
+    assert_eq!(
+        hidden.audited_refs.iter().collect::<Vec<_>>(),
+        vec![
+            "x.rs: AuditedRef::again",
+            "x.rs: via_alias",
+            "x.rs: via_rename"
+        ]
     );
 }
 
@@ -496,19 +492,32 @@ fn private_and_public_visibilities_are_told_apart() {
 }
 
 #[test]
-fn test_only_modules_are_resolved_beside_their_parent() {
-    let file = Path::new("/src/harness_adapter/mod.rs");
-    let found = test_only_modules(
-        file,
-        "#[cfg(test)] mod tests; mod live; #[cfg(test)] mod inline { fn f() {} }",
+fn test_only_file_modules_follow_the_same_rule_as_the_audit_hook_guard() {
+    let found = cfg_test_file_modules(
+        "harness_adapter/mod.rs",
+        "#[cfg(test)] mod tests; mod live;",
     );
     assert_eq!(
         found,
         vec![
-            PathBuf::from("/src/harness_adapter/tests.rs"),
-            PathBuf::from("/src/harness_adapter/tests/mod.rs"),
+            "harness_adapter/tests.rs".to_string(),
+            "harness_adapter/tests/mod.rs".to_string()
         ]
     );
-    let leaf = test_only_modules(Path::new("/src/task.rs"), "#[cfg(test)] mod tests;");
-    assert_eq!(leaf[0], PathBuf::from("/src/task/tests.rs"));
+    let leaf = cfg_test_file_modules("task.rs", "#[cfg(test)] mod tests;");
+    assert_eq!(leaf[0], "task/tests.rs");
+    let twin = "#[cfg(test)] mod t; #[cfg(not(test))] mod t;";
+    assert!(cfg_test_file_modules("a/mod.rs", twin).is_empty());
+    let pathed = "#[cfg(test)] mod x; #[path = \"x.rs\"] mod y;";
+    assert!(path_targets("a/mod.rs", pathed).contains(&"a/x.rs".to_string()));
+    let sources = [
+        ("a/mod.rs".to_string(), pathed.to_string()),
+        (
+            "a/x.rs".to_string(),
+            "fn f() { create_tool_registry(p); }".to_string(),
+        ),
+    ];
+    assert!(!skipped_files(&sources).contains("a/x.rs"));
+    let module: syn::ItemMod = syn::parse_str("#[cfg(test)] mod m;").unwrap();
+    assert!(is_exact_test_file_module(&module));
 }
