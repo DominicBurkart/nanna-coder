@@ -1,4 +1,6 @@
-use super::binding::{agent_matches_identity, registry_matches, require_audited, BindError};
+use super::binding::{
+    agent_matches_identity, registry_matches, require_audited, subject_repo, BindError,
+};
 use super::testing::{
     allowed_for, allowed_from_dir, base_registry, layers_allowing, layers_for, ok_with,
     real_workspace, scoped, Behavior,
@@ -430,4 +432,12 @@ async fn a_good_bind_keeps_the_runners_own_layers_and_the_task_id() {
         "dropping the bound workspace releases them"
     );
     workspace.cleanup().unwrap();
+}
+
+#[test]
+fn the_subject_repository_is_owner_and_name_or_the_checkout_path() {
+    let with_origin = super::testing::repo_with_origin("https://github.com/example/repo.git");
+    assert_eq!(subject_repo(with_origin.path()), "example/repo");
+    let bare = tempfile::TempDir::new().unwrap();
+    assert_eq!(subject_repo(bare.path()), bare.path().display().to_string());
 }

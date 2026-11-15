@@ -165,10 +165,14 @@ pub(crate) fn require_audited(bound: &BoundIdentity) -> Result<&AgentIdentity, B
         .ok_or(BindError::Unaudited)
 }
 
-fn subject_repo(source: &Path) -> String {
-    origin_slug(source)
-        .and_then(|slug| slug.split_once('/').map(|(_, rest)| rest.to_string()))
-        .unwrap_or_else(|| source.display().to_string())
+pub(super) fn subject_repo(source: &Path) -> String {
+    let slug = origin_slug(source).unwrap_or_default();
+    let (_, name) = slug.split_once('/').unwrap_or(("", ""));
+    if name.is_empty() {
+        source.display().to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 fn layers_match(
