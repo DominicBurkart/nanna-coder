@@ -474,7 +474,7 @@ impl ToolRegistry {
             .lock()
             .expect("action log poisoned")
             .push(ActionAuditLogEntry {
-                review,
+                review: crate::action_auditor::redact_for_log(&review),
                 verdict: verdict.clone(),
             });
         match verdict {
@@ -6344,6 +6344,65 @@ mod tests {
         );
         assert!(registry.execute("msg_send", json!({})).await.is_err());
         assert_eq!(auditor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_planted_token_in_a_blocked_msg_send_reaches_no_audit_telemetry_or_escalation_output()
+    {
+        const PLANTED: &str = "ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0123";
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("action_audit.jsonl");
+        let telemetry_path = dir.path().join("telemetry.jsonl");
+        let exporter = crate::telemetry::JsonlExporter::new(&telemetry_path, 1 << 20);
+        let telemetry =
+            Arc::new(crate::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter)));
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, escalations) = crate::test_support::escalation::escalator(&sink);
+        let gate = Arc::new(ActionGate::new(
+            Arc::new(EscalatingAuditor),
+            crate::action_auditor::ActionAuditLog::file(&audit_path),
+        ));
+        assert!(
+            gate.set_sink(Arc::new(crate::action_auditor::TelemetrySink::new(
+                Arc::clone(&telemetry)
+            )))
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(StubTool::boxed("msg_send", EffectClass::None));
+        let registry = registry
+            .with_action_gate(gate, subject(EffectClass::Production))
+            .with_action_escalator(escalator);
+
+        let err = registry
+            .execute(
+                "msg_send",
+                json!({"to": "peer", "body": format!("token {PLANTED}")}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ActionDenied(ActionDenied::Escalate { .. })
+        ));
+        telemetry.export_all().await.unwrap();
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let telemetry_out = std::fs::read_to_string(&telemetry_path).unwrap();
+        let evidence = serde_json::to_string(&sink.escalations()).unwrap();
+        let returned = format!("{err:?}{}", err);
+        let in_memory = serde_json::to_string(&registry.action_reviews()).unwrap();
+        assert!(!audit.is_empty() && !telemetry_out.is_empty() && !evidence.is_empty());
+        let _ = escalations;
+        for (name, text) in [
+            ("audit file", &audit),
+            ("telemetry", &telemetry_out),
+            ("escalation evidence", &evidence),
+            ("error returned to the agent", &returned),
+            ("in-memory reviews", &in_memory),
+        ] {
+            assert!(!text.contains(PLANTED), "{name} leaked the token");
+            assert!(!text.contains("token ghp"), "{name} leaked the body");
+        }
     }
 
     #[tokio::test]
