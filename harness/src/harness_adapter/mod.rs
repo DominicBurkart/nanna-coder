@@ -1,6 +1,6 @@
 //! Harness-neutral seam between nanna's agent definitions and the agent
 //! runtimes that execute them. Nothing here runs a runtime yet. The seam
-//! (resolve, adapter, isolation policy) is delivered; the host-side `bind` and
+//! (resolve, adapter, isolation policy) is delivered; the host-side `binding` and
 //! `broker` modules exist but nothing calls them: the socket server, the
 //! executor and the `TaskRunner` switch are not written, so this module is
 //! planned infrastructure, not a delivered isolation guarantee.
@@ -83,7 +83,8 @@ mod tests;
 
 pub use broker::{
     AuditOutcome, AuditSink, BrokerOutcome, BrokerPolicy, BrokerRequest, BrokerResponse,
-    CallRecord, HaltReason, RingAuditSink, ToolErrorKind, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES,
+    CallRecord, HaltReason, RingAuditSink, ToolErrorKind, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES,
+    MAX_REQUEST_BYTES,
 };
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};

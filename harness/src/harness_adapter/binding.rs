@@ -158,10 +158,23 @@ pub(super) fn registry_matches(
     Ok(())
 }
 
-pub(crate) fn require_audited(bound: &BoundIdentity) -> Result<&AgentIdentity, BindError> {
+#[derive(Debug)]
+pub(crate) struct AuditedRef<'a> {
+    identity: &'a AgentIdentity,
+}
+
+impl AuditedRef<'_> {
+    #[cfg(test)]
+    pub(crate) fn for_test(identity: &AgentIdentity) -> AuditedRef<'_> {
+        AuditedRef { identity }
+    }
+}
+
+pub(crate) fn require_audited(bound: &BoundIdentity) -> Result<AuditedRef<'_>, BindError> {
     let unaudited = matches!(bound, BoundIdentity::Unaudited(_));
+    let identity = bound.identity();
     (!unaudited)
-        .then_some(bound.identity())
+        .then_some(AuditedRef { identity })
         .ok_or(BindError::Unaudited)
 }
 
@@ -202,11 +215,12 @@ fn layers_match(
 impl ResolvedAgent {
     pub(crate) fn bind_workspace(
         &self,
-        identity: &AgentIdentity,
+        audited: AuditedRef<'_>,
         audited_repo: &str,
         workspace: &TaskWorkspace,
         layers: ModelFacingLayers,
     ) -> Result<BoundWorkspace, BindError> {
+        let identity = audited.identity;
         if !agent_matches_identity(self, identity, audited_repo) {
             return Err(BindError::AgentMismatch);
         }

@@ -1,5 +1,5 @@
 use super::binding::{
-    agent_matches_identity, registry_matches, require_audited, subject_repo, BindError,
+    agent_matches_identity, registry_matches, require_audited, subject_repo, AuditedRef, BindError,
 };
 use super::testing::{
     allowed_for, allowed_from_dir, base_registry, layers_allowing, layers_for, ok_with,
@@ -296,7 +296,12 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
         ..Card::new("\"*\"", "workspace")
     };
     let err = agent
-        .bind_workspace(&global.identity(), REPO, &workspace, layers())
+        .bind_workspace(
+            AuditedRef::for_test(&global.identity()),
+            REPO,
+            &workspace,
+            layers(),
+        )
         .err()
         .unwrap();
     assert!(matches!(err, BindError::AgentMismatch));
@@ -316,7 +321,7 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
     )
     .unwrap();
     let err = hollow
-        .bind_workspace(&identity, REPO, &workspace, layers())
+        .bind_workspace(AuditedRef::for_test(&identity), REPO, &workspace, layers())
         .err()
         .unwrap();
     assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "write_file"));
@@ -328,7 +333,12 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
         (ws, other)
     };
     let err = agent
-        .bind_workspace(&identity, REPO, &other_workspace, layers())
+        .bind_workspace(
+            AuditedRef::for_test(&identity),
+            REPO,
+            &other_workspace,
+            layers(),
+        )
         .err()
         .unwrap();
     assert!(matches!(err, BindError::RepoMismatch { .. }));
@@ -340,7 +350,7 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
     let (outside_identity, outside_agent) = bound_agent(&workspace, &outside);
     let err = outside_agent
         .bind_workspace(
-            &outside_identity,
+            AuditedRef::for_test(&outside_identity),
             REPO,
             &workspace,
             layers_allowing(&outside_identity, "t-bind-refusals").layers,
@@ -379,7 +389,12 @@ async fn binding_refuses_layers_that_describe_another_task_ceiling_scope_or_repo
         let mut layered = layers_allowing(&identity, "t-bind-layers");
         tamper(&mut layered.layers);
         let err = agent
-            .bind_workspace(&identity, REPO, &workspace, layered.layers)
+            .bind_workspace(
+                AuditedRef::for_test(&identity),
+                REPO,
+                &workspace,
+                layered.layers,
+            )
             .err()
             .unwrap();
         let mismatch = matches!(err, BindError::LayersMismatch { field: f } if f == field);
@@ -407,7 +422,12 @@ async fn a_good_bind_keeps_the_runners_own_layers_and_the_task_id() {
         Arc::strong_count(&log),
     );
     let bound = agent
-        .bind_workspace(&identity, REPO, &workspace, layered.layers)
+        .bind_workspace(
+            AuditedRef::for_test(&identity),
+            REPO,
+            &workspace,
+            layered.layers,
+        )
         .unwrap();
     assert_eq!(bound.task_id().0, "t-bind-ok");
     assert_eq!(

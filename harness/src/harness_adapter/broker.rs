@@ -43,13 +43,20 @@
 //! [`BrokerPolicy`], which serves nothing above `Workspace`; it exists for the
 //! day the policy is widened.
 //!
-//! Calls already running when a halt is decided complete: the halted check
-//! precedes `ToolRegistry::execute`, which includes the action review, so a
-//! call admitted just before an escalation can still run its tool. That is
-//! negligible under the default policy, where only `run_command` is reviewed,
-//! and it is a precondition for widening the policy: the broker must re-check
-//! the halted flag after the review and before the tool runs, which needs a
-//! hook in `tools.rs`.
+//! `ArmedBroker::handle` serialises calls with an async mutex held from the
+//! halted check to the end of the call, so a call that starts after an
+//! escalation sees the halt and is refused, and no two calls are in flight at
+//! once: every call, including one already queued when another escalates,
+//! passes the halted check and then the action gate. The halted check still
+//! precedes the review inside a single call, which is the call that
+//! escalates. Slices 2 and 3 must keep one connection per task and read one
+//! request at a time; widening the policy beyond `Workspace` additionally
+//! needs the lease and window handling named in [`BrokerPolicy`].
+//!
+//! Error messages put on the wire are clipped to [`MAX_MESSAGE_BYTES`], and
+//! U+2028 and U+2029 are escaped in every reply line, so a reader that splits
+//! lines on them cannot be tricked into a second frame; the executor must
+//! still frame on LF only.
 
 use super::binding::BoundWorkspace;
 use super::{verify_runtime_tools, CheckedPlan, HandshakeMismatch, ResolvedAgent, ScopeGrant};
@@ -84,6 +91,16 @@ pub const MAX_OUTPUT_BYTES: usize = 1_000_000;
 /// ```
 pub const MAX_REQUEST_BYTES: usize = 1_048_576;
 
+/// Largest message the broker puts in an error reply, in bytes before JSON
+/// escaping. It is one sixth of [`MAX_OUTPUT_BYTES`] so the escaped text, at
+/// worst six bytes per control character, still fits in the reply cap.
+/// ```
+/// use harness::harness_adapter::{MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES};
+///
+/// assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 6);
+/// ```
+pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;
+
 const HALT_ERROR_TYPE: &str = "StateError";
 const HALT_NOTICE: &str = "the task was halted by the host";
 const MAX_LOGGED_NAME: usize = 128;
@@ -92,9 +109,9 @@ const MAX_LOGGED_NAME: usize = 128;
 /// [`EffectClass::Workspace`]. The per-action gate is on main, but the action
 /// subject a task carries has no window, pull request or environment, so
 /// `Sandbox` and `Production` calls stop at the missing lease context, and the
-/// halted check precedes the action review (see the module docs), so the
-/// policy must not be widened before that is closed. It can only be widened
-/// inside the crate, by the change that does so.
+/// leases and windows are unhandled, so the policy must not be widened before
+/// that is closed. It can only be widened inside the crate, by the change that
+/// does so.
 ///
 /// ```
 /// use harness::effects::EffectClass;
@@ -403,7 +420,7 @@ impl BrokerOutcome {
             },
             BrokerOutcome::ToolError { kind, message } => BrokerResponse {
                 ok: false,
-                output: json!(message),
+                output: json!(clip(message, MAX_MESSAGE_BYTES)),
                 kind: Some(*kind),
                 halt: false,
             },
@@ -622,6 +639,7 @@ struct Core {
     started: AtomicU64,
     completed: AtomicU64,
     halted: AtomicBool,
+    serial: tokio::sync::Mutex<()>,
 }
 
 pub(crate) struct Broker {
@@ -677,6 +695,7 @@ impl Broker {
                 started: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
                 halted: AtomicBool::new(false),
+                serial: tokio::sync::Mutex::new(()),
             },
         })
     }
@@ -750,6 +769,7 @@ impl ArmedBroker {
 
     pub(crate) async fn handle(&self, request: BrokerRequest) -> BrokerOutcome {
         let core = &self.core;
+        let _serial = core.serial.lock().await;
         let args_text = request.args.to_string();
         let mut guard = CallGuard {
             core,
@@ -811,7 +831,7 @@ impl ArmedBroker {
     pub(crate) async fn handle_line(&self, line: &str) -> String {
         let bad = |message: String| BrokerResponse {
             ok: false,
-            output: json!(message),
+            output: json!(clip(&message, MAX_MESSAGE_BYTES)),
             kind: Some(ToolErrorKind::BadRequest),
             halt: false,
         };
@@ -823,7 +843,9 @@ impl ArmedBroker {
                 Err(error) => bad(format!("bad request: {error}")),
             }
         };
-        serde_json::to_string(&response).expect("broker responses are plain JSON")
+        let text = serde_json::to_string(&response).expect("broker responses are plain JSON");
+        let text = text.replace('\u{2028}', "\\u2028");
+        text.replace('\u{2029}', "\\u2029")
     }
 }
 
@@ -846,6 +868,14 @@ impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
         self.finish(AuditOutcome::Aborted);
     }
+}
+
+pub(super) fn clip(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn logged_name(name: &str) -> String {

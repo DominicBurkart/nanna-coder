@@ -38,6 +38,7 @@ impl Tool for StubTool {
     }
 
     async fn execute(&self, _args: Value) -> ToolResult<Value> {
+        tokio::task::yield_now().await;
         self.calls.fetch_add(1, Ordering::SeqCst);
         (self.behavior)()
     }

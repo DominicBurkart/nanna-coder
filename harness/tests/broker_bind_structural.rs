@@ -105,6 +105,7 @@ struct Scan {
     sites: BTreeSet<String>,
     binds: BTreeSet<String>,
     shapes: BTreeSet<String>,
+    audited_refs: BTreeSet<String>,
 }
 
 impl Scan {
@@ -230,6 +231,14 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         syn::visit::visit_expr_path(self, node);
         self.record(&last_segment(&node.path));
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        syn::visit::visit_expr_struct(self, node);
+        if last_segment(&node.path) == "AuditedRef" {
+            self.audited_refs
+                .insert(format!("{}: {}", self.file, self.context()));
+        }
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -362,6 +371,19 @@ fn bind_workspace_is_declared_once_and_the_layers_stay_crate_private() {
             "task.rs: fn model_facing_registry is pub(crate)",
             "task.rs: struct ModelFacingLayers is pub(crate)",
         ])
+    );
+}
+
+#[test]
+fn the_audited_reference_bind_workspace_requires_is_minted_only_by_require_audited() {
+    assert_eq!(
+        union(|scan| &scan.audited_refs),
+        expected(&["harness_adapter/binding.rs: require_audited"])
+    );
+    let scan = scanned("fn sneak() { let _ = AuditedRef { identity }; } #[cfg(test)] fn t() { AuditedRef { identity }; }");
+    assert_eq!(
+        scan.audited_refs.iter().collect::<Vec<_>>(),
+        vec!["x.rs: sneak"]
     );
 }
 

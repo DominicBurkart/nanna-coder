@@ -1,5 +1,5 @@
-use super::binding::BoundWorkspace;
-use super::broker::{ArmError, ArmedBroker, Broker, BrokerError};
+use super::binding::{AuditedRef, BoundWorkspace};
+use super::broker::{clip, ArmError, ArmedBroker, Broker, BrokerError};
 use super::testing::{
     allowed_for, allowed_for_repo, allowed_for_subtask, allowed_from_dir_for_repo, base_registry,
     calls, fail_with, layers_for, ok_with, real_workspace, scoped, Behavior, Counters,
@@ -1039,7 +1039,12 @@ fn armed_real(
     let layered = layers_for(&r.identity, task, "example/repo", verdict);
     let bound = r
         .agent
-        .bind_workspace(&r.identity, REPO, &r.workspace, layered.layers)
+        .bind_workspace(
+            AuditedRef::for_test(&r.identity),
+            REPO,
+            &r.workspace,
+            layered.layers,
+        )
         .unwrap();
     assert_eq!(bound.task_id().0, task);
     let broker = Broker::for_agent(&r.agent, bound, policy, sink()).unwrap();
@@ -1094,7 +1099,12 @@ async fn the_bound_registry_installs_every_model_facing_layer() {
     );
     let bound = r
         .agent
-        .bind_workspace(&r.identity, REPO, &r.workspace, layered.layers)
+        .bind_workspace(
+            AuditedRef::for_test(&r.identity),
+            REPO,
+            &r.workspace,
+            layered.layers,
+        )
         .unwrap();
     let broker = Broker::for_agent(&r.agent, bound, BrokerPolicy::default(), sink()).unwrap();
     assert_eq!(
@@ -1197,7 +1207,12 @@ async fn a_workspace_bound_for_another_audited_spawn_is_refused() {
     );
     let bound_a = a
         .agent
-        .bind_workspace(&a.identity, REPO, &a.workspace, layered.layers)
+        .bind_workspace(
+            AuditedRef::for_test(&a.identity),
+            REPO,
+            &a.workspace,
+            layered.layers,
+        )
         .unwrap();
     let err = Broker::for_agent(&b.agent, bound_a, BrokerPolicy::default(), sink())
         .err()
@@ -1212,9 +1227,116 @@ async fn a_workspace_bound_for_another_audited_spawn_is_refused() {
     );
     let bound_b = b
         .agent
-        .bind_workspace(&b.identity, REPO, &b.workspace, layered.layers)
+        .bind_workspace(
+            AuditedRef::for_test(&b.identity),
+            REPO,
+            &b.workspace,
+            layered.layers,
+        )
         .unwrap();
     assert!(Broker::for_agent(&b.agent, bound_b, BrokerPolicy::default(), sink()).is_ok());
     a.workspace.cleanup().unwrap();
     b.workspace.cleanup().unwrap();
+}
+
+#[tokio::test]
+async fn every_error_message_on_the_wire_is_clipped_on_a_character_boundary() {
+    use crate::tools::ToolError;
+    let (broker, _) = armed(vec![
+        (
+            "wide",
+            EffectClass::None,
+            fail_with(|| ToolError::ExecutionFailed {
+                message: "é".repeat(3_000_000),
+            }),
+        ),
+        (
+            "quotes",
+            EffectClass::None,
+            fail_with(|| ToolError::ExecutionFailed {
+                message: "\"".repeat(3_000_000),
+            }),
+        ),
+        (
+            "short",
+            EffectClass::None,
+            fail_with(|| ToolError::ExecutionFailed {
+                message: "tiny".into(),
+            }),
+        ),
+    ]);
+    for tool in ["wide", "quotes"] {
+        let line = broker.handle_line(&format!(r#"{{"tool":"{tool}"}}"#)).await;
+        assert!(line.len() <= MAX_OUTPUT_BYTES, "{tool}: {}", line.len());
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["kind"], "execution_failed");
+        assert!(reply["output"].as_str().unwrap().len() <= MAX_MESSAGE_BYTES);
+    }
+    let short = broker.handle_line(r#"{"tool":"short"}"#).await;
+    assert!(short.contains("Execution failed: tiny"));
+    let bad = broker.handle_line(&"x".repeat(MAX_REQUEST_BYTES + 1)).await;
+    assert!(bad.len() < 100, "{}", bad.len());
+}
+
+#[test]
+fn the_message_cap_is_one_sixth_of_the_output_cap() {
+    assert_eq!(MAX_MESSAGE_BYTES, 166_666);
+    assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 6);
+}
+
+#[tokio::test]
+async fn calls_are_serialised_so_a_call_queued_behind_an_escalation_is_refused() {
+    use crate::action_auditor::ActionDenied;
+    use crate::tools::ToolError;
+    let (broker, parts) = armed(vec![
+        (
+            "t_escalate",
+            EffectClass::None,
+            fail_with(|| {
+                ToolError::ActionDenied(ActionDenied::Escalate {
+                    reasons: vec![Reason::new(ReasonCode::Other, "needs a human")],
+                })
+            }),
+        ),
+        (
+            "t_ok",
+            EffectClass::None,
+            ok_with(serde_json::json!("fine")),
+        ),
+    ]);
+    let (first, second, third) = tokio::join!(
+        broker.handle(req("t_escalate")),
+        broker.handle(req("t_ok")),
+        broker.handle(req("t_ok"))
+    );
+    assert!(first.is_halt());
+    assert_eq!(kind_of(&second), Some(ToolErrorKind::TaskHalted));
+    assert_eq!(kind_of(&third), Some(ToolErrorKind::TaskHalted));
+    assert_eq!(calls(&parts.counters, "t_ok"), 0);
+}
+
+#[tokio::test]
+async fn reply_lines_never_contain_the_unicode_line_separators_or_a_newline() {
+    let (broker, _) = armed(vec![(
+        "echo",
+        EffectClass::None,
+        ok_with(serde_json::json!("a\u{2028}b\u{2029}c\nd")),
+    )]);
+    let line = broker
+        .handle_line("{\"tool\":\"echo\",\"args\":{\"k\":\"x\u{2028}y\u{2029}z\"}}")
+        .await;
+    assert!(!line.contains('\u{2028}'));
+    assert!(!line.contains('\u{2029}'));
+    assert!(!line.contains('\n'));
+    let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["output"], "a\u{2028}b\u{2029}c\nd");
+}
+
+#[test]
+fn clipping_never_splits_a_character() {
+    assert_eq!(clip("éééé", 3), "é");
+    assert_eq!(clip("éééé", 4), "éé");
+    assert_eq!(clip("😀😀", 5), "😀");
+    assert_eq!(clip("abc", 10), "abc");
+    assert_eq!(clip("abc", 0), "");
 }
