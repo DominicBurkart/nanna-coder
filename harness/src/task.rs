@@ -102,7 +102,7 @@ fn build_task_system_prompt(
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
 impl TaskId {
