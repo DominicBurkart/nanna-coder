@@ -44,7 +44,7 @@ pub use export::{ActionAuditEvent, ActionAuditSink, NullSink, TelemetrySink};
 pub use fail_closed::{FailClosedActionAuditor, ACTION_AUDIT_TIMEOUT};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
-pub use log::{ActionAuditLog, ActionAuditLogEntry};
+pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
 pub use review::ActionReview;
 pub use routing::{is_message_tool, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS};
 pub(crate) use rules::RUN_COMMAND_TOOL;
@@ -68,10 +68,10 @@ pub enum ActionAuditError {
     #[error("action audit log entry serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
     /// The auditor did not answer within its timeout.
-    #[error("action auditor did not answer within {secs}s")]
+    #[error("action auditor did not answer within {timeout:?}")]
     Timeout {
-        /// The timeout that elapsed, in whole seconds.
-        secs: u64,
+        /// The timeout that elapsed.
+        timeout: std::time::Duration,
     },
 }
 

@@ -74,7 +74,7 @@ impl<A: ActionAuditor> ActionAuditor for FailClosedActionAuditor<A> {
         match tokio::time::timeout(self.timeout, self.inner.review_action(review, context)).await {
             Ok(result) => result,
             Err(_) => Err(ActionAuditError::Timeout {
-                secs: self.timeout.as_secs(),
+                timeout: self.timeout,
             }),
         }
     }
@@ -189,8 +189,21 @@ mod tests {
         let a = FailClosedActionAuditor::new(Scripted(Behaviour::Hang))
             .with_timeout(Duration::from_secs(7));
         let err = bounded(&a).await.unwrap_err();
-        assert!(matches!(err, ActionAuditError::Timeout { secs: 7 }));
+        assert!(
+            matches!(err, ActionAuditError::Timeout { timeout } if timeout == Duration::from_secs(7))
+        );
         assert!(err.to_string().contains("7s"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sub_second_timeout_is_reported_exactly() {
+        let a = FailClosedActionAuditor::new(Scripted(Behaviour::Hang))
+            .with_timeout(Duration::from_millis(250));
+        let err = bounded(&a).await.unwrap_err();
+        assert!(
+            matches!(err, ActionAuditError::Timeout { timeout } if timeout == Duration::from_millis(250))
+        );
+        assert!(err.to_string().contains("250ms"));
     }
 
     #[tokio::test(start_paused = true)]

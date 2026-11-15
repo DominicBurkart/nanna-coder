@@ -89,12 +89,15 @@ pub trait OutboundRouter: Send + Sync {
 /// Sends the router's tools to an [`OutboundRouter`] and every other tool to
 /// a default [`ActionAuditor`], unchanged.
 ///
-/// The router is held as a [`Weak`] to break the ownership cycle between the
-/// hub and the registries that carry this auditor. If it has been dropped, a
-/// [`MESSAGE_TOOLS`] call is blocked; any other tool still reaches the
-/// default. An escalation calls
+/// Routing is decided by tool name alone: a [`MESSAGE_TOOLS`] call goes to
+/// the router and is blocked when the router has been dropped or does not
+/// [`handle`](OutboundRouter::handles) it, never to the default; every other
+/// call goes to the default whatever the router says. The router is held as
+/// a [`Weak`] to break the ownership cycle between the hub and the registries
+/// that carry this auditor. An escalation calls
 /// [`on_quarantine`](OutboundRouter::on_quarantine) once; if that fails the
-/// verdict is still an escalation.
+/// verdict is still an escalation, carrying an extra reason line and an error
+/// log entry.
 ///
 /// ```
 /// use harness::action_auditor::{RoutingActionAuditor, RuleActionAuditor, ActionAuditor};
@@ -144,24 +147,34 @@ impl ActionAuditor for RoutingActionAuditor {
         review: &ActionReview,
         context: &ActionContext<'_>,
     ) -> Result<ActionVerdict, ActionAuditError> {
-        let Some(router) = self.router.upgrade() else {
-            if is_message_tool(&review.tool) {
-                return Ok(ActionVerdict::block(vec![Reason::new(
-                    ReasonCode::Other,
-                    "message router unavailable; message tool refused",
-                )]));
-            }
+        if !is_message_tool(&review.tool) {
             return self.default.review_action(review, context).await;
+        }
+        let Some(router) = self.router.upgrade() else {
+            return Ok(refuse("message router unavailable; message tool refused"));
         };
         if !router.handles(&review.tool) {
-            return self.default.review_action(review, context).await;
+            return Ok(refuse("message router does not handle this message tool"));
         }
         let verdict = router.review(review, context).await?;
-        if let ActionVerdict::Escalate { reasons } = &verdict {
-            let _ = router.on_quarantine(review, reasons).await;
+        match verdict {
+            ActionVerdict::Escalate { mut reasons } => {
+                if let Err(error) = router.on_quarantine(review, &reasons).await {
+                    tracing::error!(tool = %review.tool, %error, "quarantine record not written");
+                    reasons.push(Reason::new(
+                        ReasonCode::Other,
+                        "quarantine record not written",
+                    ));
+                }
+                Ok(ActionVerdict::Escalate { reasons })
+            }
+            other => Ok(other),
         }
-        Ok(verdict)
     }
+}
+
+fn refuse(detail: &str) -> ActionVerdict {
+    ActionVerdict::block(vec![Reason::new(ReasonCode::Other, detail)])
 }
 
 #[cfg(test)]
@@ -198,7 +211,9 @@ mod tests {
         ) -> Result<ActionVerdict, ActionAuditError> {
             match &self.1 {
                 Some(v) => Ok(v.clone()),
-                None => Err(ActionAuditError::Timeout { secs: 1 }),
+                None => Err(ActionAuditError::Timeout {
+                    timeout: std::time::Duration::from_secs(1),
+                }),
             }
         }
     }
@@ -232,9 +247,9 @@ mod tests {
             _context: &ActionContext<'_>,
         ) -> Result<ActionVerdict, ActionAuditError> {
             self.reviewed.lock().unwrap().push(review.tool.clone());
-            self.verdict
-                .clone()
-                .ok_or(ActionAuditError::Timeout { secs: 2 })
+            self.verdict.clone().ok_or(ActionAuditError::Timeout {
+                timeout: std::time::Duration::from_secs(2),
+            })
         }
         async fn on_quarantine(
             &self,
@@ -246,7 +261,9 @@ mod tests {
                 .unwrap()
                 .push((review.tool.clone(), reasons.len()));
             if self.hook_fails {
-                Err(ActionAuditError::Timeout { secs: 3 })
+                Err(ActionAuditError::Timeout {
+                    timeout: std::time::Duration::from_secs(3),
+                })
             } else {
                 Ok(())
             }
@@ -356,6 +373,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, ActionVerdict::escalate(reason()));
+        assert!(!got
+            .reasons()
+            .iter()
+            .any(|r| r.detail.contains("quarantine record")));
         assert_eq!(
             *hub.quarantined.lock().unwrap(),
             vec![("msg_send".to_string(), 1)]
@@ -377,6 +398,11 @@ mod tests {
             .unwrap();
         assert_eq!(got.kind(), VerdictKind::Escalate);
         assert_eq!(hub.quarantined.lock().unwrap().len(), 1);
+        assert!(got
+            .reasons()
+            .iter()
+            .any(|r| r.detail == "quarantine record not written"));
+        assert_eq!(got.reasons().len(), reason().len() + 1);
     }
 
     #[tokio::test]
@@ -409,39 +435,118 @@ mod tests {
         assert_eq!(got, ActionVerdict::Allow);
     }
 
-    #[tokio::test]
-    async fn a_router_that_declines_a_tool_leaves_it_to_the_default() {
-        struct Declines;
-        #[async_trait]
-        impl OutboundRouter for Declines {
-            fn handles(&self, _tool: &str) -> bool {
-                false
-            }
-            async fn review(
-                &self,
-                _: &ActionReview,
-                _: &ActionContext<'_>,
-            ) -> Result<ActionVerdict, ActionAuditError> {
-                Ok(ActionVerdict::Allow)
-            }
-            async fn on_quarantine(
-                &self,
-                _: &ActionReview,
-                _: &[Reason],
-            ) -> Result<(), ActionAuditError> {
-                Ok(())
-            }
+    struct Scripted {
+        handles: bool,
+        verdict: ActionVerdict,
+        reviewed: Mutex<usize>,
+    }
+
+    impl Scripted {
+        fn new(handles: bool, verdict: ActionVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                handles,
+                verdict,
+                reviewed: Mutex::new(0),
+            })
         }
-        let router = Arc::new(Declines);
+    }
+
+    #[async_trait]
+    impl OutboundRouter for Scripted {
+        fn handles(&self, _tool: &str) -> bool {
+            self.handles
+        }
+        async fn review(
+            &self,
+            _: &ActionReview,
+            _: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, ActionAuditError> {
+            *self.reviewed.lock().unwrap() += 1;
+            Ok(self.verdict.clone())
+        }
+        async fn on_quarantine(
+            &self,
+            _: &ActionReview,
+            _: &[Reason],
+        ) -> Result<(), ActionAuditError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_router_that_declines_a_message_tool_blocks_it_and_never_uses_the_default() {
+        let router = Scripted::new(false, ActionVerdict::Allow);
         let r = RoutingActionAuditor::new(
             Arc::downgrade(&router),
-            Arc::new(Fixed("default", Some(ActionVerdict::block(reason())))),
+            Arc::new(Fixed("allow-all", Some(ActionVerdict::Allow))),
         );
-        let got = r
-            .review_action(&sample_review("msg_send", EffectClass::None), &ctx())
-            .await
-            .unwrap();
-        assert_eq!(got.kind(), VerdictKind::Block);
+        for tool in MESSAGE_TOOLS {
+            let got = r
+                .review_action(&sample_review(tool, EffectClass::None), &ctx())
+                .await
+                .unwrap();
+            assert_eq!(got.kind(), VerdictKind::Block, "{tool}");
+        }
+        assert_eq!(*router.reviewed.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_router_claiming_a_non_message_tool_never_sees_it() {
+        let router = Scripted::new(true, ActionVerdict::block(reason()));
+        let r = RoutingActionAuditor::new(
+            Arc::downgrade(&router),
+            Arc::new(Fixed("allow-all", Some(ActionVerdict::Allow))),
+        );
+        for tool in [
+            "write_file",
+            "push",
+            "run_command",
+            "msg_recv",
+            "sessions_list",
+        ] {
+            let got = r
+                .review_action(&sample_review(tool, EffectClass::Repository), &ctx())
+                .await
+                .unwrap();
+            assert_eq!(got, ActionVerdict::Allow, "{tool}");
+        }
+        assert_eq!(*router.reviewed.lock().unwrap(), 0);
+    }
+
+    fn rules_default() -> Arc<dyn ActionAuditor> {
+        Arc::new(crate::action_auditor::RuleActionAuditor::new(
+            Arc::new(crate::windows::WindowSet::default()),
+            Arc::new(crate::leases::InMemoryLeaseStore::default()),
+            chrono::Duration::minutes(10),
+        ))
+    }
+
+    #[tokio::test]
+    async fn the_rule_auditor_alone_would_allow_a_message_tool_so_routing_must_not_fall_back() {
+        let gate = ActionGate::new(rules_default(), ActionAuditLog::in_memory());
+        let review = sample_review("msg_send", EffectClass::None);
+        assert!(gate.run_gate(&review, &ctx()).await.is_allow());
+    }
+
+    #[tokio::test]
+    async fn through_the_real_gate_a_message_tool_is_never_allowed_without_a_content_review() {
+        let declining = Scripted::new(false, ActionVerdict::Allow);
+        let dropped = Scripted::new(true, ActionVerdict::Allow);
+        let dropped_weak = Arc::downgrade(&dropped);
+        drop(dropped);
+        let cases = [
+            RoutingActionAuditor::new(Arc::downgrade(&declining), rules_default()),
+            RoutingActionAuditor::new(dropped_weak, rules_default()),
+        ];
+        for routing in cases {
+            let gate = ActionGate::new(Arc::new(routing), ActionAuditLog::in_memory());
+            for tool in MESSAGE_TOOLS {
+                let v = gate
+                    .run_gate(&sample_review(tool, EffectClass::None), &ctx())
+                    .await;
+                assert_eq!(v.kind(), VerdictKind::Block, "{tool}");
+            }
+        }
     }
 
     #[test]
