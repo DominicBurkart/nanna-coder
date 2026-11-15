@@ -158,6 +158,9 @@ pub(super) fn registry_matches(
     Ok(())
 }
 
+/// Proof that an identity came through `require_audited`. The field is private
+/// to this module, so building one anywhere else is a compile error (E0451);
+/// the structural guard additionally pins the in-module constructors.
 #[derive(Debug)]
 pub(crate) struct AuditedRef<'a> {
     identity: &'a AgentIdentity,

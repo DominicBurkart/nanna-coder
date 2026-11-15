@@ -6,6 +6,7 @@ B, K, M, P = DIR + "binding.rs", DIR + "broker.rs", DIR + "mod.rs", DIR + "pi.rs
 G = "harness/tests/broker_bind_structural.rs"
 H = "harness/tests/protected_audit_hook_structural.rs"
 SH = ["--test", "protected_audit_hook_structural"]
+SM = "harness/tests/support/test_module_files.rs"
 T = ["--lib", "harness_adapter"]
 S = ["--test", "broker_bind_structural"]
 
@@ -103,14 +104,30 @@ MUTANTS = [
     (K, "while !text.is_char_boundary(end) {", "while false {", T),
     (K, "let text = text.replace('\\u{2028}', \"\\\\u2028\");", "", T),
     (K, "text.replace('\\u{2029}', \"\\\\u2029\")", "text", T),
-    (G, 'if last_segment(&node.path) == "AuditedRef" {', "if false {", S),
-    (H, "let exact = module.content.is_none() && is_cfg_test(&module.attrs);", "let exact = is_cfg_test(&module.attrs);", SH),
-    (H, 'exact && !module.attrs.iter().any(|attr| attr.path().is_ident("path"))', "exact", SH),
-    (H, "            kept.insert(name);", "            let _ = name;", SH),
-    (H, "skipped.difference(&kept)", "skipped.iter()", SH),
-    (H, 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test"))', "matches!(&meta, syn::Meta::Path(_))", SH),
+    (G, 'if name == "AuditedRef" || in_ref || self.aliases.contains(&name) {', "if false {", S),
+    (SM, "let exact = module.content.is_none() && is_exact_cfg_test(&module.attrs);", "let exact = is_exact_cfg_test(&module.attrs);", SH),
+    (SM, 'exact && !module.attrs.iter().any(|attr| attr.path().is_ident("path"))', "exact", SH),
+    (SM, "            kept.insert(name);", "            let _ = name;", SH),
+    (SM, "skipped.difference(&kept)", "skipped.iter()", SH),
+    (SM, 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test"))', "matches!(&meta, syn::Meta::Path(_))", SH),
     (H, ".filter(|(file, _)| !skipped.contains(file))", ".filter(|(_, _)| true)", SH),
-    (H, "if is_exact_test_file_module(&module) {", "if true {", SH),
+    (SM, "if is_exact_test_file_module(&module) {", "if true {", SH),
+    (K, "wire_text(&value.to_string()).len() > MAX_OUTPUT_BYTES", "value.to_string().len() > MAX_OUTPUT_BYTES", T),
+    (K, "        wire_text(&text)", "        text", T),
+    (SM, "skipped.difference(&targets).cloned().collect()", "skipped", SH),
+    (SM, "        targets.push(join_path(&[dir.clone(), literal.clone()]));", "", SH),
+    (SM, "        targets.push(join_path(&[base.clone(), literal]));", "        let _ = literal;", SH),
+    (SM, 'literal.trim_start_matches("./").to_string()', "literal", SH),
+    (SM, "                    self.found.push(text.value());", "", SH),
+    (SM, "        syn::visit::visit_item_mod(self, node);\n        for attr", "        for attr", SH),
+    (SM, "skipped.difference(&kept)", "skipped.iter()", S),
+    (SM, "skipped.difference(&targets).cloned().collect()", "skipped", S),
+    (G, 'let in_ref = name == "Self" && self.owner.last().is_some_and(|o| o == "AuditedRef");', "let in_ref = false;", S),
+    (G, "|| self.aliases.contains(&name)", "", S),
+    (G, "            self.aliases.insert(node.ident.to_string());", "", S),
+    (G, "            self.aliases.insert(node.rename.to_string());", "", S),
+    (G, "syntax.items.iter().chain(syntax.items.iter())", "syntax.items.iter()", S),
+    (G, ".filter(|(file, _)| !skipped.contains(file))", ".filter(|(_, _)| true)", S),
 ]
 
 INJECTED = [

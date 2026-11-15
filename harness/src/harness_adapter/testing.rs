@@ -217,6 +217,12 @@ pub(crate) fn repo_with_origin(url: &str) -> tempfile::TempDir {
     dir
 }
 
+pub(crate) fn unique_task(prefix: &str) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    format!("{prefix}-{}-{n}", std::process::id())
+}
+
 pub(crate) fn real_workspace(task: &str) -> (crate::workspace::TaskWorkspace, tempfile::TempDir) {
     let repo = repo_with_origin("https://github.com/example/repo.git");
     let workspace = crate::workspace::TaskWorkspace::create(repo.path(), task, "HEAD").unwrap();
