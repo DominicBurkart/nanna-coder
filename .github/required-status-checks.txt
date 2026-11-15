@@ -1,0 +1,42 @@
+# Cross-workflow required status checks
+#
+# This file lists jobs defined OUTSIDE .github/workflows/ci.yml that are
+# (or should be) configured as required status checks in branch protection
+# for `main`. The all-checks gate in ci.yml uses this allowlist to verify
+# that every job in every workflow file is covered by either:
+#   - ci.yml's `jobs.all-checks.needs` (for jobs in ci.yml), or
+#   - this file (for jobs in other workflow files).
+#
+# Format: one entry per line, `<workflow-file-basename-without-extension>/<job-id>`.
+# Lines beginning with `#` and blank lines are ignored.
+#
+# When adding a new job to a workflow file other than ci.yml:
+#   1. If the job should block merges to main, add an entry here AND
+#      configure it as a required status check in branch protection.
+#   2. If the job is intentionally optional (informational, dispatch-only,
+#      release-only, etc.), add it to the OPTIONAL section below so the
+#      gate can still account for it.
+#
+# IMPORTANT: this file is documentation/enumeration only -- it does NOT
+# itself enforce required-status-check status. Actual merge enforcement
+# lives in branch-protection settings. The string used in branch
+# protection is `<workflow `name:`> / <job `name:` or job-id>`
+# (with spaces around the slash) -- e.g. `codecov-guard / guard` --
+# whereas the entries in this file use the slug
+# `<workflow-filename-without-extension>/<job-id>` (no spaces).
+# See AGENTS.md "Adding a new CI job" for details.
+#
+# Required (must be green to merge):
+codecov-guard/guard
+ci-integration/container-loading
+ci-integration/empty-cache
+ci-integration/expected-failure
+
+# Optional / dispatch-only / scheduled (not required for merge, but
+# enumerated so the gate accounts for every job in every workflow file):
+cache-warming/summary
+cache-warming/warm-containers
+cache-warming/warm-cross-platform
+cache-warming/warm-dependencies
+eval/eval
+badges/update-badges
