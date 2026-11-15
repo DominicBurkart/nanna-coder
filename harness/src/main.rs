@@ -55,6 +55,15 @@ enum Commands {
         #[command(subcommand)]
         action: AgentsAction,
     },
+    /// Print the default model nanna would use, or the live Gemma 4 catalog
+    DefaultModel {
+        /// The configured default model (falls back to NANNA_MODEL)
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Print the Gemma 4 variants read live from the registry instead, and fail when none can be read
+        #[arg(long)]
+        catalog: bool,
+    },
     /// Health check
     Health {
         /// Skip the on-startup pod-ensure check
@@ -504,6 +513,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => catalog,
             };
             print!("{}", catalog.map_err(|e| e.to_string())?.render_table());
+        }
+        Commands::DefaultModel { model, catalog } => {
+            run_default_model(model, catalog).await?;
         }
         Commands::Health { no_ensure_pod } => {
             ensure_pod_or_exit(no_ensure_pod).await;
@@ -2026,6 +2038,35 @@ async fn shutdown_signal() {
             std::future::pending::<()>().await;
         }
     }
+}
+
+async fn run_default_model(
+    model: Option<String>,
+    catalog: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use model::default_model::{OllamaRegistryCatalog, VariantCatalog, DEFAULT_REGISTRY_URL};
+    if catalog {
+        let variants = OllamaRegistryCatalog::new(DEFAULT_REGISTRY_URL)
+            .gemma4_variants()
+            .await?;
+        for variant in &variants {
+            println!(
+                "{} params={} min_memory_bytes={}",
+                variant.tag, variant.params, variant.min_memory_bytes
+            );
+        }
+        return Ok(());
+    }
+    let provider = OllamaProvider::new(OllamaConfig::default())?;
+    let name = startup_auditor_model(
+        None,
+        configured_model(model),
+        &provider,
+        DEFAULT_REGISTRY_URL,
+    )
+    .await?;
+    println!("{name}");
+    Ok(())
 }
 
 async fn run_mcp_server(
