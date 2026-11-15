@@ -8,6 +8,24 @@ use std::time::Duration;
 const MODEL: &str = "qwen3:0.6b";
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+// NOTE: There is no in-test "is Ollama reachable?" probe here.
+//
+// These `#[ignore]`d tests require a live Ollama on `127.0.0.1:11434`. The CI
+// `integration-container` leg already gates `--run-ignored ignored-only` behind
+// a `curl --max-time 5 http://localhost:11434/api/tags` probe (see
+// `.github/workflows/ci.yml` ~L150). If the probe fails the ignored tests are
+// not invoked at all, so adding a second in-test probe here would be:
+//   1. Redundant (the CI gate already covers the no-Ollama case), and
+//   2. Risky — a silent `eprintln!; return` would report each test as PASSED
+//      with zero assertions executed, making a no-op skip indistinguishable
+//      from a real run in nextest output. If Ollama silently disappears the
+//      leg would go fully green while testing nothing.
+//
+// Locally, run these explicitly (with Ollama up) via:
+//   cargo nextest run -p model --test ollama_chat_integration --run-ignored ignored-only
+//
+// See issue #302 and the prior review on PR #315.
+
 fn make_provider() -> OllamaProvider {
     OllamaProvider::new(OllamaConfig::default().with_timeout(TIMEOUT)).expect("provider creation")
 }
