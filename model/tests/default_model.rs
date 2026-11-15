@@ -184,7 +184,7 @@ fn param_counts_parse() {
     }
 }
 
-const MANIFEST: &str = r#"{"schemaVersion":2,"config":{"digest":"sha256:aa","size":241},"layers":[
+const MANIFEST: &str = r#"{"schemaVersion":2,"config":{"digest":"sha256:aa","size":88},"layers":[
 {"mediaType":"application/vnd.ollama.image.model","digest":"sha256:01","size":5493439296},
 {"mediaType":"application/vnd.ollama.image.projector","digest":"sha256:02","size":991552256},
 {"mediaType":"application/vnd.ollama.image.draft","digest":"sha256:03","size":98653280},

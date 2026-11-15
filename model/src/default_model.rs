@@ -1,6 +1,7 @@
 //! Required default model and Gemma 4 auto-selection (message hub design 8.5).
 
 use crate::provider::ModelError;
+use crate::provider::ModelProvider;
 use async_trait::async_trait;
 
 /// Hardware accelerator class of the device.
@@ -126,18 +127,61 @@ pub fn parse_nvidia_smi(output: &str) -> Option<u64> {
         .and_then(|mib| mib.checked_mul(1 << 20))
 }
 
-fn read_gpu() -> Option<(Accel, u64)> {
-    let smi = std::process::Command::new("nvidia-smi")
+/// Longest `nvidia-smi` is given before the probe refuses.
+pub const NVIDIA_SMI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn query_nvidia_smi(
+    program: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<u64>, ModelError> {
+    use std::io::Read;
+    let mut child = match std::process::Command::new(program)
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| parse_nvidia_smi(&String::from_utf8_lossy(&o.stdout)));
-    if let Some(vram) = smi {
-        return Some((Accel::Cuda, vram));
-    }
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
+    let mut stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(out) = stdout.as_mut() {
+            let _ = out.by_ref().take(64 * 1024).read_to_string(&mut text);
+        }
+        text
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ModelError::Unknown {
+                    message: format!(
+                        "{program} did not answer within {}s and was killed",
+                        timeout.as_secs_f32()
+                    ),
+                });
+            }
+            Err(e) => {
+                return Err(ModelError::Unknown {
+                    message: format!("cannot wait for {program}: {e}"),
+                })
+            }
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    Ok(status.success().then(|| parse_nvidia_smi(&text)).flatten())
+}
+
+fn read_amd_vram() -> Option<u64> {
     let mut best: Option<u64> = None;
     for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
         let dir = entry.path().join("device");
@@ -151,15 +195,30 @@ fn read_gpu() -> Option<(Accel, u64)> {
             .filter(|b| *b > 0);
         best = best.max(total);
     }
-    best.map(|vram| (Accel::Rocm, vram))
+    best
 }
 
-/// Probe this machine: Linux `/proc/meminfo`, `nvidia-smi` and AMD sysfs VRAM. Errors on platforms without `/proc/meminfo`.
+/// Probe this machine: Linux `/proc/meminfo`, `nvidia-smi` (bounded by [`NVIDIA_SMI_TIMEOUT`]) and AMD sysfs VRAM. Errors on platforms without `/proc/meminfo`, naming the platform, and when `nvidia-smi` hangs. Blocking: call from `spawn_blocking` in async code.
 pub fn probe_device() -> Result<DeviceCapacity, ModelError> {
+    probe_device_with("nvidia-smi", NVIDIA_SMI_TIMEOUT)
+}
+
+/// [`probe_device`] with an explicit `nvidia-smi` program and time limit. A missing or failing program means no NVIDIA GPU; a program that outlives `timeout` is killed and is an error.
+pub fn probe_device_with(
+    nvidia_smi: &str,
+    timeout: std::time::Duration,
+) -> Result<DeviceCapacity, ModelError> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|e| ModelError::Unknown {
-        message: format!("cannot read /proc/meminfo: {e}"),
+        message: format!(
+            "device probing needs /proc/meminfo (supported on Linux; this platform is {}): {e}",
+            std::env::consts::OS
+        ),
     })?;
-    parse_capacity(&meminfo, read_gpu())
+    let gpu = match query_nvidia_smi(nvidia_smi, timeout)? {
+        Some(vram) => Some((Accel::Cuda, vram)),
+        None => read_amd_vram().map(|vram| (Accel::Rocm, vram)),
+    };
+    parse_capacity(&meminfo, gpu)
 }
 
 /// Largest-parameter variant whose memory need plus 20% headroom fits the device (VRAM when an accelerator is present, else RAM). Ties on parameters pick the smaller footprint.
@@ -331,17 +390,73 @@ impl OllamaRegistryCatalog {
     }
 }
 
+/// Largest registry manifest accepted.
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+/// Largest registry config blob accepted.
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+
+fn registry_base(url: &str) -> Result<String, ModelError> {
+    let bad = |why: &str| ModelError::InvalidConfig {
+        message: format!("registry URL rejected: {why}"),
+    };
+    let parsed = reqwest::Url::parse(url).map_err(|_| bad("not a URL"))?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match parsed.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err(bad("only https is allowed (plain http only for loopback)")),
+    }
+    Ok(url.trim_end_matches('/').to_string())
+}
+
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> Result<String, ModelError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ModelError::ServiceUnavailable {
+            message: format!("registry answered {what} with status {status}"),
+        });
+    }
+    let too_big = || ModelError::Unknown {
+        message: format!("registry {what} exceeds the {cap} byte limit"),
+    };
+    if response.content_length().is_some_and(|l| l > cap as u64) {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > cap {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| ModelError::Unknown {
+        message: format!("registry {what} is not UTF-8"),
+    })
+}
+
 #[async_trait]
 impl VariantCatalog for OllamaRegistryCatalog {
     async fn gemma4_variants(&self) -> Result<Vec<ModelVariant>, ModelError> {
+        let base = registry_base(&self.registry_url)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let base = self.registry_url.trim_end_matches('/');
         let mut variants = Vec::new();
         let mut last_error = None;
         for tag in GEMMA4_TAGS {
-            match fetch_variant(&client, base, tag).await {
+            match fetch_variant(&client, &base, tag).await {
                 Ok(variant) => variants.push(variant),
                 Err(e) => {
                     tracing::warn!("skipping gemma4:{tag}: {e}");
@@ -364,18 +479,17 @@ async fn fetch_variant(
     base: &str,
     tag: &str,
 ) -> Result<ModelVariant, ModelError> {
-    let manifest = client
+    let response = client
         .get(format!("{base}/v2/library/gemma4/manifests/{tag}"))
         .header(
             "Accept",
             "application/vnd.docker.distribution.manifest.v2+json",
         )
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
-    let digest = serde_json::from_str::<serde_json::Value>(&manifest)?
+    let manifest = read_capped(response, MAX_MANIFEST_BYTES, "manifest").await?;
+    let parsed = serde_json::from_str::<serde_json::Value>(&manifest)?;
+    let digest = parsed
         .pointer("/config/digest")
         .and_then(|d| d.as_str())
         .map(str::to_string)
@@ -386,12 +500,48 @@ async fn fetch_variant(
         .ok_or_else(|| ModelError::Unknown {
             message: format!("registry manifest for gemma4:{tag} has no usable config digest"),
         })?;
-    let config = client
+    let declared = parsed.pointer("/config/size").and_then(|s| s.as_u64());
+    let response = client
         .get(format!("{base}/v2/library/gemma4/blobs/{digest}"))
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+    let config = read_capped(response, MAX_CONFIG_BYTES, "config blob").await?;
+    if declared != Some(config.len() as u64) {
+        return Err(ModelError::Unknown {
+            message: format!(
+                "registry config blob for gemma4:{tag} is {} bytes but the manifest declares {declared:?}",
+                config.len()
+            ),
+        });
+    }
     variant_from_registry(&format!("gemma4:{tag}"), &manifest, &config)
+}
+
+/// Verify that an auto-selected model is present in the runtime (`/api/tags`). A configured model is not checked, since it may be hosted. Refuses with an actionable `ollama pull` message rather than letting every audit fail closed later.
+pub async fn ensure_runnable(
+    provider: &dyn ModelProvider,
+    model: &DefaultModel,
+) -> Result<(), ModelError> {
+    let DefaultModel::AutoGemma4(variant) = model else {
+        return Ok(());
+    };
+    let present = provider
+        .list_models()
+        .await
+        .map_err(|e| ModelError::InvalidConfig {
+            message: format!(
+                "cannot confirm that {} is available because the model runtime (ollama) is unreachable ({e}); start ollama and run `ollama pull {}`, or configure a model with --model or NANNA_MODEL",
+                variant.tag, variant.tag
+            ),
+        })?;
+    if present.iter().any(|m| m.name == variant.tag) {
+        Ok(())
+    } else {
+        Err(ModelError::InvalidConfig {
+            message: format!(
+                "the auto-selected default model {} is not available in the runtime; run `ollama pull {}`, or configure a model with --model or NANNA_MODEL",
+                variant.tag, variant.tag
+            ),
+        })
+    }
 }
