@@ -596,3 +596,13 @@ async fn a_manifest_redirect_is_still_never_followed() {
         .is_err());
     assert!(seen.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_config_blob_redirect_to_an_ip_literal_is_refused_before_any_request() {
+    let url = registry_redirecting_blobs_to("https://127.0.0.1/data".into(), CONFIG.len());
+    let err = OllamaRegistryCatalog::new(url)
+        .gemma4_variants()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("IP address"), "{err}");
+}

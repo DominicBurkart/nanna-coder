@@ -574,10 +574,194 @@ async fn get_blob(client: &reqwest::Client, url: &str) -> Result<reqwest::Respon
         .and_then(|v| v.to_str().ok())
         .and_then(|location| origin.join(location).ok())
         .ok_or_else(|| refuse("no usable Location header"))?;
-    let allowed = target.scheme() == "https"
-        || (target.scheme() == "http" && is_loopback(&target) && is_loopback(&origin));
-    if !allowed {
-        return Err(refuse("the target is not https"));
+    if let Some(reason) = redirect_refusal(&origin, &target) {
+        return Err(refuse(reason));
     }
     Ok(client.get(target).send().await?)
+}
+
+fn redirect_refusal(origin: &reqwest::Url, target: &reqwest::Url) -> Option<&'static str> {
+    let loopback_only = target.scheme() == "http" && is_loopback(target) && is_loopback(origin);
+    if loopback_only {
+        return None;
+    }
+    if target.scheme() != "https" {
+        return Some("the target is not https");
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Some("the target carries userinfo");
+    }
+    if target.port().is_some() {
+        return Some("the target uses a non-default port");
+    }
+    let Some(host) = target.host_str() else {
+        return Some("the target host is not a DNS name");
+    };
+    let host = host.trim_end_matches('.');
+    let ip_literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok();
+    if ip_literal {
+        return Some("the target host is an IP address");
+    }
+    let local = host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal");
+    if local {
+        return Some("the target host is a local name");
+    }
+    if !host.contains('.') {
+        return Some("the target host is not a DNS name");
+    }
+    None
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::redirect_refusal;
+
+    fn refusal(origin: &str, target: &str) -> Option<&'static str> {
+        redirect_refusal(
+            &reqwest::Url::parse(origin).unwrap(),
+            &reqwest::Url::parse(target).unwrap(),
+        )
+    }
+
+    const REGISTRY: &str = "https://registry.ollama.ai/v2/library/gemma4/blobs/sha256:ab";
+    const LOOPBACK: &str = "http://127.0.0.1:8080/v2/x";
+
+    macro_rules! refused {
+        ($name:ident, $target:expr, $reason:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(refusal(REGISTRY, $target), Some($reason));
+                assert_eq!(refusal(LOOPBACK, $target), Some($reason));
+            }
+        };
+    }
+
+    refused!(
+        an_ipv4_literal_is_refused,
+        "https://127.0.0.1/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        a_public_ipv4_literal_is_refused,
+        "https://93.184.216.34/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        an_ipv6_literal_is_refused,
+        "https://[::1]/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        a_global_ipv6_literal_is_refused,
+        "https://[2001:db8::1]/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        a_decimal_numeric_host_is_refused,
+        "https://2130706433/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        a_hex_numeric_host_is_refused,
+        "https://0x7f.0.0.1/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        an_octal_numeric_host_is_refused,
+        "https://0177.0.0.1/d",
+        "the target host is an IP address"
+    );
+    refused!(
+        localhost_is_refused,
+        "https://localhost/d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_trailing_dot_localhost_is_refused,
+        "https://localhost./d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_localhost_subdomain_is_refused,
+        "https://a.localhost/d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_dot_local_host_is_refused,
+        "https://printer.local/d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_dot_internal_host_is_refused,
+        "https://svc.internal/d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_mixed_case_local_host_is_refused,
+        "https://Printer.LOCAL/d",
+        "the target host is a local name"
+    );
+    refused!(
+        a_single_label_host_is_refused,
+        "https://intranet/d",
+        "the target host is not a DNS name"
+    );
+    refused!(
+        userinfo_with_a_password_is_refused,
+        "https://user:pw@storage.example.com/d",
+        "the target carries userinfo"
+    );
+    refused!(
+        userinfo_without_a_password_is_refused,
+        "https://user@storage.example.com/d",
+        "the target carries userinfo"
+    );
+    refused!(
+        a_non_default_port_is_refused,
+        "https://storage.example.com:8443/d",
+        "the target uses a non-default port"
+    );
+    refused!(
+        a_password_only_userinfo_is_refused,
+        "https://:pw@storage.example.com/d",
+        "the target carries userinfo"
+    );
+    refused!(
+        plain_http_is_refused,
+        "http://storage.example.com/d",
+        "the target is not https"
+    );
+
+    #[test]
+    fn a_dns_hostname_over_https_with_a_signed_query_is_accepted() {
+        let target = "https://dd20bb89.r2.cloudflarestorage.com/ollama/data?X-Amz-Signature=ab";
+        assert_eq!(refusal(REGISTRY, target), None);
+        assert_eq!(refusal(LOOPBACK, target), None);
+    }
+
+    #[test]
+    fn an_explicit_default_https_port_is_accepted() {
+        assert_eq!(refusal(REGISTRY, "https://storage.example.com:443/d"), None);
+    }
+
+    #[test]
+    fn the_plain_http_exception_needs_a_loopback_origin_and_a_loopback_target() {
+        assert_eq!(refusal(LOOPBACK, "http://127.0.0.1:9/d"), None);
+        assert_eq!(refusal(LOOPBACK, "http://localhost:9/d"), None);
+        assert_eq!(
+            refusal(REGISTRY, "http://127.0.0.1:9/d"),
+            Some("the target is not https")
+        );
+        assert_eq!(
+            refusal(LOOPBACK, "http://storage.example.com/d"),
+            Some("the target is not https")
+        );
+    }
 }
