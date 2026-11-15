@@ -4,6 +4,8 @@ import subprocess
 DIR = "harness/src/harness_adapter/"
 B, K, M, P = DIR + "binding.rs", DIR + "broker.rs", DIR + "mod.rs", DIR + "pi.rs"
 G = "harness/tests/broker_bind_structural.rs"
+H = "harness/tests/protected_audit_hook_structural.rs"
+SH = ["--test", "protected_audit_hook_structural"]
 T = ["--lib", "harness_adapter"]
 S = ["--test", "broker_bind_structural"]
 
@@ -88,15 +90,31 @@ MUTANTS = [
     (K, 'format!("production hold {escalation_id} on {repo} halted the task")', 'String::new()', T),
     (P, "agent: agent.name().to_string(),\n            model:", "agent: String::new(),\n            model:", T),
     (P, "model: agent.model().to_string(),", "model: String::new(),", T),
-    (M, "                tools: identity\n                    .scope\n                    .tools\n                    .iter()\n                    .map(ToString::to_string)\n                    .collect(),", "                tools: Vec::new(),", T),
+    (M, "                tools: tools.iter().map(ToString::to_string).collect(),", "                tools: Vec::new(),", T),
     (G, 'syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => {', "syn::Visibility::Restricted(restricted) if restricted.path.is_ident(\"super\") => {", S),
     (G, "if name == BIND {\n            self.binds", "if name == \"never\" {\n            self.binds", S),
     (G, "PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 0", "PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 1", S),
     (G, 'if CONSTRUCTORS.contains(&name) {', 'if false {', S),
+    (K, "output: json!(clip(message, MAX_MESSAGE_BYTES)),", "output: json!(message),", T),
+    (K, "output: json!(clip(&message, MAX_MESSAGE_BYTES)),", "output: json!(message),", T),
+    (K, "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;", "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 5;", T),
+    (K, "let _serial = core.serial.lock().await;", "", T),
+    (K, "let mut end = text.len().min(max);", "let mut end = text.len();", T),
+    (K, "while !text.is_char_boundary(end) {", "while false {", T),
+    (K, "let text = text.replace('\\u{2028}', \"\\\\u2028\");", "", T),
+    (K, "text.replace('\\u{2029}', \"\\\\u2029\")", "text", T),
+    (G, 'if last_segment(&node.path) == "AuditedRef" {', "if false {", S),
+    (H, "let exact = module.content.is_none() && is_cfg_test(&module.attrs);", "let exact = is_cfg_test(&module.attrs);", SH),
+    (H, 'exact && !module.attrs.iter().any(|attr| attr.path().is_ident("path"))', "exact", SH),
+    (H, "            kept.insert(name);", "            let _ = name;", SH),
+    (H, "skipped.difference(&kept)", "skipped.iter()", SH),
+    (H, 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test"))', "matches!(&meta, syn::Meta::Path(_))", SH),
+    (H, ".filter(|(file, _)| !skipped.contains(file))", ".filter(|(_, _)| true)", SH),
+    (H, "if is_exact_test_file_module(&module) {", "if true {", SH),
 ]
 
 INJECTED = [
-    ("a new bind_workspace caller in tools.rs", "harness/src/tools.rs", "pub struct EchoTool;", "#[allow(dead_code)]\nfn zz_bypass(a: &crate::harness_adapter::ResolvedAgent, i: &crate::identity::AgentIdentity, w: &crate::workspace::TaskWorkspace, l: crate::task::ModelFacingLayers) {\n    let _ = a.bind_workspace(i, \"r\", w, l);\n}\n\npub struct EchoTool;", S),
+    ("a new bind_workspace caller in harness_adapter/mod.rs", DIR + "mod.rs", "/// An audited spawn bound to a task: everything a runtime needs", "#[allow(dead_code)]\nfn zz_bypass(a: &ResolvedAgent, b: &crate::task::BoundIdentity, w: &crate::workspace::TaskWorkspace, l: crate::task::ModelFacingLayers) {\n    if let Ok(r) = binding::require_audited(b) {\n        let _ = a.bind_workspace(r, \"r\", w, l);\n    }\n}\n\n/// An audited spawn bound to a task: everything a runtime needs", S),
     ("a new registry constructor call in pr_tools.rs", "harness/src/pr_tools.rs", "fn git_cmd(workspace_root: &Path) -> Command {", "#[allow(dead_code)]\nfn zz_bypass(p: &Path) { let _ = crate::tools::create_tool_registry(p); }\n\nfn git_cmd(workspace_root: &Path) -> Command {", S),
     ("ModelFacingLayers made pub", "harness/src/task.rs", "pub(crate) struct ModelFacingLayers {", "pub struct ModelFacingLayers {", S),
 ]

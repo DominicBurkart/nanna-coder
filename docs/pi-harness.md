@@ -1,7 +1,7 @@
 # Pi as nanna's internal harness
 
 **Status: planned.** The interface layer (`harness_adapter`) exists, and so do
-the host-side `bind` and `broker` modules of slice 1, which nothing calls. No
+the host-side `binding` and `broker` modules of slice 1, which nothing calls. No
 socket server, executor or runner switch is written, nothing launches pi yet,
 and `assign_task` still runs the in-house loop. This document describes the
 target and what is and is not built. Tracking: #924 (merge criteria), #922
@@ -113,8 +113,8 @@ Not built, and the reason the default `BrokerPolicy` serves nothing above
 for `Repository` and above. The runner's action subject carries no window,
 pull request or environment today, so `Sandbox` and `Production` calls stop at
 the missing lease context. There is also no registry hook to re-check the halt
-flag between the action review and the tool (see the halt contract below), a
-precondition for widening the policy (#921 is closed; #924 tracks the merge criteria).
+flag between the action review and the tool inside the escalating call (see the
+halt contract below), a precondition for widening the policy (#921 is closed; #924 tracks the merge criteria).
 The audit log is in-memory only (`RingAuditSink`); a durable sink is executor
 work.
 
@@ -129,7 +129,7 @@ the layers against the identity and workspace (task id, effect ceiling, path
 scope, repository) and builds the bound registry through
 `model_facing_registry`, the only constructor it uses. The layers themselves
 (gate, log, escalator) are the runner's; a permissive gate cannot be detected
-by `bind`, so a `TaskRunner` method that builds the layers and the bind in one
+by `bind_workspace`, so a `TaskRunner` method that builds the layers and the bind in one
 step, and that nobody else can call, is the only intended caller (a structural
 test pins the callers of `bind_workspace`). The `TaskRunner` method is not in
 slice 1.
@@ -150,8 +150,12 @@ names the audited repository, as `TaskManager::submit_spawn` does, is done by
 against `scope.repos`). `bind_workspace` takes the identity and the audited
 repository, not the `Allowed` proof, because the runner no longer holds the
 proof when it runs (`submit_spawn` consumes it, restore re-audits and keeps the
-identity); the broker fails closed on an identity the spawn gate did not bind
-(`BoundIdentity::Unaudited`). The task prompt is carried by the `ResolvedAgent`
+identity). Its first argument is an `AuditedRef`, a crate-private type whose
+only constructor is `require_audited(&BoundIdentity)`, which refuses
+`BoundIdentity::Unaudited`; so no caller can bind an identity the spawn gate did
+not bind, and a structural test pins that `AuditedRef` is built nowhere else.
+The accept arm of `require_audited` cannot be exercised outside task.rs, so it
+is covered only once the `TaskRunner` method exists. The task prompt is carried by the `ResolvedAgent`
 and cannot be re-checked from the identity.
 
 ### The halt contract
@@ -165,9 +169,13 @@ container without waiting for pi to exit; fail the task with
 label `AgentLoop` gives an escalated action, `agent/mod.rs`) and
 `HaltReason::message()`; and surface `ArmedBroker::action_audit()` as the
 result's `action_audit`. `ProductionHeld` is unreachable under the default
-policy. A call admitted just before an escalation can still run its tool,
-because the halted check precedes `execute`, which includes the review; that is
-negligible under the default policy and a precondition for widening it.
+policy. The broker serialises calls with an async mutex, so a call that
+starts after an escalation is refused with `task_halted` and every call passes
+the action gate; slices 2 and 3 must keep one connection per task and read one
+request at a time. Error messages on the wire are clipped to
+`MAX_MESSAGE_BYTES` (a sixth of `MAX_OUTPUT_BYTES`, so the JSON-escaped text
+fits the reply cap) and U+2028/U+2029 are escaped in every reply line; the
+executor must still frame on LF only.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds
 tools that cannot honour path scope (`run_command` for path-restricted
@@ -236,7 +244,7 @@ passing. The broker, executor and `TaskRunner` switch may be developed as
 stacked draft PRs, but they merge as a unit that works; no further unwired
 slice lands on its own.
 
-Slice 1 (this change, unwired): `harness_adapter::bind` and
+Slice 1 (this change, unwired): `harness_adapter::binding` and
 `harness_adapter::broker` as described above, with `LaunchPlan.agent`,
 `LaunchPlan.model` and `ScopeGrant.tools` so a broker can be matched to its
 plan. `isolation.rs` and `checked.rs` are protected paths and are untouched; the
