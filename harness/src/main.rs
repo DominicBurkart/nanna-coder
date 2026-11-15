@@ -107,7 +107,7 @@ enum Commands {
         planner_model: Option<String>,
         #[arg(
             long,
-            help = "Run audited tasks on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_GATEWAY_SOCKET); off unless given"
+            help = "Run audited tasks on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_BROKER_DIR); off unless given"
         )]
         pi_route: bool,
     },
@@ -141,7 +141,7 @@ enum Commands {
         identity: String,
         #[arg(
             long,
-            help = "Run the task on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_GATEWAY_SOCKET); off unless given"
+            help = "Run the task on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_BROKER_DIR); off unless given"
         )]
         pi_route: bool,
     },
@@ -3350,9 +3350,9 @@ mod tests {
                 "nanna-pi@sha256:{}",
                 "a".repeat(64)
             ))),
-            harness::harness_adapter::PI_GATEWAY_SOCKET_ENV => Some(std::ffi::OsString::from(
-                "/run/user/1000/nanna/gateway.sock",
-            )),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
             _ => None,
         };
         assert!(pi_route_with(false, &configured).unwrap().is_none());

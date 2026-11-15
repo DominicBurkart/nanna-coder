@@ -1,7 +1,7 @@
-use super::{image_is_valid, ScopedCapabilities};
+use super::binding::BoundWorkspace;
+use super::{image_is_valid, Endpoint, ResolvedAgent};
+use crate::action_auditor::ActionAuditLogEntry;
 use crate::agent::{AgentError, AgentRunResult, AgentState};
-use crate::auditor::Allowed;
-use crate::tools::ToolRegistry;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const PI_IMAGE_ENV: &str = "NANNA_PI_IMAGE";
-pub const PI_GATEWAY_SOCKET_ENV: &str = "NANNA_PI_GATEWAY_SOCKET";
+pub const PI_BROKER_DIR_ENV: &str = "NANNA_PI_BROKER_DIR";
 
 const DIGEST_PREFIX: &str = "@sha256:";
 const DIGEST_HEX_LEN: usize = 64;
@@ -19,7 +19,7 @@ const DIGEST_HEX_LEN: usize = 64;
 pub enum PiRouteError {
     #[error("pi image `{image}` is not a digest-pinned reference (name@sha256:<64 hex>)")]
     Image { image: String },
-    #[error("pi gateway socket `{path}` is not a normalised absolute path")]
+    #[error("pi broker directory `{path}` is not a normalised absolute path")]
     Socket { path: String },
     #[error("pi route is enabled but {variable} is not set")]
     Missing { variable: &'static str },
@@ -40,22 +40,76 @@ impl Default for PiLimits {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct PiLaunch<'a> {
-    pub task_id: &'a str,
-    pub container_name: &'a str,
-    pub repo: &'a str,
-    pub subtask: &'a str,
-    pub allowed: &'a Allowed,
-    pub capabilities: &'a ScopedCapabilities,
-    pub registry: &'a ToolRegistry,
-    pub route: &'a PiRoute,
-    pub progress: Arc<AtomicUsize>,
-    pub deadline: Duration,
+    task_id: &'a str,
+    container_name: &'a str,
+    agent: &'a ResolvedAgent,
+    binding: BoundWorkspace,
+    route: &'a PiRoute,
+    progress: Arc<AtomicUsize>,
+    deadline: Duration,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> PiLaunch<'a> {
+    pub(crate) fn new(
+        task_id: &'a str,
+        container_name: &'a str,
+        agent: &'a ResolvedAgent,
+        binding: BoundWorkspace,
+        route: &'a PiRoute,
+        progress: Arc<AtomicUsize>,
+        deadline: Duration,
+    ) -> Self {
+        Self {
+            task_id,
+            container_name,
+            agent,
+            binding,
+            route,
+            progress,
+            deadline,
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        self.task_id
+    }
+
+    pub(crate) fn container_name(&self) -> &str {
+        self.container_name
+    }
+
+    pub(crate) fn agent(&self) -> &ResolvedAgent {
+        self.agent
+    }
+
+    pub(crate) fn route(&self) -> &PiRoute {
+        self.route
+    }
+
+    pub(crate) fn progress(&self) -> &Arc<AtomicUsize> {
+        &self.progress
+    }
+
+    pub(crate) fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    pub(crate) fn into_binding(self) -> BoundWorkspace {
+        self.binding
+    }
+}
+
+pub struct PiRunOutcome {
+    pub result: Result<AgentRunResult, AgentError>,
+    pub action_audit: Vec<ActionAuditLogEntry>,
 }
 
 #[async_trait::async_trait]
 pub trait PiExecutor: Send + Sync + std::fmt::Debug {
-    async fn run(&self, launch: PiLaunch<'_>) -> Result<AgentRunResult, AgentError>;
+    async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome;
 }
 
 #[derive(Debug)]
@@ -63,24 +117,28 @@ pub struct UnwiredPiExecutor;
 
 #[async_trait::async_trait]
 impl PiExecutor for UnwiredPiExecutor {
-    async fn run(&self, launch: PiLaunch<'_>) -> Result<AgentRunResult, AgentError> {
-        Err(AgentError::StateError {
-            message: format!(
-                "the pi executor is not wired into this build; task {} was not run",
-                launch.task_id
-            ),
-            iterations_completed: 0,
-            tool_calls_made: vec![],
-            conversation_snapshot: vec![],
-            last_agent_state: AgentState::Error("pi executor not wired".to_string()),
-        })
+    async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome {
+        PiRunOutcome {
+            result: Err(AgentError::StateError {
+                message: format!(
+                    "the pi executor is not wired into this build; task {} was not run",
+                    launch.task_id()
+                ),
+                iterations_completed: 0,
+                tool_calls_made: vec![],
+                conversation_snapshot: vec![],
+                last_agent_state: AgentState::Error("pi executor not wired".to_string()),
+            }),
+            action_audit: Vec::new(),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PiRoute {
     image: String,
-    gateway_socket: PathBuf,
+    broker_dir: PathBuf,
+    endpoint: Endpoint,
     limits: PiLimits,
     executor: Arc<dyn PiExecutor>,
 }
@@ -97,6 +155,10 @@ fn digest_pinned(image: &str) -> bool {
             .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
 }
 
+fn default_endpoint() -> Endpoint {
+    Endpoint::new("model-gateway", 11434).expect("the default endpoint is valid")
+}
+
 fn socket_is_valid(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let charset = text
@@ -110,11 +172,12 @@ fn socket_is_valid(path: &Path) -> bool {
         && rest
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
+        && super::broker_socket_is_valid(&format!("{text}/probe.sock"))
 }
 
 impl PiRoute {
     #[doc = r#"Build a route from host configuration. The image must be pinned by digest
-and the gateway socket must be a normalised absolute path.
+and the broker directory must be a normalised absolute path.
 
 ```
 use harness::harness_adapter::{PiLimits, PiRoute, UnwiredPiExecutor};
@@ -123,33 +186,34 @@ use std::sync::Arc;
 let digest = "a".repeat(64);
 let route = PiRoute::new(
     format!("nanna-pi@sha256:{digest}"),
-    "/run/user/1000/nanna/gateway.sock",
+    "/run/user/1000/nanna/broker",
     PiLimits::default(),
     Arc::new(UnwiredPiExecutor),
 )
 .unwrap();
 assert_eq!(route.limits(), PiLimits::default());
-assert!(PiRoute::new("nanna-pi:latest", "/run/gw.sock", PiLimits::default(), Arc::new(UnwiredPiExecutor)).is_err());
+assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default(), Arc::new(UnwiredPiExecutor)).is_err());
 ```"#]
     pub fn new(
         image: impl Into<String>,
-        gateway_socket: impl Into<PathBuf>,
+        broker_dir: impl Into<PathBuf>,
         limits: PiLimits,
         executor: Arc<dyn PiExecutor>,
     ) -> Result<Self, PiRouteError> {
         let image = image.into();
-        let gateway_socket = gateway_socket.into();
+        let broker_dir = broker_dir.into();
         if !digest_pinned(&image) {
             return Err(PiRouteError::Image { image });
         }
-        if !socket_is_valid(&gateway_socket) {
+        if !socket_is_valid(&broker_dir) {
             return Err(PiRouteError::Socket {
-                path: gateway_socket.display().to_string(),
+                path: broker_dir.display().to_string(),
             });
         }
         Ok(Self {
             image,
-            gateway_socket,
+            broker_dir,
+            endpoint: default_endpoint(),
             limits,
             executor,
         })
@@ -162,8 +226,8 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/gw.sock", PiLimits::default(), Arc
         let image = lookup(PI_IMAGE_ENV).ok_or(PiRouteError::Missing {
             variable: PI_IMAGE_ENV,
         })?;
-        let socket = lookup(PI_GATEWAY_SOCKET_ENV).ok_or(PiRouteError::Missing {
-            variable: PI_GATEWAY_SOCKET_ENV,
+        let socket = lookup(PI_BROKER_DIR_ENV).ok_or(PiRouteError::Missing {
+            variable: PI_BROKER_DIR_ENV,
         })?;
         let image = image.into_string().map_err(|raw| PiRouteError::Image {
             image: raw.to_string_lossy().into_owned(),
@@ -175,8 +239,21 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/gw.sock", PiLimits::default(), Arc
         &self.image
     }
 
-    pub fn gateway_socket(&self) -> &Path {
-        &self.gateway_socket
+    pub fn broker_dir(&self) -> &Path {
+        &self.broker_dir
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = endpoint;
+        self
+    }
+
+    pub(crate) fn broker_socket(&self, task_id: &str) -> PathBuf {
+        self.broker_dir.join(format!("{task_id}.sock"))
     }
 
     pub fn limits(&self) -> PiLimits {
@@ -254,19 +331,16 @@ mod tests {
 
     #[test]
     fn a_digest_pinned_image_and_a_normalised_socket_build_a_route() {
-        let route = wired(&image(), "/run/user/1000/nanna/gateway.sock").unwrap();
+        let route = wired(&image(), "/run/user/1000/nanna/broker").unwrap();
         assert_eq!(route.image(), image());
-        assert_eq!(
-            route.gateway_socket(),
-            Path::new("/run/user/1000/nanna/gateway.sock")
-        );
+        assert_eq!(route.broker_dir(), Path::new("/run/user/1000/nanna/broker"));
         assert_eq!(route.limits(), PiLimits::default());
         assert!(format!("{route:?}").contains("UnwiredPiExecutor"));
     }
 
     #[test]
     fn an_image_that_is_not_pinned_by_digest_is_refused() {
-        let socket = "/run/gw.sock";
+        let socket = "/run/nanna/broker";
         for bad in [
             "nanna-pi:latest".to_string(),
             "nanna-pi".to_string(),
@@ -314,7 +388,7 @@ mod tests {
                 PI_IMAGE_ENV,
                 "nanna-pi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
-            (PI_GATEWAY_SOCKET_ENV, "/run/user/1000/nanna/gateway.sock"),
+            (PI_BROKER_DIR_ENV, "/run/user/1000/nanna/broker"),
         ]);
         let route = PiRoute::from_lookup(&lookup, Arc::new(UnwiredPiExecutor)).unwrap();
         assert_eq!(route.image(), image());
@@ -334,14 +408,14 @@ mod tests {
             )
             .unwrap_err(),
             PiRouteError::Missing {
-                variable: PI_GATEWAY_SOCKET_ENV
+                variable: PI_BROKER_DIR_ENV
             }
         );
         assert!(matches!(
             PiRoute::from_lookup(
                 &env(&[
                     (PI_IMAGE_ENV, "latest"),
-                    (PI_GATEWAY_SOCKET_ENV, "/run/gw.sock")
+                    (PI_BROKER_DIR_ENV, "/run/nanna/broker")
                 ]),
                 Arc::new(UnwiredPiExecutor)
             ),
@@ -355,7 +429,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let lookup = |key: &str| match key {
             PI_IMAGE_ENV => Some(OsString::from_vec(vec![0x6e, 0xff])),
-            _ => Some(OsString::from("/run/gw.sock")),
+            _ => Some(OsString::from("/run/nanna/broker")),
         };
         assert!(matches!(
             PiRoute::from_lookup(&lookup, Arc::new(UnwiredPiExecutor)),
@@ -382,28 +456,39 @@ mod tests {
 
     #[tokio::test]
     async fn the_unwired_executor_refuses_every_launch() {
-        let route = wired(&image(), "/run/gw.sock").unwrap();
+        let route = wired(&image(), "/run/nanna/broker").unwrap();
         let card = "[identity]\nname = \"reader\"\ndescription = \"d\"\nloop = \"inner\"\nmodel = \"m\"\nsystem_prompt = { inline = \"p\" }\n\n[scope]\nrepos = []\npaths = [\"**\"]\nmax_effect = \"none\"\ntools = []\n\n[limits]\nmax_iterations = 1\nmax_wall_clock_secs = 1\nmax_concurrent = 1\n";
         let identity =
             crate::identity::AgentIdentity::from_toml_str(card, "agents/reader.toml").unwrap();
         let allowed = crate::harness_adapter::testing::allowed_for(&identity);
         let capabilities = crate::harness_adapter::testing::scoped(&identity, &[]);
-        let registry = ToolRegistry::new();
+        let agent = ResolvedAgent::resolve(
+            &allowed,
+            &capabilities,
+            route.endpoint().clone(),
+            route.image(),
+            route.broker_socket("t-1"),
+        )
+        .unwrap();
+        let bound = BoundWorkspace::for_test(
+            crate::tools::ToolRegistry::new(),
+            &identity,
+            allowed.repo(),
+            &agent,
+        );
         let outcome = UnwiredPiExecutor
-            .run(PiLaunch {
-                task_id: "t-1",
-                container_name: "nanna-pi-t-1",
-                repo: allowed.repo(),
-                subtask: &allowed.request().subtask,
-                allowed: &allowed,
-                capabilities: &capabilities,
-                registry: &registry,
-                route: &route,
-                progress: Arc::new(AtomicUsize::new(0)),
-                deadline: Duration::from_secs(1),
-            })
+            .run(PiLaunch::new(
+                "t-1",
+                "nanna-pi-t-1",
+                &agent,
+                bound,
+                &route,
+                Arc::new(AtomicUsize::new(0)),
+                Duration::from_secs(1),
+            ))
             .await;
-        match outcome {
+        assert!(outcome.action_audit.is_empty());
+        match outcome.result {
             Err(AgentError::StateError {
                 message,
                 iterations_completed,

@@ -490,10 +490,6 @@ impl AuditedIdentity {
         self.allowed.repo()
     }
 
-    pub(crate) fn subtask(&self) -> &str {
-        &self.allowed.request().subtask
-    }
-
     pub(crate) fn allowed(&self) -> &Allowed {
         &self.allowed
     }
@@ -541,25 +537,36 @@ impl PiRouteRefused {
     }
 }
 
-fn require_audited<'a>(
+fn require_pi_audited<'a>(
     bound: Option<&'a BoundIdentity>,
     repo_path: &Path,
-) -> Result<&'a AuditedIdentity, PiRouteRefused> {
-    match bound {
-        None => Err(PiRouteRefused::NoIdentity),
-        Some(BoundIdentity::Unaudited(_)) => Err(PiRouteRefused::Unaudited),
-        Some(BoundIdentity::Audited(audited)) => {
-            if crate::scope::names_repo(audited.repo(), repo_path) {
-                Ok(audited)
-            } else {
-                Err(PiRouteRefused::ScopeError(format!(
-                    "the audited repository {} is not the checkout {}",
-                    audited.repo(),
-                    repo_path.display()
-                )))
-            }
-        }
+) -> Result<(&'a AuditedIdentity, crate::harness_adapter::AuditedRef<'a>), PiRouteRefused> {
+    let bound = bound.ok_or(PiRouteRefused::NoIdentity)?;
+    let audited_ref =
+        crate::harness_adapter::require_audited(bound).map_err(|_| PiRouteRefused::Unaudited)?;
+    let BoundIdentity::Audited(audited) = bound else {
+        return Err(PiRouteRefused::Unaudited);
+    };
+    if crate::scope::names_repo(audited.repo(), repo_path) {
+        Ok((audited, audited_ref))
+    } else {
+        Err(PiRouteRefused::ScopeError(format!(
+            "the audited repository {} is not the checkout {}",
+            audited.repo(),
+            repo_path.display()
+        )))
     }
+}
+
+enum Prepared {
+    Loop(Box<crate::tools::ToolRegistry>),
+    Pi(
+        Arc<crate::harness_adapter::PiRoute>,
+        Box<(
+            crate::harness_adapter::ResolvedAgent,
+            crate::harness_adapter::BoundWorkspace,
+        )>,
+    ),
 }
 
 async fn audit_restored(
@@ -1026,7 +1033,7 @@ use std::sync::Arc;
 
 let route = PiRoute::new(
     format!("nanna-pi@sha256:{}", "a".repeat(64)),
-    "/run/user/1000/nanna/gateway.sock",
+    "/run/user/1000/nanna/broker",
     PiLimits::default(),
     Arc::new(UnwiredPiExecutor),
 )
@@ -1787,8 +1794,8 @@ impl TaskRunner {
                     .as_ref()
                     .is_none_or(|i| !crate::verify::is_verifier(i)) =>
             {
-                match require_audited(bound.as_ref(), &queued.repo_path) {
-                    Ok(audited) => Some((route, audited)),
+                match require_pi_audited(bound.as_ref(), &queued.repo_path) {
+                    Ok((audited, audited_ref)) => Some((route, audited, audited_ref)),
                     Err(refused) => {
                         self.fail(&task_id, refused.to_string(), refused.error_type())
                             .await;
@@ -1916,33 +1923,54 @@ impl TaskRunner {
             return;
         }
 
-        let registry_result = match &pi {
-            Some((_, audited)) => {
-                let pi_identity = Some(audited.identity());
-                let layers = self.model_facing_layers(&task_id, &queued, pi_identity);
+        let prepared = match pi {
+            Some((route, audited, audited_ref)) => {
+                let layers = self.model_facing_layers(&task_id, &queued, Some(audited.identity()));
                 workspace.bind_sandbox_pr(&layers.subject);
-                model_facing_registry(&workspace, pi_identity, layers).and_then(|registry| {
-                    registry_for(&workspace, pi_identity).map(|scoped| {
-                        let capabilities = crate::harness_adapter::ScopedCapabilities::scope(
-                            scoped,
+                'resolved: {
+                    use crate::harness_adapter::BindError;
+                    let scoped = match registry_for(&workspace, Some(audited.identity())) {
+                        Ok(registry) => crate::harness_adapter::ScopedCapabilities::scope(
+                            registry,
                             audited.identity(),
-                        );
-                        (registry, Some(capabilities))
-                    })
-                })
+                        ),
+                        Err(e) => break 'resolved Err(("ScopeError", e.to_string())),
+                    };
+                    let agent = match crate::harness_adapter::ResolvedAgent::resolve(
+                        audited.allowed(),
+                        &scoped,
+                        route.endpoint().clone(),
+                        route.image(),
+                        route.broker_socket(&task_id.0),
+                    ) {
+                        Ok(agent) => agent,
+                        Err(e) => break 'resolved Err(("StateError", e.to_string())),
+                    };
+                    match agent.bind_workspace(audited_ref, audited.repo(), &workspace, layers) {
+                        Ok(bound) => Ok(Prepared::Pi(route, Box::new((agent, bound)))),
+                        Err(e) => Err(match e {
+                            BindError::Unaudited => ("IdentityUnavailable", e.to_string()),
+                            BindError::RepoMismatch { .. } | BindError::Scope(_) => {
+                                ("ScopeError", e.to_string())
+                            }
+                            _ => ("StateError", e.to_string()),
+                        }),
+                    }
+                }
             }
             None => {
                 let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
                 workspace.bind_sandbox_pr(&layers.subject);
                 model_facing_registry(&workspace, identity.as_ref(), layers)
-                    .map(|registry| (registry, None))
+                    .map(|registry| Prepared::Loop(Box::new(registry)))
+                    .map_err(|e| ("ScopeError", e.to_string()))
             }
         };
-        let (tool_registry, capabilities) = match registry_result {
-            Ok(parts) => parts,
-            Err(e) => {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err((label, message)) => {
                 let _ = workspace.cleanup();
-                self.fail(&task_id, e.to_string(), "ScopeError").await;
+                self.fail(&task_id, message, label).await;
                 return;
             }
         };
@@ -1973,33 +2001,30 @@ impl TaskRunner {
             app_state_id: task_id.0.clone(),
         };
 
-        let (mut run_result, action_audit) = match pi.zip(capabilities) {
-            Some(((route, audited), capabilities)) => {
+        let (mut run_result, action_audit) = match prepared {
+            Prepared::Pi(route, parts) => {
+                let (agent, bound) = *parts;
                 let container_name = crate::harness_adapter::pi_container_name(&task_id.0);
                 let guard = crate::harness_adapter::PiContainerGuard::arm(container_name);
+                let deadline = std::time::Duration::from_secs(agent.limits().max_wall_clock_secs);
                 let outcome = route
                     .executor()
-                    .run(crate::harness_adapter::PiLaunch {
-                        task_id: &task_id.0,
-                        container_name: guard.name(),
-                        repo: audited.repo(),
-                        subtask: audited.subtask(),
-                        allowed: audited.allowed(),
-                        capabilities: &capabilities,
-                        registry: &tool_registry,
-                        route: &route,
-                        progress: Arc::clone(&progress_counter),
-                        deadline: std::time::Duration::from_secs(
-                            audited.identity().limits.max_wall_clock_secs,
-                        ),
-                    })
+                    .run(crate::harness_adapter::PiLaunch::new(
+                        &task_id.0,
+                        guard.name(),
+                        &agent,
+                        bound,
+                        &route,
+                        Arc::clone(&progress_counter),
+                        deadline,
+                    ))
                     .await;
                 drop(guard);
-                (outcome, tool_registry.action_reviews())
+                (outcome.result, outcome.action_audit)
             }
-            None => {
+            Prepared::Loop(tool_registry) => {
                 let mut agent =
-                    AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
+                    AgentLoop::with_tools(agent_config, entity_store, provider, *tool_registry);
                 agent.set_progress_counter(Arc::clone(&progress_counter));
                 let run_result = agent.run(context).await;
                 let action_audit = agent
@@ -4465,7 +4490,7 @@ mod identity_tests {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let route = crate::harness_adapter::PiRoute::new(
             "nanna-pi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "/run/nanna/gateway.sock",
+            "/run/nanna/broker",
             crate::harness_adapter::PiLimits::default(),
             Arc::new(crate::harness_adapter::UnwiredPiExecutor),
         )
@@ -8339,7 +8364,7 @@ mod pi_route_tests {
     use super::*;
     use crate::agent::AgentState;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
-    use crate::harness_adapter::{PiExecutor, PiLaunch, PiLimits, PiRoute};
+    use crate::harness_adapter::{PiExecutor, PiLaunch, PiLimits, PiRoute, PiRunOutcome};
     use crate::identity::{DevLoop, IdentityCatalog};
     use crate::test_support::FakePodman;
 
@@ -8361,12 +8386,11 @@ mod pi_route_tests {
         container_name: String,
         repo: String,
         subtask: String,
-        allowed_repo: String,
-        allowed_subtask: String,
         capability_names: Vec<String>,
-        registry_names: Vec<String>,
         deadline: std::time::Duration,
         image: String,
+        broker_socket: PathBuf,
+        endpoint: crate::harness_adapter::Endpoint,
     }
 
     #[derive(Debug)]
@@ -8406,56 +8430,70 @@ mod pi_route_tests {
 
     #[async_trait::async_trait]
     impl PiExecutor for Stub {
-        async fn run(&self, launch: PiLaunch<'_>) -> Result<AgentRunResult, AgentError> {
+        async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome {
+            let agent = launch.agent().clone();
             self.seen.lock().unwrap().push(Seen {
-                task_id: launch.task_id.to_string(),
-                container_name: launch.container_name.to_string(),
-                repo: launch.repo.to_string(),
-                subtask: launch.subtask.to_string(),
-                allowed_repo: launch.allowed.repo().to_string(),
-                allowed_subtask: launch.allowed.request().subtask.clone(),
-                capability_names: launch
-                    .capabilities
-                    .specs()
-                    .iter()
-                    .map(|spec| spec.name.clone())
+                task_id: launch.task_id().to_string(),
+                container_name: launch.container_name().to_string(),
+                repo: agent.audited_repo().to_string(),
+                subtask: agent.task_prompt().to_string(),
+                capability_names: agent
+                    .capability_names()
+                    .into_iter()
+                    .map(String::from)
                     .collect(),
-                registry_names: {
-                    let mut names: Vec<String> = launch
-                        .registry
-                        .get_definitions()
-                        .into_iter()
-                        .map(|def| def.function.name)
-                        .collect();
-                    names.sort();
-                    names
-                },
-                deadline: launch.deadline,
-                image: launch.route.image().to_string(),
+                deadline: launch.deadline(),
+                image: launch.route().image().to_string(),
+                broker_socket: agent.broker_socket().to_path_buf(),
+                endpoint: launch.route().endpoint().clone(),
             });
+            let result = |result| PiRunOutcome {
+                result,
+                action_audit: vec![],
+            };
             match self.mode {
-                Mode::Complete => Ok(completed("pi finished")),
-                Mode::Fail => Err(AgentError::StateError {
+                Mode::Complete => result(Ok(completed("pi finished"))),
+                Mode::Fail => result(Err(AgentError::StateError {
                     message: "pi container exited".to_string(),
                     iterations_completed: 1,
                     tool_calls_made: vec![],
                     conversation_snapshot: vec![],
                     last_agent_state: AgentState::Error("pi".to_string()),
-                }),
+                })),
                 Mode::CallGatedTool => {
-                    let _ = launch
-                        .registry
-                        .execute("github_pr_status", serde_json::json!({}))
+                    let plan = crate::harness_adapter::launch_plan(
+                        &crate::harness_adapter::PiAdapter,
+                        &agent,
+                    )
+                    .unwrap();
+                    let reported = plan.exposed_capabilities.clone();
+                    let broker = crate::harness_adapter::Broker::for_agent(
+                        &agent,
+                        launch.into_binding(),
+                        crate::harness_adapter::BrokerPolicy::new(agent.max_effect()),
+                        Arc::new(crate::harness_adapter::RingAuditSink::default()),
+                    )
+                    .unwrap()
+                    .arm(&plan, &reported)
+                    .unwrap();
+                    let _ = broker
+                        .handle(crate::harness_adapter::BrokerRequest {
+                            tool: "github_pr_status".to_string(),
+                            args: serde_json::json!({}),
+                        })
                         .await;
-                    Ok(completed("pi pushed"))
+                    PiRunOutcome {
+                        result: Ok(completed("pi pushed")),
+                        action_audit: broker.action_audit(),
+                    }
                 }
                 Mode::Hang => {
                     let status = std::process::Command::new("podman")
-                        .args(["run", "--name", launch.container_name, IMAGE])
+                        .args(["run", "--name", launch.container_name(), IMAGE])
                         .status()
                         .unwrap();
                     assert!(status.success());
-                    launch.progress.fetch_add(3, Ordering::Relaxed);
+                    launch.progress().fetch_add(3, Ordering::Relaxed);
                     self.started.notify_one();
                     std::future::pending::<()>().await;
                     unreachable!()
@@ -8467,7 +8505,7 @@ mod pi_route_tests {
     fn route(stub: &Arc<Stub>) -> PiRoute {
         PiRoute::new(
             IMAGE,
-            "/run/user/1000/nanna/gateway.sock",
+            "/run/user/1000/nanna/broker",
             PiLimits::default(),
             stub.clone() as Arc<dyn PiExecutor>,
         )
@@ -8647,13 +8685,18 @@ mod pi_route_tests {
         assert_eq!(seen.task_id, id.0);
         assert_eq!(seen.container_name, format!("nanna-pi-{}", id.0));
         assert_eq!(seen.repo, LABEL);
-        assert_eq!(seen.repo, seen.allowed_repo);
         assert_eq!(seen.subtask, "Add a regression test.");
-        assert_eq!(seen.subtask, seen.allowed_subtask);
         assert_eq!(seen.deadline, std::time::Duration::from_secs(3600));
         assert_eq!(seen.image, IMAGE);
         assert!(!seen.capability_names.is_empty());
-        assert_eq!(seen.capability_names, seen.registry_names);
+        assert_eq!(
+            seen.broker_socket,
+            PathBuf::from(format!("/run/user/1000/nanna/broker/{}.sock", id.0))
+        );
+        assert_eq!(
+            seen.endpoint,
+            crate::harness_adapter::Endpoint::new("model-gateway", 11434).unwrap()
+        );
         let removed = format!("rm -f nanna-pi-{}", id.0);
         assert!(calls_until(&fake, &removed).await.contains(&removed));
     }
@@ -8704,7 +8747,7 @@ mod pi_route_tests {
         let fake = FakePodman::install_async(None).await;
         let route = PiRoute::new(
             IMAGE,
-            "/run/nanna/gateway.sock",
+            "/run/nanna/broker",
             PiLimits::default(),
             Arc::new(crate::harness_adapter::UnwiredPiExecutor),
         )
@@ -8842,25 +8885,25 @@ mod pi_route_tests {
     }
 
     #[tokio::test]
-    async fn test_require_audited_admits_only_an_audited_identity_naming_the_checkout() {
+    async fn test_require_pi_audited_admits_only_an_audited_identity_naming_the_checkout() {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let allowed = allowed_for(LABEL).await;
         let identity = allowed.identity().clone();
         let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed).1);
-        let admitted = require_audited(Some(&audited), repo.path()).unwrap();
+        let (admitted, _) = require_pi_audited(Some(&audited), repo.path()).unwrap();
         assert_eq!(admitted.identity(), &identity);
         let other = repo_with_origin("https://github.com/example/other.git");
         assert!(matches!(
-            require_audited(Some(&audited), other.path()),
+            require_pi_audited(Some(&audited), other.path()),
             Err(PiRouteRefused::ScopeError(_))
         ));
         let unaudited = BoundIdentity::Unaudited(identity);
         assert!(matches!(
-            require_audited(Some(&unaudited), repo.path()),
+            require_pi_audited(Some(&unaudited), repo.path()),
             Err(PiRouteRefused::Unaudited)
         ));
         assert!(matches!(
-            require_audited(None, repo.path()),
+            require_pi_audited(None, repo.path()),
             Err(PiRouteRefused::NoIdentity)
         ));
     }
@@ -8871,7 +8914,6 @@ mod pi_route_tests {
         let identity = allowed.identity().clone();
         let (request, audited) = AuditedIdentity::split(allowed);
         assert_eq!(request.subtask, "Add a regression test.");
-        assert_eq!(audited.subtask(), request.subtask);
         assert_eq!(audited.repo(), LABEL);
         assert_eq!(audited.identity(), &identity);
         assert_eq!(audited.allowed().repo(), audited.repo());

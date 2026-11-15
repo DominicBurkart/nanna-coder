@@ -286,10 +286,11 @@ fn bound_agent(
 #[tokio::test]
 async fn binding_refuses_everything_that_is_not_this_identity_repository_and_task() {
     let _path = crate::test_support::hold_path_async().await;
-    let (mut workspace, _repo) = real_workspace("t-bind-refusals");
+    let task = format!("t-bind-refusals-{}", uuid::Uuid::new_v4());
+    let (mut workspace, _repo) = real_workspace(&task);
     let (identity, agent) = bound_agent(&workspace, &local_card());
     assert_eq!(agent.capability_names(), vec!["write_file"]);
-    let layers = || layers_allowing(&identity, "t-bind-refusals").layers;
+    let layers = || layers_allowing(&identity, &task).layers;
 
     let global = Card {
         repos: "[\"github.com/example/repo\"]",
@@ -328,8 +329,12 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
 
     let (other_workspace, _other_repo) = {
         let other = super::testing::repo_with_origin("https://github.com/example/other.git");
-        let ws =
-            crate::workspace::TaskWorkspace::create(other.path(), "t-bind-other", "HEAD").unwrap();
+        let ws = crate::workspace::TaskWorkspace::create(
+            other.path(),
+            &format!("t-bind-other-{}", uuid::Uuid::new_v4()),
+            "HEAD",
+        )
+        .unwrap();
         (ws, other)
     };
     let err = agent
@@ -353,7 +358,7 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
             AuditedRef::for_test(&outside_identity),
             REPO,
             &workspace,
-            layers_allowing(&outside_identity, "t-bind-refusals").layers,
+            layers_allowing(&outside_identity, &task).layers,
         )
         .err()
         .unwrap();
@@ -365,7 +370,8 @@ async fn binding_refuses_everything_that_is_not_this_identity_repository_and_tas
 #[tokio::test]
 async fn binding_refuses_layers_that_describe_another_task_ceiling_scope_or_repository() {
     let _path = crate::test_support::hold_path_async().await;
-    let (mut workspace, _repo) = real_workspace("t-bind-layers");
+    let task = format!("t-bind-layers-{}", uuid::Uuid::new_v4());
+    let (mut workspace, _repo) = real_workspace(&task);
     let (identity, agent) = bound_agent(&workspace, &local_card());
     let cases: Vec<(&str, Tamper)> = vec![
         (
@@ -386,7 +392,7 @@ async fn binding_refuses_layers_that_describe_another_task_ceiling_scope_or_repo
         ),
     ];
     for (field, tamper) in cases {
-        let mut layered = layers_allowing(&identity, "t-bind-layers");
+        let mut layered = layers_allowing(&identity, &task);
         tamper(&mut layered.layers);
         let err = agent
             .bind_workspace(
@@ -410,9 +416,10 @@ async fn binding_refuses_layers_that_describe_another_task_ceiling_scope_or_repo
 #[tokio::test]
 async fn a_good_bind_keeps_the_runners_own_layers_and_the_task_id() {
     let _path = crate::test_support::hold_path_async().await;
-    let (mut workspace, _repo) = real_workspace("t-bind-ok");
+    let task = format!("t-bind-ok-{}", uuid::Uuid::new_v4());
+    let (mut workspace, _repo) = real_workspace(&task);
     let (identity, agent) = bound_agent(&workspace, &local_card());
-    let layered = layers_for(&identity, "t-bind-ok", "example/repo", ActionVerdict::Allow);
+    let layered = layers_for(&identity, &task, "example/repo", ActionVerdict::Allow);
     let gate = Arc::clone(&layered.layers.action_gate);
     let escalator = Arc::clone(&layered.layers.action_escalator);
     let log = Arc::clone(&layered.log);
@@ -429,7 +436,7 @@ async fn a_good_bind_keeps_the_runners_own_layers_and_the_task_id() {
             layered.layers,
         )
         .unwrap();
-    assert_eq!(bound.task_id().0, "t-bind-ok");
+    assert_eq!(bound.task_id().0, task);
     assert_eq!(
         before,
         (
