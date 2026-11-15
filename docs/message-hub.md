@@ -919,7 +919,7 @@ Each item becomes one issue, and each issue becomes one draft PR with semantic c
 flowchart TD
   E[0 epic: message hub] --> D1[1 docs: docs/message-hub.md]
   D1 --> L[2 lineage on Task/QueuedTask]
-  D1 --> S[3 session + message stores]
+  L --> S[3 session + message stores]
   D1 --> F[4 Summary + generic fence label]
   D1 --> A1[5 FailClosedActionAuditor + RoutingActionAuditor + inspects_content]
   L --> R[6 session registry lifecycle in TaskManager]
@@ -949,7 +949,7 @@ flowchart TD
 | 0 | `epic: inter-agent message hub` | Links all issues and the graph; the done criteria are §11's end-to-end tests. |
 | 1 | `docs(hub): message hub design (approved interfaces)` | Commit this document as `docs/message-hub.md`. |
 | 2 | `feat(lineage): persist SessionId/RootId/Lineage through the spawn gate` | §3.2. `split` returns lineage; restore keeps it; serde default; proptests. |
-| 3 | `feat(hub): session and message stores (memory + JSONL, single writer)` | §4. Contract suite, `0600`, `fs4` lock, retention prune, path doctests. |
+| 3 | `feat(hub): session and message stores (memory + JSONL, single writer)` | §4. Stacks on issue 2: stored records embed `SessionId`, `RootId` and `Lineage`. Contract suite, `0600`, `fs4` lock, retention prune, path doctests. |
 | 4 | `feat(hub): Summary type and FenceLabel-generalized fenced_untrusted` | §3.3 and §8.6 fence. Behaviour-preserving for GitHub callers; Kani and proptests. |
 | 5 | `feat(audit): fail-closed action auditor timeout and RoutingActionAuditor` | §8.6. Extend `inspects_content`; regression on existing gate tests. |
 | 6 | `feat(hub): register session lifecycle from TaskManager` | §10. register, status, finish, `record_touched` from CallRecords. |
