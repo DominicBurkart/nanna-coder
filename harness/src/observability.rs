@@ -1097,4 +1097,41 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    #[tokio::test]
+    async fn test_observability_builder_methods() {
+        let custom_thresholds = HealthThreshold {
+            cpu_threshold: 70.0,
+            ..HealthThreshold::default()
+        };
+        let system = ObservabilitySystem::new()
+            .with_service_name("my-service")
+            .with_alert_policy(AlertPolicy::immediate_critical())
+            .with_health_thresholds(custom_thresholds)
+            .with_health_check_interval(Duration::from_secs(30));
+
+        assert_eq!(system.service_name, "my-service");
+        assert_eq!(system.health_check_interval, Duration::from_secs(30));
+        assert_eq!(system.health_thresholds.cpu_threshold, 70.0);
+    }
+
+    #[tokio::test]
+    async fn test_observability_get_uptime() {
+        let system = ObservabilitySystem::new();
+        let uptime = system.get_uptime();
+        assert!(uptime.as_secs() < 60);
+    }
+
+    #[tokio::test]
+    async fn test_observability_start_and_stop_monitoring() {
+        let mut system =
+            ObservabilitySystem::new().with_health_check_interval(Duration::from_secs(3600));
+
+        let result = system.start_monitoring().await;
+        assert!(result.is_ok());
+        assert!(system.monitoring_task.is_some());
+
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
 }
