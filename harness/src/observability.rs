@@ -1097,4 +1097,202 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    fn make_test_alert(
+        title: &str,
+        component: &str,
+        severity: AlertSeverity,
+    ) -> crate::monitoring::Alert {
+        crate::monitoring::Alert {
+            id: "test-id".to_string(),
+            title: title.to_string(),
+            description: "test description".to_string(),
+            severity,
+            component: component.to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        }
+    }
+
+    fn make_sla_compliance(availability: f64) -> SlaCompliance {
+        SlaCompliance {
+            target_availability: 99.9,
+            current_availability: availability,
+            status: if availability >= 99.9 {
+                SlaStatus::Compliant
+            } else if availability >= 99.0 {
+                SlaStatus::AtRisk
+            } else {
+                SlaStatus::Breached
+            },
+            time_to_breach: None,
+        }
+    }
+
+    #[test]
+    fn test_determine_alert_category_container() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("some alert", "my-container-01", AlertSeverity::Warning);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::ContainerHealth
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_model() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("some alert", "model:qwen3", AlertSeverity::Warning);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::ModelQuality
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_performance_from_title() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("Performance degraded", "system", AlertSeverity::Warning);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Performance
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_resource_from_title() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert(
+            "Resource exhaustion detected",
+            "system",
+            AlertSeverity::Error,
+        );
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Resources
+        );
+    }
+
+    #[test]
+    fn test_determine_alert_category_availability_fallback() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("Some unknown issue", "system", AlertSeverity::Info);
+        assert_eq!(
+            sys.determine_alert_category(&alert),
+            AlertCategory::Availability
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_critical_availability() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Critical);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Availability),
+            100
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_warning_availability() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Availability),
+            70
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_info_performance() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Info);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Performance),
+            35
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_error_resources() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Error);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Resources),
+            75
+        );
+    }
+
+    #[test]
+    fn test_calculate_priority_score_security_bonus() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        assert_eq!(
+            sys.calculate_priority_score(&alert, &AlertCategory::Security),
+            80
+        );
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_container_health() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        let actions = sys.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].contains("logs"));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_performance() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        let actions = sys.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].contains("resource"));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_model_quality() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        let actions = sys.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].contains("model"));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_availability_default() {
+        let sys = ObservabilitySystem::new();
+        let alert = make_test_alert("t", "s", AlertSeverity::Warning);
+        let actions = sys.generate_recommended_actions(&alert, &AlertCategory::Availability);
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].contains("Investigate"));
+    }
+
+    #[test]
+    fn test_calculate_availability_metrics_returns_at_risk() {
+        let sys = ObservabilitySystem::new();
+        let metrics = sys.calculate_availability_metrics().unwrap();
+        assert_eq!(metrics.sla_compliance.status, SlaStatus::AtRisk);
+        assert!((metrics.availability_percentage - 99.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_uptime_is_small_at_creation() {
+        let sys = ObservabilitySystem::new();
+        assert!(sys.get_uptime() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_sla_status_compliant_threshold() {
+        let c = make_sla_compliance(99.95);
+        assert_eq!(c.status, SlaStatus::Compliant);
+    }
+
+    #[test]
+    fn test_sla_status_breached_threshold() {
+        let c = make_sla_compliance(98.5);
+        assert_eq!(c.status, SlaStatus::Breached);
+    }
 }

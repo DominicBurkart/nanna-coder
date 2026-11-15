@@ -1242,4 +1242,106 @@ mod tests {
         let csv_export = collector.export_metrics(MetricsFormat::Csv).await.unwrap();
         assert!(csv_export.contains("timestamp,metric_type,service,value"));
     }
+
+    #[test]
+    fn test_health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Warning.is_healthy());
+        assert!(!HealthStatus::Degraded.is_healthy());
+        assert!(!HealthStatus::Unhealthy.is_healthy());
+        assert!(!HealthStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn test_health_status_requires_attention() {
+        assert!(!HealthStatus::Healthy.requires_attention());
+        assert!(HealthStatus::Warning.requires_attention());
+        assert!(HealthStatus::Degraded.requires_attention());
+        assert!(HealthStatus::Unhealthy.requires_attention());
+        assert!(!HealthStatus::Unknown.requires_attention());
+    }
+
+    #[test]
+    fn test_alert_thresholds_default() {
+        let t = AlertThresholds::default();
+        assert_eq!(t.max_latency_ms, 5000);
+        assert!((t.min_cache_hit_rate - 0.8).abs() < 1e-10);
+        assert!((t.max_error_rate - 0.05).abs() < 1e-10);
+        assert!((t.max_cpu_usage - 0.9).abs() < 1e-10);
+        assert!((t.max_memory_usage - 0.9).abs() < 1e-10);
+        assert_eq!(t.health_check_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_calculate_latency_metrics_empty() {
+        let collector = DefaultMetricsCollector::new();
+        let m = collector.calculate_latency_metrics(&[]);
+        assert_eq!(m.request_count, 0);
+        assert_eq!(m.avg_latency_ms, 0.0);
+        assert_eq!(m.max_latency_ms, 0.0);
+        assert_eq!(m.min_latency_ms, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_latency_metrics_single() {
+        let collector = DefaultMetricsCollector::new();
+        let m = collector.calculate_latency_metrics(&[Duration::from_millis(100)]);
+        assert_eq!(m.request_count, 1);
+        assert_eq!(m.avg_latency_ms, 100.0);
+        assert_eq!(m.max_latency_ms, 100.0);
+        assert_eq!(m.min_latency_ms, 100.0);
+    }
+
+    #[test]
+    fn test_calculate_latency_metrics_multiple_sorted() {
+        let collector = DefaultMetricsCollector::new();
+        let durations = vec![
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        ];
+        let m = collector.calculate_latency_metrics(&durations);
+        assert_eq!(m.request_count, 3);
+        assert_eq!(m.avg_latency_ms, 200.0);
+        assert_eq!(m.max_latency_ms, 300.0);
+        assert_eq!(m.min_latency_ms, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_metrics_all_hits() {
+        let mut collector = DefaultMetricsCollector::new();
+        for _ in 0..5 {
+            collector.record_cache_hit("k").await;
+        }
+        let m = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m.cache_metrics.hits, 5);
+        assert_eq!(m.cache_metrics.misses, 0);
+        assert_eq!(m.cache_metrics.hit_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_metrics_all_misses() {
+        let mut collector = DefaultMetricsCollector::new();
+        for _ in 0..3 {
+            collector.record_cache_miss("k").await;
+        }
+        let m = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m.cache_metrics.hits, 0);
+        assert_eq!(m.cache_metrics.misses, 3);
+        assert_eq!(m.cache_metrics.hit_rate, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_metrics_mixed() {
+        let mut collector = DefaultMetricsCollector::new();
+        collector.record_cache_hit("a").await;
+        collector.record_cache_hit("b").await;
+        collector.record_cache_hit("c").await;
+        collector.record_cache_miss("d").await;
+        collector.record_cache_miss("e").await;
+        let m = collector.get_current_metrics().await.unwrap();
+        assert_eq!(m.cache_metrics.hits, 3);
+        assert_eq!(m.cache_metrics.misses, 2);
+        assert!((m.cache_metrics.hit_rate - 0.6).abs() < 1e-10);
+    }
 }
