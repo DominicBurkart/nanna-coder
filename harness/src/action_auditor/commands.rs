@@ -1942,10 +1942,14 @@ fn protected_hit(resolved: &str, removes: bool) -> bool {
     }
     removes
         && (cleaned == "."
-            || protected
-                .mount_roots()
-                .iter()
-                .any(|root| root.starts_with(path)))
+            || protected.variants(path).is_some_and(|variants| {
+                variants.iter().any(|variant| {
+                    protected
+                        .mount_roots()
+                        .iter()
+                        .any(|root| root.starts_with(variant))
+                })
+            }))
 }
 
 fn write_escape(cwd: &Cwd, word: &Word) -> Option<String> {
@@ -5391,6 +5395,31 @@ mod tests {
     }
 
     #[test]
+    fn shell_writes_to_the_policy_file_are_refused() {
+        refuse_all(
+            &[
+                "echo 'human_gate = \"github\"' > .nanna/policy.toml",
+                "echo x >> .nanna/policy.toml",
+                "tee .nanna/policy.toml",
+                "cp x .nanna/policy.toml",
+                "mv x .nanna/policy.toml",
+                "mv .nanna/policy.toml x",
+                "rm .nanna/policy.toml",
+                "rm -f .nanna/policy.toml",
+                "touch .nanna/policy.toml",
+                "chmod 777 .nanna/policy.toml",
+                "echo x > ./.nanna/policy.toml",
+                "cd .nanna; echo x > policy.toml",
+            ],
+            "protected path",
+        );
+        allow_all(&[
+            "cat .nanna/policy.toml",
+            "grep human_gate .nanna/policy.toml",
+        ]);
+    }
+
+    #[test]
     fn secrets_cannot_be_read_by_name_glob_or_variable() {
         refuse_all(
             &[
@@ -7020,5 +7049,22 @@ mod tests {
         blocked("grep -e foo ../x", "escapes the workspace");
         blocked("mv .github x", "protected path");
         blocked("echo x > CODECOV.YML", "protected path");
+        blocked("echo x > flake.nix.", "protected path");
+        blocked("echo x > 'flake.nix '", "protected path");
+        blocked("echo x > FLAKEN~1.NIX", "protected path");
+        blocked("echo x > CODECO~1.YML", "protected path");
+        blocked("echo x > flake.nix:stream", "protected path");
+        blocked("echo x > .github./workflows/ci.yml", "protected path");
+        blocked("rm -rf GITHUB~1", "protected path");
+        blocked("rm -rf DEVCON~1", "protected path");
+        blocked("rm -rf DEVCON~1/x", "protected path");
+        blocked("rm -rf nix.", "protected path");
+        blocked(
+            "rm -rf src/G~1/G~1/G~1/G~1/G~1/G~1/G~1/G~1/x",
+            "protected path",
+        );
+        blocked("mv 'nix ' x", "protected path");
+        blocked("rm -rf docs.", "protected path");
+        blocked("rm -rf 'docs '", "protected path");
     }
 }

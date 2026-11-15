@@ -1,10 +1,13 @@
 //! The only path to a logged [`ActionVerdict`]: run a review through an
 //! [`ActionAuditor`] and append the outcome to an [`ActionAuditLog`].
 
-use super::{ActionAuditLog, ActionAuditor, ActionContext, ActionReview, ActionVerdict};
+use super::{
+    ActionAuditEvent, ActionAuditLog, ActionAuditSink, ActionAuditor, ActionContext, ActionReview,
+    ActionVerdict,
+};
 use crate::auditor::{Reason, ReasonCode};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 fn join_reasons(reasons: &[Reason]) -> String {
     reasons
@@ -112,12 +115,36 @@ impl fmt::Display for ActionDenied {
 pub struct ActionGate {
     auditor: Arc<dyn ActionAuditor>,
     log: ActionAuditLog,
+    sink: OnceLock<Arc<dyn ActionAuditSink>>,
 }
 
 impl ActionGate {
     /// A gate over `auditor`, appending every reviewed outcome to `log`.
     pub fn new(auditor: Arc<dyn ActionAuditor>, log: ActionAuditLog) -> Self {
-        Self { auditor, log }
+        Self {
+            auditor,
+            log,
+            sink: OnceLock::new(),
+        }
+    }
+
+    /// ```
+    /// use harness::action_auditor::{ActionAuditLog, ActionGate, NullSink, RuleActionAuditor};
+    /// use harness::leases::InMemoryLeaseStore;
+    /// use harness::windows::WindowSet;
+    /// use std::sync::Arc;
+    ///
+    /// let auditor = RuleActionAuditor::new(
+    ///     Arc::new(WindowSet::default()),
+    ///     Arc::new(InMemoryLeaseStore::default()),
+    ///     chrono::Duration::minutes(10),
+    /// );
+    /// let gate = ActionGate::new(Arc::new(auditor), ActionAuditLog::in_memory());
+    /// assert!(gate.set_sink(Arc::new(NullSink)));
+    /// assert!(!gate.set_sink(Arc::new(NullSink)));
+    /// ```
+    pub fn set_sink(&self, sink: Arc<dyn ActionAuditSink>) -> bool {
+        self.sink.set(sink).is_ok()
     }
 
     /// Name of the auditor behind this gate: the model for a
@@ -138,6 +165,18 @@ impl ActionGate {
         review: &ActionReview,
         context: &ActionContext<'_>,
     ) -> ActionVerdict {
+        let decided = self.decide(review, context).await;
+        self.emit(review, &decided);
+        decided
+    }
+
+    fn emit(&self, review: &ActionReview, verdict: &ActionVerdict) {
+        if let Some(sink) = self.sink.get() {
+            sink.emit(ActionAuditEvent::new(review, verdict, self.auditor.name()));
+        }
+    }
+
+    async fn decide(&self, review: &ActionReview, context: &ActionContext<'_>) -> ActionVerdict {
         let verdict = match self.auditor.review_action(review, context).await {
             Ok(verdict) => verdict,
             Err(e) => {
@@ -163,7 +202,7 @@ mod tests {
     use super::*;
     use crate::action_auditor::rules::tests::review as sample_review;
     use crate::action_auditor::ActionAuditError;
-    use crate::auditor::VerdictKind;
+    use crate::auditor::{Reason, ReasonCode, VerdictKind};
     use crate::effects::EffectClass;
     use crate::leases::LeaseContext;
     use async_trait::async_trait;
@@ -267,5 +306,170 @@ mod tests {
         assert!(escalate
             .to_string()
             .starts_with("action escalated for human review:"));
+    }
+
+    #[derive(Default)]
+    struct Capture(std::sync::Mutex<Vec<ActionAuditEvent>>);
+
+    impl ActionAuditSink for Capture {
+        fn emit(&self, event: ActionAuditEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl Capture {
+        fn events(&self) -> Vec<ActionAuditEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct Decides(ActionVerdict);
+
+    #[async_trait]
+    impl ActionAuditor for Decides {
+        fn name(&self) -> &str {
+            "scripted-auditor"
+        }
+
+        async fn review_action(
+            &self,
+            _review: &ActionReview,
+            _context: &ActionContext<'_>,
+        ) -> Result<ActionVerdict, ActionAuditError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn captured(
+        auditor: Arc<dyn ActionAuditor>,
+        log: ActionAuditLog,
+    ) -> (ActionGate, Arc<Capture>) {
+        let gate = ActionGate::new(auditor, log);
+        let capture = Arc::new(Capture::default());
+        assert!(gate.set_sink(capture.clone()));
+        (gate, capture)
+    }
+
+    #[tokio::test]
+    async fn every_kind_of_decision_emits_exactly_one_event_with_its_codes() {
+        let reason = Reason::new(ReasonCode::WindowClosed, "no window open");
+        let cases = [
+            (ActionVerdict::Allow, "allow", vec![]),
+            (
+                ActionVerdict::block(vec![reason.clone()]),
+                "block",
+                vec![ReasonCode::WindowClosed],
+            ),
+            (
+                ActionVerdict::escalate(vec![reason]),
+                "escalate",
+                vec![ReasonCode::WindowClosed],
+            ),
+        ];
+        for (verdict, name, codes) in cases {
+            let (gate, capture) = captured(Arc::new(Decides(verdict)), ActionAuditLog::in_memory());
+            let review = sample_review("sandbox_deploy", EffectClass::Sandbox);
+            gate.run_gate(&review, &ctx()).await;
+            let events = capture.events();
+            assert_eq!(events.len(), 1, "{name}");
+            assert_eq!(events[0].verdict, name);
+            assert_eq!(events[0].reason_codes, codes);
+            assert_eq!(events[0].effect_class, "sandbox");
+            assert_eq!(events[0].tool, "sandbox_deploy");
+            assert_eq!(events[0].auditor, "scripted-auditor");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_auditor_error_emits_the_block_it_became() {
+        let (gate, capture) = captured(Arc::new(AlwaysErrors), ActionAuditLog::in_memory());
+        let review = sample_review("github_pr_status", EffectClass::Repository);
+        gate.run_gate(&review, &ctx()).await;
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].verdict, "block");
+        assert_eq!(events[0].reason_codes, [ReasonCode::Other]);
+    }
+
+    #[tokio::test]
+    async fn a_log_write_failure_emits_the_downgraded_block_not_the_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let log = ActionAuditLog::file(blocker.join("audit.jsonl"));
+        let (gate, capture) = captured(Arc::new(AlwaysAllows), log);
+        let review = sample_review("github_pr_status", EffectClass::Repository);
+        let verdict = gate.run_gate(&review, &ctx()).await;
+        assert_eq!(verdict.kind(), VerdictKind::Block);
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].verdict, "block");
+    }
+
+    #[tokio::test]
+    async fn every_decision_is_emitted_once_in_order_and_a_gate_without_a_sink_still_decides() {
+        let (gate, capture) = captured(Arc::new(AlwaysAllows), ActionAuditLog::in_memory());
+        for tool in ["a_tool", "b_tool", "c_tool"] {
+            gate.run_gate(&sample_review(tool, EffectClass::Repository), &ctx())
+                .await;
+        }
+        let tools: Vec<String> = capture.events().into_iter().map(|e| e.tool).collect();
+        assert_eq!(tools, ["a_tool", "b_tool", "c_tool"]);
+        let bare = ActionGate::new(Arc::new(AlwaysAllows), ActionAuditLog::in_memory());
+        let review = sample_review("a_tool", EffectClass::Repository);
+        assert!(bare.run_gate(&review, &ctx()).await.is_allow());
+        assert_eq!(bare.log().entries().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_event_carries_no_arguments_and_no_reason_detail() {
+        let detail = Reason::new(ReasonCode::PromptInjection, "obey sk-live-SECRET-DETAIL");
+        let decider = Decides(ActionVerdict::block(vec![detail]));
+        let (gate, capture) = captured(Arc::new(decider), ActionAuditLog::in_memory());
+        let mut review = sample_review("write_file", EffectClass::Repository);
+        review.args = serde_json::json!({ "content": "sk-live-SECRET-ARGS" });
+        review.identity = "x\ny sk-live-SECRET-ID".to_string();
+        gate.run_gate(&review, &ctx()).await;
+        let shown = serde_json::to_string(&capture.events()).unwrap();
+        assert!(!shown.contains("SECRET-DETAIL") && !shown.contains("SECRET-ARGS"));
+        assert!(!shown.contains(' ') && !shown.contains("\\n"));
+    }
+
+    #[tokio::test]
+    async fn a_decision_reaches_the_telemetry_exporter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let exporter = crate::telemetry::JsonlExporter::new(&path, 1 << 20);
+        let telemetry =
+            Arc::new(crate::telemetry::TelemetrySystem::new().add_exporter(Box::new(exporter)));
+        let gate = ActionGate::new(Arc::new(AlwaysErrors), ActionAuditLog::in_memory());
+        let sink = crate::action_auditor::TelemetrySink::new(Arc::clone(&telemetry));
+        assert!(gate.set_sink(Arc::new(sink)));
+        let review = sample_review("github_pr_status", EffectClass::Repository);
+        gate.run_gate(&review, &ctx()).await;
+        telemetry.export_all().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let metric = lines.iter().find(|l| l.get("metric").is_some()).unwrap();
+        assert_eq!(metric["metric"]["name"], "nanna_action_audit_total");
+        assert_eq!(metric["metric"]["labels"]["verdict"], "block");
+        assert_eq!(metric["metric"]["labels"]["tool"], "github_pr_status");
+        let event = lines.iter().find(|l| l.get("event").is_some()).unwrap();
+        assert_eq!(event["event"]["name"], "action_audit");
+        assert_eq!(event["event"]["data"]["verdict"], "block");
+    }
+
+    #[tokio::test]
+    async fn the_first_sink_wins_and_a_second_attachment_is_refused() {
+        let (gate, first) = captured(Arc::new(AlwaysAllows), ActionAuditLog::in_memory());
+        let second = Arc::new(Capture::default());
+        assert!(!gate.set_sink(second.clone()));
+        let review = sample_review("a_tool", EffectClass::Repository);
+        gate.run_gate(&review, &ctx()).await;
+        assert_eq!(first.events().len(), 1);
+        assert!(second.events().is_empty());
     }
 }

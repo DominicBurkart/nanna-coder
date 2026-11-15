@@ -3332,6 +3332,30 @@ timeout_secs = 5
         assert!(matches!(outcome, Err(EvalRunnerError::ProtectedConfig(_))));
     }
 
+    #[tokio::test]
+    async fn run_agent_in_process_refuses_a_bad_policy_in_the_work_dir() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work_dir.path().join(".nanna")).unwrap();
+        std::fs::write(
+            work_dir.path().join(".nanna/policy.toml"),
+            "human_gate = \"duo\"",
+        )
+        .unwrap();
+        let outcome = run_agent_in_process(
+            work_dir.path(),
+            &sample_eval_case(),
+            &EvalRunnerConfig::default(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(EvalRunnerError::ProtectedConfig(
+                crate::protected::ProtectedConfigError::Policy(_)
+            ))
+        ));
+    }
+
     fn sample_eval_case() -> EvalCase {
         use crate::agent::eval_case::{CaseInfo, CaseMetadata, ExpectedResult, TaskSpec};
         EvalCase {

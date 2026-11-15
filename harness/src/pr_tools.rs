@@ -1,6 +1,7 @@
 use crate::backlog::{BacklogError, GithubClient, GithubComment, GithubReview};
 use crate::effects::EffectClass;
 use crate::marker::{parse_identity_from_text, render_html_marker, render_trailer};
+use crate::policy::HumanGate;
 use crate::protected::ProtectedPaths;
 use crate::qa::ARTIFACT_DIR;
 use crate::tools::{parse_github_remote, Tool, ToolError, ToolRegistry, ToolResult};
@@ -1827,6 +1828,8 @@ pub struct GitPushBranchTool {
     workspace_root: PathBuf,
     identity_name: String,
     protected: ProtectedPaths,
+    gate: HumanGate,
+    client: Option<Arc<dyn GithubClient>>,
 }
 
 impl GitPushBranchTool {
@@ -1836,12 +1839,47 @@ impl GitPushBranchTool {
             workspace_root,
             identity_name: identity_name.into(),
             protected,
+            gate: HumanGate::Github,
+            client: None,
         }
     }
 
     pub fn with_protected(mut self, protected: ProtectedPaths) -> Self {
         self.protected = protected;
         self
+    }
+
+    pub fn with_gate(mut self, gate: HumanGate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    pub fn with_client(mut self, client: Arc<dyn GithubClient>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    async fn ensure_no_ready_pull_request(&self, branch: &str) -> ToolResult<()> {
+        if self.gate != HumanGate::Solo {
+            return Ok(());
+        }
+        let Some(client) = &self.client else {
+            return Err(failed(
+                "refusing to push: this repository sets human_gate = \"solo\" and the pull request state cannot be read",
+            ));
+        };
+        let repo = resolve_repo(&self.workspace_root)?;
+        let open = client
+            .pull_requests_for_head(&repo, branch)
+            .await
+            .map_err(map_backlog_error)?;
+        match open.iter().find(|pr| !pr.draft) {
+            Some(ready) => Err(failed(format!(
+                "refusing to push: pull request #{} for branch '{branch}' is no longer a draft and `.nanna/policy.toml` sets human_gate = \"solo\"; open a new draft pull request for further work",
+                ready.number
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1897,7 +1935,7 @@ impl Tool for GitPushBranchTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "git_push_branch",
-            "Push the current branch to the 'origin' remote. Takes no arguments. Refuses the default or a protected branch, a detached HEAD, an unsafe branch name, any unpushed commit lacking this identity's trailer, and any unpushed commit that changes a protected path. Never forces.",
+            "Push the current branch to the 'origin' remote. Takes no arguments. Refuses the default or a protected branch, a detached HEAD, an unsafe branch name, any unpushed commit lacking this identity's trailer, and any unpushed commit that changes a protected path. When the repository's `.nanna/policy.toml` sets human_gate = \"solo\", also refuses a branch whose pull request is no longer a draft, or whose state cannot be read. Never forces.",
             object_schema(vec![], &[]),
         )
     }
@@ -1910,6 +1948,7 @@ impl Tool for GitPushBranchTool {
             &self.identity_name,
             &self.protected,
         )?;
+        self.ensure_no_ready_pull_request(&branch).await?;
         let refspec = format!("HEAD:refs/heads/{branch}");
         run_git(&self.workspace_root, &["push", "origin", &refspec])?;
         Ok(json!({ "pushed": true, "branch": branch, "remote": "origin" }))
@@ -1984,12 +2023,17 @@ impl GitCommitTool {
     }
 }
 
+fn hardlinked_in_worktree(workspace_root: &Path, relative: &str) -> bool {
+    std::fs::symlink_metadata(workspace_root.join(relative))
+        .is_ok_and(|metadata| crate::protected::is_hardlinked(&metadata))
+}
+
 #[async_trait]
 impl Tool for GitCommitTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "git_commit",
-            "Commit the working tree changes on the current branch with this identity's Nanna-Identity trailer appended to the message. Refuses the default or a protected branch and any tracked or staged change to a protected path; untracked protected paths are left out of the commit and reported.",
+            "Commit the working tree changes on the current branch with this identity's Nanna-Identity trailer appended to the message. Refuses the default or a protected branch, any tracked or staged change to a protected path and any changed file that has other hard links; untracked protected paths are left out of the commit and reported.",
             object_schema(
                 vec![
                     (
@@ -2034,8 +2078,17 @@ impl Tool for GitCommitTool {
                     "refusing to commit: '{}' is a protected path",
                     escaped(&entry.path)
                 )));
-            } else if entry.worktree != b' ' {
-                to_stage.push(format!(":(literal){}", entry.path));
+            } else {
+                if hardlinked_in_worktree(&self.workspace_root, &entry.path) {
+                    return Err(failed(format!(
+                        "refusing to commit: '{}' has other hard links ({})",
+                        escaped(&entry.path),
+                        crate::protected::HARDLINK_RULE
+                    )));
+                }
+                if entry.worktree != b' ' {
+                    to_stage.push(format!(":(literal){}", entry.path));
+                }
             }
         }
         if !to_stage.is_empty() {
@@ -2076,6 +2129,7 @@ pub struct GithubPrOpenTool {
     workspace_root: PathBuf,
     identity_name: String,
     client: Arc<dyn GithubClient>,
+    binding: crate::pr_binding::PrBindingCell,
 }
 
 impl GithubPrOpenTool {
@@ -2088,7 +2142,13 @@ impl GithubPrOpenTool {
             workspace_root,
             identity_name: identity_name.into(),
             client,
+            binding: crate::pr_binding::PrBindingCell::new(),
         }
+    }
+
+    pub(crate) fn with_binding(mut self, binding: crate::pr_binding::PrBindingCell) -> Self {
+        self.binding = binding;
+        self
     }
 }
 
@@ -2145,12 +2205,17 @@ impl Tool for GithubPrOpenTool {
                 "refusing to open a pull request from a branch into itself",
             ));
         }
+        let head_sha = run_git(&self.workspace_root, &["rev-parse", "HEAD"])?;
         let full_body = format!("{body}\n\n{trailer}\n{marker}\n");
         let created = self
             .client
             .create_draft_pull_request(&repo, title, &full_body, &head, &base)
             .await
             .map_err(map_backlog_error)?;
+        let bound = crate::pr_binding::PrBinding::new(&repo, created.number, &head, &head_sha);
+        if let Some(bound) = bound {
+            self.binding.bind(bound);
+        }
         Ok(json!({
             "number": created.number,
             "html_url": created.html_url,
@@ -2286,6 +2351,7 @@ pub struct GithubPrPromoteTool {
     workspace_root: PathBuf,
     identity_name: String,
     client: Arc<dyn GithubClient>,
+    gate: HumanGate,
 }
 
 impl GithubPrPromoteTool {
@@ -2298,7 +2364,13 @@ impl GithubPrPromoteTool {
             workspace_root,
             identity_name: identity_name.into(),
             client,
+            gate: HumanGate::Github,
         }
+    }
+
+    pub fn with_gate(mut self, gate: HumanGate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -2307,7 +2379,7 @@ impl Tool for GithubPrPromoteTool {
     fn definition(&self) -> ToolDefinition {
         definition(
             "github_pr_promote",
-            "Convert an open draft pull request carrying this identity's body marker to ready for review. The marker is advisory attribution, not authentication.",
+            "Convert an open draft pull request carrying this identity's body marker to ready for review. The marker is advisory attribution, not authentication. Always refuses when the repository's `.nanna/policy.toml` sets human_gate = \"solo\".",
             pr_number_schema(),
         )
     }
@@ -2315,6 +2387,11 @@ impl Tool for GithubPrPromoteTool {
     async fn execute(&self, args: Value) -> ToolResult<Value> {
         check_args("github_pr_promote", &args, &["pr_number"])?;
         let pr_number = number_arg(&args, "pr_number")?;
+        if self.gate == HumanGate::Solo {
+            return Err(failed(format!(
+                "refusing to promote pull request #{pr_number}: `.nanna/policy.toml` sets human_gate = \"solo\", so a human must mark it ready for review"
+            )));
+        }
         let repo = resolve_repo(&self.workspace_root)?;
         let detail = self
             .client
@@ -2584,13 +2661,12 @@ pub fn register(
     workspace_root: &Path,
     identity: &crate::identity::AgentIdentity,
 ) {
-    register_granted(registry, workspace_root, identity.name(), &|name| {
-        identity
-            .scope
-            .tools
-            .iter()
-            .any(|pattern| pattern.as_str() == name)
-    });
+    register_guarded(
+        registry,
+        workspace_root,
+        identity,
+        &ProtectedPaths::for_repo(workspace_root),
+    );
 }
 
 pub fn register_guarded(
@@ -2599,29 +2675,18 @@ pub fn register_guarded(
     identity: &crate::identity::AgentIdentity,
     protected: &ProtectedPaths,
 ) {
-    register(registry, workspace_root, identity);
-    let granted = |name: &str| {
-        identity
-            .scope
-            .tools
-            .iter()
-            .any(|pattern| pattern.as_str() == name)
-    };
-    register_if(
+    register_granted(
         registry,
-        &granted,
-        Box::new(
-            GitCommitTool::new(workspace_root.to_path_buf(), identity.name())
-                .with_protected(protected.clone()),
-        ),
-    );
-    register_if(
-        registry,
-        &granted,
-        Box::new(
-            GitPushBranchTool::new(workspace_root.to_path_buf(), identity.name())
-                .with_protected(protected.clone()),
-        ),
+        workspace_root,
+        identity.name(),
+        &|name| {
+            identity
+                .scope
+                .tools
+                .iter()
+                .any(|pattern| pattern.as_str() == name)
+        },
+        protected,
     );
 }
 
@@ -2630,12 +2695,14 @@ fn register_granted(
     workspace_root: &Path,
     identity_name: &str,
     granted: &dyn Fn(&str) -> bool,
+    protected: &ProtectedPaths,
 ) {
     register_granted_at(
         registry,
         workspace_root,
         identity_name,
         granted,
+        protected,
         crate::backlog::GITHUB_API_URL,
     );
 }
@@ -2645,37 +2712,45 @@ fn register_granted_at(
     workspace_root: &Path,
     identity_name: &str,
     granted: &dyn Fn(&str) -> bool,
+    protected: &ProtectedPaths,
     base_url: &str,
 ) {
+    let binding = registry.pr_binding();
     let token = std::env::var("GITHUB_TOKEN").ok();
     let client: Arc<dyn GithubClient> =
         Arc::new(crate::backlog::ReqwestGithubClient::new(base_url, token));
     let allowed_authors =
         parse_allowed_authors(std::env::var(TRUSTED_PR_COMMENTERS_ENV).ok().as_deref());
+    let gate = protected.policy().human_gate();
     register_if(
         registry,
         granted,
-        Box::new(GitCommitTool::new(
-            workspace_root.to_path_buf(),
-            identity_name,
-        )),
+        Box::new(
+            GitCommitTool::new(workspace_root.to_path_buf(), identity_name)
+                .with_protected(protected.clone()),
+        ),
     );
     register_if(
         registry,
         granted,
-        Box::new(GitPushBranchTool::new(
-            workspace_root.to_path_buf(),
-            identity_name,
-        )),
+        Box::new(
+            GitPushBranchTool::new(workspace_root.to_path_buf(), identity_name)
+                .with_protected(protected.clone())
+                .with_gate(gate)
+                .with_client(Arc::clone(&client)),
+        ),
     );
     register_if(
         registry,
         granted,
-        Box::new(GithubPrOpenTool::new(
-            workspace_root.to_path_buf(),
-            identity_name,
-            Arc::clone(&client),
-        )),
+        Box::new(
+            GithubPrOpenTool::new(
+                workspace_root.to_path_buf(),
+                identity_name,
+                Arc::clone(&client),
+            )
+            .with_binding(binding.clone()),
+        ),
     );
     register_if(
         registry,
@@ -2689,11 +2764,14 @@ fn register_granted_at(
     register_if(
         registry,
         granted,
-        Box::new(GithubPrPromoteTool::new(
-            workspace_root.to_path_buf(),
-            identity_name,
-            Arc::clone(&client),
-        )),
+        Box::new(
+            GithubPrPromoteTool::new(
+                workspace_root.to_path_buf(),
+                identity_name,
+                Arc::clone(&client),
+            )
+            .with_gate(gate),
+        ),
     );
     register_if(
         registry,
@@ -2735,6 +2813,7 @@ mod tests {
     use super::*;
     use crate::backlog::test_support::MockGithub;
     use crate::backlog::{GithubIssueDetail, GithubPullRequestCreated, GithubPullRequestDetail};
+    use crate::policy::HumanGate;
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -3217,6 +3296,111 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
         assert!(err.to_string().contains("422"));
+    }
+
+    fn created(number: u64) -> Option<GithubPullRequestCreated> {
+        Some(GithubPullRequestCreated {
+            number,
+            html_url: format!("https://example.invalid/pr/{number}"),
+            node_id: format!("PR_{number}"),
+        })
+    }
+
+    async fn open_with(
+        dir: &Path,
+        binding: &crate::pr_binding::PrBindingCell,
+        mock: MockGithub,
+        args: Value,
+    ) -> ToolResult<Value> {
+        let tool = GithubPrOpenTool::new(dir.to_path_buf(), "sdlc-dev", Arc::new(mock))
+            .with_binding(binding.clone());
+        tool.execute(args).await
+    }
+
+    fn open_args() -> Value {
+        json!({ "title": "t", "body": "b", "base": "main" })
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_binds_the_pull_request_it_created_from_host_resolved_values() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let mock = MockGithub {
+            created_pr: created(9),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, mock, open_args())
+            .await
+            .unwrap();
+        let bound = binding.get().expect("bound after a successful creation");
+        let sha = run_git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(bound.repo(), "example/repo");
+        assert_eq!(bound.number(), 9);
+        assert_eq!(bound.head_branch(), "feature");
+        assert_eq!(bound.head_sha(), sha);
+    }
+
+    #[tokio::test]
+    async fn github_pr_open_binds_nothing_when_creation_fails_or_arguments_try_to_set_the_binding()
+    {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let failing = MockGithub {
+            fail_status: Some(422),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, failing, open_args())
+            .await
+            .unwrap_err();
+        assert!(binding.get().is_none());
+        for key in ["pr", "number", "pr_number", "head_sha", "repo"] {
+            let mut args = open_args();
+            args[key] = json!(99);
+            let mock = MockGithub {
+                created_pr: created(9),
+                ..Default::default()
+            };
+            let err = open_with(dir.path(), &binding, mock, args)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments { .. }), "{key}");
+            assert!(binding.get().is_none(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_pull_request_does_not_replace_the_first_binding() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        for number in [9, 10] {
+            let mock = MockGithub {
+                created_pr: created(number),
+                ..Default::default()
+            };
+            let opened = open_with(dir.path(), &binding, mock, open_args())
+                .await
+                .unwrap();
+            assert_eq!(opened["number"], json!(number));
+        }
+        assert_eq!(binding.get().unwrap().number(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_created_pull_request_with_an_unusable_number_or_repository_is_not_bound() {
+        let dir = github_repo_fixture();
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let binding = crate::pr_binding::PrBindingCell::new();
+        let mock = MockGithub {
+            created_pr: created(0),
+            ..Default::default()
+        };
+        open_with(dir.path(), &binding, mock, open_args())
+            .await
+            .unwrap();
+        assert!(binding.get().is_none());
     }
 
     fn fence(text: &str) -> String {
@@ -4438,7 +4622,9 @@ mod tests {
             "codecov.yml",
             "windows.toml",
             ".nanna/agents/x.toml",
+            ".nanna/policy.toml",
             "crates/api/.nanna/agents/x.toml",
+            "crates/api/.nanna/policy.toml",
         ] {
             let fixture = push_fixture();
             git(fixture.work.path(), &["checkout", "-q", "-b", "feature-p"]);
@@ -4766,6 +4952,7 @@ mod tests {
             "codecov.yml",
             ".github/workflows/ci.yml",
             ".nanna/agents/x.toml",
+            ".nanna/policy.toml",
         ] {
             let dir = github_repo_fixture();
             commit_file(dir.path(), path, "a: 1\n", "base");
@@ -4894,6 +5081,448 @@ mod tests {
         }
     }
 
+    fn bare_has(fixture: &PushFixture, branch: &str) -> bool {
+        let out = StdCommand::new("git")
+            .args(["ls-remote", "--heads"])
+            .arg(fixture._bare.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&format!("refs/heads/{branch}"))
+    }
+
+    fn solo_identity() -> crate::identity::AgentIdentity {
+        let mut identity = granted_identity();
+        identity
+            .scope
+            .tools
+            .push("github_pr_promote".parse().unwrap());
+        identity
+    }
+
+    fn solo_paths() -> ProtectedPaths {
+        ProtectedPaths::for_repo(Path::new("/nonexistent"))
+            .with_policy(crate::policy::RepoPolicy::solo())
+    }
+
+    fn github_push_fixture() -> PushFixture {
+        let fixture = push_fixture();
+        let bare = fixture._bare.path().to_str().unwrap().to_string();
+        git(
+            fixture.work.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:example/repo.git",
+            ],
+        );
+        git(
+            fixture.work.path(),
+            &["remote", "set-url", "--push", "origin", &bare],
+        );
+        git(
+            fixture.work.path(),
+            &["checkout", "-q", "-b", "feature-solo"],
+        );
+        commit_file(
+            fixture.work.path(),
+            "f.txt",
+            "x",
+            "f\n\nNanna-Identity: sdlc-dev",
+        );
+        fixture
+    }
+
+    fn solo_push_tool(work: &Path, mock: &Arc<MockGithub>) -> GitPushBranchTool {
+        let client: Arc<dyn GithubClient> = mock.clone();
+        GitPushBranchTool::new(work.to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Solo)
+            .with_client(client)
+    }
+
+    fn head_listing(prs: Vec<GithubPullRequestDetail>) -> Arc<MockGithub> {
+        Arc::new(MockGithub {
+            head_prs: HashMap::from([(
+                ("example/repo".to_string(), "feature-solo".to_string()),
+                prs,
+            )]),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn solo_promote_refuses_before_any_client_call() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 7),
+                pr_detail(7, true, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone())
+            .with_gate(HumanGate::Solo);
+        for number in [7, 8] {
+            let err = tool
+                .execute(json!({ "pr_number": number }))
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("human_gate") && text.contains("solo"),
+                "{text}"
+            );
+            assert!(text.contains("human must mark"), "{text}");
+        }
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn promote_with_the_github_gate_still_promotes() {
+        let dir = github_repo_fixture();
+        let mock = Arc::new(MockGithub {
+            pr_details: HashMap::from([(
+                ("example/repo".to_string(), 7),
+                pr_detail(7, true, "sdlc-dev"),
+            )]),
+            ..Default::default()
+        });
+        let tool = GithubPrPromoteTool::new(dir.path().to_path_buf(), "sdlc-dev", mock.clone())
+            .with_gate(HumanGate::Github);
+        let result = tool.execute(json!({ "pr_number": 7 })).await.unwrap();
+        assert_eq!(result["promoted"], json!(true));
+        assert_eq!(mock.calls(), vec!["mark_pull_request_ready example/repo#7"]);
+    }
+
+    #[tokio::test]
+    async fn solo_push_allows_a_branch_with_only_draft_pull_requests_or_none() {
+        for listing in [vec![], vec![pr_detail(7, true, "sdlc-dev")]] {
+            let fixture = github_push_fixture();
+            let mock = head_listing(listing);
+            let tool = solo_push_tool(fixture.work.path(), &mock);
+            let result = tool.execute(json!({})).await.unwrap();
+            assert_eq!(result["pushed"], json!(true));
+            assert!(bare_has(&fixture, "feature-solo"));
+            assert_eq!(
+                mock.calls(),
+                vec!["pull_requests_for_head example/repo feature-solo"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_push_refuses_a_branch_whose_pull_request_is_ready() {
+        let listings = [
+            vec![pr_detail(7, false, "sdlc-dev")],
+            vec![
+                pr_detail(7, true, "sdlc-dev"),
+                pr_detail(8, false, "sdlc-dev"),
+            ],
+            vec![pr_detail(7, false, "someone-else")],
+        ];
+        for listing in listings {
+            let fixture = github_push_fixture();
+            let mock = head_listing(listing);
+            let tool = solo_push_tool(fixture.work.path(), &mock);
+            let err = tool.execute(json!({})).await.unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("no longer a draft"), "{text}");
+            assert!(text.contains("new draft"), "{text}");
+            assert!(!bare_has(&fixture, "feature-solo"));
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_push_fails_closed_when_the_state_cannot_be_read() {
+        let fixture = github_push_fixture();
+        let mock = Arc::new(MockGithub {
+            fail_status: Some(502),
+            ..Default::default()
+        });
+        let tool = solo_push_tool(fixture.work.path(), &mock);
+        assert!(tool.execute(json!({})).await.is_err());
+        assert!(!bare_has(&fixture, "feature-solo"));
+
+        let no_client = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Solo);
+        let err = no_client.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        assert!(!bare_has(&fixture, "feature-solo"));
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_head_lookup_errors_makes_solo_push_fail_closed() {
+        let fixture = github_push_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(ScriptedGithub {
+            failing: "pull_requests_for_head",
+            inner: MockGithub::default(),
+        });
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Solo)
+            .with_client(client);
+        assert!(tool.execute(json!({})).await.is_err());
+        assert!(!bare_has(&fixture, "feature-solo"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn solo_push_refuses_alias_spellings_of_the_policy_file_before_any_lookup() {
+        for path in [
+            ".nanna./policy.toml",
+            ".nanna /policy.toml",
+            "NANNA~1/POLICY~1.TOML",
+        ] {
+            let fixture = github_push_fixture();
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "p\n\nNanna-Identity: sdlc-dev",
+            );
+            let mock = head_listing(vec![]);
+            let tool = solo_push_tool(fixture.work.path(), &mock);
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(err.to_string().contains("protected path"), "{path}: {err}");
+            assert!(mock.calls().is_empty(), "{path}");
+            assert!(!bare_has(&fixture, "feature-solo"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scripted_client_that_does_not_fail_lets_a_solo_push_through() {
+        let fixture = github_push_fixture();
+        let client: Arc<dyn GithubClient> = Arc::new(ScriptedGithub {
+            failing: "",
+            inner: MockGithub::default(),
+        });
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Solo)
+            .with_client(client);
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap()["pushed"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unguarded_register_entry_registers_the_granted_tools_on_the_github_gate() {
+        let identity = solo_identity();
+        let fixture = local_origin_branch("feature-reg");
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, fixture.work.path(), &identity);
+        let mut names = registry.list_tools();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["git_commit", "git_push_branch", "github_pr_promote"]
+        );
+        let push = registry.get_tool("git_push_branch").unwrap();
+        assert_eq!(
+            push.execute(json!({})).await.unwrap()["pushed"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn solo_push_fails_closed_when_the_repository_cannot_be_resolved() {
+        let fixture = push_fixture();
+        git(
+            fixture.work.path(),
+            &["checkout", "-q", "-b", "feature-solo"],
+        );
+        commit_file(
+            fixture.work.path(),
+            "f.txt",
+            "x",
+            "f\n\nNanna-Identity: sdlc-dev",
+        );
+        let mock = Arc::new(MockGithub::default());
+        let tool = solo_push_tool(fixture.work.path(), &mock);
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("not a GitHub remote"), "{err}");
+        assert!(mock.calls().is_empty());
+        assert!(!bare_has(&fixture, "feature-solo"));
+    }
+
+    #[tokio::test]
+    async fn push_with_the_github_gate_never_reads_pull_request_state() {
+        let fixture = github_push_fixture();
+        let mock = head_listing(vec![pr_detail(7, false, "sdlc-dev")]);
+        let client: Arc<dyn GithubClient> = mock.clone();
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_gate(HumanGate::Github)
+            .with_client(client);
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap()["pushed"],
+            json!(true)
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn solo_push_still_applies_the_trailer_and_protected_path_checks_first() {
+        let fixture = github_push_fixture();
+        commit_file(
+            fixture.work.path(),
+            "ci/x.sh",
+            "x",
+            "p\n\nNanna-Identity: sdlc-dev",
+        );
+        let mock = head_listing(vec![]);
+        let client: Arc<dyn GithubClient> = mock.clone();
+        let declared = crate::protected::ProtectedExtras::parse(r#"extra = ["ci/**"]"#).unwrap();
+        let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+            .with_protected(ProtectedPaths::for_repo_with_extras(
+                Path::new("/nonexistent"),
+                &declared,
+            ))
+            .with_gate(HumanGate::Solo)
+            .with_client(client);
+        let err = tool.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("protected path"), "{err}");
+        assert!(mock.calls().is_empty());
+    }
+
+    fn local_origin_branch(branch: &str) -> PushFixture {
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", branch]);
+        commit_file(
+            fixture.work.path(),
+            "f.txt",
+            "x",
+            "f\n\nNanna-Identity: rust-implementer",
+        );
+        fixture
+    }
+
+    #[tokio::test]
+    async fn the_registered_promote_and_push_tools_follow_the_policy_they_were_given() {
+        let identity = solo_identity();
+        let fixture = local_origin_branch("feature-solo");
+        let mut registry = ToolRegistry::new();
+        register_guarded(&mut registry, fixture.work.path(), &identity, &solo_paths());
+        let promote = registry.get_tool("github_pr_promote").unwrap();
+        let err = promote
+            .execute(json!({ "pr_number": 7 }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("human_gate"), "{err}");
+        let push = registry.get_tool("git_push_branch").unwrap();
+        let err = push.execute(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("not a GitHub remote"), "{err}");
+        assert!(!bare_has(&fixture, "feature-solo"));
+    }
+
+    #[tokio::test]
+    async fn the_registered_push_tool_pushes_when_the_policy_is_github() {
+        let identity = solo_identity();
+        let fixture = local_origin_branch("feature-solo");
+        let mut registry = ToolRegistry::new();
+        register_guarded(
+            &mut registry,
+            fixture.work.path(),
+            &identity,
+            &ProtectedPaths::for_repo(Path::new("/nonexistent")),
+        );
+        let push = registry.get_tool("git_push_branch").unwrap();
+        assert_eq!(
+            push.execute(json!({})).await.unwrap()["pushed"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_registries_hand_the_policy_to_promote_and_push() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+        let identity = solo_identity();
+        let fixture = github_push_fixture();
+        let plain = crate::tools::create_tool_registry_for_guarded(
+            fixture.work.path(),
+            &identity,
+            solo_paths(),
+        )
+        .unwrap();
+        let handle = Arc::new(ContainerHandle {
+            name: "test-handle".to_string(),
+            runtime: ContainerRuntime::None,
+            port: None,
+            needs_cleanup: false,
+        });
+        let contained = crate::tools::create_container_tool_registry_for_guarded(
+            fixture.work.path(),
+            handle,
+            "/workspace",
+            &identity,
+            solo_paths(),
+        )
+        .unwrap();
+        for registry in [plain, contained] {
+            let promote = registry.get_tool("github_pr_promote").unwrap();
+            let err = promote
+                .execute(json!({ "pr_number": 7 }))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("human_gate"), "{err}");
+        }
+    }
+
+    const ALIAS_SPELLINGS: [&str; 3] = [
+        "tools/RELEAS~1.SH",
+        "gate~1/x.rs",
+        "tools/release-helper.sh.",
+    ];
+
+    fn alias_declared() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_windows_aliases_of_declared_paths_out_of_the_commit() {
+        let dir = feature_repo();
+        for path in ALIAS_SPELLINGS {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(alias_declared());
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(committed, "ok.txt");
+        let skipped = result["skipped_protected"].as_array().unwrap();
+        assert_eq!(skipped.len(), ALIAS_SPELLINGS.len());
+    }
+
+    #[tokio::test]
+    async fn push_refuses_windows_aliases_of_declared_paths() {
+        for path in ALIAS_SPELLINGS {
+            let fixture = push_fixture();
+            git(
+                fixture.work.path(),
+                &["checkout", "-q", "-b", "feature-alias"],
+            );
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "declared\n\nNanna-Identity: sdlc-dev",
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+                .with_protected(alias_declared());
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                err.to_string().contains("changes protected path"),
+                "{path}: {err}"
+            );
+            assert!(!remote_has(fixture.work.path(), "feature-alias"), "{path}");
+        }
+    }
+
     const UNICODE_SPELLINGS: [(&str, &str); 3] = [
         ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
         ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
@@ -4964,6 +5593,402 @@ mod tests {
             );
             assert!(!remote_has(fixture.work.path(), "feature-nfc"), "{path}");
         }
+    }
+
+    const COMBINED_SPELLINGS: [&str; 4] = [
+        "docs/cafe\u{301}./x.md",
+        "src/caf\u{e9}.rs.",
+        "docs/re\u{301}sume\u{301}~1.txt",
+        "fla\u{212A}e.nix.",
+    ];
+
+    fn combined_declared() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[tokio::test]
+    async fn commit_leaves_combined_unicode_and_windows_spellings_out_of_the_commit() {
+        let dir = feature_repo();
+        for path in COMBINED_SPELLINGS {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(combined_declared());
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert_eq!(committed, "ok.txt");
+        let skipped = result["skipped_protected"].as_array().unwrap();
+        assert_eq!(skipped.len(), COMBINED_SPELLINGS.len());
+    }
+
+    #[tokio::test]
+    async fn push_refuses_combined_unicode_and_windows_spellings() {
+        for path in COMBINED_SPELLINGS {
+            let fixture = push_fixture();
+            git(
+                fixture.work.path(),
+                &["checkout", "-q", "-b", "feature-combined"],
+            );
+            commit_file(
+                fixture.work.path(),
+                path,
+                "x",
+                "declared\n\nNanna-Identity: sdlc-dev",
+            );
+            let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
+                .with_protected(combined_declared());
+            let err = tool.execute(json!({})).await.unwrap_err();
+            assert!(
+                err.to_string().contains("changes protected path"),
+                "{path}: {err}"
+            );
+            assert!(
+                !remote_has(fixture.work.path(), "feature-combined"),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_an_untracked_hardlink_to_a_repo_declared_file() {
+        let dir = feature_repo();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/gate.rs"), "original").unwrap();
+        std::fs::hard_link(dir.path().join("src/gate.rs"), dir.path().join("alias.txt")).unwrap();
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+            .with_protected(declared_extras());
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(
+            err.to_string().contains(crate::protected::HARDLINK_RULE),
+            "{err}"
+        );
+        assert_eq!(head_sha(dir.path()), before);
+        assert!(run_git(dir.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    fn linked_repo(alias: &str) -> TempDir {
+        let dir = feature_repo();
+        commit_file(dir.path(), "keep.bin", "original", "partner");
+        let linked = dir.path().join(alias);
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::hard_link(dir.path().join("keep.bin"), linked).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn folded_commit_paths() -> ProtectedPaths {
+        let extras = crate::protected::ProtectedExtras::parse(
+            "extra = [\"docs/caf\u{e9}/**\", \"tools/release-helper.sh\"]",
+        )
+        .unwrap();
+        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_an_unprotected_alias_of_a_hardlinked_file() {
+        for name in ["cafe\u{301}-x.txt.", "plain.txt", "tools/OTHER~1.SH"] {
+            let dir = linked_repo(name);
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+                .with_protected(folded_commit_paths());
+            let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+            assert!(
+                err.to_string().contains("has other hard links"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_leaves_a_folded_protected_alias_out_instead_of_refusing_it_as_a_link() {
+        for name in ["docs/cafe\u{301}./x.md", "tools/RELEAS~1.SH"] {
+            let dir = linked_repo(name);
+            std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+            let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+                .with_protected(folded_commit_paths());
+            let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+            assert_eq!(result["committed"], true, "{name}");
+            assert_eq!(
+                result["skipped_protected"].as_array().unwrap().len(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_an_alias_that_is_already_staged() {
+        let dir = linked_repo("alias.txt");
+        git(dir.path(), &["add", "alias.txt"]);
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+        assert_eq!(head_sha(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_nested_git_repository_as_a_hard_link() {
+        let dir = feature_repo();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        git(&nested, &["init", "-q"]);
+        git(&nested, &["config", "user.email", "test@example.com"]);
+        git(&nested, &["config", "user.name", "Test User"]);
+        git(&nested, &["commit", "-q", "--allow-empty", "-m", "nested"]);
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+    }
+
+    #[cfg(unix)]
+    fn nested_repository(dir: &Path, name: &str) {
+        let nested = dir.join(name);
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        git(&nested, &["init", "-q"]);
+        git(&nested, &["config", "user.email", "test@example.com"]);
+        git(&nested, &["config", "user.name", "Test User"]);
+        git(&nested, &["config", "commit.gpgsign", "false"]);
+        git(&nested, &["commit", "-q", "--allow-empty", "-m", "nested"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_staged_gitlink_as_a_hard_link() {
+        let dir = feature_repo();
+        nested_repository(dir.path(), "nested");
+        git(dir.path(), &["add", "nested"]);
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_does_not_treat_a_modified_submodule_as_a_hard_link() {
+        let library = TempDir::new().unwrap();
+        nested_repository(library.path(), ".");
+        let dir = feature_repo();
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                library.path().to_str().unwrap(),
+                "lib",
+            ],
+        );
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git(dir.path(), &["commit", "-q", "-m", "submodule"]);
+        let lib = dir.path().join("lib");
+        git(&lib, &["config", "user.email", "test@example.com"]);
+        git(&lib, &["config", "user.name", "Test User"]);
+        git(&lib, &["config", "commit.gpgsign", "false"]);
+        git(&lib, &["commit", "-q", "--allow-empty", "-m", "moved"]);
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_a_modified_tracked_file_whose_inode_is_shared() {
+        let dir = feature_repo();
+        commit_file(dir.path(), "shared.txt", "a\n", "base");
+        std::fs::hard_link(dir.path().join("shared.txt"), dir.path().join("zz.txt")).unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "b\n").unwrap();
+        let before = head_sha(dir.path());
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+        assert_eq!(head_sha(dir.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_registered_commit_tool_refuses_a_hardlink_to_a_declared_file() {
+        let identity = granted_identity();
+        let fixture = push_fixture();
+        git(fixture.work.path(), &["checkout", "-q", "-b", "feature-hl"]);
+        std::fs::create_dir_all(fixture.work.path().join("ci")).unwrap();
+        std::fs::write(fixture.work.path().join("ci/deploy.sh"), "original").unwrap();
+        std::fs::hard_link(
+            fixture.work.path().join("ci/deploy.sh"),
+            fixture.work.path().join("alias.sh"),
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        register_guarded(
+            &mut registry,
+            fixture.work.path(),
+            &identity,
+            &declared_extras(),
+        );
+        let commit = registry.get_tool("git_commit").unwrap();
+        let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    fn solo_declared() -> ProtectedPaths {
+        combined_declared().with_policy(crate::policy::RepoPolicy::solo())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_refuses_hardlinks_identically_under_the_solo_gate_and_without_a_policy() {
+        let mut messages = Vec::new();
+        for protected in [combined_declared(), solo_declared()] {
+            for name in ["plain.txt", "cafe\u{301}-x.txt.", "copy.sh"] {
+                let dir = feature_repo();
+                let original = dir.path().join("keep.bin");
+                std::fs::write(&original, "original").unwrap();
+                std::fs::hard_link(&original, dir.path().join(name)).unwrap();
+                let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
+                    .with_protected(protected.clone());
+                let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
+                assert!(
+                    err.to_string().contains("has other hard links"),
+                    "{name}: {err}"
+                );
+                messages.push(err.to_string().replace(name, "<name>"));
+            }
+        }
+        let (first, second) = messages.split_at(3);
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn solo_push_and_promote_decisions_are_unaffected_by_hard_links_in_the_tree() {
+        let fixture = github_push_fixture();
+        std::fs::write(fixture.work.path().join("keep.bin"), "original").unwrap();
+        std::fs::hard_link(
+            fixture.work.path().join("keep.bin"),
+            fixture.work.path().join("zz-link.bin"),
+        )
+        .unwrap();
+        let ready = head_listing(vec![pr_detail(7, false, "sdlc-dev")]);
+        let err = solo_push_tool(fixture.work.path(), &ready)
+            .execute(json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no longer a draft"), "{err}");
+        assert!(!bare_has(&fixture, "feature-solo"));
+        let draft = head_listing(vec![pr_detail(7, true, "sdlc-dev")]);
+        solo_push_tool(fixture.work.path(), &draft)
+            .execute(json!({}))
+            .await
+            .unwrap();
+        assert!(bare_has(&fixture, "feature-solo"));
+        let mock = Arc::new(MockGithub::default());
+        let promote =
+            GithubPrPromoteTool::new(fixture.work.path().to_path_buf(), "sdlc-dev", mock.clone())
+                .with_gate(HumanGate::Solo);
+        let err = promote
+            .execute(json!({ "pr_number": 7 }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("human must mark"), "{err}");
+        assert!(mock.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_registered_commit_tool_refuses_a_hardlink_under_a_solo_policy() {
+        let identity = solo_identity();
+        let fixture = push_fixture();
+        git(
+            fixture.work.path(),
+            &["checkout", "-q", "-b", "feature-solo-hl"],
+        );
+        std::fs::create_dir_all(fixture.work.path().join("src")).unwrap();
+        std::fs::write(fixture.work.path().join("src/cafe\u{301}.rs"), "original").unwrap();
+        std::fs::hard_link(
+            fixture.work.path().join("src/cafe\u{301}.rs"),
+            fixture.work.path().join("alias.txt."),
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        register_guarded(
+            &mut registry,
+            fixture.work.path(),
+            &identity,
+            &solo_declared(),
+        );
+        let commit = registry.get_tool("git_commit").unwrap();
+        let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_judges_a_symlink_itself_and_not_the_file_it_points_at() {
+        let dir = feature_repo();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("shared.txt");
+        std::fs::write(&target, "shared").unwrap();
+        std::fs::hard_link(&target, outside.path().join("other.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("only-a-symlink")).unwrap();
+        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
+        std::os::unix::fs::symlink("README.md", dir.path().join("one")).unwrap();
+        std::fs::hard_link(dir.path().join("one"), dir.path().join("two")).unwrap();
+        let err = tool.execute(json!({ "subject": "y" })).await.unwrap_err();
+        assert!(err.to_string().contains("has other hard links"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_in_a_fresh_local_clone_with_hardlinked_objects_is_not_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = push_fixture();
+        let parent = TempDir::new().unwrap();
+        let clone = parent.path().join("clone");
+        git(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                fixture.work.path().to_str().unwrap(),
+                "clone",
+            ],
+        );
+        git(&clone, &["config", "user.email", "test@example.com"]);
+        git(&clone, &["config", "user.name", "Test User"]);
+        git(&clone, &["checkout", "-q", "-b", "feature-clone"]);
+        let linked = std::fs::read_dir(clone.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|dir| dir.file_name().len() == 2)
+            .flat_map(|dir| std::fs::read_dir(dir.path()).unwrap().flatten())
+            .any(|object| object.metadata().unwrap().nlink() > 1);
+        assert!(linked);
+        std::fs::write(clone.join("README.md"), "changed\n").unwrap();
+        std::fs::write(clone.join("new.txt"), "new\n").unwrap();
+        let tool = GitCommitTool::new(clone.clone(), "sdlc-dev");
+        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
+        assert_eq!(result["committed"], true);
     }
 
     fn granted_identity() -> crate::identity::AgentIdentity {
@@ -5367,6 +6392,7 @@ mod tests {
                 "list_review_comments",
                 "mark_pull_request_ready",
                 "open_pull_requests",
+                "pull_requests_for_head",
                 "search_open_issues",
             ]
         );
@@ -5410,7 +6436,13 @@ mod tests {
     fn register_never_adds_a_tool_outside_the_pinned_set() {
         let dir = github_repo_fixture();
         let mut registry = ToolRegistry::new();
-        register_granted(&mut registry, dir.path(), "sdlc-dev", &|_| true);
+        register_granted(
+            &mut registry,
+            dir.path(),
+            "sdlc-dev",
+            &|_| true,
+            &ProtectedPaths::for_repo(dir.path()),
+        );
         let mut names = registry.list_tools();
         names.sort_unstable();
         assert_eq!(names, ALL_TOOL_NAMES.to_vec());
@@ -7034,6 +8066,16 @@ mod tests {
             }
             self.inner.get_pull_request(repo, number).await
         }
+        async fn pull_requests_for_head(
+            &self,
+            repo: &str,
+            head: &str,
+        ) -> Result<Vec<GithubPullRequestDetail>, BacklogError> {
+            if self.failing == "pull_requests_for_head" {
+                return Err(hostile_failure());
+            }
+            self.inner.pull_requests_for_head(repo, head).await
+        }
         async fn mark_pull_request_ready(
             &self,
             repo: &str,
@@ -7845,7 +8887,14 @@ mod tests {
 
     fn production_registry(root: &Path, base: &str) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        register_granted_at(&mut registry, root, "sdlc-dev", &|_| true, base);
+        register_granted_at(
+            &mut registry,
+            root,
+            "sdlc-dev",
+            &|_| true,
+            &ProtectedPaths::for_repo(root),
+            base,
+        );
         registry
     }
 
