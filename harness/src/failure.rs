@@ -56,12 +56,16 @@ impl FailureKind {
         match error_type {
             "MaxIterationsExceeded" => FailureKind::MaxIterations,
             "StateError" => FailureKind::StateError,
-            "TaskCheckFailed" => FailureKind::TaskCheckFailed,
+            "TaskCheckFailed" | "VerificationFailed" => FailureKind::TaskCheckFailed,
             "ProtectedPathViolation" => FailureKind::ProtectedPathViolation,
             "ScopeError" => FailureKind::ScopeError,
             "IdentityUnavailable" => FailureKind::IdentityUnavailable,
             "NoProvider" => FailureKind::ModelUnavailable,
-            "ContainerSetupFailed" | "SidecarSetupFailed" => FailureKind::ContainerSetupFailed,
+            "ContainerSetupFailed"
+            | "SidecarSetupFailed"
+            | "VerifierRequiresContainer"
+            | "VerifierExecFailed" => FailureKind::ContainerSetupFailed,
+            "VerifierChecksInvalid" => FailureKind::InvalidRequest,
             "WorkspaceCreationFailed" => FailureKind::WorkspaceSetupFailed,
             "ImpactError" => FailureKind::ImpactError,
             "QueuePersistFailed" => FailureKind::QueueError,
@@ -94,6 +98,13 @@ mod tests {
         ("NoProvider", FailureKind::ModelUnavailable),
         ("ContainerSetupFailed", FailureKind::ContainerSetupFailed),
         ("SidecarSetupFailed", FailureKind::ContainerSetupFailed),
+        ("VerificationFailed", FailureKind::TaskCheckFailed),
+        (
+            "VerifierRequiresContainer",
+            FailureKind::ContainerSetupFailed,
+        ),
+        ("VerifierExecFailed", FailureKind::ContainerSetupFailed),
+        ("VerifierChecksInvalid", FailureKind::InvalidRequest),
         ("WorkspaceCreationFailed", FailureKind::WorkspaceSetupFailed),
         ("ImpactError", FailureKind::ImpactError),
         ("QueuePersistFailed", FailureKind::QueueError),
@@ -160,7 +171,6 @@ mod tests {
             .collect();
         let expected: HashSet<FailureKind> = [
             FailureKind::SpawnRefused,
-            FailureKind::InvalidRequest,
             FailureKind::Cancelled,
             FailureKind::Unclassified,
         ]
@@ -194,10 +204,14 @@ mod tests {
                 );
             }
         }
+        let constants: HashSet<String> = crate_error_constants()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
         for (label, _) in KNOWN_LABELS {
             assert!(
-                seen.contains(*label),
-                "{label} no longer appears in task.rs"
+                seen.contains(*label) || constants.contains(*label),
+                "{label} no longer appears in task.rs or in an ERROR_* constant"
             );
         }
     }
@@ -278,22 +292,30 @@ mod tests {
         assert_eq!(error_constants(crlf), ["Delta"]);
     }
 
-    #[test]
-    fn every_error_constant_in_the_crate_is_classified() {
+    fn crate_error_constants() -> Vec<(std::path::PathBuf, String)> {
         let mut files = Vec::new();
         rust_sources(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
         assert!(files.len() > 50);
+        let mut found = Vec::new();
         for file in files {
             for label in error_constants(&std::fs::read_to_string(&file).unwrap()) {
-                assert!(
-                    KNOWN_LABELS.iter().any(|(known, _)| *known == label),
-                    "{} defines the error_type label {label:?}; add it to FailureKind::from_error_type and KNOWN_LABELS",
-                    file.display()
-                );
+                found.push((file.clone(), label));
             }
+        }
+        found
+    }
+
+    #[test]
+    fn every_error_constant_in_the_crate_is_classified() {
+        for (file, label) in crate_error_constants() {
+            assert!(
+                KNOWN_LABELS.iter().any(|(known, _)| *known == label),
+                "{} defines the error_type label {label:?}; add it to FailureKind::from_error_type and KNOWN_LABELS",
+                file.display()
+            );
         }
     }
 
