@@ -650,11 +650,10 @@ let handle = start_container_with_fallback(&config).await?;
 ## 📞 Support & Contact
 
 ### Documentation
-- **System Overview**: This document
-- **API Documentation**: `/docs/api/`
-- **Developer Guide**: `/docs/developer-experience.md`
-- **CI/CD Guide**: `/docs/ci-cd-pipeline.md`
-- **Troubleshooting**: See above section
+- **System Overview**: this document
+- **Developer Guide**: [developer-experience.md](./developer-experience.md)
+- **CI/CD Guide**: [ci-cd-pipeline.md](./ci-cd-pipeline.md)
+- **Troubleshooting**: see [Troubleshooting Guide](#-troubleshooting-guide) above
 
 ### Getting Help
 - **Issues**: GitHub Issues for bug reports
