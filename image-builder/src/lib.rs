@@ -212,4 +212,19 @@ mod tests {
         let result = validate_image(f.path());
         assert!(result.unwrap());
     }
+
+    #[test]
+    fn test_validate_image_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = validate_image(dir.path());
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn test_validate_image_non_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("image.json"), b"{}").unwrap();
+        let result = validate_image(dir.path());
+        assert!(result.unwrap());
+    }
 }
