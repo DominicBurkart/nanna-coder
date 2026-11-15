@@ -114,6 +114,7 @@ pub fn queue_path_from(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum Record {
     Insert { task: QueuedTask },
     Remove { id: TaskId },

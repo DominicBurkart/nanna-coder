@@ -13,11 +13,8 @@ pub const MAX_PLAN_ID_LEN: usize = 80;
 
 const MAX_REPO_LEN: usize = 140;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const MCP_PREFIX: &str = "mcp-";
-#[cfg_attr(not(test), allow(dead_code))]
 const PLAN_PREFIX: &str = "plan-";
-#[cfg_attr(not(test), allow(dead_code))]
 const BACKLOG_PREFIX: &str = "backlog-";
 
 /// A spawned subagent's id. Same value as its [`TaskId`].
@@ -262,7 +259,7 @@ pub struct SessionBinding {
 }
 
 impl SessionBinding {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_proof(allowed: &Allowed, task: TaskId, lineage: Lineage) -> Self {
         Self {
             session: SessionId::from_task(task),
@@ -288,7 +285,6 @@ impl SessionBinding {
 ///
 /// `Ok(None)` means the parent is not a recognised entry point or known
 /// session; the caller gives the new task its own `Legacy` root.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn derive_lineage(
     parent_id: &str,
     lookup: &dyn Fn(&TaskId) -> Option<Lineage>,
@@ -319,7 +315,6 @@ pub(crate) fn derive_lineage(
 
 /// Combine a lineage already carried by a queue entry with the one derived
 /// from its audit proof. They must agree.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reconcile(
     carried: Option<Lineage>,
     derived: Option<Lineage>,
