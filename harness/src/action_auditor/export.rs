@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub const MAX_NAME_CHARS: usize = 64;
 pub const MAX_REASON_CODES: usize = 8;
 
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     let keep = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
     let reduced = text.chars().take(MAX_NAME_CHARS);
     reduced.map(|c| if keep(c) { c } else { '?' }).collect()

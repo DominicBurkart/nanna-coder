@@ -37,6 +37,7 @@ mod rules;
 mod verdict;
 
 pub use context::ActionContext;
+pub(crate) use export::plain;
 pub use export::{ActionAuditEvent, ActionAuditSink, NullSink, TelemetrySink};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
