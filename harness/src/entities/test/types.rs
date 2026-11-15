@@ -44,3 +44,45 @@ impl Default for TestEntity {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_test_entity_new() {
+        let entity = TestEntity::new();
+        assert_eq!(entity.metadata().entity_type, EntityType::Test);
+        assert_eq!(entity.entity_type(), EntityType::Test);
+        assert!(!entity.id().is_empty());
+    }
+
+    #[test]
+    fn test_test_entity_default_matches_new() {
+        let from_new = TestEntity::new();
+        let from_default = TestEntity::default();
+        assert_eq!(from_new.entity_type(), from_default.entity_type());
+    }
+
+    #[test]
+    fn test_test_entity_to_json_roundtrip() {
+        let entity = TestEntity::new();
+        let json = entity.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // entity_type flattened from EntityMetadata should be "Test"
+        assert_eq!(parsed["entity_type"], "Test");
+    }
+
+    #[test]
+    fn test_test_entity_ids_are_unique() {
+        let e1 = TestEntity::new();
+        let e2 = TestEntity::new();
+        assert_ne!(e1.id(), e2.id());
+    }
+
+    #[test]
+    fn test_test_entity_metadata_version_starts_at_one() {
+        let entity = TestEntity::new();
+        assert_eq!(entity.metadata().version, 1);
+    }
+}
