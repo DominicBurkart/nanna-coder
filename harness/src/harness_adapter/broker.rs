@@ -817,13 +817,17 @@ impl ArmedBroker {
             core.halted.store(true, Ordering::SeqCst);
         }
         match outcome {
-            BrokerOutcome::Output(value) if value.to_string().len() > MAX_OUTPUT_BYTES => refuse(
-                ToolErrorKind::ReplyTooLarge,
-                format!(
-                    "output of `{}` exceeds {MAX_OUTPUT_BYTES} bytes",
-                    request.tool
-                ),
-            ),
+            BrokerOutcome::Output(value)
+                if wire_text(&value.to_string()).len() > MAX_OUTPUT_BYTES =>
+            {
+                refuse(
+                    ToolErrorKind::ReplyTooLarge,
+                    format!(
+                        "output of `{}` exceeds {MAX_OUTPUT_BYTES} bytes",
+                        request.tool
+                    ),
+                )
+            }
             outcome => outcome,
         }
     }
@@ -844,8 +848,7 @@ impl ArmedBroker {
             }
         };
         let text = serde_json::to_string(&response).expect("broker responses are plain JSON");
-        let text = text.replace('\u{2028}', "\\u2028");
-        text.replace('\u{2029}', "\\u2029")
+        wire_text(&text)
     }
 }
 
@@ -868,6 +871,11 @@ impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
         self.finish(AuditOutcome::Aborted);
     }
+}
+
+fn wire_text(text: &str) -> String {
+    let text = text.replace('\u{2028}', "\\u2028");
+    text.replace('\u{2029}', "\\u2029")
 }
 
 pub(super) fn clip(text: &str, max: usize) -> String {

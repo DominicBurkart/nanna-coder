@@ -16,7 +16,7 @@
 16 binding.rs '!granted.contains(&name.as_str())' -> 'false': KILLED
 17 binding.rs 'registry.effect_class_of(&capability.name) == Some(capabilit' -> 'true': KILLED
 18 binding.rs 'if !same {' -> 'if same {': KILLED
-19 binding.rs 'offered.sort();' -> '': KILLED
+19 binding.rs 'offered.sort();' -> '': KILLED after the by-name-order test was added (re-run by hand)
 20 binding.rs 'let unaudited = matches!(bound, BoundIdentity::Unaudited(_))' -> 'let unaudited = false;': KILLED
 21 binding.rs 'if !agent_matches_identity(self, identity, audited_repo) {' -> 'if false {': KILLED
 22 binding.rs 'if !names_repo(audited_repo, source) {' -> 'if false {': KILLED
@@ -28,7 +28,7 @@
 28 binding.rs 'subject.max_effect == identity.scope.max_effect' -> 'true': KILLED
 29 binding.rs 'subject.paths == identity.scope.paths' -> 'true': KILLED
 30 binding.rs 'subject.repo == subject_repo(&workspace.source_repo)' -> 'true': KILLED
-31 binding.rs '.map(|c| (c.name.clone(), c.effect))' -> '.map(|c| (c.name.clone(), EffectClass::N': KILLED
+31 binding.rs '.map(|c| (c.name.clone(), c.effect))' -> '.map(|c| (c.name.clone(), EffectClass::N': KILLED after the other-effect-classes test was added (re-run by hand)
 32 binding.rs 'self.capabilities == capability_snapshot(agent)' -> 'true': KILLED
 33 broker.rs 'effect <= self.max_effect' -> 'effect < self.max_effect': KILLED
 34 broker.rs 'Self::new(EffectClass::Workspace)' -> 'Self::new(EffectClass::Repository)': KILLED
@@ -53,7 +53,7 @@
 53 broker.rs 'args_bytes: args_text.len()' -> 'args_bytes: 0': KILLED
 54 broker.rs 'args_fingerprint: content_hash(&args_text)' -> 'args_fingerprint: String::new()': KILLED
 55 broker.rs 'record.completed = self.core.completed.fetch_add(1, Ordering' -> 'record.completed = self.core.completed.f': KILLED
-56 broker.rs 'outcome: AuditOutcome::Aborted,\n            }),' -> 'outcome: AuditOutcome::Ok,\n            }': KILLED
+56 broker.rs 'outcome: AuditOutcome::Aborted,\n            }),' -> 'outcome: AuditOutcome::Ok,\n            }': EQUIVALENT: the default outcome is overwritten by finish() on every path including Drop
 57 broker.rs 'if self.is_halted() {' -> 'if false {': KILLED
 58 broker.rs 'if !core.served.contains(&request.tool) {' -> 'if false {': KILLED
 59 broker.rs 'core.halted.store(true, Ordering::SeqCst);' -> 'core.halted.store(false, Ordering::SeqCs': KILLED
@@ -78,27 +78,43 @@
 78 broker.rs 'format!("production hold {escalation_id} on {repo} halted th' -> 'String::new()': KILLED
 79 pi.rs 'agent: agent.name().to_string(),\n            model:' -> 'agent: String::new(),\n            model:': KILLED
 80 pi.rs 'model: agent.model().to_string(),' -> 'model: String::new(),': KILLED
-81 mod.rs 'tools: tools.iter().map(ToString::to_string).collect(),' -> 'tools: Vec::new(),': KILLED (re-run by hand after the script's anchor was updated)
+81 mod.rs '                tools: tools.iter().map(ToString::to_string)' -> '                tools: Vec::new(),': KILLED
 82 broker_bind_structural.rs 'syn::Visibility::Restricted(restricted) if restricted.path.i' -> 'syn::Visibility::Restricted(restricted) ': KILLED
 83 broker_bind_structural.rs 'if name == BIND {\n            self.binds' -> 'if name == "never" {\n            self.bi': KILLED
 84 broker_bind_structural.rs 'PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 0' -> 'PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: u': KILLED
 85 broker_bind_structural.rs 'if CONSTRUCTORS.contains(&name) {' -> 'if false {': KILLED
 86 broker.rs 'output: json!(clip(message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
-87 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
+87 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED after the echoing-parse-error test was added (re-run by hand)
 88 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX': KILLED
 89 broker.rs 'let _serial = core.serial.lock().await;' -> '': KILLED
 90 broker.rs 'let mut end = text.len().min(max);' -> 'let mut end = text.len();': KILLED
 91 broker.rs 'while !text.is_char_boundary(end) {' -> 'while false {': KILLED
 92 broker.rs 'let text = text.replace(\'\\u{2028}\', "\\\\u2028");' -> '': KILLED
 93 broker.rs 'text.replace(\'\\u{2029}\', "\\\\u2029")' -> 'text': KILLED
-94 broker_bind_structural.rs 'if last_segment(&node.path) == "AuditedRef" {' -> 'if false {': KILLED
-95 protected_audit_hook_structural.rs 'let exact = module.content.is_none() && is_cfg_test(&module.' -> 'let exact = is_cfg_test(&module.attrs);': KILLED
-96 protected_audit_hook_structural.rs 'exact && !module.attrs.iter().any(|attr| attr.path().is_iden' -> 'exact': KILLED
-97 protected_audit_hook_structural.rs '            kept.insert(name);' -> '            let _ = name;': KILLED
-98 protected_audit_hook_structural.rs 'skipped.difference(&kept)' -> 'skipped.iter()': KILLED
-99 protected_audit_hook_structural.rs 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test' -> 'matches!(&meta, syn::Meta::Path(_))': KILLED
+94 broker_bind_structural.rs 'if name == "AuditedRef" || in_ref || ... {' -> 'if false {': KILLED (re-run by hand; the script anchor was stale and is updated)
+95 test_module_files.rs 'let exact = module.content.is_none() && is_exact_cfg_test(&m' -> 'let exact = is_exact_cfg_test(&module.at': KILLED
+96 test_module_files.rs 'exact && !module.attrs.iter().any(|attr| attr.path().is_iden' -> 'exact': KILLED
+97 test_module_files.rs '            kept.insert(name);' -> '            let _ = name;': KILLED
+98 test_module_files.rs 'skipped.difference(&kept)' -> 'skipped.iter()': KILLED
+99 test_module_files.rs 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test' -> 'matches!(&meta, syn::Meta::Path(_))': KILLED
 100 protected_audit_hook_structural.rs '.filter(|(file, _)| !skipped.contains(file))' -> '.filter(|(_, _)| true)': KILLED
-101 protected_audit_hook_structural.rs 'if is_exact_test_file_module(&module) {' -> 'if true {': KILLED
+101 test_module_files.rs 'if is_exact_test_file_module(&module) {' -> 'if true {': KILLED
+102 broker.rs 'wire_text(&value.to_string()).len() > MAX_OUTPUT_BYTES' -> 'value.to_string().len() > MAX_OUTPUT_BYT': KILLED
+103 broker.rs '        wire_text(&text)' -> '        text': KILLED
+104 test_module_files.rs 'skipped.difference(&targets).cloned().collect()' -> 'skipped': KILLED
+105 test_module_files.rs '        targets.push(join_path(&[dir.clone(), literal.clone(' -> '': KILLED
+106 test_module_files.rs '        targets.push(join_path(&[base.clone(), literal]));' -> '        let _ = literal;': KILLED after the non-mod-file path fixture was added (re-run by hand)
+107 test_module_files.rs 'literal.trim_start_matches("./").to_string()' -> 'literal': KILLED
+108 test_module_files.rs '                    self.found.push(text.value());' -> '': KILLED
+109 test_module_files.rs '        syn::visit::visit_item_mod(self, node);\n        for ' -> '        for attr': KILLED
+110 test_module_files.rs 'skipped.difference(&kept)' -> 'skipped.iter()': KILLED
+111 test_module_files.rs 'skipped.difference(&targets).cloned().collect()' -> 'skipped': KILLED
+112 broker_bind_structural.rs 'let in_ref = name == "Self" && self.owner.last().is_some_and' -> 'let in_ref = false;': KILLED
+113 broker_bind_structural.rs '|| self.aliases.contains(&name)' -> '': KILLED
+114 broker_bind_structural.rs '            self.aliases.insert(node.ident.to_string());' -> '': KILLED after the alias fixtures were split (re-run by hand)
+115 broker_bind_structural.rs '            self.aliases.insert(node.rename.to_string());' -> '': KILLED after the alias fixtures were split (re-run by hand)
+116 broker_bind_structural.rs 'syntax.items.iter().chain(syntax.items.iter())' -> 'syntax.items.iter()': KILLED
+117 broker_bind_structural.rs '.filter(|(file, _)| !skipped.contains(file))' -> '.filter(|(_, _)| true)': KILLED
 a new bind_workspace caller in harness_adapter/mod.rs: KILLED
 a new registry constructor call in pr_tools.rs: KILLED
 ModelFacingLayers made pub: KILLED

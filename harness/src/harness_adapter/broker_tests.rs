@@ -2,7 +2,7 @@ use super::binding::{AuditedRef, BoundWorkspace};
 use super::broker::{clip, ArmError, ArmedBroker, Broker, BrokerError};
 use super::testing::{
     allowed_for, allowed_for_repo, allowed_for_subtask, allowed_from_dir_for_repo, base_registry,
-    calls, fail_with, layers_for, ok_with, real_workspace, scoped, Behavior, Counters,
+    calls, fail_with, layers_for, ok_with, real_workspace, scoped, unique_task, Behavior, Counters,
 };
 use super::tests::{gateway, Card, SOCKET};
 use super::*;
@@ -560,13 +560,8 @@ async fn wire_lines_round_trip_and_bad_or_oversized_requests_are_not_logged() {
         assert_eq!(reply["ok"], false, "{bad}");
         assert_eq!(reply["kind"], "bad_request", "{bad}");
         assert_eq!(reply["halt"], false);
-        assert!(
-            reply["output"]
-                .as_str()
-                .unwrap()
-                .starts_with("bad request: "),
-            "{bad}"
-        );
+        let text = reply["output"].as_str().unwrap();
+        assert!(text.starts_with("bad request: "), "{bad}");
     }
     let prefix = r#"{"tool":"read_file","args":""#;
     let suffix = r#""}"#;
@@ -1057,14 +1052,20 @@ fn armed_real(
 
 #[tokio::test]
 async fn bound_to_a_real_workspace_an_out_of_path_write_is_refused_end_to_end() {
+    let task_e2e = unique_task("t-e2e");
     let _path = crate::test_support::hold_path_async().await;
     let mut r = real(
-        "t-e2e",
+        task_e2e.as_str(),
         &real_card("[\"api/**\"]", "\"write_file\"", "workspace"),
     );
     assert_eq!(r.agent.capability_names(), vec!["write_file"]);
-    let (armed, _) = armed_real(&r, "t-e2e", ActionVerdict::Allow, BrokerPolicy::default());
-    assert_eq!(armed.task_id().0, "t-e2e");
+    let (armed, _) = armed_real(
+        &r,
+        task_e2e.as_str(),
+        ActionVerdict::Allow,
+        BrokerPolicy::default(),
+    );
+    assert_eq!(armed.task_id().0, task_e2e.as_str());
     let denied = armed
         .handle(BrokerRequest {
             tool: "write_file".into(),
@@ -1086,14 +1087,15 @@ async fn bound_to_a_real_workspace_an_out_of_path_write_is_refused_end_to_end() 
 
 #[tokio::test]
 async fn the_bound_registry_installs_every_model_facing_layer() {
+    let task_layers_b = unique_task("t-layers-b");
     let _path = crate::test_support::hold_path_async().await;
     let mut r = real(
-        "t-layers-b",
+        task_layers_b.as_str(),
         &real_card("[\"api/**\"]", "\"write_file\"", "workspace"),
     );
     let layered = layers_for(
         &r.identity,
-        "t-layers-b",
+        task_layers_b.as_str(),
         "example/repo",
         ActionVerdict::Allow,
     );
@@ -1120,6 +1122,8 @@ async fn the_bound_registry_installs_every_model_facing_layer() {
 
 #[tokio::test]
 async fn a_real_gate_blocks_and_a_real_escalation_halts_and_is_audited() {
+    let task_escalate_b = unique_task("t-escalate-b");
+    let task_block_b = unique_task("t-block-b");
     let _path = crate::test_support::hold_path_async().await;
     let card = real_card("[\"**\"]", "\"github_pr_status\"", "repository");
     let widened = BrokerPolicy::new(EffectClass::Repository);
@@ -1128,10 +1132,10 @@ async fn a_real_gate_blocks_and_a_real_escalation_halts_and_is_audited() {
         args: serde_json::json!({}),
     };
 
-    let mut g = real("t-block-b", &card);
+    let mut g = real(task_block_b.as_str(), &card);
     let (armed, _) = armed_real(
         &g,
-        "t-block-b",
+        task_block_b.as_str(),
         ActionVerdict::block(vec![Reason::new(ReasonCode::Other, "no")]),
         widened,
     );
@@ -1141,10 +1145,10 @@ async fn a_real_gate_blocks_and_a_real_escalation_halts_and_is_audited() {
     assert_eq!(armed.action_audit().len(), 1);
     g.workspace.cleanup().unwrap();
 
-    let mut g = real("t-escalate-b", &card);
+    let mut g = real(task_escalate_b.as_str(), &card);
     let (armed, log) = armed_real(
         &g,
-        "t-escalate-b",
+        task_escalate_b.as_str(),
         ActionVerdict::escalate(vec![Reason::new(ReasonCode::Other, "needs a human")]),
         widened,
     );
@@ -1165,14 +1169,15 @@ async fn a_real_gate_blocks_and_a_real_escalation_halts_and_is_audited() {
 
 #[tokio::test]
 async fn a_workspace_call_below_repository_never_reaches_the_action_gate() {
+    let task_below_gate = unique_task("t-below-gate");
     let _path = crate::test_support::hold_path_async().await;
     let mut r = real(
-        "t-below-gate",
+        task_below_gate.as_str(),
         &real_card("[\"api/**\"]", "\"write_file\"", "workspace"),
     );
     let (armed, _) = armed_real(
         &r,
-        "t-below-gate",
+        task_below_gate.as_str(),
         ActionVerdict::block(vec![Reason::new(ReasonCode::Other, "no")]),
         BrokerPolicy::default(),
     );
@@ -1190,18 +1195,20 @@ async fn a_workspace_call_below_repository_never_reaches_the_action_gate() {
 
 #[tokio::test]
 async fn a_workspace_bound_for_another_audited_spawn_is_refused() {
+    let task_cross_b = unique_task("t-cross-b");
+    let task_cross_a = unique_task("t-cross-a");
     let _path = crate::test_support::hold_path_async().await;
     let mut a = real(
-        "t-cross-a",
+        task_cross_a.as_str(),
         &real_card("[\"**\"]", "\"write_file\"", "workspace"),
     );
     let mut b = real(
-        "t-cross-b",
+        task_cross_b.as_str(),
         &real_card("[\"api/**\"]", "\"write_file\"", "workspace"),
     );
     let layered = layers_for(
         &a.identity,
-        "t-cross-a",
+        task_cross_a.as_str(),
         "example/repo",
         ActionVerdict::Allow,
     );
@@ -1221,7 +1228,7 @@ async fn a_workspace_bound_for_another_audited_spawn_is_refused() {
     assert!(!b.workspace.workspace_path.join("src/x.rs").exists());
     let layered = layers_for(
         &b.identity,
-        "t-cross-b",
+        task_cross_b.as_str(),
         "example/repo",
         ActionVerdict::Allow,
     );
@@ -1339,4 +1346,75 @@ fn clipping_never_splits_a_character() {
     assert_eq!(clip("😀😀", 5), "😀");
     assert_eq!(clip("abc", 10), "abc");
     assert_eq!(clip("abc", 0), "");
+}
+
+#[tokio::test]
+async fn the_output_cap_is_measured_on_the_escaped_reply_line() {
+    let separators = ["\u{2028}", "\u{2029}"];
+    for separator in separators {
+        let over = separator.repeat(333_332);
+        let exact = separator.repeat(166_666);
+        let (broker, _) = armed(vec![
+            ("over", EffectClass::None, ok_with(serde_json::json!(over))),
+            (
+                "exact",
+                EffectClass::None,
+                ok_with(serde_json::json!(exact)),
+            ),
+        ]);
+        let refused = broker.handle_line(r#"{"tool":"over"}"#).await;
+        assert!(refused.len() <= 1_048_576, "{}", refused.len());
+        assert!(refused.contains("reply_too_large"));
+        let accepted = broker.handle_line(r#"{"tool":"exact"}"#).await;
+        assert!(accepted.len() <= 1_048_576, "{}", accepted.len());
+        assert!(accepted.contains("\"ok\":true"));
+    }
+    let controls = "\u{1}".repeat(MAX_MESSAGE_BYTES);
+    let (broker, _) = armed(vec![(
+        "ctl",
+        EffectClass::None,
+        fail_with(|| crate::tools::ToolError::ExecutionFailed {
+            message: "\u{1}".repeat(3_000_000),
+        }),
+    )]);
+    let line = broker.handle_line(r#"{"tool":"ctl"}"#).await;
+    assert!(line.len() <= 1_048_576, "{}", line.len());
+    assert_eq!(controls.len(), MAX_MESSAGE_BYTES);
+}
+
+#[test]
+fn a_workspace_bound_for_the_same_names_with_other_effect_classes_is_refused() {
+    let card = Card::new("\"*\"", "workspace");
+    let allowed = allowed_for(&card.identity());
+    let resolve_with_effect = |effect: EffectClass| {
+        let tools = vec![("read_file", effect, ok_with(serde_json::json!(0)))];
+        let grant = scoped(allowed.identity(), &specs_of(&tools));
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap()
+    };
+    let quiet = resolve_with_effect(EffectClass::None);
+    let loud = resolve_with_effect(EffectClass::Workspace);
+    let tools = || {
+        vec![(
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        )]
+    };
+    let bound_quiet = bound_for(allowed.identity(), allowed.repo(), &quiet, tools());
+    let err = Broker::for_agent(&loud, bound_quiet, BrokerPolicy::default(), sink())
+        .err()
+        .unwrap();
+    assert!(matches!(err, BrokerError::BoundWorkspaceMismatch), "{err}");
+}
+
+#[tokio::test]
+async fn a_bad_request_that_echoes_its_input_in_the_parse_error_is_clipped() {
+    let (broker, _) = armed(two_tools());
+    let line = format!("\"{}\"", "a".repeat(1_000_000));
+    let reply: serde_json::Value = serde_json::from_str(&broker.handle_line(&line).await).unwrap();
+    assert_eq!(reply["kind"], "bad_request");
+    let text = reply["output"].as_str().unwrap();
+    assert!(text.starts_with("bad request: "));
+    assert!(text.len() <= MAX_MESSAGE_BYTES, "{}", text.len());
 }
