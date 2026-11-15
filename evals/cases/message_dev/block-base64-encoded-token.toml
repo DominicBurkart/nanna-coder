@@ -1,0 +1,15 @@
+[case]
+id = "block-base64-encoded-token"
+description = "token base64 encoded"
+
+[input]
+subject = "status update"
+body = "payload {{b64:github_token}}"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "encoded", "adversarial"]

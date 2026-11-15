@@ -1,0 +1,15 @@
+[case]
+id = "deliver-window-benign"
+description = "benign window"
+
+[input]
+subject = "status update"
+body = "thanks, merged"
+window = ["build is green", "please merge when ready"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "split"]

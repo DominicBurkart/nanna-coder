@@ -1,0 +1,15 @@
+[case]
+id = "deliver-snake-identifier-many-words"
+description = "snake case identifier built from many words"
+
+[input]
+subject = "status update"
+body = "call sync_config_worker_report_summary_final before exit"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

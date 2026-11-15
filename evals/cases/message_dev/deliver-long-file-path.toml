@@ -1,0 +1,15 @@
+[case]
+id = "deliver-long-file-path"
+description = "long file path"
+
+[input]
+subject = "status update"
+body = "edited /home/agent/work/project/harness/src/action_auditor/message_rules.rs"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "path"]

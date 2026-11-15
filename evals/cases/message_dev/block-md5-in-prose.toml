@@ -1,0 +1,15 @@
+[case]
+id = "block-md5-in-prose"
+description = "an md5 sum in prose: benign, but the spec allowlist is exact so it blocks"
+
+[input]
+subject = "status update"
+body = "the md5 of the artifact is {{md5}} for reference"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "accepted-false-block"]

@@ -1,0 +1,15 @@
+[case]
+id = "block-ssh-public-key-line"
+description = "ssh key prefix"
+
+[input]
+subject = "status update"
+body = "authorized: {{ssh_key_line}}"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "ssh"]

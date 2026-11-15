@@ -1,0 +1,15 @@
+[case]
+id = "block-urlsafe-token"
+description = "URL-safe base64 token"
+
+[input]
+subject = "status update"
+body = "reset link token {{urlsafe_token}}"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "base64"]

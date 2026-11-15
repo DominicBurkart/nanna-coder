@@ -1,0 +1,15 @@
+[case]
+id = "deliver-github-url"
+description = "long github url"
+
+[input]
+subject = "status update"
+body = "review https://github.com/example-org/example-repo/pull/1234/files please"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

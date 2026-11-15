@@ -1371,9 +1371,12 @@ mod tests {
 
     #[test]
     fn rule_8_window_trimming_is_char_boundary_safe() {
-        let filler = "é".repeat(5000);
+        let filler = format!("{}a", "é".repeat(6000));
         let outcome = rules().review("s", "ok", &[filler.as_str()]);
         assert!(outcome.verdict.is_deliver());
+        let tail = window_tail(&[filler.as_str()]);
+        assert!(tail.len() <= WINDOW_BYTES);
+        assert!(tail.ends_with('a'));
     }
 
     #[test]
@@ -1690,6 +1693,18 @@ mod tests {
             let refs: Vec<&str> = window.iter().map(String::as_str).collect();
             let _ = rules().review(&subject, &body, &refs);
             let _ = rules().review_field(&body);
+        }
+
+        #[test]
+        fn window_trimming_never_panics_and_stays_bounded_on_multibyte_text(
+            window in prop::collection::vec("[é日a\u{1f642}]{0,500}", 0..40),
+        ) {
+            let refs: Vec<&str> = window.iter().map(String::as_str).collect();
+            let tail = window_tail(&refs);
+            prop_assert!(tail.len() <= WINDOW_BYTES);
+            let joined: String = window.concat();
+            prop_assert!(joined.ends_with(tail.as_str()));
+            let _ = rules().review("s", "ok", &refs);
         }
 
         #[test]

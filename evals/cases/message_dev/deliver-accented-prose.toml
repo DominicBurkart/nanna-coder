@@ -1,0 +1,15 @@
+[case]
+id = "deliver-accented-prose"
+description = "accented prose"
+
+[input]
+subject = "status update"
+body = "na\u00efve caf\u00e9 r\u00e9sum\u00e9 co\u00f6rdinate"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "unicode"]

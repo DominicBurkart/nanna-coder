@@ -1,0 +1,15 @@
+[case]
+id = "quarantine-ssh-config-fenced"
+description = "ssh config pasted in a fence"
+
+[input]
+subject = "status update"
+body = "contents of ~/.ssh/config:\n```\nHost build\n  User deploy\n```"
+window = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

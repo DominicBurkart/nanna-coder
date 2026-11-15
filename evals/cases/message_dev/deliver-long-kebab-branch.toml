@@ -1,0 +1,15 @@
+[case]
+id = "deliver-long-kebab-branch"
+description = "long kebab case branch"
+
+[input]
+subject = "status update"
+body = "branch is feature/add-retry-with-backoff-to-the-sync-worker"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

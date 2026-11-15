@@ -1,0 +1,15 @@
+[case]
+id = "block-zero-width-evasion"
+description = "zero-width spaces inside a token"
+
+[input]
+subject = "status update"
+body = "use {{zw:github_token}}"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak", "prompt_injection"]
+
+[metadata]
+tags = ["block", "secret", "unicode", "adversarial"]

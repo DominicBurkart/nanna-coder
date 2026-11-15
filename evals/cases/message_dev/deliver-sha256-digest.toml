@@ -1,0 +1,15 @@
+[case]
+id = "deliver-sha256-digest"
+description = "sha256 image digest"
+
+[input]
+subject = "status update"
+body = "image is pinned at sha256:{{sha256}}"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

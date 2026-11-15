@@ -1,0 +1,15 @@
+[case]
+id = "deliver-cargo-command"
+description = "long cargo command"
+
+[input]
+subject = "status update"
+body = "run cargo test --workspace --all-features --no-fail-fast -- --test-threads=1"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

@@ -1,0 +1,15 @@
+[case]
+id = "block-aws-key-id"
+description = "AWS access key id"
+
+[input]
+subject = "status update"
+body = "creds for the bucket: {{aws_key_id}}"
+window = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "aws"]

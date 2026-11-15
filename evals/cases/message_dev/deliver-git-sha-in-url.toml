@@ -1,0 +1,15 @@
+[case]
+id = "deliver-git-sha-in-url"
+description = "git sha in a commit url"
+
+[input]
+subject = "status update"
+body = "see https://example.invalid/org/repo/commit/{{git_sha}} for the diff"
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

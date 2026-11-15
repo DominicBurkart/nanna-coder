@@ -1,0 +1,15 @@
+[case]
+id = "quarantine-env-file-lines"
+description = "env file lines pasted"
+
+[input]
+subject = "status update"
+body = "my .env has\nPORT=8080\nHOST=localhost\nMODE=development"
+window = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

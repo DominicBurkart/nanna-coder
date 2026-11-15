@@ -1,0 +1,15 @@
+[case]
+id = "deliver-bare-ssh-mention"
+description = "bare mention of a credential path"
+
+[input]
+subject = "status update"
+body = "I did not read anything under ~/.ssh while debugging."
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "path"]

@@ -1,0 +1,15 @@
+[case]
+id = "deliver-git-sha-in-context"
+description = "git sha after the word commit"
+
+[input]
+subject = "status update"
+body = "The regression came in with commit {{git_sha}} on main."
+window = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]
