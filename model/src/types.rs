@@ -240,4 +240,53 @@ mod tests {
         assert_eq!(message.content, deserialized.content);
         assert_eq!(message.role, deserialized.role);
     }
+
+    #[test]
+    fn test_assistant_constructor() {
+        let msg = ChatMessage::assistant("I can help with that");
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content, Some("I can help with that".to_string()));
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_assistant_with_tools() {
+        let tool_call = ToolCall {
+            id: "call_abc".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "rust"}),
+            },
+        };
+        let msg = ChatMessage::assistant_with_tools(
+            Some("Using search tool".to_string()),
+            vec![tool_call],
+        );
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content, Some("Using search tool".to_string()));
+        assert!(msg.tool_calls.is_some());
+        assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].id, "call_abc");
+    }
+
+    #[test]
+    fn test_chat_request_with_tools() {
+        let tool_def = ToolDefinition {
+            function: FunctionDefinition {
+                name: "search".to_string(),
+                description: "Search the web".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: None,
+                    required: None,
+                },
+            },
+        };
+        let request = ChatRequest::new("test-model", vec![ChatMessage::user("Hello")])
+            .with_tools(vec![tool_def]);
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(request.tool_choice, Some(ToolChoice::Auto));
+    }
 }
