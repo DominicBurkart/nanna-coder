@@ -14,6 +14,9 @@ use thiserror::Error;
 ///
 /// assert_eq!(ReasonCode::LoopMismatch.as_str(), "loop_mismatch");
 /// assert_eq!("prompt_injection".parse::<ReasonCode>(), Ok(ReasonCode::PromptInjection));
+/// assert_eq!(ReasonCode::SecretLeak.as_str(), "secret_leak");
+/// assert_eq!("cross_scope_steering".parse::<ReasonCode>(), Ok(ReasonCode::CrossScopeSteering));
+/// assert_eq!(ReasonCode::ALL.len(), 12);
 /// assert!("shrug".parse::<ReasonCode>().is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,11 +41,15 @@ pub enum ReasonCode {
     /// Anything else, described in the reason detail.
     Other,
     ModelFailure,
+    /// A message body, subject or metadata field carries credential material.
+    SecretLeak,
+    /// A message steers a recipient into effects its sender may not cause.
+    CrossScopeSteering,
 }
 
 impl ReasonCode {
     /// Every code, in declaration order.
-    pub const ALL: [ReasonCode; 10] = [
+    pub const ALL: [ReasonCode; 12] = [
         ReasonCode::ScopeCreep,
         ReasonCode::LoopMismatch,
         ReasonCode::PromptInjection,
@@ -53,6 +60,8 @@ impl ReasonCode {
         ReasonCode::RepeatedDenials,
         ReasonCode::Other,
         ReasonCode::ModelFailure,
+        ReasonCode::SecretLeak,
+        ReasonCode::CrossScopeSteering,
     ];
 
     /// Stable snake_case name, identical to the serde representation.
@@ -68,6 +77,8 @@ impl ReasonCode {
             ReasonCode::RepeatedDenials => "repeated_denials",
             ReasonCode::Other => "other",
             ReasonCode::ModelFailure => "model_failure",
+            ReasonCode::SecretLeak => "secret_leak",
+            ReasonCode::CrossScopeSteering => "cross_scope_steering",
         }
     }
 }
@@ -331,6 +342,26 @@ mod tests {
             EffectClass::Sandbox,
             "needs a deploy card",
         )
+    }
+
+    #[test]
+    fn the_message_hub_codes_are_pinned_with_their_wire_names() {
+        assert_eq!(ReasonCode::ALL.len(), 12);
+        assert_eq!(ReasonCode::SecretLeak.as_str(), "secret_leak");
+        assert_eq!(
+            ReasonCode::CrossScopeSteering.as_str(),
+            "cross_scope_steering"
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasonCode::SecretLeak).unwrap(),
+            "\"secret_leak\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReasonCode>("\"cross_scope_steering\"").unwrap(),
+            ReasonCode::CrossScopeSteering
+        );
+        assert_eq!(ReasonCode::ALL[10], ReasonCode::SecretLeak);
+        assert_eq!(ReasonCode::ALL[11], ReasonCode::CrossScopeSteering);
     }
 
     #[test]
