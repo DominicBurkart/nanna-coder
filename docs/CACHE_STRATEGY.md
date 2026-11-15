@@ -1,8 +1,10 @@
 # Nanna Coder Cache Strategy
 
+> Operational reference for the Cachix-based CI cache. For migration history see [cachix-migration.md](./cachix-migration.md); for maintainer push setup see [../CACHIX_SETUP.md](../CACHIX_SETUP.md).
+
 ## Overview
 
-This document describes the caching strategy implemented to optimize CI/CD build times. The strategy uses Cachix binary cache for unlimited storage and maximizes cache reuse across jobs.
+This document describes the caching strategy used to optimize CI/CD build times. The strategy uses Cachix as the sole binary cache (Pro plan: unlimited storage) and maximizes cache reuse across jobs.
 
 ## Cache Architecture
 
@@ -317,50 +319,9 @@ grep "name: nanna-coder" .github/workflows/*.yml
      gh secret set CACHIX_AUTH
      ```
 
-## Migration Guide
+## Migration & Rollback
 
-### From GitHub Actions Cache to Cachix
-
-The migration from GitHub Actions cache to Cachix provides:
-- **Unlimited storage** vs 10GB GitHub Actions limit
-- **Faster cache restoration** via CDN distribution
-- **Better reliability** with dedicated binary cache infrastructure
-- **Enhanced monitoring** via Cachix dashboard
-
-Migration steps:
-1. Configure `CACHIX_AUTH` repository secret
-2. Update workflows to use `cachix/cachix-action@v15`
-3. Change cache key prefix from `nix-v3-deps-` to `cachix-v1-deps-`
-4. Remove GitHub Actions cache configuration (e.g., `gc-max-store-size`)
-
-First build after migration:
-- Cachix cache will be empty initially
-- `prebuild-deps` job populates Cachix with dependencies
-- Subsequent builds pull from Cachix automatically
-- Old GitHub Actions cache can be safely ignored/deleted
-
-### Rollback Procedure
-
-If issues arise with Cachix:
-
-1. Revert to GitHub Actions cache:
-   ```bash
-   git revert <cachix-migration-commit>
-   ```
-
-2. Or temporarily disable Cachix:
-   ```yaml
-   # Comment out cachix-action steps in workflows
-   # - uses: cachix/cachix-action@v15
-   #   with:
-   #     name: nanna-coder
-   #     authToken: '${{ secrets.CACHIX_AUTH }}'
-   ```
-
-3. Monitor rollback impact:
-   - Builds will be slower without cache
-   - Consider increasing GitHub Actions cache allocation
-   - Re-enable cache warming workflow
+See [cachix-migration.md](./cachix-migration.md) for migration history (from GitHub Actions cache → cache-nix-action → Cachix), the rollback procedure, and the migration checklist.
 
 ## References
 

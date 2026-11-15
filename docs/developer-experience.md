@@ -362,31 +362,7 @@ podman exec -it container-name bash
 
 ## IDE Integration
 
-### VS Code Setup
-
-#### Recommended Extensions
-- **rust-analyzer**: Rust language server
-- **CodeLLDB**: Debugging support
-- **Better TOML**: Cargo.toml syntax highlighting
-- **Nix IDE**: Nix language support
-
-#### Settings Configuration
-```json
-{
-  "rust-analyzer.server.path": "rust-analyzer",
-  "rust-analyzer.cargo.features": "all",
-  "rust-analyzer.checkOnSave.command": "clippy",
-  "rust-analyzer.cargo.buildScripts.enable": true
-}
-```
-
-### Neovim Setup
-
-#### Required Plugins
-- **nvim-lspconfig**: LSP configuration
-- **rust-tools.nvim**: Enhanced Rust support
-- **nvim-cmp**: Completion engine
-- **telescope.nvim**: Fuzzy finder
+Use any editor with `rust-analyzer` support. Suggested settings (configure `rust-analyzer.checkOnSave.command = "clippy"` and `cargo.features = "all"` so editor diagnostics match CI). Nix language support is also recommended (e.g. `Nix IDE` for VS Code, `nixd`/`nil` for LSP-based editors).
 
 ## Best Practices
 
@@ -416,4 +392,4 @@ podman exec -it container-name bash
 
 ---
 
-For additional help or feature requests, consult the project documentation or create an issue in the repository.
+For additional help or feature requests, file an issue.
