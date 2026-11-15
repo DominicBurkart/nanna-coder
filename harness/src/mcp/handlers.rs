@@ -25,17 +25,17 @@ pub const POLL_INTERVAL_MS: u64 = 2000;
 /// `ttl` values are clamped to this. 24 hours.
 pub const MAX_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Why `assign_task` returned no task, with the stable [`FailureKind`] a
-/// caller can branch on without parsing the message.
-///
-/// ```
-/// use harness::failure::FailureKind;
-/// use harness::mcp::handlers::AssignError;
-///
-/// let invalid = AssignError::from("Missing required field: identity".to_string());
-/// assert_eq!(invalid.kind, FailureKind::InvalidRequest);
-/// assert_eq!(AssignError::refused("spawn refused").kind, FailureKind::SpawnRefused);
-/// ```
+#[doc = r#"Why `assign_task` returned no task, with the stable [`FailureKind`] a
+caller can branch on without parsing the message.
+
+```
+use harness::failure::FailureKind;
+use harness::mcp::handlers::AssignError;
+
+let invalid = AssignError::from("Missing required field: identity".to_string());
+assert_eq!(invalid.kind, FailureKind::InvalidRequest);
+assert_eq!(AssignError::refused("spawn refused").kind, FailureKind::SpawnRefused);
+```"#]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct AssignError {
@@ -74,10 +74,10 @@ impl From<String> for AssignError {
 ///
 /// `ttl_ms` is the client-requested lifetime (from the request's `task`
 /// field), clamped to [`MAX_TTL_MS`] here.
-///
-/// A failure carries its [`FailureKind`]: gate refusals are
-/// [`FailureKind::SpawnRefused`], malformed arguments are
-/// [`FailureKind::InvalidRequest`].
+#[doc = r#"
+A failure carries its [`FailureKind`]: gate refusals are
+[`FailureKind::SpawnRefused`], malformed arguments are
+[`FailureKind::InvalidRequest`]."#]
 pub async fn handle_assign_task(
     params: &Value,
     task_manager: &Arc<TaskManager>,

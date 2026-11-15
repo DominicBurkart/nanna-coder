@@ -24,15 +24,15 @@ macro_rules! failure_kinds {
 }
 
 failure_kinds! {
-    ///
-    /// ```
-    /// use harness::failure::FailureKind;
-    ///
-    /// assert_eq!(FailureKind::from_error_type("MaxIterationsExceeded"), FailureKind::MaxIterations);
-    /// assert_eq!(FailureKind::from_error_type("ProtectedPathViolation").as_str(), "protected_path_violation");
-    /// assert_eq!(FailureKind::from_error_type("SomethingNew"), FailureKind::Unclassified);
-    /// assert!(FailureKind::ALL.contains(&FailureKind::SpawnRefused));
-    /// ```
+    #[doc = r#"
+```
+use harness::failure::FailureKind;
+
+assert_eq!(FailureKind::from_error_type("MaxIterationsExceeded"), FailureKind::MaxIterations);
+assert_eq!(FailureKind::from_error_type("ProtectedPathViolation").as_str(), "protected_path_violation");
+assert_eq!(FailureKind::from_error_type("SomethingNew"), FailureKind::Unclassified);
+assert!(FailureKind::ALL.contains(&FailureKind::SpawnRefused));
+```"#]
     MaxIterations => "max_iterations",
     StateError => "state_error",
     TaskCheckFailed => "task_check_failed",
@@ -243,6 +243,59 @@ mod tests {
     }
 
     const PASCAL_LITERALS_THAT_ARE_NOT_ERROR_TYPES: &[&str] = &[];
+
+    fn error_constants(source: &str) -> Vec<String> {
+        production_part(source)
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start();
+                let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+                let rest = rest.strip_prefix("const ERROR_")?;
+                let (_, value) = rest.split_once("&str = \"")?;
+                value.split_once('"').map(|(label, _)| label.to_string())
+            })
+            .collect()
+    }
+
+    fn rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn the_error_constant_scanner_reads_pub_and_private_constants_and_skips_tests() {
+        let source = "pub const ERROR_A: &str = \"AlphaFailed\";\nconst ERROR_B: &str = \"Beta\";\nconst OTHER: &str = \"Gamma\";\n#[cfg(test)]\nmod tests {\n}\n";
+        assert_eq!(error_constants(source), ["AlphaFailed", "Beta"]);
+        let hidden = "fn a() {}\n#[cfg(test)]\npub const ERROR_C: &str = \"Hidden\";\n";
+        assert!(error_constants(hidden).is_empty());
+        let crlf = "pub const ERROR_D: &str = \"Delta\";\r\n";
+        assert_eq!(error_constants(crlf), ["Delta"]);
+    }
+
+    #[test]
+    fn every_error_constant_in_the_crate_is_classified() {
+        let mut files = Vec::new();
+        rust_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 50);
+        for file in files {
+            for label in error_constants(&std::fs::read_to_string(&file).unwrap()) {
+                assert!(
+                    KNOWN_LABELS.iter().any(|(known, _)| *known == label),
+                    "{} defines the error_type label {label:?}; add it to FailureKind::from_error_type and KNOWN_LABELS",
+                    file.display()
+                );
+            }
+        }
+    }
 
     proptest! {
         #[test]
