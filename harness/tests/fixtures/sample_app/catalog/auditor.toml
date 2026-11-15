@@ -6,7 +6,7 @@ model = "gemma4:e4b"
 system_prompt = "prompts/auditor.md"
 
 [scope]
-repos = ["github.com/1-Track/one_track"]
+repos = ["github.com/example/sample-app"]
 paths = []
 read_paths = []
 max_effect = "none"
