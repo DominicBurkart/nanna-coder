@@ -4,7 +4,7 @@
 //! approval types. Release deployments require an explicit approval record;
 //! dev and sandbox deployments do not.
 
-use crate::entities::{Entity, EntityMetadata, EntityResult, EntityType};
+use crate::entities::{Entity, EntityError, EntityId, EntityMetadata, EntityResult, EntityType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use thiserror::Error;
 /// environment.
 ///
 /// The `container` field holds the id of the `ContainerConfigEntity` being
-/// deployed (string id, matching [`crate::entities::EntityId`]).
+/// deployed (typed as [`EntityId`], which is a string alias today).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentManifest {
     #[serde(flatten)]
@@ -29,18 +29,26 @@ pub struct DeploymentManifest {
     /// Desired replica count.
     pub replicas: u32,
 
-    /// Id of the `ContainerConfigEntity` being deployed.
-    pub container: String,
+    /// Id of the `ContainerConfigEntity` being deployed. Typed as
+    /// [`EntityId`] (finding #264-4).
+    pub container: EntityId,
 }
 
 impl DeploymentManifest {
     /// Create a new deployment manifest.
+    ///
+    /// Debug-asserts that `container` is a non-empty [`EntityId`] so that
+    /// misuse from test fixtures is caught loudly in debug builds.
     pub fn new(
         target: DeploymentTarget,
         service_name: String,
         replicas: u32,
-        container: String,
+        container: EntityId,
     ) -> Self {
+        debug_assert!(
+            !container.is_empty(),
+            "DeploymentManifest::new requires a non-empty container EntityId"
+        );
         Self {
             metadata: EntityMetadata::new(EntityType::Env),
             target,
@@ -50,9 +58,31 @@ impl DeploymentManifest {
         }
     }
 
+    /// Coarse impact classification derived from [`Self::target`].
+    ///
+    /// This is the *intrinsic* impact of the target environment and ignores
+    /// the `approval_required` flag — the flag is a workflow knob, not a
+    /// license to downgrade impact. See finding #264-1.
+    pub fn impact_level(&self) -> ImpactLevel {
+        match self.target {
+            DeploymentTarget::Dev => ImpactLevel::DevOnly,
+            DeploymentTarget::Sandbox => ImpactLevel::SandboxIsolated,
+            DeploymentTarget::Release { .. } => ImpactLevel::ProductionCritical,
+        }
+    }
+
     /// Whether this deployment requires an approval record before it can
     /// proceed.
+    ///
+    /// Any [`ImpactLevel::ProductionCritical`] deployment requires approval
+    /// regardless of the `approval_required` flag — this is a security
+    /// cross-check against accidental or malicious
+    /// `DeploymentTarget::Release { approval_required: false }` records.
+    /// See finding #264-1.
     pub fn requires_approval(&self) -> bool {
+        if self.impact_level() == ImpactLevel::ProductionCritical {
+            return true;
+        }
         match self.target {
             DeploymentTarget::Dev | DeploymentTarget::Sandbox => false,
             DeploymentTarget::Release { approval_required } => approval_required,
@@ -67,6 +97,10 @@ impl DeploymentManifest {
     ///   [`EnvError::ApprovalRequired`].
     /// - If approval is provided but any checklist item is unverified,
     ///   returns [`EnvError::InvalidConfig`].
+    ///
+    /// Additionally validates the embedded [`super::security::SecurityContext`]
+    /// posture of any container referenced by this manifest is handled by
+    /// the bridge; this function focuses on the approval workflow.
     pub fn validate_with_approval(
         &self,
         approval: Option<&DeploymentApproval>,
@@ -133,8 +167,9 @@ pub enum ImpactLevel {
 /// Record of an approval for a deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentApproval {
-    /// Id of the [`DeploymentManifest`] being approved.
-    pub deployment_id: String,
+    /// Id of the [`DeploymentManifest`] being approved. Typed as
+    /// [`EntityId`] (finding #264-4).
+    pub deployment_id: EntityId,
 
     /// Approver identity.
     pub approver: String,
@@ -173,6 +208,24 @@ pub enum EnvError {
     /// Referenced entity could not be found.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// An env var was rejected because its name looks like a secret but its
+    /// source is plaintext [`super::types::EnvVarSource::Literal`]. See
+    /// finding #264-6.
+    #[error("refusing to store secret-shaped env var `{var_name}` as a Literal; use EnvVarSource::SecretRef")]
+    LikelySecretInLiteral {
+        /// The environment variable name that was rejected.
+        var_name: String,
+    },
+
+    /// Security posture for a container is too permissive for the caller's
+    /// target. See finding #264-8.
+    #[error("security context rejected: {0}")]
+    InsecureSecurityContext(String),
+
+    /// Error propagated from the generic entity layer.
+    #[error("entity error: {0}")]
+    Entity(#[from] EntityError),
 }
 
 #[cfg(test)]
@@ -202,10 +255,70 @@ mod tests {
         });
         assert!(m.requires_approval());
 
+        // SECURITY (finding #264-1): Even with `approval_required: false`,
+        // a Release target is ProductionCritical and therefore REQUIRES
+        // approval — the flag cannot silently bypass the check.
         let m2 = manifest(DeploymentTarget::Release {
             approval_required: false,
         });
-        assert!(!m2.requires_approval());
+        assert!(
+            m2.requires_approval(),
+            "ProductionCritical must require approval regardless of approval_required"
+        );
+    }
+
+    #[test]
+    fn test_impact_level_is_intrinsic_to_target() {
+        assert_eq!(
+            manifest(DeploymentTarget::Dev).impact_level(),
+            ImpactLevel::DevOnly
+        );
+        assert_eq!(
+            manifest(DeploymentTarget::Sandbox).impact_level(),
+            ImpactLevel::SandboxIsolated
+        );
+        assert_eq!(
+            manifest(DeploymentTarget::Release {
+                approval_required: false,
+            })
+            .impact_level(),
+            ImpactLevel::ProductionCritical
+        );
+        assert_eq!(
+            manifest(DeploymentTarget::Release {
+                approval_required: true,
+            })
+            .impact_level(),
+            ImpactLevel::ProductionCritical
+        );
+    }
+
+    #[test]
+    fn test_validate_production_critical_flag_bypass_rejected() {
+        // SECURITY (finding #264-1): a `Release { approval_required: false }`
+        // manifest MUST be rejected without approval.
+        let m = manifest(DeploymentTarget::Release {
+            approval_required: false,
+        });
+        match m.validate_with_approval(None) {
+            Err(EnvError::ApprovalRequired) => {}
+            other => panic!(
+                "expected ApprovalRequired (ProductionCritical bypass rejection), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_env_error_from_entity_error() {
+        // finding #264-3: `From<EntityError> for EnvError` lets the env layer
+        // lift generic entity failures transparently.
+        let entity_err = EntityError::NotFound("entity-missing".to_string());
+        let env_err: EnvError = entity_err.into();
+        match env_err {
+            EnvError::Entity(EntityError::NotFound(id)) => assert_eq!(id, "entity-missing"),
+            other => panic!("expected Entity(NotFound), got {:?}", other),
+        }
     }
 
     #[test]

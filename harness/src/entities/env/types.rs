@@ -58,6 +58,14 @@ impl Default for EnvEntity {
 /// Built to replace ad-hoc `container::ContainerConfig` bags with a queryable
 /// entity carrying an explicit `SecurityContext` and references (never
 /// plaintext) to secrets.
+///
+/// TODO(issue #25, finding #264-7): `ContainerConfigEntity`, [`EnvEntity`],
+/// and [`super::deployment::DeploymentManifest`] all share the single
+/// [`EntityType::Env`] discriminator, so `EntityStore::list_by_kind`
+/// returns a mixed bag without a way to filter without deserializing.
+/// Splitting `EntityType::Env` into `EnvContainer | EnvDeployment | ...`
+/// (or adding a tag-string) is a cross-cutting refactor and is deferred
+/// to its own slice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerConfigEntity {
     #[serde(flatten)]
@@ -253,23 +261,45 @@ mod new_types_tests {
 
     #[test]
     fn test_env_var_source_secret_never_inlines_value() {
-        let secret = EnvVarSource::secret_ref("primary", "api_token");
+        // SECURITY canary (finding #264-5): assert the structural invariant
+        // — a serialized SecretRef contains EXACTLY the locator keys
+        // {"type","vault","key"} and no plaintext-value field — by parsing
+        // the encoded JSON instead of relying on brittle substring checks.
+        // We deliberately use vault/key strings that contain the substrings
+        // "value" and "literal" to prove substring-based assertions would
+        // miss real leaks.
+        let secret = EnvVarSource::secret_ref("value-vault", "literal-key");
         let encoded = serde_json::to_string(&secret).expect("serialize SecretRef");
 
-        // Confirm only the locator fields are present — no `value` key and
-        // no plaintext token material.
-        assert!(encoded.contains("\"vault\""));
-        assert!(encoded.contains("\"key\""));
-        assert!(encoded.contains("primary"));
-        assert!(encoded.contains("api_token"));
-        assert!(
-            !encoded.to_lowercase().contains("value"),
-            "SecretRef must not serialize a `value` field: {}",
-            encoded
+        let parsed: serde_json::Value =
+            serde_json::from_str(&encoded).expect("encoded SecretRef must be JSON");
+        let obj = parsed
+            .as_object()
+            .expect("encoded SecretRef must be a JSON object");
+
+        // Exactly the three locator keys, in any order.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["key", "type", "vault"],
+            "SecretRef must serialize EXACTLY {{type,vault,key}}; got {:?}",
+            keys
         );
+        assert_eq!(obj.get("type").and_then(|v| v.as_str()), Some("secret_ref"));
+        assert_eq!(
+            obj.get("vault").and_then(|v| v.as_str()),
+            Some("value-vault")
+        );
+        assert_eq!(obj.get("key").and_then(|v| v.as_str()), Some("literal-key"));
+
+        // Sentinel-plaintext invariant: a sentinel value associated with
+        // the locator must NEVER appear in the encoded form.
+        const SENTINEL_PLAINTEXT: &str = "PLAINTEXT-CANARY-9b0e7f2c";
+        let _ = SENTINEL_PLAINTEXT; // referenced for clarity; not stored
         assert!(
-            !encoded.to_lowercase().contains("literal"),
-            "SecretRef must not serialize as a Literal variant: {}",
+            !encoded.contains(SENTINEL_PLAINTEXT),
+            "sentinel plaintext must not appear in encoded SecretRef: {}",
             encoded
         );
     }
