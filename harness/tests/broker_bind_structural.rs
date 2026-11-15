@@ -168,11 +168,10 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         syn::visit::visit_item_struct(self, node);
         if node.ident == "ModelFacingLayers" {
-            self.shapes.insert(format!(
-                "{}: struct ModelFacingLayers is {}",
-                self.file,
-                visibility(&node.vis)
-            ));
+            let vis = visibility(&node.vis);
+            let file = &self.file;
+            self.shapes
+                .insert(format!("{file}: struct ModelFacingLayers is {vis}"));
         }
     }
 
@@ -268,13 +267,14 @@ fn test_only_modules(file: &Path, source: &str) -> Vec<PathBuf> {
             }
             _ => None,
         })
-        .flat_map(|name| {
-            [
-                home.join(format!("{name}.rs")),
-                home.join(&name).join("mod.rs"),
-            ]
-        })
+        .flat_map(|name| module_files(&home, &name))
         .collect()
+}
+
+fn module_files(home: &Path, name: &str) -> Vec<PathBuf> {
+    let flat = home.join(format!("{name}.rs"));
+    let nested = home.join(name).join("mod.rs");
+    vec![flat, nested]
 }
 
 fn scan_all() -> Vec<Scan> {
@@ -297,12 +297,8 @@ fn scan_all() -> Vec<Scan> {
         .iter()
         .filter(|(path, _)| !skipped.contains(path))
         .map(|(path, source)| {
-            let relative = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            scan_source(&relative, source)
+            let text = path.strip_prefix(&root).unwrap().to_string_lossy();
+            scan_source(&text.replace('\\', "/"), source)
         })
         .collect()
 }
@@ -425,6 +421,12 @@ fn the_scanner_ignores_test_code_but_records_shapes() {
         impl X { fn y(&self) { self.bind_workspace(); } }
         #[cfg(not(test))]
         fn live() { create_tool_registry(p); }
+        #[cfg(any(test, unix))]
+        fn anyfn() { create_tool_registry(p); }
+        #[cfg(all(test, unix))]
+        fn allfn() { create_tool_registry(p); }
+        impl R for &Y { fn k(&self) { create_tool_registry(p); } }
+        impl R for [u8; 2] { fn k(&self) { create_tool_registry(p); } }
         trait T { fn k(&self) { create_tool_registry(p); } }
         pub(crate) struct ModelFacingLayers;
         pub fn model_facing_registry() {}
@@ -435,7 +437,10 @@ fn the_scanner_ignores_test_code_but_records_shapes() {
     assert_eq!(
         sites,
         vec![
+            "x.rs: ::k calls create_tool_registry",
             "x.rs: T::k calls create_tool_registry",
+            "x.rs: Y::k calls create_tool_registry",
+            "x.rs: anyfn calls create_tool_registry",
             "x.rs: live calls create_tool_registry"
         ]
     );

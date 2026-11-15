@@ -98,10 +98,7 @@ fn req(tool: &str) -> BrokerRequest {
 }
 
 fn kind_of(outcome: &BrokerOutcome) -> Option<ToolErrorKind> {
-    match outcome {
-        BrokerOutcome::ToolError { kind, .. } => Some(*kind),
-        _ => None,
-    }
+    outcome.to_response().kind
 }
 
 fn two_tools() -> Vec<(&'static str, EffectClass, Behavior)> {
@@ -234,10 +231,8 @@ fn arming_refuses_a_plan_built_for_another_agent_or_task() {
     for (field, plan) in cases {
         let (broker, parts) = build_with(&base, two_tools(), BrokerPolicy::default());
         let err = broker.arm(&plan, &parts.reported()).err().unwrap();
-        assert!(
-            matches!(err, ArmError::PlanMismatch { field: f } if f == field),
-            "{field}: {err}"
-        );
+        let mismatch = matches!(err, ArmError::PlanMismatch { field: f } if f == field);
+        assert!(mismatch, "{field}: {err}");
         assert_eq!(
             err.to_string(),
             format!("plan does not belong to this broker: {field} differs")
@@ -280,10 +275,9 @@ fn a_plan_exposing_capabilities_above_the_policy_cannot_arm() {
             BrokerPolicy::default(),
         );
         assert_eq!(broker.served(), vec!["read_file"], "{ceiling}");
-        match broker.arm(&parts.plan, &parts.reported()).err().unwrap() {
-            ArmError::ExposedNotServed { names } => assert_eq!(names, unserved, "{ceiling}"),
-            other => panic!("{ceiling}: {other:?}"),
-        }
+        let err = broker.arm(&parts.plan, &parts.reported()).err().unwrap();
+        let exposed = matches!(&err, ArmError::ExposedNotServed { names } if *names == unserved);
+        assert!(exposed, "{ceiling}: {err}");
         assert_eq!(calls(&parts.counters, "git_push"), 0);
     }
     let (broker, parts) = build_with(
@@ -338,15 +332,12 @@ async fn granted_calls_run_and_ungranted_calls_never_reach_the_tool() {
 async fn the_not_granted_echo_is_truncated() {
     let (broker, _) = armed(two_tools());
     let huge = "x".repeat(5000);
-    match broker.handle(req(&huge)).await {
-        BrokerOutcome::ToolError { kind, message } => {
-            assert_eq!(kind, ToolErrorKind::NotGranted);
-            assert!(message.len() < 200, "{}", message.len());
-            assert!(message.contains(&"x".repeat(128)));
-            assert!(!message.contains(&"x".repeat(129)));
-        }
-        other => panic!("{other:?}"),
-    }
+    let reply = broker.handle(req(&huge)).await.to_response();
+    let message = reply.output.as_str().unwrap().to_string();
+    assert_eq!(reply.kind, Some(ToolErrorKind::NotGranted));
+    assert!(message.len() < 200, "{}", message.len());
+    assert!(message.contains(&"x".repeat(128)));
+    assert!(!message.contains(&"x".repeat(129)));
 }
 
 #[tokio::test]
@@ -474,13 +465,9 @@ async fn tool_errors_map_to_kinds_and_the_production_hold_halts_the_task() {
         ("t_budget", ToolErrorKind::BudgetRefused),
     ];
     for (tool, kind) in expect {
-        match broker.handle(req(tool)).await {
-            BrokerOutcome::ToolError { kind: got, message } => {
-                assert_eq!(got, kind, "{tool}");
-                assert!(!message.is_empty());
-            }
-            other => panic!("{tool}: {other:?}"),
-        }
+        let reply = broker.handle(req(tool)).await.to_response();
+        assert_eq!(reply.kind, Some(kind), "{tool}");
+        assert!(!reply.output.as_str().unwrap().is_empty());
     }
     assert!(!broker.is_halted());
     let held = broker.handle(req("t_held")).await;
@@ -750,10 +737,8 @@ fn building_refuses_a_workspace_bound_for_a_different_identity_or_repository() {
         let err = Broker::for_agent(&parts.agent, bound, BrokerPolicy::default(), sink())
             .err()
             .unwrap_or_else(|| panic!("{label} accepted"));
-        assert!(
-            matches!(err, BrokerError::IdentityMismatch { .. }),
-            "{label}"
-        );
+        let mismatch = matches!(err, BrokerError::IdentityMismatch { .. });
+        assert!(mismatch, "{label}");
         assert_eq!(
             err.to_string(),
             "the bound workspace's identity does not match the resolved agent `a`"

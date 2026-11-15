@@ -34,34 +34,34 @@ impl<'a> Card<'a> {
     }
 
     pub(super) fn identity(&self) -> AgentIdentity {
+        let name = self.name;
+        let model = self.model;
+        let prompt = self.prompt;
+        let repos = self.repos;
+        let paths = self.paths;
+        let read_paths = self.read_paths;
+        let effect = self.effect;
+        let tools = self.tools;
+        let iterations = self.iterations;
         let toml = format!(
             r#"
 [identity]
-name = "{}"
+name = "{name}"
 description = "d"
 loop = "inner"
-model = "{}"
-system_prompt = {{ inline = "{}" }}
+model = "{model}"
+system_prompt = {{ inline = "{prompt}" }}
 [scope]
-repos = {}
-paths = {}
-{}
-max_effect = "{}"
-tools = [{}]
+repos = {repos}
+paths = {paths}
+{read_paths}
+max_effect = "{effect}"
+tools = [{tools}]
 [limits]
-max_iterations = {}
+max_iterations = {iterations}
 max_wall_clock_secs = 9
 max_concurrent = 2
-"#,
-            self.name,
-            self.model,
-            self.prompt,
-            self.repos,
-            self.paths,
-            self.read_paths,
-            self.effect,
-            self.tools,
-            self.iterations
+"#
         );
         AgentIdentity::from_toml_str(&toml, "x.toml").unwrap()
     }

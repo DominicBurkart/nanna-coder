@@ -446,6 +446,7 @@ impl ResolvedAgent {
                 });
             }
         }
+        let tools = &identity.scope.tools;
         let model = identity.identity.model.clone();
         if !model_is_valid(&model) {
             return Err(ResolveError::InvalidModel { model });
@@ -471,12 +472,7 @@ impl ResolvedAgent {
                 repos: identity.scope.repos.clone(),
                 paths: identity.scope.paths.clone(),
                 read_paths: identity.scope.read_paths.clone(),
-                tools: identity
-                    .scope
-                    .tools
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
+                tools: tools.iter().map(ToString::to_string).collect(),
             },
             image,
             broker_socket,

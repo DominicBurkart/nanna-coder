@@ -380,10 +380,8 @@ async fn binding_refuses_layers_that_describe_another_task_ceiling_scope_or_repo
             .bind_workspace(&identity, REPO, &workspace, layered.layers)
             .err()
             .unwrap();
-        assert!(
-            matches!(err, BindError::LayersMismatch { field: f } if f == field),
-            "{field}: {err}"
-        );
+        let mismatch = matches!(err, BindError::LayersMismatch { field: f } if f == field);
+        assert!(mismatch, "{field}: {err}");
         assert_eq!(
             err.to_string(),
             format!("the model-facing layers do not belong to this task: {field} differs")

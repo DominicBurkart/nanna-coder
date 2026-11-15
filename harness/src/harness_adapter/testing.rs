@@ -286,4 +286,13 @@ mod tests {
         };
         assert_eq!(tool.execute(Value::Null).await.unwrap(), Value::Null);
     }
+
+    #[test]
+    fn the_fixed_verdict_auditor_is_named() {
+        let auditor = FixedVerdict(crate::action_auditor::ActionVerdict::Allow);
+        assert_eq!(
+            crate::action_auditor::ActionAuditor::name(&auditor),
+            "fixed-verdict"
+        );
+    }
 }
