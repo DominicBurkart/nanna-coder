@@ -166,11 +166,8 @@ fn production() -> Vec<Idents> {
         files
             .into_iter()
             .map(|path| {
-                let relative = path
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let text = path.strip_prefix(&root).unwrap().to_string_lossy();
+                let relative = text.replace('\\', "/");
                 (relative, fs::read_to_string(&path).unwrap())
             })
             .collect(),
@@ -271,12 +268,16 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         ("z.rs", "fn f() { TaskWorkspace; }"),
         (
             "a/mod.rs",
-            "#[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] #[path = \"p.rs\"] mod w; #[cfg(test)] mod inline { }",
+            "#[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] #[path = \"p.rs\"] mod w; #[cfg(test)] mod inline { } #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
         ),
         ("a/t.rs", "fn f() { TaskWorkspace; }"),
         ("a/u.rs", "fn f() { TaskWorkspace; }"),
         ("a/v.rs", "fn f() { TaskWorkspace; }"),
         ("a/p.rs", "fn f() { TaskWorkspace; }"),
+        ("a/ya.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yb.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yc.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yd.rs", "fn f() { TaskWorkspace; }"),
         ("b.rs", "#[cfg(test)] mod x;"),
         ("b/x/mod.rs", "fn f() { TaskWorkspace; }"),
         ("c.rs", "fn f() { TaskWorkspace; }"),
@@ -289,9 +290,20 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         .flat_map(|scan| scan.found)
         .filter_map(|(entry, _)| entry.strip_suffix(": TaskWorkspace").map(str::to_string))
         .collect();
-    let expected: BTreeSet<String> = ["a/p.rs", "a/u.rs", "a/v.rs", "c.rs"]
-        .iter()
-        .map(|file| file.to_string())
-        .collect();
+    let expected: BTreeSet<String> = [
+        "a/p.rs", "a/u.rs", "a/v.rs", "a/ya.rs", "a/yb.rs", "a/yc.rs", "a/yd.rs", "c.rs",
+    ]
+    .iter()
+    .map(|file| file.to_string())
+    .collect();
     assert_eq!(scanned, expected);
+}
+
+#[test]
+fn the_cfg_test_match_is_exact() {
+    assert!(cfg_test_file_modules("a/mod.rs", "#[cfg(any(test, unix))] mod ya;").is_empty());
+    assert_eq!(
+        cfg_test_file_modules("a/mod.rs", "#[cfg(test)] mod t;"),
+        vec!["a/t.rs".to_string(), "a/t/mod.rs".to_string()]
+    );
 }
