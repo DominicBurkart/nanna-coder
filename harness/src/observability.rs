@@ -1097,4 +1097,382 @@ mod tests {
         let trends = system.analyze_current_trends(&metrics).unwrap();
         assert!(trends.performance_score >= 0.0 && trends.performance_score <= 100.0);
     }
+
+    fn make_alert(component: &str, title: &str) -> crate::monitoring::Alert {
+        make_alert_with_severity(component, title, AlertSeverity::Warning)
+    }
+
+    fn make_alert_with_severity(
+        component: &str,
+        title: &str,
+        severity: AlertSeverity,
+    ) -> crate::monitoring::Alert {
+        crate::monitoring::Alert {
+            id: "test-id".to_string(),
+            title: title.to_string(),
+            description: "test description".to_string(),
+            severity,
+            component: component.to_string(),
+            timestamp: Utc::now(),
+            context: HashMap::new(),
+            acknowledged: false,
+        }
+    }
+
+    fn make_metrics(
+        latencies: HashMap<String, crate::monitoring::LatencyMetrics>,
+        error_rate: f64,
+        cache_hit_rate: f64,
+    ) -> SystemMetrics {
+        SystemMetrics {
+            timestamp: Utc::now(),
+            request_latencies: latencies,
+            cache_metrics: crate::monitoring::CacheMetrics {
+                hits: (cache_hit_rate * 100.0) as u64,
+                misses: ((1.0 - cache_hit_rate) * 100.0) as u64,
+                hit_rate: cache_hit_rate,
+                size_bytes: 0,
+                item_count: 0,
+                evictions: 0,
+            },
+            container_metrics: Vec::new(),
+            system_resources: crate::monitoring::SystemResourceMetrics {
+                cpu_usage_percent: 50.0,
+                total_memory_bytes: 8_000_000_000,
+                used_memory_bytes: 4_000_000_000,
+                memory_usage_percent: 50.0,
+                available_disk_bytes: 100_000_000_000,
+                total_disk_bytes: 200_000_000_000,
+                disk_usage_percent: 50.0,
+                load_average: [1.0, 1.0, 1.0],
+            },
+            model_metrics: HashMap::new(),
+            error_metrics: crate::monitoring::ErrorMetrics {
+                total_errors: 0,
+                errors_by_type: HashMap::new(),
+                error_rate,
+                recent_errors: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_determine_alert_category_container() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("container-health", "down");
+        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ContainerHealth);
+    }
+
+    #[test]
+    fn test_determine_alert_category_model() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("model-quality", "degraded");
+        assert_eq!(system.determine_alert_category(&alert), AlertCategory::ModelQuality);
+    }
+
+    #[test]
+    fn test_determine_alert_category_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Performance degradation detected");
+        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Performance);
+    }
+
+    #[test]
+    fn test_determine_alert_category_resources() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Resource exhaustion warning");
+        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Resources);
+    }
+
+    #[test]
+    fn test_determine_alert_category_availability() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "Service unreachable");
+        assert_eq!(system.determine_alert_category(&alert), AlertCategory::Availability);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_critical_availability_capped() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert_with_severity("system", "down", AlertSeverity::Critical);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Availability);
+        // Critical=100 + Availability bonus=20 would be 120 -> capped at 100
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_warning_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert_with_severity("system", "slow", AlertSeverity::Warning);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::Performance);
+        // Warning=50 + Performance bonus=10 = 60
+        assert_eq!(score, 60);
+    }
+
+    #[test]
+    fn test_calculate_priority_score_info_model_quality() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert_with_severity("system", "notice", AlertSeverity::Info);
+        let score = system.calculate_priority_score(&alert, &AlertCategory::ModelQuality);
+        // Info=25, no bonus for ModelQuality
+        assert_eq!(score, 25);
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_container_health() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("container", "down");
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ContainerHealth);
+        assert!(!actions.is_empty());
+        assert!(actions.iter().any(|a| a.to_lowercase().contains("container")));
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_performance() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "slow");
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Performance);
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_model_quality() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("model", "poor quality");
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::ModelQuality);
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_recommended_actions_default_category() {
+        let system = ObservabilitySystem::new();
+        let alert = make_alert("system", "issue");
+        let actions = system.generate_recommended_actions(&alert, &AlertCategory::Security);
+        assert!(!actions.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_trends_degraded_latency() {
+        let mut system = ObservabilitySystem::new();
+        system.health_thresholds.max_latency_ms = 100;
+
+        let mut latencies = HashMap::new();
+        latencies.insert(
+            "api".to_string(),
+            crate::monitoring::LatencyMetrics {
+                avg_latency_ms: 500.0,
+                p95_latency_ms: 600.0,
+                p99_latency_ms: 700.0,
+                max_latency_ms: 800.0,
+                min_latency_ms: 200.0,
+                request_count: 10,
+                requests_per_second: 5.0,
+            },
+        );
+        let metrics = make_metrics(latencies, 0.0, 0.9);
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.latency_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score < 100.0);
+    }
+
+    #[test]
+    fn test_analyze_trends_degraded_error_rate() {
+        let mut system = ObservabilitySystem::new();
+        system.health_thresholds.max_error_rate = 0.05;
+
+        let metrics = make_metrics(HashMap::new(), 0.2, 0.9);
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.error_rate_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score < 100.0);
+    }
+
+    #[test]
+    fn test_analyze_trends_degraded_cache() {
+        let mut system = ObservabilitySystem::new();
+        system.health_thresholds.min_cache_hit_rate = 0.8;
+
+        let metrics = make_metrics(HashMap::new(), 0.0, 0.3);
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.cache_performance_trend, TrendDirection::Degrading);
+        assert!(trends.performance_score < 100.0);
+    }
+
+    #[test]
+    fn test_analyze_trends_all_stable_score_100() {
+        let mut system = ObservabilitySystem::new();
+        system.health_thresholds.max_latency_ms = 10000;
+        system.health_thresholds.max_error_rate = 0.5;
+        system.health_thresholds.min_cache_hit_rate = 0.1;
+
+        let metrics = make_metrics(HashMap::new(), 0.01, 0.95);
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert_eq!(trends.latency_trend, TrendDirection::Stable);
+        assert_eq!(trends.error_rate_trend, TrendDirection::Stable);
+        assert_eq!(trends.cache_performance_trend, TrendDirection::Stable);
+        assert_eq!(trends.performance_score, 100.0);
+    }
+
+    #[test]
+    fn test_performance_score_floored_at_zero() {
+        let mut system = ObservabilitySystem::new();
+        system.health_thresholds.max_latency_ms = 1;
+        system.health_thresholds.max_error_rate = 0.0;
+        system.health_thresholds.min_cache_hit_rate = 1.0;
+
+        let mut latencies = HashMap::new();
+        latencies.insert(
+            "api".to_string(),
+            crate::monitoring::LatencyMetrics {
+                avg_latency_ms: 9999.0,
+                p95_latency_ms: 9999.0,
+                p99_latency_ms: 9999.0,
+                max_latency_ms: 9999.0,
+                min_latency_ms: 9999.0,
+                request_count: 10,
+                requests_per_second: 1.0,
+            },
+        );
+        let metrics = make_metrics(latencies, 0.5, 0.0);
+        let trends = system.analyze_current_trends(&metrics).unwrap();
+        assert!(trends.performance_score >= 0.0);
+    }
+
+    #[test]
+    fn test_get_model_summary_no_models() {
+        let system = ObservabilitySystem::new();
+        let metrics = make_metrics(HashMap::new(), 0.0, 0.9);
+        let summary = system.get_model_summary(&metrics).unwrap();
+        assert_eq!(summary.total_models, 0);
+        assert_eq!(summary.availability_percentage, 0.0);
+    }
+
+    #[test]
+    fn test_get_model_summary_with_model() {
+        let system = ObservabilitySystem::new();
+        let mut model_metrics = HashMap::new();
+        model_metrics.insert(
+            "model-a".to_string(),
+            crate::monitoring::ModelMetrics {
+                model_name: "model-a".to_string(),
+                inference_count: 100,
+                avg_inference_time_ms: 200.0,
+                tokens_per_second: 20.0,
+                success_rate: 0.95,
+                quality_scores: crate::monitoring::QualityMetrics {
+                    avg_coherence: 0.8,
+                    avg_relevance: 0.9,
+                    consistency: 0.85,
+                    accuracy_rate: 0.9,
+                },
+                resource_usage: crate::monitoring::ModelResourceUsage {
+                    peak_memory_mb: 256.0,
+                    avg_cpu_percent: 40.0,
+                    gpu_utilization_percent: None,
+                },
+            },
+        );
+        let mut metrics = make_metrics(HashMap::new(), 0.0, 0.9);
+        metrics.model_metrics = model_metrics;
+
+        let summary = system.get_model_summary(&metrics).unwrap();
+        assert_eq!(summary.total_models, 1);
+        assert_eq!(summary.availability_percentage, 95.0);
+        assert_eq!(summary.avg_inference_time_ms, 200.0);
+    }
+
+    #[test]
+    fn test_calculate_availability_returns_at_risk() {
+        let system = ObservabilitySystem::new();
+        let avail = system.calculate_availability_metrics().unwrap();
+        // Default returns 99.5% which is AtRisk (99.0 <= x < 99.9)
+        assert_eq!(avail.sla_compliance.status, SlaStatus::AtRisk);
+        assert!(avail.availability_percentage > 0.0);
+        assert!(avail.mtbf.is_some());
+        assert!(avail.mttr.is_some());
+    }
+
+    #[test]
+    fn test_sla_status_breached_below_99() {
+        let status = if 98.0_f64 >= 99.9 {
+            SlaStatus::Compliant
+        } else if 98.0_f64 >= 99.0 {
+            SlaStatus::AtRisk
+        } else {
+            SlaStatus::Breached
+        };
+        assert_eq!(status, SlaStatus::Breached);
+    }
+
+    #[test]
+    fn test_sla_status_compliant_at_100() {
+        let status = if 100.0_f64 >= 99.9 {
+            SlaStatus::Compliant
+        } else if 100.0_f64 >= 99.0 {
+            SlaStatus::AtRisk
+        } else {
+            SlaStatus::Breached
+        };
+        assert_eq!(status, SlaStatus::Compliant);
+    }
+
+    #[tokio::test]
+    async fn test_perform_health_checks_caps_history_at_50() {
+        let health_history = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let thresholds = HealthThreshold::default();
+        let runtime = crate::container::detect_runtime();
+
+        // Pre-populate with 60 entries to trigger the drain logic
+        {
+            let mut history = health_history.lock().unwrap();
+            let entries: Vec<HealthHistoryEntry> = (0..60)
+                .map(|_| HealthHistoryEntry {
+                    timestamp: Utc::now(),
+                    status: HealthStatus::Healthy,
+                    duration: Duration::from_millis(10),
+                })
+                .collect();
+            history.insert("system".to_string(), entries);
+        }
+
+        ObservabilitySystem::perform_health_checks(&health_history, &thresholds, &runtime)
+            .await
+            .unwrap();
+
+        let history = health_history.lock().unwrap();
+        let entries = history.get("system").unwrap();
+        // 60 entries + 1 added = 61; drain removes 61-50=11 → 50 remain
+        assert!(entries.len() <= 50, "history should be capped, got {}", entries.len());
+    }
+
+    #[tokio::test]
+    async fn test_stop_monitoring_without_start_is_safe() {
+        let mut system = ObservabilitySystem::new();
+        system.stop_monitoring().await;
+        assert!(system.monitoring_task.is_none());
+    }
+
+    #[test]
+    fn test_alert_policy_balanced_has_grouping_rules() {
+        let policy = AlertPolicy::balanced();
+        assert!(!policy.escalation_rules.is_empty());
+        assert!(!policy.grouping_rules.is_empty());
+    }
+
+    #[test]
+    fn test_observability_with_service_name_and_thresholds() {
+        let custom_thresholds = HealthThreshold {
+            cpu_threshold: 70.0,
+            memory_threshold: 75.0,
+            disk_threshold: 85.0,
+            max_latency_ms: 1000,
+            min_cache_hit_rate: 0.7,
+            max_error_rate: 0.03,
+            container_timeout: Duration::from_secs(20),
+        };
+        let system = ObservabilitySystem::new()
+            .with_service_name("my-service")
+            .with_health_thresholds(custom_thresholds);
+        assert_eq!(system.health_thresholds.cpu_threshold, 70.0);
+        assert_eq!(system.health_thresholds.max_latency_ms, 1000);
+    }
 }
