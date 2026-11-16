@@ -784,11 +784,11 @@ mod tests {
             rr in proptest::option::of(proptest::collection::btree_set(0usize..4, 0..4)),
             sr in proptest::option::of(proptest::collection::btree_set(0usize..4, 0..4)),
         ) {
-            let names = |set: &std::collections::BTreeSet<usize>| -> Vec<&'static str> {
+            fn names(set: &std::collections::BTreeSet<usize>) -> Vec<&'static str> {
                 set.iter().map(|i| PATH_POOL[*i]).collect()
-            };
-            let recipient = pathed(&names(&rw), rr.as_ref().map(&names).as_deref());
-            let sender = pathed(&names(&sw), sr.as_ref().map(&names).as_deref());
+            }
+            let recipient = pathed(&names(&rw), rr.as_ref().map(names).as_deref());
+            let sender = pathed(&names(&sw), sr.as_ref().map(names).as_deref());
             let writes_wider = rw.iter().any(|i| !sw.contains(i));
             let reads_wider = match (&rr, &sr) {
                 (_, None) => false,
