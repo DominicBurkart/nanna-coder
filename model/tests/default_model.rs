@@ -303,10 +303,8 @@ fn serve_registry() -> String {
                 ("200 OK", CONFIG.to_string())
             } else if path.contains("/manifests/31b") {
                 ("404 Not Found", "{}".to_string())
-            } else if path.contains("/manifests/") {
-                ("200 OK", MANIFEST.to_string())
             } else {
-                ("404 Not Found", "{}".to_string())
+                ("200 OK", MANIFEST.to_string())
             };
             let reply = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",

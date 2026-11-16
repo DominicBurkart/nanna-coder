@@ -2,49 +2,38 @@ const MAIN: &str = include_str!("../src/main.rs");
 
 fn function_body(name: &str) -> &'static str {
     let marker = format!("async fn {name}(");
-    let start = MAIN
-        .find(&marker)
-        .unwrap_or_else(|| panic!("{name} not found"));
+    let start = MAIN.find(&marker).expect("function present in main.rs");
     let rest = &MAIN[start..];
-    let end = rest[1..]
-        .find("\nasync fn ")
-        .into_iter()
-        .chain(rest[1..].find("\nfn "))
-        .chain(rest[1..].find("\n#[cfg(test)]"))
-        .min()
-        .map_or(rest.len(), |at| at + 1);
+    let end = [
+        rest[1..].find("\nasync fn "),
+        rest[1..].find("\nfn "),
+        rest[1..].find("\n#[cfg(test)]"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map_or(rest.len(), |at| at + 1);
     &rest[..end]
 }
 
 fn call_arguments<'a>(body: &'a str, callee: &str) -> &'a str {
     let marker = format!("{callee}(");
-    let start = body
-        .find(&marker)
-        .unwrap_or_else(|| panic!("{callee} is not called"))
-        + marker.len();
-    let mut depth = 1usize;
-    for (offset, ch) in body[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &body[start..start + offset];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced call to {callee}");
+    let start = body.find(&marker).expect("callee is called") + marker.len();
+    let mut depth = 1i32;
+    let length = body[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            depth += i32::from(ch == '(') - i32::from(ch == ')');
+            (depth == 0).then_some(offset)
+        })
+        .expect("balanced call");
+    &body[start..start + length]
 }
 
 #[test]
 fn mcp_serve_resolves_the_default_model_and_gives_the_auditors_that_binding() {
     let body = function_body("run_mcp_server");
-    assert!(
-        body.contains("startup_auditor_model("),
-        "startup resolution is not called"
-    );
+    assert!(body.contains("startup_auditor_model("), "no startup call");
     let manager = call_arguments(body, "build_mcp_task_manager");
     assert!(manager.contains("&auditor_name"), "{manager}");
     let gate = call_arguments(body, "serve_spawn_gate");
@@ -55,10 +44,7 @@ fn mcp_serve_resolves_the_default_model_and_gives_the_auditors_that_binding() {
 #[test]
 fn delegate_resolves_the_default_model_and_gives_the_auditors_that_binding() {
     let body = function_body("run_delegate");
-    assert!(
-        body.contains("startup_auditor_model("),
-        "startup resolution is not called"
-    );
+    assert!(body.contains("startup_auditor_model("), "no startup call");
     assert!(call_arguments(body, "build_delegate_task_manager").contains("auditor_name"));
     assert!(call_arguments(body, "delegate_spawn_gate").contains("auditor_name"));
 }

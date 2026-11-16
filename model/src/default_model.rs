@@ -216,8 +216,17 @@ pub fn meminfo_error(e: &std::io::Error) -> ModelError {
 }
 
 fn read_amd_vram() -> Option<u64> {
+    amd_vram_under(std::path::Path::new("/sys/class/drm"))
+}
+
+/// Largest VRAM total among AMD (vendor `0x1002`) cards under a DRM sysfs root.
+///
+/// ```
+/// assert_eq!(model::default_model::amd_vram_under(std::path::Path::new("/nonexistent")), None);
+/// ```
+pub fn amd_vram_under(root: &std::path::Path) -> Option<u64> {
     let mut best: Option<u64> = None;
-    for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
         let dir = entry.path().join("device");
         let vendor = std::fs::read_to_string(dir.join("vendor")).unwrap_or_default();
         if vendor.trim() != "0x1002" {

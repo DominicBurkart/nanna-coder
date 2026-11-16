@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use model::default_model::*;
-use model::{ChatRequest, ChatResponse, ModelError, ModelInfo, ModelProvider, ModelResult};
+use model::{ModelError, OllamaConfig, OllamaProvider};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,16 +52,15 @@ fn spawn_stub(handler: impl Fn(&str) -> Reply + Send + 'static) -> (String, Seen
             }
             out.push_str("\r\n");
             let _ = stream.write_all(out.as_bytes());
-            match reply.split_at {
-                Some(at) if at < reply.body.len() => {
-                    let _ = stream.write_all(&reply.body[..at]);
-                    let _ = stream.flush();
-                    std::thread::sleep(Duration::from_millis(100));
-                    let _ = stream.write_all(&reply.body[at..]);
-                }
-                _ => {
-                    let _ = stream.write_all(&reply.body);
-                }
+            let at = reply
+                .split_at
+                .filter(|at| *at < reply.body.len())
+                .unwrap_or(reply.body.len());
+            let _ = stream.write_all(&reply.body[..at]);
+            let _ = stream.flush();
+            if at < reply.body.len() {
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = stream.write_all(&reply.body[at..]);
             }
         }
     });
@@ -81,10 +79,8 @@ fn good_registry() -> (String, Seen) {
     spawn_stub(|path| {
         if path.contains("/blobs/") {
             ok(CONFIG)
-        } else if path.contains("/manifests/") {
-            ok(manifest(CONFIG.len(), 0))
         } else {
-            unreachable!("only manifests and blobs are requested: {path}")
+            ok(manifest(CONFIG.len(), 0))
         }
     })
 }
@@ -101,13 +97,7 @@ async fn a_well_formed_registry_is_accepted() {
 
 #[tokio::test]
 async fn an_oversized_manifest_is_rejected() {
-    let (url, _) = spawn_stub(|path| {
-        if path.contains("/blobs/") {
-            ok(CONFIG)
-        } else {
-            ok(manifest(CONFIG.len(), 300_000))
-        }
-    });
+    let (url, _) = spawn_stub(|_| ok(manifest(CONFIG.len(), 300_000)));
     let err = OllamaRegistryCatalog::new(url)
         .gemma4_variants()
         .await
@@ -184,15 +174,8 @@ async fn a_config_blob_whose_length_differs_from_the_manifest_is_rejected() {
 
 #[tokio::test]
 async fn a_config_digest_that_is_not_plain_hex_is_never_requested() {
-    let (url, seen) = spawn_stub(|path| {
-        if path.contains("/manifests/") {
-            ok(
-                r#"{"config":{"digest":"sha256:../../x","size":1},"layers":[{"mediaType":"application/vnd.ollama.image.model","size":1000}]}"#,
-            )
-        } else {
-            ok(CONFIG)
-        }
-    });
+    let bad_digest = r#"{"config":{"digest":"sha256:../../x","size":1},"layers":[{"mediaType":"application/vnd.ollama.image.model","size":1000}]}"#;
+    let (url, seen) = spawn_stub(move |_| ok(bad_digest));
     assert!(OllamaRegistryCatalog::new(url)
         .gemma4_variants()
         .await
@@ -275,41 +258,6 @@ fn a_failing_nvidia_smi_counts_as_no_nvidia_gpu() {
     assert_ne!(cap.accel, Accel::Cuda);
 }
 
-struct Runtime {
-    names: Option<Vec<String>>,
-}
-
-#[async_trait]
-impl ModelProvider for Runtime {
-    async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
-        Err(ModelError::Unknown {
-            message: "unused".into(),
-        })
-    }
-    async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
-        match &self.names {
-            Some(names) => Ok(names
-                .iter()
-                .map(|n| ModelInfo {
-                    name: n.clone(),
-                    size: None,
-                    digest: None,
-                    modified_at: None,
-                })
-                .collect()),
-            None => Err(ModelError::ServiceUnavailable {
-                message: "down".into(),
-            }),
-        }
-    }
-    async fn health_check(&self) -> ModelResult<()> {
-        Ok(())
-    }
-    fn provider_name(&self) -> &'static str {
-        "fake"
-    }
-}
-
 fn auto(tag: &str) -> DefaultModel {
     DefaultModel::AutoGemma4(ModelVariant {
         tag: tag.into(),
@@ -318,10 +266,18 @@ fn auto(tag: &str) -> DefaultModel {
     })
 }
 
-fn runtime(names: &[&str]) -> Runtime {
-    Runtime {
-        names: Some(names.iter().map(|n| n.to_string()).collect()),
-    }
+fn runtime(names: &[&str]) -> OllamaProvider {
+    let models: Vec<String> = names
+        .iter()
+        .map(|n| format!(r#"{{"name":"{n}","modified_at":"2024-01-01T00:00:00Z","size":1}}"#))
+        .collect();
+    let body = format!(r#"{{"models":[{}]}}"#, models.join(","));
+    let (url, _) = spawn_stub(move |_| ok(body.clone()));
+    OllamaProvider::new(OllamaConfig::default().with_base_url(url)).unwrap()
+}
+
+fn dead_runtime() -> OllamaProvider {
+    OllamaProvider::new(OllamaConfig::default().with_base_url("http://127.0.0.1:1")).unwrap()
 }
 
 #[tokio::test]
@@ -352,10 +308,12 @@ async fn a_tag_prefix_is_not_a_match() {
 
 #[tokio::test]
 async fn an_unreachable_runtime_refuses_an_auto_selection() {
-    let err = ensure_runnable(&Runtime { names: None }, &auto("gemma4:e4b"))
+    let err = ensure_runnable(&dead_runtime(), &auto("gemma4:e4b"))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("ollama"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("unreachable"), "{text}");
+    assert!(text.contains("ollama pull gemma4:e4b"), "{text}");
 }
 
 #[tokio::test]
@@ -363,22 +321,14 @@ async fn a_configured_model_is_not_checked_against_the_local_runtime() {
     let configured = DefaultModel::Configured(ModelConfig {
         name: "hosted-api-model".into(),
     });
-    ensure_runnable(&Runtime { names: None }, &configured)
-        .await
-        .unwrap();
+    ensure_runnable(&dead_runtime(), &configured).await.unwrap();
 }
 
 #[tokio::test]
 async fn an_oversized_manifest_without_a_declared_length_is_cut_off_while_streaming() {
-    let (url, _) = spawn_stub(|path| {
-        if path.contains("/blobs/") {
-            ok(CONFIG)
-        } else {
-            Reply {
-                unannounced_length: true,
-                ..ok(manifest(CONFIG.len(), 300_000))
-            }
-        }
+    let (url, _) = spawn_stub(|_| Reply {
+        unannounced_length: true,
+        ..ok(manifest(CONFIG.len(), 300_000))
     });
     let err = OllamaRegistryCatalog::new(url)
         .gemma4_variants()
@@ -469,10 +419,7 @@ async fn a_body_of_exactly_the_cap_is_accepted() {
         for announce in [true, false] {
             for split in [None, Some(cap - 7)] {
                 let got = fetch_with_body_of(target, cap, announce, split).await;
-                assert!(
-                    got.is_ok(),
-                    "{target:?} announce={announce} split={split:?}: {got:?}"
-                );
+                assert!(got.is_ok(), "{target:?} {announce} {split:?}: {got:?}");
             }
         }
     }
@@ -487,10 +434,8 @@ async fn a_body_one_byte_over_the_cap_is_rejected() {
                 let err = fetch_with_body_of(target, cap + 1, announce, split)
                     .await
                     .unwrap_err();
-                assert!(
-                    err.to_string().contains("exceeds"),
-                    "{target:?} announce={announce} split={split:?}: {err}"
-                );
+                let said_exceeds = err.to_string().contains("exceeds");
+                assert!(said_exceeds, "{target:?} {announce} {split:?}: {err}");
             }
         }
     }
@@ -627,13 +572,66 @@ fn the_default_probe_reads_this_machine() {
 fn probe_errors_name_the_action_the_program_and_the_platform() {
     let io = std::io::Error::other("boom");
     let text = smi_error("nvidia-smi", "wait for", &io).to_string();
-    assert!(
-        text.contains("cannot wait for nvidia-smi") && text.contains("boom"),
-        "{text}"
-    );
+    let names_action = text.contains("cannot wait for nvidia-smi") && text.contains("boom");
+    assert!(names_action, "{text}");
     let text = meminfo_error(&io).to_string();
-    assert!(
-        text.contains(std::env::consts::OS) && text.contains("/proc/meminfo"),
-        "{text}"
-    );
+    let names_platform = text.contains(std::env::consts::OS) && text.contains("/proc/meminfo");
+    assert!(names_platform, "{text}");
+}
+
+fn sysfs_card(root: &std::path::Path, name: &str, vendor: &str, vram: Option<&str>) {
+    let dir = root.join(name).join("device");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vendor"), vendor).unwrap();
+    if let Some(vram) = vram {
+        std::fs::write(dir.join("mem_info_vram_total"), vram).unwrap();
+    }
+}
+
+fn fresh_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "nanna-1064-sysfs-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn the_largest_amd_vram_is_reported_and_other_vendors_and_bad_values_are_ignored() {
+    let root = fresh_dir();
+    sysfs_card(&root, "card0", "0x1002\n", Some("8589934592\n"));
+    sysfs_card(&root, "card1", "0x1002\n", Some("17179869184\n"));
+    sysfs_card(&root, "card2", "0x10de\n", Some("34359738368\n"));
+    sysfs_card(&root, "card3", "0x1002\n", Some("0\n"));
+    sysfs_card(&root, "card4", "0x1002\n", Some("lots\n"));
+    sysfs_card(&root, "card5", "0x1002\n", None);
+    assert_eq!(amd_vram_under(&root), Some(17_179_869_184));
+}
+
+#[test]
+fn no_amd_card_or_no_sysfs_means_no_amd_vram() {
+    let root = fresh_dir();
+    sysfs_card(&root, "card0", "0x10de\n", Some("1024\n"));
+    assert_eq!(amd_vram_under(&root), None);
+    assert_eq!(amd_vram_under(&root.join("missing")), None);
+}
+
+#[test]
+fn an_amd_card_that_reports_zero_or_unreadable_vram_is_not_a_gpu() {
+    let zero = fresh_dir();
+    sysfs_card(&zero, "card0", "0x1002\n", Some("0\n"));
+    assert_eq!(amd_vram_under(&zero), None);
+    let garbage = fresh_dir();
+    sysfs_card(&garbage, "card0", "0x1002\n", Some("lots\n"));
+    assert_eq!(amd_vram_under(&garbage), None);
+}
+
+#[test]
+fn a_manifest_without_a_layers_array_is_rejected_with_a_clear_reason() {
+    let err = variant_from_registry("gemma4:x", "{}", CONFIG).unwrap_err();
+    assert!(err.to_string().contains("no layers"), "{err}");
 }

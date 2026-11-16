@@ -113,10 +113,8 @@ proptest! {
         };
         let a = select_default(&small, &variants).map(|v| v.params);
         let b = select_default(&big, &variants).map(|v| v.params);
-        match (a, b) {
-            (Some(a), Some(b)) => prop_assert!(b >= a),
-            (Some(_), None) => prop_assert!(false, "bigger device lost its model"),
-            _ => {}
+        if let Some(a) = a {
+            prop_assert!(b.is_some_and(|b| b >= a), "bigger device shrank: {a} -> {b:?}");
         }
     }
 
