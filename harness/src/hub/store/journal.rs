@@ -2,7 +2,7 @@ use super::StoreError;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -123,6 +123,7 @@ pub(super) trait Journal: Send {
 pub(super) trait Backing: Write + Send {
     fn len(&self) -> io::Result<u64>;
     fn truncate(&mut self, len: u64) -> io::Result<()>;
+    fn seek_to(&mut self, pos: u64) -> io::Result<()>;
 }
 
 impl Backing for File {
@@ -132,6 +133,10 @@ impl Backing for File {
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
         self.set_len(len)
+    }
+
+    fn seek_to(&mut self, pos: u64) -> io::Result<()> {
+        self.seek(SeekFrom::Start(pos)).map(|_| ())
     }
 }
 
@@ -155,6 +160,7 @@ impl<B: Backing> Journal for FileJournal<B> {
             return Err(io::Error::other("journal unusable after failed rollback"));
         }
         let before = self.backing.len()?;
+        self.backing.seek_to(before)?;
         let wrote = self.backing.write_all(bytes);
         let written = wrote.and_then(|()| self.backing.flush());
         if let Err(error) = written {
@@ -166,7 +172,7 @@ impl<B: Backing> Journal for FileJournal<B> {
 }
 
 pub(super) fn open_append(path: &Path) -> io::Result<File> {
-    OpenOptions::new().append(true).open(path)
+    OpenOptions::new().read(true).write(true).open(path)
 }
 
 pub(super) fn rewrite_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -227,6 +233,10 @@ mod tests {
                 return Err(io::Error::other("stat failed"));
             }
             Ok(self.bytes.len() as u64)
+        }
+
+        fn seek_to(&mut self, _pos: u64) -> io::Result<()> {
+            Ok(())
         }
 
         fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -292,10 +302,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"hello").unwrap();
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = open_append(&path).unwrap();
         assert_eq!(Backing::len(&file).unwrap(), 5);
         Backing::truncate(&mut file, 2).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"he");
+    }
+
+    struct Limited {
+        file: File,
+        budget: Option<usize>,
+    }
+
+    impl Write for Limited {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match self.budget {
+                Some(room) if room < buf.len() => {
+                    self.file.write_all(&buf[..room])?;
+                    Err(io::Error::other("disk full"))
+                }
+                _ => self.file.write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Backing for Limited {
+        fn len(&self) -> io::Result<u64> {
+            Backing::len(&self.file)
+        }
+
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            Backing::truncate(&mut self.file, len)
+        }
+
+        fn seek_to(&mut self, pos: u64) -> io::Result<()> {
+            Backing::seek_to(&mut self.file, pos)
+        }
+    }
+
+    #[test]
+    fn a_journal_on_a_real_file_appends_after_the_existing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abc\n").unwrap();
+        let mut journal = FileJournal::new(open_append(&path).unwrap());
+        journal.append(b"def\n").unwrap();
+        journal.append(b"ghi\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc\ndef\nghi\n");
+    }
+
+    #[test]
+    fn a_failed_append_on_a_real_file_is_truncated_back_and_the_journal_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"one\n").unwrap();
+        let file = open_append(&path).unwrap();
+        let mut journal = FileJournal::new(Limited { file, budget: None });
+        journal.append(b"two\n").unwrap();
+        journal.backing.budget = Some(3);
+        assert!(journal.append(b"three-three\n").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        assert!(!journal.poisoned);
+        journal.backing.budget = None;
+        journal.append(b"four\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\nfour\n");
     }
 
     #[test]
