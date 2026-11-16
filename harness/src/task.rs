@@ -9,6 +9,7 @@ use crate::effects::EffectClass;
 use crate::entities::context::types::ToolCallRecord;
 use crate::entities::InMemoryEntityStore;
 use crate::escalation::{default_window, EscalationLog, EscalationSnapshot, Escalator};
+use crate::hub::lineage::{derive_lineage, reconcile, Lineage, LineageError, RootId};
 use crate::identity::AgentIdentity;
 use crate::impact::BlastRadius;
 use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, SystemClock};
@@ -102,7 +103,7 @@ fn build_task_system_prompt(
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
 impl TaskId {
@@ -315,6 +316,10 @@ pub struct Task {
     /// Backlog origin, when the task was ingested from GitHub.
     #[serde(default)]
     pub origin: Option<TaskOrigin>,
+    /// Where the task sits in its session tree. Always set once the task is
+    /// registered; absent only in data written before lineage existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
 }
 
 /// Per-task terminal-completion channels. `wait_terminal` subscribes to the
@@ -445,6 +450,9 @@ pub enum SpawnRefused {
     /// The audited identity's `scope.repos` does not list the target.
     #[error(transparent)]
     OutsideScope(#[from] crate::scope::ScopeError),
+    /// The spawn's parent names a malformed root or sits too deep.
+    #[error(transparent)]
+    Lineage(#[from] LineageError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -478,8 +486,17 @@ pub(crate) struct AuditedIdentity {
 }
 
 impl AuditedIdentity {
-    fn split(allowed: Allowed) -> (crate::auditor::SpawnRequest, Self) {
-        (allowed.request().clone(), Self { allowed })
+    fn split(
+        allowed: Allowed,
+        lookup: &dyn Fn(&TaskId) -> Option<Lineage>,
+    ) -> (
+        crate::auditor::SpawnRequest,
+        Self,
+        Result<Option<Lineage>, LineageError>,
+    ) {
+        let request = allowed.request().clone();
+        let lineage = derive_lineage(&request.parent_task.id, lookup);
+        (request, Self { allowed }, lineage)
     }
 
     pub(crate) fn identity(&self) -> &AgentIdentity {
@@ -591,7 +608,7 @@ async fn audit_restored(
         hint,
         queued.description.clone(),
     );
-    Ok(AuditedIdentity::split(gate.check(request).await?).1)
+    Ok(AuditedIdentity::split(gate.check(request).await?, &|_| None).1)
 }
 
 pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
@@ -1296,7 +1313,11 @@ assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
             });
         }
         crate::scope::check_repo(allowed.identity(), &repo_path)?;
-        let (request, identity) = AuditedIdentity::split(allowed);
+        let (request, identity, lineage) = {
+            let tasks = self.runner.tasks.read().await;
+            AuditedIdentity::split(allowed, &|id| tasks.get(id).and_then(|t| t.lineage.clone()))
+        };
+        let lineage = lineage?;
         Ok(self
             .submit_bound(
                 request.subtask,
@@ -1306,6 +1327,7 @@ assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
                 max_iterations,
                 provider,
                 Some(BoundIdentity::Audited(identity)),
+                lineage,
             )
             .await)
     }
@@ -1329,10 +1351,12 @@ assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
         max_iterations: usize,
         provider: Arc<dyn ModelProvider>,
         identity: Option<BoundIdentity>,
+        lineage: Option<Lineage>,
     ) -> TaskId {
         let hint = identity.as_ref().map(|i| i.identity().name().to_string());
         let queued = QueuedTask::new(description, repo_path, branch, model, max_iterations)
-            .with_identity_hint(hint);
+            .with_identity_hint(hint)
+            .with_lineage(lineage);
         if let Some(identity) = identity {
             self.runner
                 .bound
@@ -1363,17 +1387,33 @@ assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
             max_iterations,
             provider,
             identity.map(BoundIdentity::Unaudited),
+            None,
         )
         .await
     }
 
     pub(crate) async fn submit_audited(
         &self,
-        queued: QueuedTask,
+        mut queued: QueuedTask,
         allowed: Allowed,
         provider: Arc<dyn ModelProvider>,
     ) -> TaskId {
-        let (_, identity) = AuditedIdentity::split(allowed);
+        let (_, identity, derived) = {
+            let tasks = self.runner.tasks.read().await;
+            AuditedIdentity::split(allowed, &|id| tasks.get(id).and_then(|t| t.lineage.clone()))
+        };
+        let task_id = queued.id.clone();
+        match derived.and_then(|derived| reconcile(queued.lineage.take(), derived)) {
+            Ok(lineage) => queued.lineage = lineage,
+            Err(error) => {
+                tracing::error!(task_id = %task_id, %error, "Refusing an audited entry whose lineage disagrees with its audit proof");
+                self.runner.register(&queued, Some(provider)).await;
+                self.runner
+                    .fail(&task_id, error.to_string(), "LineageInconsistent")
+                    .await;
+                return task_id;
+            }
+        }
         self.runner
             .bound
             .write()
@@ -1620,6 +1660,12 @@ impl TaskRunner {
             not_before: queued.not_before,
             identity_hint: queued.identity_hint.clone(),
             origin: queued.origin.clone(),
+            lineage: Some(
+                queued
+                    .lineage
+                    .clone()
+                    .unwrap_or_else(|| Lineage::root_child(RootId::legacy(queued.id.clone()))),
+            ),
         };
         self.tasks.write().await.insert(queued.id.clone(), task);
         let (tx, rx) = watch::channel(TaskStatus::Pending);
@@ -2777,6 +2823,7 @@ max_concurrent = 1
             not_before: None,
             identity_hint: None,
             origin: None,
+            lineage: None,
         };
         {
             let mut tasks = manager.runner.tasks.write().await;
@@ -5846,6 +5893,40 @@ mod identity_tests {
         assert_eq!(log[0].request.identity, "rust-implementer");
     }
 
+    async fn restored_lineage(manager: &TaskManager, id: &TaskId) -> Lineage {
+        manager.poll(id).await.unwrap().lineage.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_restore_keeps_the_persisted_lineage_and_mints_no_restore_root() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let persisted = Lineage::root_child(RootId::plan("plan-keep-me").unwrap());
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status")
+            .with_lineage(Some(persisted.clone()));
+        let gate = crate::auditor::test_support::fixture_gate();
+        let (manager, store) =
+            restore_audited(&[&entry], &fixture_catalog(), &gate, untouched_provider()).await;
+        assert_eq!(restored_lineage(&manager, &entry.id).await, persisted);
+        assert_eq!(store.load().unwrap()[0].lineage, Some(persisted));
+        let log = gate.log().entries().unwrap();
+        assert!(log
+            .iter()
+            .all(|e| e.request.parent_task.id == format!("restore-{}", entry.id.0)));
+    }
+
+    #[tokio::test]
+    async fn test_restore_of_a_pre_lineage_entry_gives_it_its_own_legacy_root() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        assert_eq!(entry.lineage, None);
+        let gate = crate::auditor::test_support::fixture_gate();
+        let (manager, _store) =
+            restore_audited(&[&entry], &fixture_catalog(), &gate, untouched_provider()).await;
+        let lineage = restored_lineage(&manager, &entry.id).await;
+        assert_eq!(lineage.root(), &RootId::legacy(entry.id.clone()));
+        assert_eq!(lineage.depth(), 1);
+    }
+
     #[tokio::test]
     async fn test_cancelling_a_restored_queued_entry_drops_its_audited_bound_entry() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
@@ -7667,6 +7748,7 @@ mod spawn_tests {
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    use crate::hub::lineage::{SessionBinding, SessionId};
     use crate::identity::{DevLoop, IdentityCatalog};
 
     fn context() -> AuditContext {
@@ -7768,6 +7850,218 @@ mod spawn_tests {
         let held = bound.get(&id).unwrap();
         assert!(matches!(held, BoundIdentity::Audited(_)));
         assert_eq!(held.identity(), &audited);
+    }
+
+    async fn allowed_with_parent(parent_id: &str) -> Allowed {
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new(parent_id, "Fix bug X", "github.com/example/repo"),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        gate.check(request, &context()).await.unwrap()
+    }
+
+    async fn spawn_under(
+        manager: &TaskManager,
+        repo: &std::path::Path,
+        parent_id: &str,
+    ) -> Result<TaskId, SpawnRefused> {
+        manager
+            .submit_spawn(
+                allowed_with_parent(parent_id).await,
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+    }
+
+    async fn lineage_of(manager: &TaskManager, id: &TaskId) -> Lineage {
+        manager.poll(id).await.unwrap().lineage.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_roots_an_mcp_parent_at_its_mcp_root() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let uuid = uuid::Uuid::new_v4();
+        let id = spawn_under(&manager, repo.path(), &format!("mcp-{uuid}"))
+            .await
+            .unwrap();
+        let lineage = lineage_of(&manager, &id).await;
+        assert_eq!(lineage.root(), &RootId::mcp(uuid));
+        assert_eq!(lineage.depth(), 1);
+        assert_eq!(lineage.parent(), None);
+    }
+
+    #[tokio::test]
+    async fn test_submit_spawn_roots_a_plan_parent_at_its_plan_root() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let plan = format!("plan-{}", uuid::Uuid::new_v4());
+        let id = spawn_under(&manager, repo.path(), &plan).await.unwrap();
+        assert_eq!(
+            lineage_of(&manager, &id).await.root(),
+            &RootId::plan(plan).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_parent_becomes_its_own_legacy_root() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let id = spawn_under(&manager, repo.path(), "parent-1")
+            .await
+            .unwrap();
+        let lineage = lineage_of(&manager, &id).await;
+        assert_eq!(lineage.root(), &RootId::legacy(id));
+        assert_eq!(lineage.depth(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_known_parent_task_makes_a_child_in_the_same_root() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let uuid = uuid::Uuid::new_v4();
+        let first = spawn_under(&manager, repo.path(), &format!("mcp-{uuid}"))
+            .await
+            .unwrap();
+        let second = spawn_under(&manager, repo.path(), &first.0).await.unwrap();
+        let lineage = lineage_of(&manager, &second).await;
+        assert_eq!(lineage.root(), &RootId::mcp(uuid));
+        assert_eq!(lineage.depth(), 2);
+        assert_eq!(lineage.parent(), Some(&SessionId::from_task(first)));
+    }
+
+    #[tokio::test]
+    async fn test_a_spawn_chain_deeper_than_the_cap_is_refused_and_registers_nothing() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let mut parent = format!("mcp-{}", uuid::Uuid::new_v4());
+        for _ in 0..crate::hub::lineage::MAX_DEPTH {
+            parent = spawn_under(&manager, repo.path(), &parent).await.unwrap().0;
+        }
+        let before = manager.list().await.len();
+        let refused = spawn_under(&manager, repo.path(), &parent)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            SpawnRefused::Lineage(LineageError::TooDeep(crate::hub::lineage::MAX_DEPTH))
+        );
+        assert_eq!(manager.list().await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn test_a_malformed_root_parent_is_refused() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        for parent in ["mcp-not-a-uuid", "plan-UPPER", "backlog-no-issue"] {
+            let refused = spawn_under(&manager, repo.path(), parent)
+                .await
+                .unwrap_err();
+            assert!(matches!(refused, SpawnRefused::Lineage(_)), "{parent}");
+        }
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_audited_derives_a_backlog_lineage_from_the_proof() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let allowed = allowed_with_parent("backlog-example/repo#42").await;
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        );
+        let id = manager.submit_audited(queued, allowed, provider()).await;
+        assert_eq!(
+            lineage_of(&manager, &id).await.root(),
+            &RootId::backlog("example/repo", 42).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_audited_refuses_an_entry_whose_lineage_disagrees_with_the_proof() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(1);
+        let allowed = allowed_with_parent("backlog-example/repo#42").await;
+        let other = Lineage::root_child(RootId::backlog("example/other", 1).unwrap());
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        )
+        .with_lineage(Some(other));
+        let id = manager.submit_audited(queued, allowed, provider()).await;
+        let task = manager.poll(&id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed { diagnostics, .. } => {
+                assert_eq!(diagnostics.error_type, "LineageInconsistent");
+            }
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(manager.bound_identity_of(&id).await.is_none());
+        assert!(!manager.dispatcher.is_queued(&id).await);
+        assert!(!manager.dispatcher.is_running(&id).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_binding_takes_identity_from_the_proof_and_session_from_the_task() {
+        let allowed = allowed_for("github.com/example/repo").await;
+        let task = TaskId("t-1".to_string());
+        let lineage = Lineage::root_child(RootId::legacy(task.clone()));
+        let binding = SessionBinding::from_proof(&allowed, task.clone(), lineage.clone());
+        assert_eq!(binding.session(), &SessionId::from_task(task));
+        assert_eq!(binding.lineage(), &lineage);
+        assert_eq!(binding.identity(), allowed.identity());
+    }
+
+    #[tokio::test]
+    async fn test_lineage_never_appears_on_the_mcp_task_wire_shape() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = TaskManager::new(0);
+        let id = spawn_under(
+            &manager,
+            repo.path(),
+            &format!("mcp-{}", uuid::Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let task = manager.poll(&id).await.unwrap();
+        assert!(task.lineage.is_some());
+        let wire = crate::mcp::handlers::task_to_wire(&task);
+        let keys: std::collections::BTreeSet<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "createdAt",
+                "lastUpdatedAt",
+                "pollInterval",
+                "status",
+                "statusMessage",
+                "taskId",
+                "ttl"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!wire.to_string().contains("lineage"));
     }
 
     async fn rejecting_manager() -> TaskManager {
@@ -8955,7 +9249,7 @@ mod pi_route_tests {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let allowed = allowed_for(LABEL).await;
         let identity = allowed.identity().clone();
-        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed).1);
+        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed, &|_| None).1);
         let (admitted, _) = require_pi_audited(Some(&audited), repo.path()).unwrap();
         assert_eq!(admitted.identity(), &identity);
         let other = repo_with_origin("https://github.com/example/other.git");
@@ -8978,7 +9272,7 @@ mod pi_route_tests {
     async fn test_an_audited_identity_keeps_the_proof_it_was_split_from() {
         let allowed = allowed_for(LABEL).await;
         let identity = allowed.identity().clone();
-        let (request, audited) = AuditedIdentity::split(allowed);
+        let (request, audited, _) = AuditedIdentity::split(allowed, &|_| None);
         assert_eq!(request.subtask, "Add a regression test.");
         assert_eq!(audited.repo(), LABEL);
         assert_eq!(audited.identity(), &identity);

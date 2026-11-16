@@ -12,6 +12,7 @@
 //! [`ManagerSink`], or a bare [`QueueStore`] via [`StoreSink`] for the CLI.
 
 use crate::auditor::{Allowed, SpawnGate, TaskSummary};
+use crate::hub::lineage::{derive_lineage, reconcile, Lineage, LineageError, RootId};
 use crate::scheduler::{QueueStore, QueueStoreError, QueuedTask, TaskOrigin, TaskQueue};
 use crate::task::TaskManager;
 use async_trait::async_trait;
@@ -130,6 +131,8 @@ pub enum BacklogError {
     UnresolvedIdentity { identity: String },
     #[error("backlog task names no identity; refusing to enqueue")]
     MissingIdentity,
+    #[error("backlog task has an unusable lineage: {0}")]
+    Lineage(#[from] LineageError),
     #[error("GitHub rate limit exceeded for {url} after {attempts} attempt(s), retry after {retry_after_secs:?}s")]
     RateLimited {
         url: String,
@@ -587,6 +590,16 @@ pub async fn backlog_sync(
                 report.capped += 1;
                 continue;
             }
+            let lineage = match RootId::backlog(source.repo.clone(), issue.number) {
+                Ok(root) => Lineage::root_child(root),
+                Err(error) => {
+                    report.refused.push(RefusedIssue {
+                        origin,
+                        reason: format!("backlog root refused: {error}"),
+                    });
+                    continue;
+                }
+            };
             let description = describe_issue(&source.repo, &issue);
             let request = gate.request(
                 TaskSummary::new(
@@ -615,7 +628,8 @@ pub async fn backlog_sync(
                 source.max_iterations,
             )
             .with_identity_hint(Some(source.identity.clone()))
-            .with_origin(Some(origin.clone()));
+            .with_origin(Some(origin.clone()))
+            .with_lineage(Some(lineage));
             sink.enqueue(task, proof).await?;
             *count += 1;
             known_origins.insert(origin.clone());
@@ -659,6 +673,12 @@ fn hinted_identity(task: &QueuedTask) -> Result<&str, BacklogError> {
         .ok_or(BacklogError::MissingIdentity)
 }
 
+fn bind_lineage(mut task: QueuedTask, proof: &Allowed) -> Result<QueuedTask, BacklogError> {
+    let derived = derive_lineage(&proof.request().parent_task.id, &|_| None)?;
+    task.lineage = reconcile(task.lineage.take(), derived)?;
+    Ok(task)
+}
+
 fn unresolved_identity(name: &str) -> BacklogError {
     BacklogError::UnresolvedIdentity {
         identity: name.to_string(),
@@ -687,6 +707,7 @@ impl BacklogSink for StoreSink {
             return Err(unresolved_identity(hint));
         }
         ensure_audited(&task, &proof)?;
+        let task = bind_lineage(task, &proof)?;
         let mut queue = self.queue.lock().await;
         let stored = queue.push(task);
         self.store.insert(&stored)?;
@@ -728,6 +749,7 @@ impl BacklogSink for ManagerSink {
             return Err(unresolved_identity(hint));
         }
         ensure_audited(&task, &proof)?;
+        let task = bind_lineage(task, &proof)?;
         self.manager
             .submit_audited(task, proof, Arc::clone(&self.provider))
             .await;
@@ -1933,6 +1955,104 @@ mod tests {
 
     fn audited_task(path: &str) -> QueuedTask {
         task_for(PROOF_SUBTASK, PROOF_REPO, path)
+    }
+
+    async fn proof_with_parent(parent: &str) -> Allowed {
+        let gate = fixture_gate();
+        let request = gate.request(
+            TaskSummary::new(parent, "d", PROOF_REPO),
+            "rust-implementer",
+            PROOF_SUBTASK,
+        );
+        gate.check(request).await.unwrap()
+    }
+
+    fn sink_over(store: &InMemoryQueueStore) -> StoreSink {
+        StoreSink::open(Box::new(store.clone()), known_identities()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn backlog_sync_stamps_each_entry_with_its_backlog_root() {
+        let github = github_with(vec![issue(2)]);
+        let store = InMemoryQueueStore::default();
+        let sink = sink_over(&store);
+        let cfg = config(vec![source("o/n", "/repo")], None);
+        backlog_sync(&github, &sink, &cfg, &fixture_gate())
+            .await
+            .unwrap();
+        let stored = store.load().unwrap();
+        assert_eq!(
+            stored[0].lineage,
+            Some(Lineage::root_child(RootId::backlog("o/n", 2).unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn backlog_sync_skips_a_repository_that_cannot_be_a_root_and_keeps_the_rest() {
+        let github = MockGithub {
+            issues: HashMap::from([
+                ("o/n/x".to_string(), vec![issue(2)]),
+                ("o/n".to_string(), vec![issue(3)]),
+            ]),
+            ..Default::default()
+        };
+        let store = InMemoryQueueStore::default();
+        let sink = sink_over(&store);
+        let cfg = config(vec![source("o/n/x", "/bad"), source("o/n", "/repo")], None);
+        let report = backlog_sync(&github, &sink, &cfg, &fixture_gate())
+            .await
+            .unwrap();
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].origin.repo, "o/n/x");
+        assert!(report.refused[0].reason.starts_with("backlog root refused"));
+        assert_eq!(report.enqueued.len(), 1);
+        assert_eq!(report.enqueued[0].repo, "o/n");
+        let stored = store.load().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].origin.as_ref().unwrap().repo, "o/n");
+    }
+
+    #[tokio::test]
+    async fn the_store_sink_derives_the_lineage_from_the_proof() {
+        let store = InMemoryQueueStore::default();
+        let sink = sink_over(&store);
+        let proof = proof_with_parent("backlog-example/repo#7").await;
+        sink.enqueue(audited_task("/repo"), proof).await.unwrap();
+        assert_eq!(
+            store.load().unwrap()[0].lineage,
+            Some(Lineage::root_child(
+                RootId::backlog("example/repo", 7).unwrap()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_sink_refuses_a_lineage_the_proof_does_not_support() {
+        let other = Lineage::root_child(RootId::backlog("example/other", 1).unwrap());
+        for parent in ["backlog-example/repo#7", "t"] {
+            let store = InMemoryQueueStore::default();
+            let sink = sink_over(&store);
+            let task = audited_task("/repo").with_lineage(Some(other.clone()));
+            let err = sink
+                .enqueue(task, proof_with_parent(parent).await)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BacklogError::Lineage(_)), "{parent}: {err}");
+            assert!(store.load().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_store_sink_refuses_a_malformed_backlog_parent() {
+        let store = InMemoryQueueStore::default();
+        let sink = sink_over(&store);
+        let proof = proof_with_parent("backlog-not-a-repo#x").await;
+        let err = sink
+            .enqueue(audited_task("/repo"), proof)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BacklogError::Lineage(_)), "{err}");
+        assert!(store.load().unwrap().is_empty());
     }
 
     fn issue_with(number: u64, body: &str) -> GithubIssue {

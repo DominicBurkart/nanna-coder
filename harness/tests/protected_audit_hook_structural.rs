@@ -6,7 +6,7 @@ use syn::visit::Visit;
 #[path = "support/test_module_files.rs"]
 mod test_module_files;
 use test_module_files::{
-    cfg_test_file_modules, is_exact_test_file_module, path_targets, skipped_files,
+    cfg_test_file_modules, is_exact_test_file_module, path_attribute_files, skipped_files,
 };
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -114,7 +114,7 @@ fn scan_source(file: &str, source: &str) -> Idents {
 }
 
 fn production_from(sources: Vec<(String, String)>) -> Vec<Idents> {
-    let skipped = skipped_files(&sources);
+    let skipped = skipped_files(&sources).unwrap_or_else(|reason| panic!("{reason}"));
     sources
         .iter()
         .filter(|(file, _)| !skipped.contains(file))
@@ -232,14 +232,11 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         ("z.rs", "fn f() { TaskWorkspace; }"),
         (
             "a/mod.rs",
-            "fn helper() {} #[cfg(test)] mod px; #[path = \"px.rs\"] mod py; #[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] #[path = \"p.rs\"] mod w; #[cfg(test)] mod inline { } #[cfg(test)] mod t2; #[cfg(not(test))] mod t2; #[cfg(test)] mod t3; mod t3; #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
+            "fn helper() {} #[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] mod inline { } #[cfg(test)] mod t2; #[cfg(not(test))] mod t2; #[cfg(test)] mod t3; mod t3; #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
         ),
         ("a/t.rs", "fn f() { TaskWorkspace; }"),
         ("a/u.rs", "fn f() { TaskWorkspace; }"),
         ("a/v.rs", "fn f() { TaskWorkspace; }"),
-        ("a/p.rs", "fn f() { TaskWorkspace; }"),
-        ("a/w.rs", "fn f() { TaskWorkspace; }"),
-        ("a/px.rs", "fn f() { TaskWorkspace; }"),
         ("a/inline.rs", "fn f() { TaskWorkspace; }"),
         ("a/t2.rs", "fn f() { TaskWorkspace; }"),
         ("a/t3.rs", "fn f() { TaskWorkspace; }"),
@@ -261,13 +258,10 @@ fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scann
         .collect();
     let expected: BTreeSet<String> = [
         "a/inline.rs",
-        "a/p.rs",
-        "a/px.rs",
         "a/t2.rs",
         "a/t3.rs",
         "a/u.rs",
         "a/v.rs",
-        "a/w.rs",
         "a/ya.rs",
         "a/yb.rs",
         "a/yc.rs",
@@ -308,47 +302,67 @@ fn an_inline_test_module_never_skips_a_file_of_the_same_name() {
     assert!(!is_exact_test_file_module(
         &syn::parse_str("#[cfg(test)] mod m { }").unwrap()
     ));
-    assert!(!is_exact_test_file_module(
-        &syn::parse_str("#[cfg(test)] #[path = \"p.rs\"] mod m;").unwrap()
-    ));
+}
+
+fn sources(files: &[(&str, &str)]) -> Vec<(String, String)> {
+    files
+        .iter()
+        .map(|(file, source)| (file.to_string(), source.to_string()))
+        .collect()
 }
 
 #[test]
-fn a_path_declaration_anywhere_keeps_its_target_scanned() {
-    let source =
-        "#[cfg(test)] mod x; #[path = \"./x.rs\"] mod y; mod inner { #[path = \"z.rs\"] mod q; }";
-    let targets = path_targets("a/mod.rs", source);
-    assert!(targets.contains(&"a/x.rs".to_string()));
-    assert!(targets.contains(&"a/z.rs".to_string()));
-    let sources = [
-        ("a/mod.rs".to_string(), source.to_string()),
+fn any_path_attribute_anywhere_makes_the_guard_refuse_to_skip_and_names_the_file() {
+    let evasions = [
+        ("dotdot", "#[path = \"../a/x.rs\"] mod y;"),
+        ("unnormalised", "#[path = \"s/../x.rs\"] mod y;"),
         (
-            "a/x.rs".to_string(),
-            "fn f() { TaskWorkspace; }".to_string(),
+            "cfg_attr_not_test",
+            "#[cfg_attr(not(test), path = \"x.rs\")] mod y;",
         ),
-    ];
-    assert!(!skipped_files(&sources).contains("a/x.rs"));
-    let elsewhere = [
-        ("a/mod.rs".to_string(), "#[cfg(test)] mod x;".to_string()),
+        ("cfg_attr_unix", "#[cfg_attr(unix, path = \"x.rs\")] mod y;"),
         (
-            "b.rs".to_string(),
-            "#[path = \"a/x.rs\"] mod y;".to_string(),
+            "nested_cfg_attr",
+            "#[cfg_attr(unix, cfg_attr(unix, path = \"x.rs\"))] mod y;",
         ),
+        ("inline_module", "mod inner { #[path = \"z.rs\"] mod q; }"),
+        ("other_file", "#[path = \"a/x.rs\"] mod y;"),
+        (
+            "macro_body",
+            "macro_rules! m { () => { #[path = \"x.rs\"] mod y; } }",
+        ),
+        ("plain", "#[path = \"x.rs\"] mod y;"),
     ];
-    assert!(!skipped_files(&elsewhere).contains("a/x.rs"));
-    assert_eq!(
-        skipped_files(&[("a/mod.rs".to_string(), "#[cfg(test)] mod x;".to_string())]).len(),
-        2
-    );
+    for (label, carrier) in evasions {
+        let files = sources(&[
+            ("a/mod.rs", "#[cfg(test)] mod x;"),
+            ("a/x.rs", "fn f() { TaskWorkspace; }"),
+            ("carrier.rs", carrier),
+        ]);
+        assert_eq!(
+            path_attribute_files(&files),
+            vec!["carrier.rs".to_string()],
+            "{label}"
+        );
+        let reason = skipped_files(&files).unwrap_err();
+        assert!(reason.contains("carrier.rs"), "{label}: {reason}");
+    }
 }
 
 #[test]
-fn a_path_target_is_resolved_beside_the_file_and_inside_its_module_directory() {
-    let targets = path_targets("a.rs", "#[path = \"x.rs\"] mod y;");
-    assert_eq!(targets, vec!["x.rs".to_string(), "a/x.rs".to_string()]);
-    let sources = [(
-        "a.rs".to_string(),
-        "#[cfg(test)] mod x; #[path = \"x.rs\"] mod y;".to_string(),
-    )];
-    assert!(!skipped_files(&sources).contains("a/x.rs"));
+fn attributes_that_merely_mention_a_path_do_not_trip_the_refusal() {
+    let files = sources(&[
+        ("a/mod.rs", "#[cfg(test)] mod x; #[cfg_attr(test, derive(Debug))] struct S; #[cfg(feature = \"path\")] fn g() {} #[doc = \"path\"] fn h() { let path = 1; let _ = (path == 1, path); }"),
+        ("a/x.rs", "fn f() { TaskWorkspace; }"),
+    ]);
+    assert!(path_attribute_files(&files).is_empty());
+    let skipped = skipped_files(&files).unwrap();
+    assert!(skipped.contains("a/x.rs"));
+}
+
+#[test]
+#[should_panic(expected = "cannot reason about module files")]
+fn the_scan_itself_fails_when_a_path_attribute_exists() {
+    let files = sources(&[("a.rs", "#[path = \"b.rs\"] mod m;"), ("b.rs", "")]);
+    let _ = production_from(files);
 }
