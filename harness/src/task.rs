@@ -568,9 +568,8 @@ fn require_pi_audited<'a>(
     let audited_ref = require_audited(bound).map_err(|_| PiRouteRefused::Unaudited)?;
     let audited = bound.audited().ok_or(PiRouteRefused::Unaudited)?;
     let refusal = scope_refusal(audited.repo(), repo_path);
-    crate::scope::names_repo(audited.repo(), repo_path)
-        .then_some((audited, audited_ref))
-        .ok_or(refusal)
+    let named = crate::scope::names_repo(audited.repo(), repo_path);
+    named.then_some((audited, audited_ref)).ok_or(refusal)
 }
 
 #[rustfmt::skip]
