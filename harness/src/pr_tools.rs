@@ -1691,7 +1691,6 @@ fn render_escaped(chars: &[char]) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum FenceLabel {
     GithubText,
     AgentMessage,
@@ -1699,7 +1698,6 @@ pub(crate) enum FenceLabel {
 }
 
 impl FenceLabel {
-    #[cfg(test)]
     pub(crate) const ALL: [FenceLabel; 3] = [
         FenceLabel::GithubText,
         FenceLabel::AgentMessage,
