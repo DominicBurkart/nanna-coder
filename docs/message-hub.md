@@ -646,7 +646,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
   4. `FailClosedMessageAuditor` applies a 30 s timeout.
 - **Inbound** (at `msg_recv`, inside the hub; recv args carry no content, so the action gate has nothing to review):
   1. Rules are re-run against the *recipient's* context. This is cheap, and catches rule-set updates between send and receive.
-  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
+  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks, or the recipient's write paths (or read paths; an absent read scope means unrestricted) are not an exact-string subset of the sender's, the same rule as `narrows()`. The comparison can over-trigger and never under-triggers. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
 - **Verdict mapping:**
 
 | `MessageVerdict` | Outbound result | Inbound result |
@@ -736,7 +736,7 @@ pub enum MessageVerdict { Deliver, Block { reasons: Vec<Reason> }, Quarantine { 
 
 pub struct OutboundReview<'a> { pub sender: &'a SessionBinding, pub tool: &'a str, pub recipients: &'a [RecipientScope], pub subject: &'a str, pub body: &'a str, pub window: &'a [StoredMessage], pub thread: &'a [StoredMessage] }
 pub struct InboundReview<'a>  { pub recipient: &'a SessionBinding, pub sender: RecipientScope, pub message: &'a StoredMessage, pub thread: &'a [StoredMessage] }
-pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String> }
+pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String>, pub read_paths: Option<Vec<String>> }
 
 #[async_trait]
 pub trait MessageAuditor: Send + Sync {
@@ -1047,7 +1047,7 @@ Issues 1–14 and 16 work on the current runtime. Issue 15 is the only pi-couple
 | D3 | What happens on a secret hit? | **Block** with the reason code only (no silent redaction). The 3rd denial escalates. Quarantine is for injection, steering and collusion. |
 | D4 | Delivery model | **Pull-first** (`msg_recv`, long-poll ≤60 s) ships on the current runtime. The `steer` doorbell comes with the pi executor. |
 | D5 | What does the librarian index contain? | **Decided:** a redacted per-session activity log (§4.1) plus metadata. No message bodies and no file contents. |
-| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case); otherwise rules plus the hash-bound outbound verdict. |
+| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case: higher `max_effect`, extra tools, or wider write or read paths); otherwise rules plus the hash-bound outbound verdict. |
 | D7 | Persistence | JSONL in `~/.local/state/nanna/`. Single writer per host process; no database dependency. |
 | D8 | What if no auditor model is configured? | **Decided:** a default model is required to use nanna and also serves the auditor. With none configured, nanna uses the highest-parameter Gemma 4 that fits the device (§8.5). |
 | D9 | How does the librarian run? | **Decided:** a built-in, non-overridable identity, broker-only, via `LaunchTarget::NoWorkspace` (G9). |

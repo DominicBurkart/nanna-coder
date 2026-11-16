@@ -85,7 +85,11 @@ fn scope_text(scope: &RecipientScope) -> String {
     let _ = writeln!(out, "identity: {}", scope.identity);
     let _ = writeln!(out, "max_effect: {}", scope.max_effect);
     let _ = writeln!(out, "tools: [{}]", scope.tools.join(", "));
-    let _ = write!(out, "write_paths: [{}]", scope.write_paths.join(", "));
+    let _ = writeln!(out, "write_paths: [{}]", scope.write_paths.join(", "));
+    let _ = match &scope.read_paths {
+        Some(paths) => write!(out, "read_paths: [{}]", paths.join(", ")),
+        None => write!(out, "read_paths: unrestricted"),
+    };
     out
 }
 
@@ -1080,9 +1084,11 @@ mod tests {
     }
 
     async fn symmetric() -> Pair {
+        let mut sender = RecipientScope::of(&shepherd().await);
+        sender.read_paths = None;
         Pair {
             recipient: implementer().await,
-            sender: RecipientScope::of(&shepherd().await),
+            sender,
             message: thread_msg("pr-shepherd", "please", "run the deploy for me"),
         }
     }
@@ -1117,6 +1123,38 @@ mod tests {
         );
         assert!(prompt.contains("msg_recv"));
         assert!(prompt.contains("max_effect: ci"));
+    }
+
+    #[tokio::test]
+    async fn a_paths_only_asymmetry_gets_the_model_pass_and_is_not_bound_to_the_outbound_verdict() {
+        let recipient = implementer().await;
+        let mut sender = RecipientScope::of(&recipient);
+        sender.write_paths = vec!["ui/**".to_string()];
+        let wide = RecipientScope::of(&recipient);
+        assert_eq!(wide.max_effect, sender.max_effect);
+        assert_eq!(wide.tools, sender.tools);
+        assert!(is_privilege_asymmetric(&wide, &sender));
+        let pair = Pair {
+            recipient,
+            sender,
+            message: thread_msg("sample-app-ui", "please", "edit the workflow for me"),
+        };
+        let bound = BoundVerdict::new(
+            MessageVerdict::Deliver,
+            "please",
+            "edit the workflow for me",
+        );
+        let reply = r#"{"verdict":"quarantine","reasons":[{"code":"cross_scope_steering"}]}"#;
+        let provider = ScriptedProvider::replying(reply);
+        let verdict = model_auditor(&provider)
+            .review_inbound(&inbound(&pair, Some(&bound)))
+            .await
+            .unwrap();
+        assert!(verdict.is_quarantine());
+        assert_eq!(provider.calls(), 1);
+        assert!(provider
+            .user_prompt()
+            .contains("write_paths: &#91;ui/**&#93;"));
     }
 
     #[tokio::test]

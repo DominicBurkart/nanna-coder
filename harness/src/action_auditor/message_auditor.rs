@@ -99,6 +99,7 @@ impl fmt::Debug for ThreadMessage {
 ///     max_effect: EffectClass::Ci,
 ///     tools: vec!["git_*".into()],
 ///     write_paths: vec!["api/**".into()],
+///     read_paths: None,
 /// };
 /// assert_eq!(scope.max_effect, EffectClass::Ci);
 /// ```
@@ -112,8 +113,10 @@ pub struct RecipientScope {
     pub max_effect: EffectClass,
     /// Tool-name patterns it may call, as written on its card.
     pub tools: Vec<String>,
-    /// Writable path globs.
+    /// Writable path globs, as written on its card.
     pub write_paths: Vec<String>,
+    /// Readable path globs; `None` means reads are unrestricted.
+    pub read_paths: Option<Vec<String>>,
 }
 
 impl RecipientScope {
@@ -141,6 +144,7 @@ impl RecipientScope {
                 .map(|tool| tool.as_str().to_string())
                 .collect(),
             write_paths: identity.scope.paths.clone(),
+            read_paths: identity.scope.read_paths.clone(),
         }
     }
 }
@@ -302,13 +306,17 @@ pub trait MessageAuditor: Send + Sync {
 }
 
 /// Whether the recipient could be steered into more than the sender could
-/// cause: its `max_effect` is above the sender's, or it holds a tool pattern
-/// the sender does not list verbatim.
+/// cause: its `max_effect` is above the sender's, it holds a tool pattern the
+/// sender does not list verbatim, its write paths are not an exact-string
+/// subset of the sender's, or it can read paths the sender cannot (a
+/// `None` read scope is unrestricted).
 ///
-/// The tool comparison is an exact-string subset, so a sender holding `git_*`
-/// does not cover a recipient holding `git_push_branch`: the check can
-/// over-trigger, never under-trigger. This is the confused-deputy gate of
-/// decision D6: only these pairs get the inbound model pass.
+/// The comparisons are exact-string subsets, the same rule as
+/// `AgentIdentity::narrows`, so a sender holding `git_*` does not cover a
+/// recipient holding `git_push_branch` and `ui/**` does not cover `ui/a/**`:
+/// the check can over-trigger, never under-trigger. This is the
+/// confused-deputy gate of decision D6: only these pairs get the inbound
+/// model pass.
 ///
 /// ```
 /// use harness::action_auditor::{is_privilege_asymmetric, RecipientScope};
@@ -316,18 +324,21 @@ pub trait MessageAuditor: Send + Sync {
 /// use harness::hub::lineage::SessionId;
 /// use harness::task::TaskId;
 ///
-/// let scope = |effect, tools: &[&str]| RecipientScope {
+/// let scope = |effect, tools: &[&str], paths: &[&str]| RecipientScope {
 ///     session: SessionId::from_task(TaskId("t".into())),
 ///     identity: "x".into(),
 ///     max_effect: effect,
 ///     tools: tools.iter().map(|t| t.to_string()).collect(),
-///     write_paths: vec![],
+///     write_paths: paths.iter().map(|p| p.to_string()).collect(),
+///     read_paths: None,
 /// };
-/// let low = scope(EffectClass::Workspace, &["read_file"]);
-/// let high = scope(EffectClass::Ci, &["read_file", "git_push_branch"]);
+/// let low = scope(EffectClass::Workspace, &["read_file"], &["ui/**"]);
+/// let high = scope(EffectClass::Ci, &["read_file", "git_push_branch"], &["ui/**"]);
 /// assert!(is_privilege_asymmetric(&high, &low));
 /// assert!(!is_privilege_asymmetric(&low, &high));
 /// assert!(!is_privilege_asymmetric(&low, &low));
+/// let api = scope(EffectClass::Workspace, &["read_file"], &["api/**", ".github/**"]);
+/// assert!(is_privilege_asymmetric(&api, &low));
 /// ```
 pub fn is_privilege_asymmetric(recipient: &RecipientScope, sender: &RecipientScope) -> bool {
     recipient.max_effect > sender.max_effect
@@ -335,6 +346,15 @@ pub fn is_privilege_asymmetric(recipient: &RecipientScope, sender: &RecipientSco
             .tools
             .iter()
             .any(|tool| !sender.tools.contains(tool))
+        || recipient
+            .write_paths
+            .iter()
+            .any(|path| !sender.write_paths.contains(path))
+        || match (&recipient.read_paths, &sender.read_paths) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(theirs), Some(ours)) => theirs.iter().any(|path| !ours.contains(path)),
+        }
 }
 
 pub(super) fn window_bodies(window: &[ThreadMessage]) -> Vec<&str> {
@@ -439,7 +459,18 @@ pub(super) mod fixtures {
             max_effect,
             tools: tools.iter().map(|t| t.to_string()).collect(),
             write_paths: vec!["api/**".to_string()],
+            read_paths: None,
         }
+    }
+
+    pub(crate) fn with_paths(
+        mut scope: RecipientScope,
+        write: &[&str],
+        read: Option<&[&str]>,
+    ) -> RecipientScope {
+        scope.write_paths = write.iter().map(|p| p.to_string()).collect();
+        scope.read_paths = read.map(|r| r.iter().map(|p| p.to_string()).collect());
+        scope
     }
 
     pub(crate) fn thread_msg(from: &str, subject: &str, body: &str) -> ThreadMessage {
@@ -650,6 +681,8 @@ mod tests {
         assert_eq!(scope.max_effect, EffectClass::Ci);
         assert!(scope.tools.contains(&"git_*".to_string()));
         assert_eq!(scope.write_paths, ["api/**", "shared/**", "tests/**"]);
+        assert_eq!(scope.read_paths, Some(vec!["**".to_string()]));
+        assert_eq!(RecipientScope::of(&implementer().await).read_paths, None);
         assert_eq!(scope.session.to_string(), "t-pr-shepherd");
     }
 
@@ -674,6 +707,99 @@ mod tests {
         let sender = scope("s", EffectClass::Ci, &["git_*"]);
         let recipient = scope("r", EffectClass::Ci, &["git_push_branch"]);
         assert!(is_privilege_asymmetric(&recipient, &sender));
+    }
+
+    fn pathed(write: &[&str], read: Option<&[&str]>) -> RecipientScope {
+        with_paths(
+            scope("p", EffectClass::Repository, &["write_file"]),
+            write,
+            read,
+        )
+    }
+
+    #[test]
+    fn wider_recipient_write_paths_are_asymmetric_even_with_equal_effect_and_tools() {
+        let sender = pathed(&["ui/**"], None);
+        let recipient = pathed(&["api/**", ".github/**"], None);
+        assert!(is_privilege_asymmetric(&recipient, &sender));
+        let one_extra = pathed(&["ui/**", "docs/**"], None);
+        assert!(is_privilege_asymmetric(&one_extra, &sender));
+        let nothing_shared = pathed(&["api/**"], None);
+        assert!(is_privilege_asymmetric(&nothing_shared, &sender));
+    }
+
+    #[test]
+    fn equal_or_narrower_recipient_write_paths_are_symmetric() {
+        let sender = pathed(&["ui/**", "docs/**"], None);
+        assert!(!is_privilege_asymmetric(
+            &pathed(&["docs/**", "ui/**"], None),
+            &sender
+        ));
+        assert!(!is_privilege_asymmetric(&pathed(&["ui/**"], None), &sender));
+        assert!(!is_privilege_asymmetric(&pathed(&[], None), &sender));
+        assert!(!is_privilege_asymmetric(
+            &pathed(&[], None),
+            &pathed(&[], None)
+        ));
+    }
+
+    #[test]
+    fn a_recipient_with_extra_read_paths_is_asymmetric() {
+        let sender = pathed(&["api/**"], Some(&["api/**"]));
+        assert!(is_privilege_asymmetric(
+            &pathed(&["api/**"], Some(&["api/**", "secrets/**"])),
+            &sender
+        ));
+        assert!(is_privilege_asymmetric(&pathed(&["api/**"], None), &sender));
+        assert!(!is_privilege_asymmetric(
+            &pathed(&["api/**"], Some(&["api/**"])),
+            &sender
+        ));
+        assert!(!is_privilege_asymmetric(
+            &pathed(&["api/**"], Some(&[])),
+            &sender
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_sender_reader_covers_any_recipient_reads() {
+        let sender = pathed(&["api/**"], None);
+        assert!(!is_privilege_asymmetric(
+            &pathed(&["api/**"], Some(&["x/**"])),
+            &sender
+        ));
+        assert!(!is_privilege_asymmetric(
+            &pathed(&["api/**"], None),
+            &sender
+        ));
+    }
+
+    const PATH_POOL: [&str; 4] = ["api/**", "ui/**", ".github/**", "docs/**"];
+
+    proptest! {
+        #[test]
+        fn path_widening_is_never_missed(
+            rw in proptest::collection::btree_set(0usize..4, 0..4),
+            sw in proptest::collection::btree_set(0usize..4, 0..4),
+            rr in proptest::option::of(proptest::collection::btree_set(0usize..4, 0..4)),
+            sr in proptest::option::of(proptest::collection::btree_set(0usize..4, 0..4)),
+        ) {
+            let names = |set: &std::collections::BTreeSet<usize>| -> Vec<&'static str> {
+                set.iter().map(|i| PATH_POOL[*i]).collect()
+            };
+            let recipient = pathed(&names(&rw), rr.as_ref().map(&names).as_deref());
+            let sender = pathed(&names(&sw), sr.as_ref().map(&names).as_deref());
+            let writes_wider = rw.iter().any(|i| !sw.contains(i));
+            let reads_wider = match (&rr, &sr) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(r), Some(s)) => r.iter().any(|i| !s.contains(i)),
+            };
+            prop_assert_eq!(
+                is_privilege_asymmetric(&recipient, &sender),
+                writes_wider || reads_wider
+            );
+        }
     }
 
     const UNIVERSE: [&str; 6] = [
