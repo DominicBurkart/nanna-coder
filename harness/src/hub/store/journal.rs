@@ -36,11 +36,9 @@ pub(super) struct Claim {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.lock
-            .claimed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.name);
+        let set = &self.lock.claimed;
+        let mut claimed = set.lock().unwrap_or_else(PoisonError::into_inner);
+        claimed.remove(&self.name);
     }
 }
 
@@ -154,15 +152,11 @@ impl<B: Backing> FileJournal<B> {
 impl<B: Backing> Journal for FileJournal<B> {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         if self.poisoned {
-            return Err(io::Error::other(
-                "journal is unusable after a failed rollback",
-            ));
+            return Err(io::Error::other("journal unusable after failed rollback"));
         }
         let before = self.backing.len()?;
-        let written = self
-            .backing
-            .write_all(bytes)
-            .and_then(|()| self.backing.flush());
+        let wrote = self.backing.write_all(bytes);
+        let written = wrote.and_then(|()| self.backing.flush());
         if let Err(error) = written {
             self.poisoned = self.backing.truncate(before).is_err();
             return Err(error);

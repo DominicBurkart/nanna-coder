@@ -43,14 +43,13 @@ fn replay<T: Table>(bytes: &[u8]) -> Result<T, StoreError> {
     let mut table = T::default();
     let mut segments = bytes.split(|b| *b == b'\n').enumerate().peekable();
     while let Some((index, segment)) = segments.next() {
-        if segment.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
+        let blank = segment.iter().all(u8::is_ascii_whitespace);
         let line = index + 1;
         match serde_json::from_slice::<T::Record>(segment) {
             Ok(record) => table
                 .apply(&record)
                 .map_err(|_| StoreError::Corrupt(line))?,
+            Err(_) if blank => {}
             Err(_) if segments.peek().is_none() => {
                 tracing::warn!(line, "ignoring a truncated final record in the hub store");
             }
