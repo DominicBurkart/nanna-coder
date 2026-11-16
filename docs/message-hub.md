@@ -694,6 +694,12 @@ A rule `Block` is final: `RulesOutcome::combine(model_verdict)` returns it uncha
   - (d) coordinates evasion of audits, gates or humans;
   - (e) misrepresents work state.
 - **Output.** Strict JSON `{"verdict":"deliver|block|quarantine","reasons":[{code,detail}]}`. Unparsable output is treated as `Quarantine`.
+  - The whole trimmed reply must be one JSON object (no prose, no code fence, unknown fields denied, at most 16 raw reasons, at most 16 KiB). Any other reply, a `deliver` with reasons, or a `block`/`quarantine` without reasons is a `Quarantine` with a fixed `Other` reason.
+  - The model may use only `SecretLeak`, `CrossScopeSteering`, `PromptInjection`, `ScopeCreep` and `Other`; any other known code is mapped to `Other`, an unknown code string is a schema violation. Reasons are de-duplicated by code.
+  - The model's `detail` text is never carried into a verdict. Each model reason gets a fixed detail for its code, so a model that quotes the message cannot put message text into the audit log, telemetry or escalation evidence. Error strings from the provider are replaced by fixed text for the same reason.
+  - Prompt sections are fixed host fences (`<<<SENDER_SCOPE`, `<<<RECIPIENT_SCOPE`, `<<<THREAD`, `<<<MESSAGE`); agent-authored text inside them goes through `fenced_untrusted_as` (`AgentText` for scopes and the tool name, `AgentMessage` for subject, body and thread), which escapes `<`, `>` and brackets, so no text can forge any fence. The thread shows the last 3 messages; at most 20 recipients are listed.
+  - Inbound, for a pair that is not privilege-asymmetric, the outbound verdict is reused only when `InboundReview.outbound` carries a `BoundVerdict` whose `message_content_hash(subject, body)` matches the stored message. A missing or mismatching binding is a `Quarantine` and the model is not called. The asymmetry test is an exact-string subset on tool patterns, so it can over-trigger but never under-trigger. The hash is the 64-bit non-cryptographic `content_hash` over a length-prefixed subject and body: it detects a changed stored message, it is not an integrity proof against a collision search.
+  - The identifier oracle is fixed per auditor at construction (`with_oracle`); a hub that needs a per-recipient oracle builds one auditor per recipient workspace.
 
 ### 8.5 Required default model (the auditor is always present)
 
@@ -784,6 +790,12 @@ impl ActionAuditor for RoutingActionAuditor {
 // auditor/verdict.rs: ReasonCode gains SecretLeak and CrossScopeSteering.
 // ReasonCode::ALL grows to 12; the auditor_heldout manifest/digests in
 // harness/tests/auditor_heldout_cases.rs are regenerated in the same commit.
+
+// Deviations (implemented in harness/src/action_auditor/message_auditor.rs, message_model.rs, message_fail_closed.rs):
+// `StoredMessage` does not exist yet, so `window`, `thread` and `InboundReview.message` use the view `ThreadMessage { from, from_identity, subject, body }`
+// (Debug prints lengths and hash only); `InboundReview` gains `outbound: Option<&BoundVerdict>` (`BoundVerdict { verdict, content_hash }`, standing in for `VerdictRef`);
+// `FailClosedMessageAuditor` also holds a `RuleMessageAuditor` and an oracle for the rules re-run: a rules `Block` stays `Block`, a rules `Quarantine` stays `Quarantine`,
+// a clean message becomes `Quarantine`, each with a fixed `ModelFailure` reason appended. The code lives under `action_auditor/`, next to the rules layer.
 ```
 
 Change to `tools.rs`: `inspects_content(name)` also returns true for `msg_send`, `session_set_note` and `sessions_query`. That makes the gate review them at `EffectClass::None`. It stays a fixed list, pinned by a test.
