@@ -200,8 +200,15 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default()
         limits: PiLimits,
         executor: Arc<dyn PiExecutor>,
     ) -> Result<Self, PiRouteError> {
-        let image = image.into();
-        let broker_dir = broker_dir.into();
+        Self::checked(image.into(), broker_dir.into(), limits, executor)
+    }
+
+    fn checked(
+        image: String,
+        broker_dir: PathBuf,
+        limits: PiLimits,
+        executor: Arc<dyn PiExecutor>,
+    ) -> Result<Self, PiRouteError> {
         if !digest_pinned(&image) {
             return Err(PiRouteError::Image { image });
         }
@@ -211,9 +218,13 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default()
             });
         }
         let endpoint = default_endpoint();
-        #[rustfmt::skip]
-        let route = Self { image, broker_dir, endpoint, limits, executor };
-        Ok(route)
+        Ok(Self {
+            image,
+            broker_dir,
+            endpoint,
+            limits,
+            executor,
+        })
     }
 
     pub fn from_lookup(

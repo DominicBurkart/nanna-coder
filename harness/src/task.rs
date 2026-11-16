@@ -519,9 +519,11 @@ pub(crate) enum BoundIdentity {
 }
 
 impl BoundIdentity {
-    #[rustfmt::skip]
     fn audited(&self) -> Option<&AuditedIdentity> {
-        match self { BoundIdentity::Audited(audited) => Some(audited), BoundIdentity::Unaudited(_) => None }
+        match self {
+            BoundIdentity::Audited(audited) => Some(audited),
+            BoundIdentity::Unaudited(_) => None,
+        }
     }
 
     pub(crate) fn identity(&self) -> &AgentIdentity {
@@ -572,9 +574,20 @@ fn require_pi_audited<'a>(
     named.then_some((audited, audited_ref)).ok_or(refusal)
 }
 
-#[rustfmt::skip]
 fn scope_refusal(repo: &str, checkout: &Path) -> PiRouteRefused {
-    PiRouteRefused::ScopeError(format!("the audited repository {repo} is not the checkout {}", checkout.display()))
+    let path = checkout.display();
+    let message = format!("the audited repository {repo} is not the checkout {path}");
+    PiRouteRefused::ScopeError(message)
+}
+
+fn pi_bind_error(e: crate::harness_adapter::BindError) -> (&'static str, String) {
+    use crate::harness_adapter::BindError;
+    let label = match &e {
+        BindError::Unaudited => "IdentityUnavailable",
+        BindError::RepoMismatch { .. } | BindError::Scope(_) => "ScopeError",
+        _ => "StateError",
+    };
+    (label, e.to_string())
 }
 
 fn pi_bind_failed<E: std::fmt::Display>(
@@ -2008,7 +2021,7 @@ impl TaskRunner {
                     .and_then(|agent| {
                         agent
                             .bind_workspace(audited_ref, audited.repo(), &workspace, layers)
-                            .map_err(pi_bind_failed("StateError"))
+                            .map_err(pi_bind_error)
                             .map(|bound| Prepared::Pi(route, Box::new((agent, bound))))
                     })
             }
@@ -8955,9 +8968,19 @@ mod pi_route_tests {
             .unwrap()
     }
 
-    #[rustfmt::skip]
     fn failed(status: &TaskStatus) -> (&str, &str) {
-        match status { TaskStatus::Failed { error, diagnostics, .. } => (diagnostics.error_type.as_str(), error.as_str()), other => panic!("expected a failed task, got {other:?}") }
+        match status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (diagnostics.error_type.as_str(), error.as_str()),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a failed task")]
+    fn test_the_failed_helper_rejects_a_task_that_did_not_fail() {
+        failed(&TaskStatus::Pending);
     }
 
     fn worktrees(repo: &Path) -> usize {
@@ -9282,6 +9305,49 @@ mod pi_route_tests {
         let scope = PiRouteRefused::ScopeError("elsewhere".to_string());
         assert_eq!(scope.error_type(), "ScopeError");
         assert!(scope.to_string().contains("elsewhere"));
+    }
+
+    #[test]
+    fn test_every_bind_failure_keeps_a_failing_label_and_its_message() {
+        use crate::harness_adapter::BindError;
+        let scope = crate::scope::ScopeError::InvalidGlob {
+            identity: "i".to_string(),
+            field: "scope.paths",
+            pattern: "[".to_string(),
+            reason: "r".to_string(),
+        };
+        let cases = [
+            (BindError::Unaudited, "IdentityUnavailable"),
+            (
+                BindError::RepoMismatch {
+                    audited: "a".to_string(),
+                    target: "b".to_string(),
+                },
+                "ScopeError",
+            ),
+            (BindError::Scope(scope), "ScopeError"),
+            (BindError::AgentMismatch, "StateError"),
+            (BindError::LayersMismatch { field: "task id" }, "StateError"),
+            (
+                BindError::CapabilityMismatch {
+                    tool: "t".to_string(),
+                },
+                "StateError",
+            ),
+        ];
+        for (error, label) in cases {
+            let message = error.to_string();
+            assert_eq!(pi_bind_error(error), (label, message));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_bound_identity_exposes_its_audited_form_only_when_audited() {
+        let allowed = allowed_for(LABEL).await;
+        let identity = allowed.identity().clone();
+        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed, &|_| None).1);
+        assert_eq!(audited.audited().map(AuditedIdentity::repo), Some(LABEL));
+        assert!(BoundIdentity::Unaudited(identity).audited().is_none());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod default_model;
 pub mod judge;
 pub mod ollama;
 pub mod provider;

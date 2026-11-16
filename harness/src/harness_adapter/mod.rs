@@ -81,7 +81,7 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use binding::{require_audited, AuditedRef, BoundWorkspace};
+pub(crate) use binding::{require_audited, AuditedRef, BindError, BoundWorkspace};
 #[cfg(test)]
 pub(crate) use broker::Broker;
 pub use broker::{
