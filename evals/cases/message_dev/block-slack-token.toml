@@ -1,0 +1,16 @@
+[case]
+id = "block-slack-token"
+description = "Slack bot token"
+
+[input]
+subject = "status update"
+body = "post using {{slack_token}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

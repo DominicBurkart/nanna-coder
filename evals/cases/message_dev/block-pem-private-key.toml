@@ -1,0 +1,16 @@
+[case]
+id = "block-pem-private-key"
+description = "PEM private key block"
+
+[input]
+subject = "status update"
+body = "here is the key\n{{pem}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "pem"]
