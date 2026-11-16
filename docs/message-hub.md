@@ -202,13 +202,19 @@ impl Summary {
     /// "{identity} [{status}] {text}", where text = note, else the first line of subtask.
     /// Pipeline: strip_unprintable → redact_resilient → collapse whitespace
     /// → truncate to MAX_CHARS *chars* (ending in '…' when cut).
-    pub fn compose(identity: &str, status: SessionStatus, text: &str) -> Summary;
+    /// `status_label` is the rendered status name; the hub's `SessionStatus` is not a dependency
+    /// of this type, so callers pass its label.
+    pub fn compose(identity: &str, status_label: &str, text: &str) -> Summary;
     pub fn as_str(&self) -> &str;
 }
+
+impl TryFrom<String> for Summary { type Error = SummaryError; /* TooLong | Unprintable | Unredacted | NotCollapsed */ }
 ```
 
 `Summary` invariants:
-- **Kani + proptest:** `chars().count() < 180` for all inputs.
+- **Kani + proptest:** `chars().count() < 180` for all inputs. Status: the Kani harness (`cut_plan_output_is_within_the_limit_and_never_over_slices`) has never been executed (`cargo-kani` is not installed on the build hosts) and is not verified in CI; the proptests are the only evidence.
+- **Valid by construction:** a cut never lands inside a redaction marker (candidates that `redact` would change are shortened further), and `compose` ends with a full validity check that falls back to the constant `[summary withheld]`, so `redact(s) == s` and every other invariant hold for every `Summary`.
+- **Deserialization re-validates:** `#[serde(try_from = "String")]` accepts a string only if it is at most 179 characters, has no unprintable or bidi characters, is unchanged by `redact`, and is whitespace-collapsed; otherwise it fails with the matching `SummaryError`.
 - **Untrusted fields are audited before peers see them (T13).** `subtask`, `note`, `result_summary` and `touched_paths` are agent- or planner-authored, and peers read them via `session_describe`, list summaries and the librarian. `register`, `finish`, `set_note` and `record_touched` run `RuleMessageAuditor::review_field` on each value before storing it. On a hit, the field is stored as `Withheld { reason }` (shown to peers as `"[withheld: secret_leak]"`) and the session itself is not blocked. `note` is also covered by the full outbound gate (it is a reviewed tool).
 - **Proptest:** the output never contains a string that `redact` would change, and never contains unprintable or bidi characters.
 
@@ -775,6 +781,8 @@ Generalized fence (`pr_tools.rs`, behaviour-preserving):
 pub(crate) enum FenceLabel { GithubText, AgentMessage, AgentText }
 pub(crate) fn fenced_untrusted_as(label: FenceLabel, text: &str, cap: usize, budget: &mut Budget) -> String;
 pub(crate) fn fenced_untrusted(text: &str, cap: usize, budget: &mut Budget) -> String { fenced_untrusted_as(FenceLabel::GithubText, text, cap, budget) }
+pub(crate) fn untrusted_notice_as(label: FenceLabel) -> String; // untrusted_notice() == untrusted_notice_as(GithubText), byte for byte
+// markers: <<<UNTRUSTED_GITHUB_TEXT, <<<UNTRUSTED_AGENT_MESSAGE, <<<UNTRUSTED_AGENT_TEXT (each closed by NAME>>>)
 ```
 
 ---
