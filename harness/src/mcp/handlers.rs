@@ -347,6 +347,7 @@ mod tests {
             not_before: None,
             identity_hint: None,
             origin: None,
+            lineage: None,
         }
     }
 
