@@ -477,3 +477,15 @@ fn oracle_cases_deliver_only_because_the_oracle_vouches() {
         );
     }
 }
+
+#[test]
+#[should_panic(expected = "unknown generator")]
+fn a_fixture_naming_an_unknown_generator_fails_loudly() {
+    expand("typo-case", "token {{github_tokn}}");
+}
+
+#[test]
+#[should_panic(expected = "unknown function")]
+fn a_fixture_naming_an_unknown_function_fails_loudly() {
+    expand("typo-case", "token {{b65:github_token}}");
+}
