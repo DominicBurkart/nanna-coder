@@ -1173,6 +1173,26 @@ mod tests {
     }
 
     #[test]
+    fn rule_4_scan_survives_multibyte_text_right_after_the_header() {
+        let tail = "é".repeat(20);
+        assert!(!r_ok(&format!("---BEGINx{tail}")).verdict.is_block());
+        let found = r_ok(&format!("---BEGIN PRIVATE KEY{tail}"));
+        assert_block(&found, ReasonCode::SecretLeak, "rule 4");
+        assert!(r_ok(&format!("---BEGINx{tail} PRIVATE KEY"))
+            .verdict
+            .is_deliver());
+    }
+
+    #[test]
+    fn the_default_auditor_is_the_new_auditor() {
+        assert_eq!(RuleMessageAuditor::default(), RuleMessageAuditor::new());
+        assert_eq!(
+            RuleMessageAuditor::default().thresholds(),
+            EntropyThresholds::default()
+        );
+    }
+
+    #[test]
     fn rule_4_ignores_certificates_and_prose() {
         assert!(r_ok("-----BEGIN CERTIFICATE-----").verdict.is_deliver());
         assert!(r_ok("we begin by rotating the private key tomorrow")
