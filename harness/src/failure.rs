@@ -59,6 +59,7 @@ impl FailureKind {
             "TaskCheckFailed" => FailureKind::TaskCheckFailed,
             "ProtectedPathViolation" => FailureKind::ProtectedPathViolation,
             "ScopeError" => FailureKind::ScopeError,
+            "LineageInconsistent" => FailureKind::SpawnRefused,
             "IdentityUnavailable" => FailureKind::IdentityUnavailable,
             "NoProvider" => FailureKind::ModelUnavailable,
             "ContainerSetupFailed" | "SidecarSetupFailed" => FailureKind::ContainerSetupFailed,
@@ -90,6 +91,7 @@ mod tests {
             FailureKind::ProtectedPathViolation,
         ),
         ("ScopeError", FailureKind::ScopeError),
+        ("LineageInconsistent", FailureKind::SpawnRefused),
         ("IdentityUnavailable", FailureKind::IdentityUnavailable),
         ("NoProvider", FailureKind::ModelUnavailable),
         ("ContainerSetupFailed", FailureKind::ContainerSetupFailed),
@@ -159,7 +161,6 @@ mod tests {
             .filter(|kind| !reachable.contains(kind))
             .collect();
         let expected: HashSet<FailureKind> = [
-            FailureKind::SpawnRefused,
             FailureKind::InvalidRequest,
             FailureKind::Cancelled,
             FailureKind::Unclassified,
