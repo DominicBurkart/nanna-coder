@@ -6,6 +6,7 @@ description = "crlf multi line"
 subject = "status update"
 body = "line one\r\nline two\r\n\tindented three"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

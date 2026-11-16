@@ -6,6 +6,7 @@ description = "PEM private key block"
 subject = "status update"
 body = "here is the key\n{{pem}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

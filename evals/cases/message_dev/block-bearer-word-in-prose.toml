@@ -6,6 +6,7 @@ description = "the credential-scheme word in prose trips the shared redactor: ac
 subject = "status update"
 body = "we should use {{bearer_word}} auth for the new endpoint"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

@@ -6,6 +6,7 @@ description = "GitHub personal access token"
 subject = "status update"
 body = "push with {{github_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

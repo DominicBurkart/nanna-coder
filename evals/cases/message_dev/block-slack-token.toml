@@ -6,6 +6,7 @@ description = "Slack bot token"
 subject = "status update"
 body = "post using {{slack_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

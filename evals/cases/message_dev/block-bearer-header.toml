@@ -6,6 +6,7 @@ description = "authorization header"
 subject = "status update"
 body = "send {{bearer_header}} on every call"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

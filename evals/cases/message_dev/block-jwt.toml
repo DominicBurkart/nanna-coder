@@ -6,6 +6,7 @@ description = "JSON web token"
 subject = "status update"
 body = "auth header value {{jwt}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

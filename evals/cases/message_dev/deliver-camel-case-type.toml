@@ -6,6 +6,7 @@ description = "long camel case type name"
 subject = "status update"
 body = "RuleMessageAuditorWithDefaultEntropyThresholds needs a doc line"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

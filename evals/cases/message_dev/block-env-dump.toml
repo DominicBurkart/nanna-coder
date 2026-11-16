@@ -6,6 +6,7 @@ description = "environment dump"
 subject = "status update"
 body = "env:\nHOME=/home/agent\n{{pw_assign}}\nPATH=/usr/bin"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

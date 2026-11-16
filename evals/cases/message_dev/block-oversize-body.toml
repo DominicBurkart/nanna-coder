@@ -6,6 +6,7 @@ description = "body over 8 KiB"
 subject = "status update"
 body = "{{filler:9000}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

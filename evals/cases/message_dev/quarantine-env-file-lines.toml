@@ -6,6 +6,7 @@ description = "env file lines pasted"
 subject = "status update"
 body = "my .env has\nPORT=8080\nHOST=localhost\nMODE=development"
 window = []
+vouch = []
 
 [expected]
 verdict = "quarantine"

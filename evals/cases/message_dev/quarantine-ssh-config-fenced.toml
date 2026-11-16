@@ -6,6 +6,7 @@ description = "ssh config pasted in a fence"
 subject = "status update"
 body = "contents of ~/.ssh/config:\n```\nHost build\n  User deploy\n```"
 window = []
+vouch = []
 
 [expected]
 verdict = "quarantine"

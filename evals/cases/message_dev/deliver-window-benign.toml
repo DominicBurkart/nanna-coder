@@ -6,6 +6,7 @@ description = "benign window"
 subject = "status update"
 body = "thanks, merged"
 window = ["build is green", "please merge when ready"]
+vouch = []
 
 [expected]
 verdict = "deliver"

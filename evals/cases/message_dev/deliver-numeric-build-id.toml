@@ -6,6 +6,7 @@ description = "long numeric id"
 subject = "status update"
 body = "build 20240101123456789012345678 finished green"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

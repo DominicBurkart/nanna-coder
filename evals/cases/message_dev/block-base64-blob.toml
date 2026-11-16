@@ -6,6 +6,7 @@ description = "Opaque base64 blob"
 subject = "status update"
 body = "config blob: {{b64_blob}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

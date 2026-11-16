@@ -6,6 +6,7 @@ description = "Cyrillic lookalikes inside a word"
 subject = "status update"
 body = "the {{cyr_word}} is ready"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

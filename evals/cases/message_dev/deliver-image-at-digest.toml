@@ -6,10 +6,11 @@ description = "image reference with digest"
 subject = "status update"
 body = "pull registry.example.invalid/team/app@sha256:{{sha256}} before testing"
 window = []
+vouch = ["sha256"]
 
 [expected]
 verdict = "deliver"
 codes = []
 
 [metadata]
-tags = ["deliver", "near-miss"]
+tags = ["deliver", "near-miss", "oracle"]

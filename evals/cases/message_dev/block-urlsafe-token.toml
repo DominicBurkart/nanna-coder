@@ -6,6 +6,7 @@ description = "URL-safe base64 token"
 subject = "status update"
 body = "reset link token {{urlsafe_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

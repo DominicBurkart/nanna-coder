@@ -7,7 +7,7 @@
 //! 2. unprintable, bidi, zero-width and mixed-script characters;
 //! 3. `redact_resilient(strip_unprintable(text)) != strip_unprintable(text)`;
 //! 4. PEM private key blocks and ssh key prefixes;
-//! 5. entropy of base64, hex and urlsafe tokens, with an allowlist;
+//! 5. entropy of base64, hex and urlsafe tokens, with an oracle-vouched exemption for exact identifiers;
 //! 6. base64 and hex runs of 32 or more characters, decoded once and rescanned;
 //! 7. the injection heuristics of [`RuleAuditor::injection_findings`];
 //! 8. the sliding window of the sender's recent outbound text to the same
@@ -36,35 +36,6 @@ const CONTENT_TOKEN_LEN: usize = 16;
 const CONTENT_TOKEN_BITS: f64 = 3.5;
 const CONTENT_ASSIGNMENT_LINES: usize = 3;
 const MIN_MIXED_SCRIPT_CHARS: usize = 3;
-
-const GIT_SHA_CONTEXT: &[&str] = &[
-    "commit",
-    "commits",
-    "sha",
-    "sha1",
-    "rev",
-    "revision",
-    "hash",
-    "head",
-    "merge",
-    "merged",
-    "cherry-pick",
-    "cherry-picked",
-    "revert",
-    "reverts",
-    "reverted",
-    "bisect",
-    "tree",
-    "blob",
-];
-
-const DIGEST_PREFIXES: &[(&str, usize)] = &[
-    ("sha1:", 40),
-    ("sha224:", 56),
-    ("sha256:", 64),
-    ("sha384:", 96),
-    ("sha512:", 128),
-];
 
 const INVISIBLE: &[char] = &[
     '\u{00ad}', '\u{061c}', '\u{180e}', '\u{200b}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}',
@@ -300,6 +271,48 @@ impl EntropyThresholds {
     }
 }
 
+/// Answers whether a token is a real identifier, from data the sender cannot
+/// influence. The rules layer never exempts a token because of the words
+/// around it: a 40-hex string after `commit`, a 64-hex string after `sha256:`
+/// and a UUID are all credential shapes, so they are blocked unless an oracle
+/// vouches for that exact token. Real oracles live where the data lives
+/// (`git cat-file -e` in the sender's workspace; the hub's own session and
+/// message ids); this module ships only the trait and [`NullOracle`].
+///
+/// ```
+/// use harness::action_auditor::{IdentifierOracle, NullOracle};
+///
+/// assert!(!NullOracle.is_known_git_object("0123456789abcdef0123456789abcdef01234567"));
+/// assert!(!NullOracle.is_known_hub_id("123e4567-e89b-42d3-a456-426614174000"));
+/// ```
+pub trait IdentifierOracle {
+    /// Whether `hex` (an all-hex token as written) names an object that exists.
+    fn is_known_git_object(&self, hex: &str) -> bool;
+    /// Whether `id` (a UUID-shaped token as written) is an id the hub issued.
+    fn is_known_hub_id(&self, id: &str) -> bool;
+}
+
+/// The default oracle: vouches for nothing.
+///
+/// ```
+/// use harness::action_auditor::{NullOracle, RuleMessageAuditor};
+///
+/// let uuid = "123e4567-e89b-42d3-a456-426614174000";
+/// let out = RuleMessageAuditor::new().review_with("s", uuid, &[], &NullOracle);
+/// assert!(out.verdict.is_block());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NullOracle;
+
+impl IdentifierOracle for NullOracle {
+    fn is_known_git_object(&self, _hex: &str) -> bool {
+        false
+    }
+    fn is_known_hub_id(&self, _id: &str) -> bool {
+        false
+    }
+}
+
 /// The deterministic first layer of the message audit.
 ///
 /// ```
@@ -392,6 +405,34 @@ impl RuleMessageAuditor {
     /// assert!(rules.review("s", note, &[]).verdict.is_quarantine());
     /// ```
     pub fn review(&self, subject: &str, body: &str, window: &[&str]) -> RulesOutcome {
+        self.review_with(subject, body, window, &NullOracle)
+    }
+
+    /// [`review`](Self::review) with an [`IdentifierOracle`] that may vouch
+    /// for exact tokens the sender cannot forge (a real git object, a hub id).
+    /// Nothing the message says can exempt a token; only the oracle can.
+    ///
+    /// ```
+    /// use harness::action_auditor::{IdentifierOracle, RuleMessageAuditor};
+    ///
+    /// struct Known(String);
+    /// impl IdentifierOracle for Known {
+    ///     fn is_known_git_object(&self, hex: &str) -> bool { hex == self.0 }
+    ///     fn is_known_hub_id(&self, _id: &str) -> bool { false }
+    /// }
+    /// let sha = "0123456789abcdef".repeat(2) + "01234567";
+    /// let rules = RuleMessageAuditor::new();
+    /// let text = format!("fixed in commit {sha}");
+    /// assert!(rules.review("s", &text, &[]).verdict.is_block());
+    /// assert!(rules.review_with("s", &text, &[], &Known(sha)).verdict.is_deliver());
+    /// ```
+    pub fn review_with(
+        &self,
+        subject: &str,
+        body: &str,
+        window: &[&str],
+        oracle: &dyn IdentifierOracle,
+    ) -> RulesOutcome {
         let shape = shape_findings(subject, body);
         if !shape.is_empty() {
             return RulesOutcome {
@@ -400,12 +441,12 @@ impl RuleMessageAuditor {
             };
         }
         let mut blocks = Vec::new();
-        self.scan_text(subject, "subject", &mut blocks);
-        self.scan_text(body, "body", &mut blocks);
+        self.scan_text(subject, "subject", oracle, &mut blocks);
+        self.scan_text(body, "body", oracle, &mut blocks);
         if window.iter().any(|w| !w.is_empty()) {
             let joined = format!("{}{}", window_tail(window), body);
             let mut found = Vec::new();
-            self.secret_findings(&joined, "window", true, &mut found);
+            self.secret_findings(&joined, "window", true, oracle, &mut found);
             blocks.extend(found);
         }
         dedupe(&mut blocks);
@@ -422,7 +463,7 @@ impl RuleMessageAuditor {
                 signals: Vec::new(),
             };
         }
-        if looks_like_content(body) || looks_like_content(subject) {
+        if looks_like_content(body, oracle) || looks_like_content(subject, oracle) {
             return RulesOutcome {
                 verdict: MessageVerdict::Quarantine {
                     reasons: vec![Reason::new(
@@ -459,11 +500,25 @@ impl RuleMessageAuditor {
     /// assert!(rules.review_field(&"x".repeat(9000)).is_some());
     /// ```
     pub fn review_field(&self, text: &str) -> Option<Reason> {
+        self.review_field_with(text, &NullOracle)
+    }
+
+    /// [`review_field`](Self::review_field) with an [`IdentifierOracle`].
+    ///
+    /// ```
+    /// use harness::action_auditor::{NullOracle, RuleMessageAuditor};
+    ///
+    /// assert!(RuleMessageAuditor::new().review_field_with("fine", &NullOracle).is_none());
+    /// ```
+    pub fn review_field_with(&self, text: &str, oracle: &dyn IdentifierOracle) -> Option<Reason> {
         let mut found = shape_findings_field(text);
         if found.is_empty() {
-            self.scan_text(text, "field", &mut found);
+            self.scan_text(text, "field", oracle, &mut found);
         }
-        if found.is_empty() && !credential_paths(text).is_empty() && looks_like_content(text) {
+        if found.is_empty()
+            && !credential_paths(text).is_empty()
+            && looks_like_content(text, oracle)
+        {
             found.push(Reason::new(
                 ReasonCode::SecretLeak,
                 "rule 9: credential path mentioned together with file-content-like text",
@@ -472,9 +527,15 @@ impl RuleMessageAuditor {
         found.into_iter().next()
     }
 
-    fn scan_text(&self, text: &str, place: &str, out: &mut Vec<Reason>) {
+    fn scan_text(
+        &self,
+        text: &str,
+        place: &str,
+        oracle: &dyn IdentifierOracle,
+        out: &mut Vec<Reason>,
+    ) {
         char_findings(text, place, out);
-        self.secret_findings(text, place, true, out);
+        self.secret_findings(text, place, true, oracle, out);
         for finding in RuleAuditor::injection_findings(text) {
             let label = finding
                 .detail
@@ -487,7 +548,14 @@ impl RuleMessageAuditor {
         }
     }
 
-    fn secret_findings(&self, text: &str, place: &str, decode: bool, out: &mut Vec<Reason>) {
+    fn secret_findings(
+        &self,
+        text: &str,
+        place: &str,
+        decode: bool,
+        oracle: &dyn IdentifierOracle,
+        out: &mut Vec<Reason>,
+    ) {
         let cleaned = strip_unprintable(text);
         if redact_resilient(&cleaned) != cleaned {
             out.push(secret(format!(
@@ -501,14 +569,17 @@ impl RuleMessageAuditor {
         }
         let ascii: String = cleaned.chars().filter(char::is_ascii).collect();
         let views: [&str; 2] = [&cleaned, &ascii];
-        if views.iter().any(|view| self.has_high_entropy_token(view)) {
+        if views
+            .iter()
+            .any(|view| self.has_high_entropy_token(view, oracle))
+        {
             out.push(secret(format!("rule 5: high-entropy token in {place}")));
         }
         if decode {
             for view in views {
-                for decoded in decoded_runs(view) {
+                for decoded in decoded_runs(view, oracle) {
                     let mut inner = Vec::new();
-                    self.secret_findings(&decoded, place, false, &mut inner);
+                    self.secret_findings(&decoded, place, false, oracle, &mut inner);
                     if !inner.is_empty() {
                         out.push(secret(format!(
                             "rule 6: encoded run in {place} decodes to a secret"
@@ -525,7 +596,7 @@ impl RuleMessageAuditor {
         }
     }
 
-    fn has_high_entropy_token(&self, text: &str) -> bool {
+    fn has_high_entropy_token(&self, text: &str, oracle: &dyn IdentifierOracle) -> bool {
         let min_len = self.thresholds.min_len;
         token_runs(text).into_iter().any(|(start, end)| {
             let token = &text[start..end];
@@ -537,13 +608,13 @@ impl RuleMessageAuditor {
             let segments: Vec<(usize, usize)> = anchored.collect();
             let remaining: Vec<&str> = segments
                 .iter()
-                .filter(|(s, e)| !(e > s && is_allowlisted(text, *s, *e)))
+                .filter(|(s, e)| !(e > s && is_allowlisted(text, *s, *e, oracle)))
                 .map(|(s, e)| &text[*s..*e])
                 .collect();
             self.token_is_secret(&remaining.join("/"))
                 || segments.iter().any(|(s, e)| {
                     *e - *s >= min_len
-                        && !is_allowlisted(text, *s, *e)
+                        && !is_allowlisted(text, *s, *e, oracle)
                         && self.token_is_secret(&text[*s..*e])
                 })
         })
@@ -558,6 +629,10 @@ impl RuleMessageAuditor {
     }
 
     fn is_secret_shaped(&self, token: &str) -> bool {
+        if is_uuid(token) {
+            let hex: Vec<u8> = token.bytes().filter(|b| *b != b'-').collect();
+            return shannon_bits(&hex) >= self.thresholds.hex_bits;
+        }
         let bits = shannon_bits(token.as_bytes());
         if token.bytes().all(|b| b.is_ascii_hexdigit()) {
             bits >= self.thresholds.hex_bits
@@ -764,45 +839,19 @@ fn is_uuid(token: &str) -> bool {
             .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn preceding(text: &str, start: usize, chars: usize) -> String {
-    let mut before: Vec<char> = text[..start].chars().rev().take(chars).collect();
-    before.reverse();
-    before.into_iter().collect::<String>().to_ascii_lowercase()
-}
-
-fn is_allowlisted(text: &str, start: usize, end: usize) -> bool {
+fn is_allowlisted(text: &str, start: usize, end: usize, oracle: &dyn IdentifierOracle) -> bool {
     let token = &text[start..end];
     if is_uuid(token) {
-        return true;
+        return oracle.is_known_hub_id(token);
     }
-    if !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return false;
-    }
-    let before = preceding(text, start, 32);
-    if DIGEST_PREFIXES
-        .iter()
-        .any(|(prefix, len)| token.len() == *len && before.ends_with(prefix))
-    {
-        return true;
-    }
-    if token.len() == 40 {
-        let trimmed = before.trim_end_matches(|c: char| !c.is_alphanumeric());
-        return GIT_SHA_CONTEXT.iter().any(|word| {
-            trimmed.ends_with(word)
-                && trimmed[..trimmed.len() - word.len()]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|c| !c.is_alphanumeric())
-        });
-    }
-    false
+    token.bytes().all(|b| b.is_ascii_hexdigit()) && oracle.is_known_git_object(token)
 }
 
-fn decoded_runs(text: &str) -> Vec<String> {
+fn decoded_runs(text: &str, oracle: &dyn IdentifierOracle) -> Vec<String> {
     let mut out = Vec::new();
     for (start, end) in token_runs(text) {
         let token = &text[start..end];
-        if token.len() < MIN_DECODE_LEN || is_allowlisted(text, start, end) {
+        if token.len() < MIN_DECODE_LEN || is_allowlisted(text, start, end, oracle) {
             continue;
         }
         if token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -914,7 +963,7 @@ fn credential_paths(text: &str) -> Vec<&'static str> {
         .collect()
 }
 
-fn looks_like_content(text: &str) -> bool {
+fn looks_like_content(text: &str, oracle: &dyn IdentifierOracle) -> bool {
     if text.contains("```") {
         return true;
     }
@@ -939,7 +988,7 @@ fn looks_like_content(text: &str) -> bool {
     }
     token_runs(text).into_iter().any(|(s, e)| {
         let token = &text[s..e];
-        !is_allowlisted(text, s, e)
+        !is_allowlisted(text, s, e, oracle)
             && token.len() >= CONTENT_TOKEN_LEN
             && token.bytes().any(|b| b.is_ascii_digit())
             && shannon_bits(token.as_bytes()) >= CONTENT_TOKEN_BITS
@@ -1218,54 +1267,111 @@ mod tests {
             .is_deliver());
     }
 
-    #[test]
-    fn rule_5_allows_git_shas_uuids_and_digests() {
-        let sha = hex_token(40);
-        let digest = format!("{}{}", hex_token(32), hex_token(32));
-        let uuid = "123e4567-e89b-42d3-a456-426614174000";
-        assert!(r_ok(&format!("reverted commit {sha} on main"))
-            .verdict
-            .is_deliver());
-        assert!(r_ok(&format!("see /commit/{sha}")).verdict.is_deliver());
-        assert!(r_ok(&format!("pinned at sha256:{digest}"))
-            .verdict
-            .is_deliver());
-        assert!(r_ok(&format!("image@sha256:{digest}")).verdict.is_deliver());
-        assert!(r_ok(&format!("request {uuid} failed")).verdict.is_deliver());
-        assert!(r_ok(&format!("request {} failed", uuid.to_uppercase()))
-            .verdict
-            .is_deliver());
+    struct Vouch(Vec<String>);
+
+    impl IdentifierOracle for Vouch {
+        fn is_known_git_object(&self, hex: &str) -> bool {
+            self.0.iter().any(|known| known == hex)
+        }
+        fn is_known_hub_id(&self, id: &str) -> bool {
+            self.0.iter().any(|known| known == id)
+        }
+    }
+
+    fn probes(token: &str, kind: usize) -> String {
+        match kind {
+            0 => format!("head {token}"),
+            1 => format!("hash: {token}"),
+            2 => format!("merge {token}"),
+            3 => format!("the key is sha256:{token}"),
+            4 => format!("token {token}"),
+            5 => format!("reverted commit {token} on main"),
+            _ => format!("see /commit/{token}"),
+        }
     }
 
     #[test]
-    fn rule_5_allowlist_needs_its_context() {
+    fn a_context_word_never_exempts_a_token_with_the_null_oracle() {
         let sha = hex_token(40);
         let digest = format!("{}{}", hex_token(32), hex_token(32));
+        let uuid = "123e4567-e89b-42d3-a456-426614174000";
+        for (token, kinds) in [
+            (sha.as_str(), vec![0, 1, 2, 5, 6]),
+            (digest.as_str(), vec![3, 1]),
+            (uuid, vec![4, 1]),
+        ] {
+            for kind in kinds {
+                let text = probes(token, kind);
+                assert_block(&r_ok(&text), ReasonCode::SecretLeak, "rule 5");
+                let explicit = rules().review_with("s", &text, &[], &NullOracle);
+                assert_block(&explicit, ReasonCode::SecretLeak, "rule 5");
+            }
+        }
         assert_block(
-            &r_ok(&format!("the value {sha}")),
+            &r_ok(&uuid.to_uppercase()),
             ReasonCode::SecretLeak,
             "rule 5",
         );
-        assert_block(
-            &r_ok(&format!("{sha} ok")),
-            ReasonCode::SecretLeak,
-            "rule 5",
-        );
-        assert_block(
-            &r_ok(&format!("digest {digest}")),
-            ReasonCode::SecretLeak,
-            "rule 5",
-        );
-        assert_block(
-            &r_ok(&format!("sha256:{sha}")),
-            ReasonCode::SecretLeak,
-            "rule 5",
-        );
-        assert_block(
-            &r_ok(&format!("xcommit {sha}")),
-            ReasonCode::SecretLeak,
-            "rule 5",
-        );
+    }
+
+    #[test]
+    fn an_oracle_vouches_only_for_the_exact_token() {
+        let sha = hex_token(40);
+        let other = format!("{}0", &sha[..39]);
+        let digest = format!("{}{}", hex_token(32), hex_token(32));
+        let uuid = "123e4567-e89b-42d3-a456-426614174000";
+        let oracle = Vouch(vec![sha.clone(), digest.clone(), uuid.to_string()]);
+        for (token, kinds) in [
+            (sha.as_str(), vec![0, 1, 2, 5, 6]),
+            (digest.as_str(), vec![3]),
+            (uuid, vec![4]),
+        ] {
+            for kind in kinds {
+                let text = probes(token, kind);
+                let out = rules().review_with("s", &text, &[], &oracle);
+                assert!(out.verdict.is_deliver(), "{text}: {out:?}");
+            }
+        }
+        let text = probes(&other, 5);
+        let out = rules().review_with("s", &text, &[], &oracle);
+        assert_block(&out, ReasonCode::SecretLeak, "rule 5");
+        let both = format!("{} then {}", probes(&sha, 0), probes(&other, 1));
+        let out = rules().review_with("s", &both, &[], &oracle);
+        assert!(out.verdict.is_block());
+    }
+
+    #[test]
+    fn an_oracle_does_not_exempt_a_secret_placed_beside_a_vouched_token() {
+        let sha = hex_token(40);
+        let oracle = Vouch(vec![sha.clone()]);
+        let text = format!("commit {sha}/{}", secret_token(40));
+        let out = rules().review_with("s", &text, &[], &oracle);
+        assert!(out.verdict.is_block(), "{out:?}");
+    }
+
+    #[test]
+    fn a_review_field_oracle_vouches_the_same_way() {
+        let sha = hex_token(40);
+        let text = format!("commit {sha}");
+        assert!(rules().review_field(&text).is_some());
+        assert!(rules()
+            .review_field_with(&text, &Vouch(vec![sha]))
+            .is_none());
+    }
+
+    #[test]
+    fn null_oracle_knows_nothing() {
+        assert!(!NullOracle.is_known_git_object(&hex_token(40)));
+        assert!(!NullOracle.is_known_hub_id("123e4567-e89b-42d3-a456-426614174000"));
+        let made: NullOracle = Default::default();
+        assert_eq!(NullOracle, made);
+    }
+
+    #[test]
+    fn short_shas_are_below_the_token_minimum_and_need_no_oracle() {
+        assert!(r_ok("fixed in commit 0123abc and 0123abcdef01")
+            .verdict
+            .is_deliver());
     }
 
     #[test]
@@ -1341,10 +1447,11 @@ mod tests {
     }
 
     #[test]
-    fn rule_6_does_not_decode_allowlisted_digests() {
+    fn rule_6_does_not_decode_a_vouched_digest() {
         let digest = format!("{}{}", hex_token(32), hex_token(32));
+        let oracle = Vouch(vec![digest.clone()]);
         assert!(lenient()
-            .review("s", &format!("sha256:{digest}"), &[])
+            .review_with("s", &format!("sha256:{digest}"), &[], &oracle)
             .verdict
             .is_deliver());
     }
@@ -1607,11 +1714,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_env_mention_beside_a_commit_sha_is_only_a_signal() {
+    fn a_bare_env_mention_beside_a_vouched_sha_is_only_a_signal() {
         let sha = hex_token(40);
-        let outcome = r_ok(&format!("the .env.example changed in commit {sha}"));
+        let text = format!("the .env.example changed in commit {sha}");
+        let outcome = rules().review_with("s", &text, &[], &Vouch(vec![sha]));
         assert!(outcome.verdict.is_deliver(), "{outcome:?}");
         assert!(!outcome.signals.is_empty());
+        assert!(r_ok(&text).verdict.is_block());
     }
 
     #[test]
@@ -1679,22 +1788,34 @@ mod tests {
         }
 
         #[test]
-        fn allowlisted_constructions_never_leak(
-            sha in "[0-9a-f]{40}",
-            digest in "[0-9a-f]{64}",
-            uuid in "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        fn identifier_constructions_never_leak(
             words in prop::collection::vec(prop::sample::select(vec!["render", "final", "summary", "report", "retry", "worker", "sync", "config"]), 3..8),
-            kind in 0usize..5,
+            kind in 0usize..2,
         ) {
             let text = match kind {
-                0 => format!("fixed in commit {sha} today"),
-                1 => format!("image pinned at sha256:{digest}"),
-                2 => format!("request {uuid} failed"),
-                3 => format!("call {} now", words.join("_")),
+                0 => format!("call {} now", words.join("_")),
                 _ => format!("branch {}", words.join("-")),
             };
             let outcome = rules().review("s", &text, &[]);
             prop_assert!(!codes(&outcome).contains(&ReasonCode::SecretLeak), "{text}: {outcome:?}");
+        }
+
+        #[test]
+        fn no_context_word_exempts_random_hex_or_a_uuid(
+            sha in "[0-9a-f]{40}",
+            digest in "[0-9a-f]{64}",
+            uuid in "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            kind in 0usize..7,
+            which in 0usize..3,
+        ) {
+            prop_assume!(sha.bytes().any(|b| b.is_ascii_lowercase()));
+            prop_assume!(digest.bytes().any(|b| b.is_ascii_lowercase()));
+            let token = [sha, digest, uuid][which].clone();
+            let text = probes(&token, kind);
+            let outcome = rules().review("s", &text, &[]);
+            prop_assert!(outcome.verdict.is_block(), "{text}: {outcome:?}");
+            let vouched = rules().review_with("s", &text, &[], &Vouch(vec![token]));
+            prop_assert!(!vouched.verdict.is_block(), "{text}: {vouched:?}");
         }
 
         #[test]

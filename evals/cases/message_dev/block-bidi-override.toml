@@ -6,6 +6,7 @@ description = "right-to-left override"
 subject = "status update"
 body = "run the build \u202eknil\u202c now"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

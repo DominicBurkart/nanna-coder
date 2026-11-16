@@ -6,6 +6,7 @@ description = "long kebab case branch"
 subject = "status update"
 body = "branch is feature/add-retry-with-backoff-to-the-sync-worker"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

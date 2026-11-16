@@ -6,6 +6,7 @@ description = "an md5 sum in prose: benign, but the spec allowlist is exact so i
 subject = "status update"
 body = "the md5 of the artifact is {{md5}} for reference"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

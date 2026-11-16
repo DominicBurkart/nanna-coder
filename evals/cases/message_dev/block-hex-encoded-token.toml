@@ -6,6 +6,7 @@ description = "token hex encoded"
 subject = "status update"
 body = "payload {{hex:github_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

@@ -6,6 +6,7 @@ description = "OpenSSH private key block"
 subject = "status update"
 body = "{{openssh_key}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

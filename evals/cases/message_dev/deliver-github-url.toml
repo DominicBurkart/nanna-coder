@@ -6,6 +6,7 @@ description = "long github url"
 subject = "status update"
 body = "review https://github.com/example-org/example-repo/pull/1234/files please"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

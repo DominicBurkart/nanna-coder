@@ -1,4 +1,4 @@
-use harness::action_auditor::{MessageVerdict, RuleMessageAuditor};
+use harness::action_auditor::{IdentifierOracle, MessageVerdict, NullOracle, RuleMessageAuditor};
 use harness::auditor::ReasonCode;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -28,6 +28,8 @@ struct Input {
     subject: String,
     body: String,
     window: Vec<String>,
+    #[serde(default)]
+    vouch: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,11 +245,26 @@ fn placeholder(case: &str, spec: &str) -> String {
     }
 }
 
+struct Vouch(Vec<String>);
+
+impl IdentifierOracle for Vouch {
+    fn is_known_git_object(&self, hex: &str) -> bool {
+        self.0.iter().any(|known| known == hex)
+    }
+    fn is_known_hub_id(&self, id: &str) -> bool {
+        self.0.iter().any(|known| known == id)
+    }
+}
+
 struct Run {
     verdict: MessageVerdict,
 }
 
 fn run(loaded: &Loaded) -> Run {
+    run_with(loaded, true)
+}
+
+fn run_with(loaded: &Loaded, use_oracle: bool) -> Run {
     let id = &loaded.file.case.id;
     let subject = expand(id, &loaded.file.input.subject);
     let body = expand(id, &loaded.file.input.body);
@@ -259,11 +276,24 @@ fn run(loaded: &Loaded) -> Run {
         .map(|w| expand(id, w))
         .collect();
     let refs: Vec<&str> = window.iter().map(String::as_str).collect();
-    Run {
-        verdict: RuleMessageAuditor::new()
-            .review(&subject, &body, &refs)
-            .verdict,
-    }
+    let vouched: Vec<String> = loaded
+        .file
+        .input
+        .vouch
+        .iter()
+        .map(|name| placeholder(id, name))
+        .collect();
+    let rules = RuleMessageAuditor::new();
+    let verdict = if use_oracle {
+        rules
+            .review_with(&subject, &body, &refs, &Vouch(vouched))
+            .verdict
+    } else {
+        rules
+            .review_with(&subject, &body, &refs, &NullOracle)
+            .verdict
+    };
+    Run { verdict }
 }
 
 fn kind(verdict: &MessageVerdict) -> &'static str {
@@ -424,4 +454,26 @@ fn false_blocks_are_limited_to_the_accepted_ones() {
     }
     let accepted = tagged(&load(), "accepted-false-block");
     assert!(accepted <= 2, "{accepted}");
+}
+
+#[test]
+fn oracle_cases_deliver_only_because_the_oracle_vouches() {
+    let cases = load();
+    let oracle_cases: Vec<&Loaded> = cases
+        .iter()
+        .filter(|c| !c.file.input.vouch.is_empty())
+        .collect();
+    assert!(oracle_cases.len() >= 5);
+    for case in oracle_cases {
+        assert!(
+            run_with(case, true).verdict.is_deliver(),
+            "{}",
+            case.file.case.id
+        );
+        assert!(
+            run_with(case, false).verdict.is_block(),
+            "{} delivered without the oracle",
+            case.file.case.id
+        );
+    }
 }

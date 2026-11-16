@@ -6,6 +6,7 @@ description = "npmrc contents in a fence"
 subject = "status update"
 body = "the .npmrc is:\n```\nregistry=https://registry.example.invalid/\n```"
 window = []
+vouch = []
 
 [expected]
 verdict = "quarantine"

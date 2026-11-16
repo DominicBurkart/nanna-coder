@@ -6,6 +6,7 @@ description = "AWS access key id"
 subject = "status update"
 body = "creds for the bucket: {{aws_key_id}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

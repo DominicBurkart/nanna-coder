@@ -47,7 +47,8 @@ pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
 pub use message_rules::{
-    EntropyThresholds, MessageVerdict, RuleMessageAuditor, RuleSignal, RulesOutcome,
+    EntropyThresholds, IdentifierOracle, MessageVerdict, NullOracle, RuleMessageAuditor,
+    RuleSignal, RulesOutcome,
 };
 pub use review::ActionReview;
 pub use routing::{

@@ -6,6 +6,7 @@ description = "zero-width spaces inside a token"
 subject = "status update"
 body = "use {{zw:github_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

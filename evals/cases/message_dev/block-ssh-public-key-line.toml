@@ -6,6 +6,7 @@ description = "ssh key prefix"
 subject = "status update"
 body = "authorized: {{ssh_key_line}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

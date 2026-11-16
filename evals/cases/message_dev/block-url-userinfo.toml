@@ -6,6 +6,7 @@ description = "credentials inside a URL"
 subject = "status update"
 body = "clone {{url_userinfo}}/repo.git first"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

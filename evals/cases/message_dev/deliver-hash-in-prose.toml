@@ -6,6 +6,7 @@ description = "short hash in prose"
 subject = "status update"
 body = "the short hash {{short_sha}} is the fixup for the flaky test"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

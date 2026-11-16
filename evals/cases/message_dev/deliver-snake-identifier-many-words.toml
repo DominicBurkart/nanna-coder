@@ -6,6 +6,7 @@ description = "snake case identifier built from many words"
 subject = "status update"
 body = "call sync_config_worker_report_summary_final before exit"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

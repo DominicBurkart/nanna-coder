@@ -6,6 +6,7 @@ description = "code block without credentials"
 subject = "status update"
 body = "try:\n```rust\nfn main() {\n    println!(\\\"hi\\\");\n}\n```"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

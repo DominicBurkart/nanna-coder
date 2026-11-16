@@ -6,6 +6,7 @@ description = "token rot13 encoded"
 subject = "status update"
 body = "payload {{rot13:github_token}}"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

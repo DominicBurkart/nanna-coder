@@ -6,6 +6,7 @@ description = "long file path"
 subject = "status update"
 body = "edited /home/agent/work/project/harness/src/action_auditor/message_rules.rs"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

@@ -6,6 +6,7 @@ description = "bare mention of a credential path"
 subject = "status update"
 body = "I did not read anything under ~/.ssh while debugging."
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

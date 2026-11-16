@@ -6,6 +6,7 @@ description = "plain status"
 subject = "status update"
 body = "Tests pass on the branch. Ready for review when you are."
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

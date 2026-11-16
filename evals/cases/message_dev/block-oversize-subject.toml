@@ -6,6 +6,7 @@ description = "subject over 120 characters"
 subject = "{{filler:130}}"
 body = "short"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"

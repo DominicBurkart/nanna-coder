@@ -6,10 +6,11 @@ description = "sha256 image digest"
 subject = "status update"
 body = "image is pinned at sha256:{{sha256}}"
 window = []
+vouch = ["sha256"]
 
 [expected]
 verdict = "deliver"
 codes = []
 
 [metadata]
-tags = ["deliver", "near-miss"]
+tags = ["deliver", "near-miss", "oracle"]

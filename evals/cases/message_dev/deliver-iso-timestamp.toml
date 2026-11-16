@@ -6,6 +6,7 @@ description = "iso timestamp"
 subject = "status update"
 body = "failed at 2026-11-16T10:20:30.123456Z and again at 2026-11-16T10:25:31.654321Z"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

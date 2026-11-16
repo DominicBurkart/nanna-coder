@@ -6,6 +6,7 @@ description = "accented prose"
 subject = "status update"
 body = "na\u00efve caf\u00e9 r\u00e9sum\u00e9 co\u00f6rdinate"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

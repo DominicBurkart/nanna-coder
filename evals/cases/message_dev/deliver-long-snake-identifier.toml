@@ -6,6 +6,7 @@ description = "long snake case identifier"
 subject = "status update"
 body = "rename render_the_final_summary_report_for_users to render_summary"
 window = []
+vouch = []
 
 [expected]
 verdict = "deliver"

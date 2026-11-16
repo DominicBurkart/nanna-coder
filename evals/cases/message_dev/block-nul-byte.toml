@@ -6,6 +6,7 @@ description = "NUL in the body"
 subject = "status update"
 body = "before\u0000after"
 window = []
+vouch = []
 
 [expected]
 verdict = "block"
