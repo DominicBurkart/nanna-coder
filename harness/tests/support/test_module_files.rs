@@ -30,8 +30,7 @@ fn is_exact_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 pub fn is_exact_test_file_module(module: &syn::ItemMod) -> bool {
-    let exact = module.content.is_none() && is_exact_cfg_test(&module.attrs);
-    exact && !module.attrs.iter().any(|attr| attr.path().is_ident("path"))
+    module.content.is_none() && is_exact_cfg_test(&module.attrs)
 }
 
 pub fn cfg_test_file_modules(file: &str, source: &str) -> Vec<String> {
@@ -57,48 +56,95 @@ pub fn cfg_test_file_modules(file: &str, source: &str) -> Vec<String> {
     files
 }
 
-#[derive(Default)]
-struct PathLiterals {
-    found: Vec<String>,
-}
-
-impl<'ast> Visit<'ast> for PathLiterals {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        syn::visit::visit_item_mod(self, node);
-        for attr in &node.attrs {
-            let value = attr.meta.require_name_value().ok().map(|pair| &pair.value);
-            if let (true, Some(syn::Expr::Lit(lit))) = (attr.path().is_ident("path"), value) {
-                if let syn::Lit::Str(text) = &lit.lit {
-                    self.found.push(text.value());
+fn assigns_path(tokens: proc_macro2::TokenStream) -> bool {
+    let mut previous_path = false;
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Group(group) => {
+                if assigns_path(group.stream()) {
+                    return true;
                 }
+                previous_path = false;
             }
+            proc_macro2::TokenTree::Ident(ident) => previous_path = ident == "path",
+            proc_macro2::TokenTree::Punct(punct) => {
+                if previous_path && punct.as_char() == '=' {
+                    return true;
+                }
+                previous_path = false;
+            }
+            proc_macro2::TokenTree::Literal(_) => previous_path = false,
         }
     }
+    false
 }
 
-pub fn path_targets(file: &str, source: &str) -> Vec<String> {
-    let mut literals = PathLiterals::default();
-    literals.visit_file(&syn::parse_file(source).unwrap());
-    let dir = Path::new(file).parent().unwrap().to_string_lossy();
-    let dir = dir.replace('\\', "/");
-    let base = module_base(file);
-    let mut targets = Vec::new();
-    for literal in literals.found {
-        let literal = literal.trim_start_matches("./").to_string();
-        targets.push(join_path(&[dir.clone(), literal.clone()]));
-        targets.push(join_path(&[base.clone(), literal]));
+fn attribute_assigns_path(tokens: proc_macro2::TokenStream) -> bool {
+    let mut after_hash = false;
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Group(group) => {
+                let attribute = after_hash && group.delimiter() == proc_macro2::Delimiter::Bracket;
+                if (attribute && assigns_path(group.stream()))
+                    || attribute_assigns_path(group.stream())
+                {
+                    return true;
+                }
+                after_hash = false;
+            }
+            proc_macro2::TokenTree::Punct(punct) => {
+                after_hash = punct.as_char() == '#' || (after_hash && punct.as_char() == '!');
+            }
+            _ => after_hash = false,
+        }
     }
-    targets
+    false
 }
 
-pub fn skipped_files(sources: &[(String, String)]) -> BTreeSet<String> {
-    let skipped: BTreeSet<String> = sources
+#[derive(Default)]
+struct PathAttributes {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for PathAttributes {
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        let direct = node.path().is_ident("path");
+        let conditional = node.path().is_ident("cfg_attr") && assigns_path(node_tokens(node));
+        self.found = self.found || direct || conditional;
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.found = self.found || attribute_assigns_path(node.tokens.clone());
+    }
+}
+
+fn node_tokens(attr: &syn::Attribute) -> proc_macro2::TokenStream {
+    let list = attr.meta.require_list();
+    list.map(|list| list.tokens.clone()).unwrap_or_default()
+}
+
+pub fn path_attribute_files(sources: &[(String, String)]) -> Vec<String> {
+    let mut files = Vec::new();
+    for (file, source) in sources {
+        let mut visitor = PathAttributes::default();
+        visitor.visit_file(&syn::parse_file(source).unwrap());
+        if visitor.found {
+            files.push(file.clone());
+        }
+    }
+    files
+}
+
+pub fn skipped_files(sources: &[(String, String)]) -> Result<BTreeSet<String>, String> {
+    let carriers = path_attribute_files(sources);
+    if !carriers.is_empty() {
+        return Err(format!(
+            "cannot reason about module files: a path attribute (#[path], cfg_attr(.., path = ..) or one inside a macro) appears in {carriers:?}; review by hand before any cfg(test) file module is skipped"
+        ));
+    }
+    let skipped = sources
         .iter()
         .flat_map(|(file, source)| cfg_test_file_modules(file, source))
-        .collect();
-    let targets: BTreeSet<String> = sources
-        .iter()
-        .flat_map(|(file, source)| path_targets(file, source))
-        .collect();
-    skipped.difference(&targets).cloned().collect()
+        .collect::<BTreeSet<String>>();
+    Ok(skipped)
 }

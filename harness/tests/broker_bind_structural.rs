@@ -7,7 +7,7 @@ use syn::visit::Visit;
 #[path = "support/test_module_files.rs"]
 mod test_module_files;
 use test_module_files::{
-    cfg_test_file_modules, is_exact_test_file_module, path_targets, skipped_files,
+    cfg_test_file_modules, is_exact_test_file_module, path_attribute_files, skipped_files,
 };
 
 const BIND: &str = "bind_workspace";
@@ -140,11 +140,24 @@ impl Scan {
     }
 
     fn scan_tokens(&mut self, tokens: TokenStream) {
+        let mut previous_ref = false;
         for token in tokens {
             match token {
-                TokenTree::Group(group) => self.scan_tokens(group.stream()),
-                TokenTree::Ident(ident) => self.record(&ident.to_string()),
-                _ => {}
+                TokenTree::Group(group) => {
+                    if previous_ref && group.delimiter() == proc_macro2::Delimiter::Brace {
+                        let context = self.context();
+                        self.audited_refs
+                            .insert(format!("{}: {context}", self.file));
+                    }
+                    previous_ref = false;
+                    self.scan_tokens(group.stream());
+                }
+                TokenTree::Ident(ident) => {
+                    let name = ident.to_string();
+                    previous_ref = name == "AuditedRef" || self.aliases.contains(&name);
+                    self.record(&name);
+                }
+                _ => previous_ref = false,
             }
         }
     }
@@ -223,7 +236,8 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         syn::visit::visit_item_type(self, node);
-        if type_name(&node.ty) == "AuditedRef" {
+        let target = type_name(&node.ty);
+        if target == "AuditedRef" || self.aliases.contains(&target) {
             self.aliases.insert(node.ident.to_string());
         }
     }
@@ -271,8 +285,10 @@ fn scan_source(file: &str, source: &str) -> Scan {
         file: file.to_string(),
         ..Scan::default()
     };
-    for item in syntax.items.iter().chain(syntax.items.iter()) {
-        scan.visit_item(item);
+    for _ in 0..4 {
+        for item in &syntax.items {
+            scan.visit_item(item);
+        }
     }
     scan
 }
@@ -289,7 +305,11 @@ fn scan_all() -> Vec<Scan> {
             (text.replace('\\', "/"), fs::read_to_string(&path).unwrap())
         })
         .collect();
-    let skipped = skipped_files(&sources);
+    scan_sources(sources)
+}
+
+fn scan_sources(sources: Vec<(String, String)>) -> Vec<Scan> {
+    let skipped = skipped_files(&sources).unwrap_or_else(|reason| panic!("{reason}"));
     sources
         .iter()
         .filter(|(file, _)| !skipped.contains(file))
@@ -372,6 +392,13 @@ fn the_audited_reference_bind_workspace_requires_is_minted_only_by_require_audit
     );
     let hidden = scanned(
         "impl AuditedRef<'_> { fn again(identity: &I) -> Self { Self { identity } } } fn via_alias() { let _ = Alias { identity }; } fn via_rename() { let _ = Renamed { identity }; } type Alias = AuditedRef<'static>; use crate::AuditedRef as Renamed;",
+    );
+    let chained = scanned(
+        "fn deep() { let _ = Outer { identity }; } type Outer = Middle; type Middle = AuditedRef<'static>; macro_rules! forge { () => { AuditedRef { identity } } }",
+    );
+    assert_eq!(
+        chained.audited_refs.iter().collect::<Vec<_>>(),
+        vec!["x.rs: ", "x.rs: deep"]
     );
     assert_eq!(
         hidden.audited_refs.iter().collect::<Vec<_>>(),
@@ -509,7 +536,6 @@ fn test_only_file_modules_follow_the_same_rule_as_the_audit_hook_guard() {
     let twin = "#[cfg(test)] mod t; #[cfg(not(test))] mod t;";
     assert!(cfg_test_file_modules("a/mod.rs", twin).is_empty());
     let pathed = "#[cfg(test)] mod x; #[path = \"x.rs\"] mod y;";
-    assert!(path_targets("a/mod.rs", pathed).contains(&"a/x.rs".to_string()));
     let sources = [
         ("a/mod.rs".to_string(), pathed.to_string()),
         (
@@ -517,7 +543,36 @@ fn test_only_file_modules_follow_the_same_rule_as_the_audit_hook_guard() {
             "fn f() { create_tool_registry(p); }".to_string(),
         ),
     ];
-    assert!(!skipped_files(&sources).contains("a/x.rs"));
+    assert_eq!(path_attribute_files(&sources), vec!["a/mod.rs".to_string()]);
+    assert!(skipped_files(&sources).unwrap_err().contains("a/mod.rs"));
     let module: syn::ItemMod = syn::parse_str("#[cfg(test)] mod m;").unwrap();
     assert!(is_exact_test_file_module(&module));
+}
+
+#[test]
+#[should_panic(expected = "cannot reason about module files")]
+fn the_scan_fails_when_a_path_attribute_exists_anywhere() {
+    let sources = vec![("a.rs".to_string(), "#[path = \"b.rs\"] mod m;".to_string())];
+    let _ = scan_sources(sources);
+}
+
+#[test]
+fn the_scan_skips_only_cfg_test_file_modules_when_no_path_attribute_exists() {
+    let sources = vec![
+        (
+            "a/mod.rs".to_string(),
+            "#[cfg(test)] mod t; mod u;".to_string(),
+        ),
+        (
+            "a/t.rs".to_string(),
+            "fn f() { create_tool_registry(p); }".to_string(),
+        ),
+        (
+            "a/u.rs".to_string(),
+            "fn f() { create_tool_registry(p); }".to_string(),
+        ),
+    ];
+    let scans = scan_sources(sources);
+    let files: Vec<&str> = scans.iter().map(|scan| scan.file.as_str()).collect();
+    assert_eq!(files, vec!["a/mod.rs", "a/u.rs"]);
 }
