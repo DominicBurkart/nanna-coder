@@ -211,13 +211,9 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default()
             });
         }
         let endpoint = default_endpoint();
-        Ok(Self {
-            image,
-            broker_dir,
-            endpoint,
-            limits,
-            executor,
-        })
+        #[rustfmt::skip]
+        let route = Self { image, broker_dir, endpoint, limits, executor };
+        Ok(route)
     }
 
     pub fn from_lookup(
