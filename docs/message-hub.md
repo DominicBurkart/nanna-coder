@@ -288,6 +288,21 @@ pub trait ActivityStore: Send + Sync {
 - **Single writer.** On open, the hub takes an `fs4` exclusive `try_lock` on `hub.lock` next to the files (as `budget.rs` does). If a second process opens it, the open fails with `Locked`. The hub tools then return `HubError::Unavailable`, failing closed and avoiding the double-writer bug of #684.
 - **Permissions.** Files are created with mode `0600`.
 
+**Deviations implemented in #1061 (`harness/src/hub/store/`, `session.rs`, `message.rs`):**
+
+1. `SessionRecord.note` and `SessionStore::set_note` use `Option<String>` / `String` until `Summary` (#1062) merges; that issue changes the field type and nothing else in the stores.
+2. `MessageStore` gains `get(id) -> Option<StoredMessage>` (the hub needs it to resolve a quarantined message). `StoreError` gains `NotFound` (unknown id on `set_status`, `set_note`, `set_state`) and `Duplicate` (a reused `MessageId`). No `StoreError` variant carries record content: a serde error can quote the offending text, so `Corrupt` holds only the line number.
+3. The lock is a separate `HubLock::acquire(dir)` value passed to `JsonlSessionStore::open(path, &lock)` and `JsonlMessageStore::open(path, &lock)`, so both files share one `hub.lock`. The file must sit directly in the locked directory, and a second open of the same file through the same lock also fails with `Locked`. Env overrides that put the two files in different directories need two locks (a note for #1069).
+4. `VerdictRef` is `{ log_id: String, content_hash: u64 }`. `Retention` uses `chrono::Duration` and has a `Default` of 7 days, 24 hours and 7 days.
+5. `SessionRecord` and `StoredMessage` have hand-written `Debug` impls that print ids, states and byte lengths, never `subject`, `body`, `note`, `subtask` or other agent-authored text.
+6. `append` assigns `Seq` (from 1, never reused) and ignores the `seq` the caller put in the record. The next `Seq` is persisted as a `counter` record, so it survives a prune that empties the store.
+7. `inbox` and `unread` see only `Pending` and `Delivered` messages. `ack` moves only `Delivered` messages with `seq <= upto` for that recipient to `Acked`; `Pending`, `Withheld` and `Quarantined` ones are never acked by a cursor.
+8. `outbound_window` returns the sender's newest messages in any state (a quarantined fragment still counts for split-window detection), oldest first, while the running total of subject plus body bytes stays within the budget. A `Session` recipient narrows it to that session; the group recipients are resolved by the hub, so the store returns the sender's whole window for them.
+9. Retention measures age from `sent_at` with a strict `>`: an `Acked` message uses `acked_message_ttl`, `Quarantined` is never pruned, every other state uses `unacked_message_ttl`. Session pruning is per root: a root is removed, all its sessions together, once every session is terminal and the latest `last_activity` is older than `completed_session_ttl`. `in_root` orders by `created_at`, then id. `SessionStatus::is_active` is true for `Pending`, `Running` and `WaitingOnMessages`.
+10. An empty `NANNA_SESSIONS_PATH` or `NANNA_MESSAGES_PATH` counts as unset.
+11. Durability and crash behaviour: each commit is one `write_all` plus `flush` of whole lines, and a failed write is truncated back so the next append starts on a record boundary. If the truncate fails too, the journal refuses all later appends until reopen. There is no `fsync` per append, so the log survives a process crash but not necessarily power loss. A multi-record commit (`prune`, `ack`) can be partly written after a crash; both are monotone, so replaying the partial result is safe. `open` compacts through a `0600` temporary file and an atomic rename, which also narrows a pre-existing wider file.
+12. Every commit clones the whole table (the pattern of `leases/jsonl.rs`), so a commit costs time proportional to the store size. That is acceptable for the bounded retention above and is a known limit.
+
 ---
 
 ## 5. Messages
