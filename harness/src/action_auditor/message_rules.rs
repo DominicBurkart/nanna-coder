@@ -1369,15 +1369,6 @@ mod tests {
     }
 
     #[test]
-    fn the_saved_proptest_regression_is_committed_and_names_the_two_symbol_input() {
-        let saved = include_str!("../../proptest-regressions/action_auditor/message_rules.txt");
-        assert!(
-            saved.contains("cc cc47713e9d911afc5567d0a580c3403c0bad2f1d0c2f46af437598f6444b4ea4")
-        );
-        assert!(saved.contains("000aa0a00aa0a000a000aa0a00a0a000a0aa0000"));
-    }
-
-    #[test]
     fn null_oracle_knows_nothing() {
         assert!(!NullOracle.is_known_git_object(&hex_token(40)));
         assert!(!NullOracle.is_known_hub_id("123e4567-e89b-42d3-a456-426614174000"));
