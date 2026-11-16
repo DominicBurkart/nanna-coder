@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 03f3f1cd480dd8c90df956b3adc1609046415a313acf368b266fde241924f0cb # shrinks to variants = [ModelVariant { tag: "gemma4:1-0", params: 1, min_memory_bytes: 0 }, ModelVariant { tag: "gemma4:2-0", params: 2, min_memory_bytes: 0 }], ram = 0, vram = None, accel = Cpu
+cc d3dd198e956620299de6b86344dd56a4d8407a39f7bd30cdbbf9122d15b82da3 # shrinks to variants = [ModelVariant { tag: "gemma4:1-1", params: 1, min_memory_bytes: 1 }, ModelVariant { tag: "gemma4:2-1", params: 2, min_memory_bytes: 1 }], ram = 2, vram = None, accel = Cpu
+cc 21cce52a1339f8d57f355d2168020df564af3de3ed8c48c9db753f2580a1e1a7 # shrinks to variants = [ModelVariant { tag: "gemma4:138451348446-1", params: 138451348446, min_memory_bytes: 1 }, ModelVariant { tag: "gemma4:1-414141786953", params: 1, min_memory_bytes: 414141786953 }], ram = 2, vram = None, extra_ram = 496970144342, extra_vram = 0, accel = Cpu
+cc 6fddb03586b142914f75d09ff9999f2815b7b5c8cfa048dabdf959ac946e6420 # shrinks to variants = [ModelVariant { tag: "gemma4:1-7703744023107681887", params: 1, min_memory_bytes: 7703744023107681887 }, ModelVariant { tag: "gemma4:2-0", params: 2, min_memory_bytes: 0 }], ram = 0, extra = 18446744073709551615, accel = Cpu
