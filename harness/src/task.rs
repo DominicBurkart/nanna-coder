@@ -559,19 +559,18 @@ fn require_pi_audited<'a>(
     repo_path: &Path,
 ) -> Result<(&'a AuditedIdentity, crate::harness_adapter::AuditedRef<'a>), PiRouteRefused> {
     let bound = bound.ok_or(PiRouteRefused::NoIdentity)?;
-    let audited_ref =
-        crate::harness_adapter::require_audited(bound).map_err(|_| PiRouteRefused::Unaudited)?;
-    let BoundIdentity::Audited(audited) = bound else {
-        return Err(PiRouteRefused::Unaudited);
-    };
-    if crate::scope::names_repo(audited.repo(), repo_path) {
-        Ok((audited, audited_ref))
-    } else {
-        Err(PiRouteRefused::ScopeError(format!(
+    match (bound, crate::harness_adapter::require_audited(bound)) {
+        (BoundIdentity::Audited(audited), Ok(audited_ref))
+            if crate::scope::names_repo(audited.repo(), repo_path) =>
+        {
+            Ok((audited, audited_ref))
+        }
+        (BoundIdentity::Audited(audited), Ok(_)) => Err(PiRouteRefused::ScopeError(format!(
             "the audited repository {} is not the checkout {}",
             audited.repo(),
             repo_path.display()
-        )))
+        ))),
+        _ => Err(PiRouteRefused::Unaudited),
     }
 }
 
@@ -1979,36 +1978,30 @@ impl TaskRunner {
             Some((route, audited, audited_ref)) => {
                 let layers = self.model_facing_layers(&task_id, &queued, Some(audited.identity()));
                 workspace.bind_sandbox_pr(&layers.subject);
-                'resolved: {
-                    use crate::harness_adapter::BindError;
-                    let scoped = match registry_for(&workspace, Some(audited.identity())) {
-                        Ok(registry) => crate::harness_adapter::ScopedCapabilities::scope(
+                registry_for(&workspace, Some(audited.identity()))
+                    .map_err(|e| ("ScopeError", e.to_string()))
+                    .map(|registry| {
+                        crate::harness_adapter::ScopedCapabilities::scope(
                             registry,
                             audited.identity(),
-                        ),
-                        Err(e) => break 'resolved Err(("ScopeError", e.to_string())),
-                    };
-                    let agent = match crate::harness_adapter::ResolvedAgent::resolve(
-                        audited.allowed(),
-                        &scoped,
-                        route.endpoint().clone(),
-                        route.image(),
-                        route.broker_socket(&task_id.0),
-                    ) {
-                        Ok(agent) => agent,
-                        Err(e) => break 'resolved Err(("StateError", e.to_string())),
-                    };
-                    match agent.bind_workspace(audited_ref, audited.repo(), &workspace, layers) {
-                        Ok(bound) => Ok(Prepared::Pi(route, Box::new((agent, bound)))),
-                        Err(e) => Err(match e {
-                            BindError::Unaudited => ("IdentityUnavailable", e.to_string()),
-                            BindError::RepoMismatch { .. } | BindError::Scope(_) => {
-                                ("ScopeError", e.to_string())
-                            }
-                            _ => ("StateError", e.to_string()),
-                        }),
-                    }
-                }
+                        )
+                    })
+                    .and_then(|scoped| {
+                        crate::harness_adapter::ResolvedAgent::resolve(
+                            audited.allowed(),
+                            &scoped,
+                            route.endpoint().clone(),
+                            route.image(),
+                            route.broker_socket(&task_id.0),
+                        )
+                        .map_err(|e| ("StateError", e.to_string()))
+                    })
+                    .and_then(|agent| {
+                        agent
+                            .bind_workspace(audited_ref, audited.repo(), &workspace, layers)
+                            .map_err(|e| ("StateError", e.to_string()))
+                            .map(|bound| Prepared::Pi(route, Box::new((agent, bound))))
+                    })
             }
             None => {
                 let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());

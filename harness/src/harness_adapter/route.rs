@@ -210,10 +210,11 @@ assert!(PiRoute::new("nanna-pi:latest", "/run/nanna/broker", PiLimits::default()
                 path: broker_dir.display().to_string(),
             });
         }
+        let endpoint = default_endpoint();
         Ok(Self {
             image,
             broker_dir,
-            endpoint: default_endpoint(),
+            endpoint,
             limits,
             executor,
         })
@@ -337,6 +338,18 @@ mod tests {
         assert_eq!(route.broker_dir(), Path::new("/run/user/1000/nanna/broker"));
         assert_eq!(route.limits(), PiLimits::default());
         assert!(format!("{route:?}").contains("UnwiredPiExecutor"));
+    }
+
+    #[test]
+    fn the_model_endpoint_defaults_and_can_be_replaced() {
+        let route = wired(&image(), "/run/nanna/broker").unwrap();
+        assert_eq!(
+            route.endpoint(),
+            &Endpoint::new("model-gateway", 11434).unwrap()
+        );
+        let other = Endpoint::new("gw.internal", 8080).unwrap();
+        let route = route.with_endpoint(other.clone());
+        assert_eq!(route.endpoint(), &other);
     }
 
     #[test]
