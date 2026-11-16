@@ -52,10 +52,7 @@ fn spawn_stub(handler: impl Fn(&str) -> Reply + Send + 'static) -> (String, Seen
             }
             out.push_str("\r\n");
             let _ = stream.write_all(out.as_bytes());
-            let at = reply
-                .split_at
-                .filter(|at| *at < reply.body.len())
-                .unwrap_or(reply.body.len());
+            let at = split_point(&reply);
             let _ = stream.write_all(&reply.body[..at]);
             let _ = stream.flush();
             if at < reply.body.len() {
@@ -65,6 +62,11 @@ fn spawn_stub(handler: impl Fn(&str) -> Reply + Send + 'static) -> (String, Seen
         }
     });
     (format!("http://{addr}"), seen)
+}
+
+fn split_point(reply: &Reply) -> usize {
+    let len = reply.body.len();
+    reply.split_at.map_or(len, |at| at.min(len))
 }
 
 fn manifest(config_size: usize, pad: usize) -> String {
