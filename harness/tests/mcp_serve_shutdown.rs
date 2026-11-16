@@ -43,6 +43,7 @@ fn serve_then_signal(signal: i32) {
         Command::new(env!("CARGO_BIN_EXE_nanna"))
             .arg("mcp-serve")
             .env("NANNA_QUEUE_PATH", dir.path().join("queue.jsonl"))
+            .env("NANNA_MODEL", "qwen3:0.6b")
             .env("NANNA_CONFIG_DIR", dir.path().join("config"))
             .env("HOME", dir.path())
             .stdin(Stdio::piped())
