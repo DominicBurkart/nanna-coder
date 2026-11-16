@@ -1360,6 +1360,24 @@ mod tests {
     }
 
     #[test]
+    fn a_two_symbol_hex_string_is_below_the_entropy_threshold_and_delivers() {
+        let text = "head 000aa0a00aa0a000a000aa0a00a0a000a0aa0000";
+        let token = &text[5..];
+        assert!(shannon_bits(token.as_bytes()) < EntropyThresholds::default().hex_bits);
+        let outcome = r_ok(text);
+        assert!(outcome.verdict.is_deliver(), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_saved_proptest_regression_is_committed_and_names_the_two_symbol_input() {
+        let saved = include_str!("../../proptest-regressions/action_auditor/message_rules.txt");
+        assert!(
+            saved.contains("cc cc47713e9d911afc5567d0a580c3403c0bad2f1d0c2f46af437598f6444b4ea4")
+        );
+        assert!(saved.contains("000aa0a00aa0a000a000aa0a00a0a000a0aa0000"));
+    }
+
+    #[test]
     fn null_oracle_knows_nothing() {
         assert!(!NullOracle.is_known_git_object(&hex_token(40)));
         assert!(!NullOracle.is_known_hub_id("123e4567-e89b-42d3-a456-426614174000"));
@@ -1802,15 +1820,20 @@ mod tests {
 
         #[test]
         fn no_context_word_exempts_random_hex_or_a_uuid(
-            sha in "[0-9a-f]{40}",
-            digest in "[0-9a-f]{64}",
-            uuid in "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            perm in Just((0u8..16).collect::<Vec<u8>>()).prop_shuffle(),
             kind in 0usize..7,
             which in 0usize..3,
         ) {
-            prop_assume!(sha.bytes().any(|b| b.is_ascii_lowercase()));
-            prop_assume!(digest.bytes().any(|b| b.is_ascii_lowercase()));
-            let token = [sha, digest, uuid][which].clone();
+            let digits = |n: usize| -> String {
+                (0..n)
+                    .map(|i| char::from(HEX[usize::from(perm[i % 16])]))
+                    .collect()
+            };
+            let uuid = {
+                let d = digits(32);
+                format!("{}-{}-{}-{}-{}", &d[..8], &d[8..12], &d[12..16], &d[16..20], &d[20..])
+            };
+            let token = [digits(40), digits(64), uuid][which].clone();
             let text = probes(&token, kind);
             let outcome = rules().review("s", &text, &[]);
             prop_assert!(outcome.verdict.is_block(), "{text}: {outcome:?}");
