@@ -222,6 +222,7 @@ fn nothing_a_task_controls_gains_a_pull_request_or_window_field() {
             "not_before",
             "identity_hint",
             "origin",
+            "lineage",
         ])
     );
     let tools = source("src/tools.rs");
