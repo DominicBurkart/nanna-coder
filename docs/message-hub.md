@@ -294,6 +294,21 @@ pub trait ActivityStore: Send + Sync {
 - **Single writer.** On open, the hub takes an `fs4` exclusive `try_lock` on `hub.lock` next to the files (as `budget.rs` does). If a second process opens it, the open fails with `Locked`. The hub tools then return `HubError::Unavailable`, failing closed and avoiding the double-writer bug of #684.
 - **Permissions.** Files are created with mode `0600`.
 
+**Deviations implemented in #1061 (`harness/src/hub/store/`, `session.rs`, `message.rs`):**
+
+1. `SessionRecord.note` and `SessionStore::set_note` use `Option<String>` / `String` until `Summary` (#1062) merges; that issue changes the field type and nothing else in the stores.
+2. `MessageStore` gains `get(id) -> Option<StoredMessage>` (the hub needs it to resolve a quarantined message). `StoreError` gains `NotFound` (unknown id on `set_status`, `set_note`, `set_state`) and `Duplicate` (a reused `MessageId`). No `StoreError` variant carries record content: a serde error can quote the offending text, so `Corrupt` holds only the line number.
+3. The lock is a separate `HubLock::acquire(dir)` value passed to `JsonlSessionStore::open(path, &lock)` and `JsonlMessageStore::open(path, &lock)`, so both files share one `hub.lock`. The file must sit directly in the locked directory, and a second open of the same file through the same lock also fails with `Locked`. Env overrides that put the two files in different directories need two locks (a note for #1069).
+4. `VerdictRef` is `{ log_id: String, content_hash: u64 }`. `Retention` uses `chrono::Duration` and has a `Default` of 7 days, 24 hours and 7 days.
+5. `SessionRecord` and `StoredMessage` have hand-written `Debug` impls that print ids, states and byte lengths, never `subject`, `body`, `note`, `subtask` or other agent-authored text.
+6. `append` assigns `Seq` (from 1, never reused) and ignores the `seq` the caller put in the record. The next `Seq` is persisted as a `counter` record, so it survives a prune that empties the store.
+7. `inbox` and `unread` see only `Pending` and `Delivered` messages. `ack` moves only `Delivered` messages with `seq <= upto` for that recipient to `Acked`; `Pending`, `Withheld` and `Quarantined` ones are never acked by a cursor.
+8. `outbound_window` returns the sender's newest messages in any state (a quarantined fragment still counts for split-window detection), oldest first, while the running total of subject plus body bytes stays within the budget. A `Session` recipient narrows it to that session; the group recipients are resolved by the hub, so the store returns the sender's whole window for them.
+9. Retention measures age from `sent_at` with a strict `>`: an `Acked` message uses `acked_message_ttl`, `Quarantined` is never pruned, every other state uses `unacked_message_ttl`. Session pruning is per root: a root is removed, all its sessions together, once every session is terminal and the latest `last_activity` is older than `completed_session_ttl`. `in_root` orders by `created_at`, then id. `SessionStatus::is_active` is true for `Pending`, `Running` and `WaitingOnMessages`.
+10. An empty `NANNA_SESSIONS_PATH` or `NANNA_MESSAGES_PATH` counts as unset.
+11. Durability and crash behaviour: each commit is one `write_all` plus `flush` of whole lines, and a failed write is truncated back so the next append starts on a record boundary. If the truncate fails too, the journal refuses all later appends until reopen. There is no `fsync` per append, so the log survives a process crash but not necessarily power loss. A multi-record commit (`prune`, `ack`) can be partly written after a crash; both are monotone, so replaying the partial result is safe. `open` compacts through a `0600` temporary file and an atomic rename, which also narrows a pre-existing wider file.
+12. Every commit clones the whole table (the pattern of `leases/jsonl.rs`), so a commit costs time proportional to the store size. That is acceptable for the bounded retention above and is a known limit.
+
 ---
 
 ## 5. Messages
@@ -706,26 +721,35 @@ A rule `Block` is final: `RulesOutcome::combine(model_verdict)` returns it uncha
 Decision D8: a default model is **required to use nanna**, both local and via API, and the auditor uses it too. So the message audit is never rules-only. If no model is configured, nanna selects **the highest-parameter Gemma 4 variant the device can run**.
 
 ```rust
-// model/src/default_model.rs (new)
+// model/src/default_model.rs
 pub struct DeviceCapacity { pub ram_bytes: u64, pub vram_bytes: Option<u64>, pub accel: Accel }
 pub enum Accel { Cpu, Cuda, Rocm, Metal }
-pub struct ModelVariant { pub tag: String, pub params: u64, pub min_memory_bytes: u64 }
+pub struct ModelVariant { pub tag: String /* full runtime name, e.g. "gemma4:e4b" */, pub params: u64, pub min_memory_bytes: u64 }
+pub struct ModelConfig { pub name: String }
 
-pub trait VariantCatalog { fn gemma4_variants(&self) -> Result<Vec<ModelVariant>, ModelError>; } // from the local runtime's registry metadata (e.g. Ollama tags), not hard-coded sizes
-pub fn probe_device() -> Result<DeviceCapacity, ModelError>;
-/// Largest `params` whose `min_memory_bytes` fits (VRAM if accel, else RAM, with 20% headroom).
+#[async_trait]
+pub trait VariantCatalog: Send + Sync { async fn gemma4_variants(&self) -> Result<Vec<ModelVariant>, ModelError>; }
+// live: OllamaRegistryCatalog::new(registry_url); tests: FixtureCatalog { variants, fail }
+
+pub fn parse_capacity(meminfo: &str, gpu: Option<(Accel, u64)>) -> Result<DeviceCapacity, ModelError>; // pure
+pub fn probe_device() -> Result<DeviceCapacity, ModelError>; // blocking; probe_device_with(nvidia_smi, timeout)
+/// Largest `params` whose `min_memory_bytes * 1.2` fits (VRAM if accel, falling back to RAM when VRAM is unknown, else RAM).
 pub fn select_default(cap: &DeviceCapacity, variants: &[ModelVariant]) -> Option<ModelVariant>;
 
 pub enum DefaultModel { Configured(ModelConfig), AutoGemma4(ModelVariant) }
-pub fn resolve_default_model(cfg: Option<ModelConfig>, cap: &DeviceCapacity, cat: &dyn VariantCatalog) -> Result<DefaultModel, ModelError>;
+pub async fn resolve_default_model(cfg: Option<ModelConfig>, cap: &DeviceCapacity, cat: &dyn VariantCatalog) -> Result<DefaultModel, ModelError>;
+pub async fn ensure_runnable(provider: &dyn ModelProvider, model: &DefaultModel) -> Result<(), ModelError>;
 // Error (nanna refuses to start tasks) when no model is configured and no Gemma 4 variant fits or can be fetched.
 ```
 
-- **Startup.** `nanna mcp-serve`, `delegate` and task assignment call `resolve_default_model`. When the result is `AutoGemma4`, it is logged, along with the selected tag.
-- **Auditors.** The spawn auditor, action auditor and `ModelMessageAuditor` use the default model unless an auditor model is configured explicitly. This removes the opt-in caveat.
+- **Startup.** `nanna mcp-serve`, `delegate` and `backlog-sync` resolve the default model. When the result is `AutoGemma4`, it is logged, along with the selected tag. A configured model (`--model`, else `NANNA_MODEL`; a blank value counts as unset) is used as is, with no device probe and no network call.
+- **Auditors.** The spawn auditor, action auditor and `ModelMessageAuditor` use the default model unless an auditor model is configured explicitly (`--audit-model`). An explicit audit model satisfies the requirement for the auditors: the default model is then not resolved, so no probe and no registry call happens. `backlog-sync` audits with its own `--model` unless `--audit-model` is given. This removes the opt-in caveat. `delegate` and `backlog-sync` previously fell back to rules-only auditing when no audit model was given; they now always use a model.
+- **Runnable check.** An auto-selected model must already be pulled: `ensure_runnable` lists the runtime's models and, when the tag is missing or the runtime is unreachable, startup is refused with an actionable `ollama pull <tag>` message (falling back to the largest already-pulled variant that fits is a follow-up). A configured model is not checked, since it may be hosted.
 - **Runtime outage.** If the model is unavailable or times out at runtime, the result is still fail-closed (`Quarantine(ModelFailure)`), so a message is never delivered unaudited.
-- **Tests.** `select_default` is pure and gets a table test plus a proptest that the selection is monotone in capacity. Catalog parsing gets a fixture test. There is no network in tests.
-- **Variant sizes** are read from the runtime's registry metadata at selection time, never hard-coded, because the published sizes may change.
+- **Registry metadata is TLS-authenticated but not content-verified.** Manifests are capped at 256 KiB and config blobs at 64 KiB, enforced while streaming; the registry URL must be https (plain http only for loopback); manifest requests never follow redirects; the config blob request follows at most one redirect, only to an https URL whose host is a DNS name (no IP literal in any notation, no `localhost`, `.localhost`, `.local` or `.internal`, no single-label name, no userinfo, no non-default port; plain http only when both the registry and the target are loopback) (the real registry answers blob GETs with a redirect to its object store), and the redirect target is subject to the same cap; the config digest must be plain hex; and the config blob length must equal the size the manifest declares. The blob's SHA-256 is deliberately not checked against the manifest digest: both come from the same TLS origin, so a content hash would add almost no authentication, and the model crate has no hashing dependency. The residual risk is a compromised registry (or object store) choosing the reported sizes and parameter counts; the blast radius is selecting a smaller or larger variant, bounded by the memory-fit check in `select_default` and by the requirement that the selected model is already pulled (`ensure_runnable`).
+- **Device probe.** `probe_device` reads `/proc/meminfo` (Linux only; other platforms are refused with a message naming the platform), `nvidia-smi` (killed after 5 seconds; a hang is a refusal, an absent or failing program means no NVIDIA GPU) and AMD sysfs VRAM. It is blocking, so the startup path runs it with `spawn_blocking`. Metal is never auto-detected.
+- **Tests.** `select_default` is pure and gets a table test plus proptests (monotone in capacity, including full-range sizes and parameter ties). Catalog parsing gets fixture tests, and the live catalog is tested against a loopback stub. There is no external network in tests.
+- **Variant sizes** are read from the runtime's registry metadata at selection time (the model, projector and draft layer sizes of the manifest, and `model_type` of the config blob), never hard-coded, because the published sizes may change. Only the tag names (`e2b`, `e4b`, `12b`, `26b`, `31b`) are listed in code, because the registry has no tag-listing endpoint.
 
 ### 8.6 Interfaces
 
