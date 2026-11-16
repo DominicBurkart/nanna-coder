@@ -76,9 +76,9 @@ fn cut_plan(chars: usize) -> Option<usize> {
     }
 }
 
-fn truncate_chars(text: &str) -> String {
+fn truncate_chars(text: &str) -> Option<String> {
     match cut_plan(text.chars().count()) {
-        None => text.to_string(),
+        None => Some(text.to_string()),
         Some(keep) => (0..=keep)
             .rev()
             .map(|k| {
@@ -87,22 +87,20 @@ fn truncate_chars(text: &str) -> String {
                     .chain(std::iter::once(ELLIPSIS))
                     .collect::<String>()
             })
-            .find(|candidate| violation(candidate).is_none())
-            .unwrap_or_else(|| ELLIPSIS.to_string()),
+            .find(|candidate| violation(candidate).is_none()),
     }
 }
 
-fn pipeline(raw: &str) -> String {
+fn pipeline(raw: &str) -> Option<String> {
     let stripped = strip_unprintable(raw);
     let redacted = redact_resilient(&stripped);
     truncate_chars(&collapse_whitespace(&redacted))
 }
 
-fn finish(candidate: String) -> String {
-    match violation(&candidate) {
-        None => candidate,
-        Some(_) => WITHHELD.to_string(),
-    }
+fn finish(candidate: Option<String>) -> String {
+    candidate
+        .filter(|c| violation(c).is_none())
+        .unwrap_or_else(|| WITHHELD.to_string())
 }
 
 impl Summary {
@@ -314,14 +312,20 @@ mod tests {
             "token=abc".to_string(),
             "a  b".to_string(),
         ] {
-            assert_eq!(finish(bad), WITHHELD);
+            assert_eq!(finish(Some(bad)), WITHHELD);
         }
-        assert_eq!(finish("fine text".to_string()), "fine text");
+        assert_eq!(finish(Some("fine text".to_string())), "fine text");
+        assert_eq!(finish(None), WITHHELD);
         assert!(violation(WITHHELD).is_none());
         assert_eq!(
             Summary::try_from(WITHHELD.to_string()).unwrap().as_str(),
             WITHHELD
         );
+    }
+
+    #[test]
+    fn the_lone_ellipsis_never_violates_so_the_shortest_cut_always_exists() {
+        assert_eq!(violation(&ELLIPSIS.to_string()), None);
     }
 
     #[test]
@@ -335,9 +339,9 @@ mod tests {
     #[test]
     fn truncate_chars_keeps_whole_text_at_the_limit_and_cuts_one_over() {
         let at = "\u{e9}".repeat(179);
-        assert_eq!(truncate_chars(&at), at);
+        assert_eq!(truncate_chars(&at), Some(at.clone()));
         let over = "\u{e9}".repeat(180);
-        let cut = truncate_chars(&over);
+        let cut = truncate_chars(&over).unwrap();
         assert_eq!(cut.chars().count(), 179);
         assert!(cut.ends_with(ELLIPSIS));
         assert_eq!(cut.chars().filter(|c| *c == '\u{e9}').count(), 178);
