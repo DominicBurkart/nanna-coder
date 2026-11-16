@@ -459,6 +459,29 @@ mod tests {
     }
 
     #[test]
+    fn an_inapplicable_record_between_good_ones_fails_closed_at_its_own_line() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        let r = root(1);
+        store
+            .upsert(session("a", &r, SessionStatus::Running, 0, 0))
+            .unwrap();
+        store
+            .upsert(session("b", &r, SessionStatus::Running, 1, 1))
+            .unwrap();
+        drop(store);
+        let good = lines(&fixture);
+        let ghost = r#"{"op":"status","id":"ghost","status":"failed","at":"2023-11-14T22:13:20Z"}"#;
+        let broken = format!("{}\n{ghost}\n{}\n", good[0], good[1]);
+        std::fs::write(fixture.path("sessions.jsonl"), &broken).unwrap();
+        assert!(matches!(open(&fixture).err(), Some(StoreError::Corrupt(2))));
+        assert_eq!(
+            std::fs::read_to_string(fixture.path("sessions.jsonl")).unwrap(),
+            broken
+        );
+    }
+
+    #[test]
     fn a_path_that_cannot_be_read_is_an_io_error() {
         let fixture = Fixture::new();
         std::fs::create_dir(fixture.path("sessions.jsonl")).unwrap();

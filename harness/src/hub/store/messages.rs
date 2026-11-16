@@ -511,6 +511,25 @@ mod tests {
     }
 
     #[test]
+    fn an_inapplicable_record_between_good_ones_fails_closed_at_its_own_line() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        for n in 1..=2 {
+            store
+                .append(message(n, "a", "b", DeliveryState::Pending, 0, "m"))
+                .unwrap();
+        }
+        drop(store);
+        let text = file_text(&fixture);
+        let good: Vec<&str> = text.lines().collect();
+        let ghost = format!(r#"{{"op":"drop","id":"{}"}}"#, mid(9).as_uuid());
+        let broken = format!("{}\n{ghost}\n{}\n{}\n", good[0], good[1], good[2]);
+        std::fs::write(fixture.path("messages.jsonl"), &broken).unwrap();
+        assert!(matches!(open(&fixture).err(), Some(StoreError::Corrupt(2))));
+        assert_eq!(file_text(&fixture), broken);
+    }
+
+    #[test]
     fn an_exhausted_sequence_space_refuses_the_append() {
         let fixture = Fixture::new();
         let text = format!(r#"{{"op":"counter","next":{}}}"#, u64::MAX);
