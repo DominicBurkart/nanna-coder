@@ -99,6 +99,10 @@ pub struct QueuedTask {
     /// Backlog origin, when the task was ingested rather than submitted.
     #[serde(default)]
     pub origin: Option<TaskOrigin>,
+    /// Where the entry sits in its session tree. Absent for entries written
+    /// before lineage existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::hub::lineage::Lineage>,
 }
 
 impl QueuedTask {
@@ -123,7 +127,14 @@ impl QueuedTask {
             not_before: None,
             identity_hint: None,
             origin: None,
+            lineage: None,
         }
+    }
+
+    /// Record where the entry sits in its session tree.
+    pub fn with_lineage(mut self, lineage: Option<crate::hub::lineage::Lineage>) -> Self {
+        self.lineage = lineage;
+        self
     }
 
     /// Park the entry until `not_before`.

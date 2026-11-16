@@ -59,6 +59,7 @@ impl FailureKind {
             "TaskCheckFailed" | "VerificationFailed" => FailureKind::TaskCheckFailed,
             "ProtectedPathViolation" => FailureKind::ProtectedPathViolation,
             "ScopeError" => FailureKind::ScopeError,
+            "LineageInconsistent" => FailureKind::SpawnRefused,
             "IdentityUnavailable" => FailureKind::IdentityUnavailable,
             "NoProvider" => FailureKind::ModelUnavailable,
             "ContainerSetupFailed"
@@ -94,6 +95,7 @@ mod tests {
             FailureKind::ProtectedPathViolation,
         ),
         ("ScopeError", FailureKind::ScopeError),
+        ("LineageInconsistent", FailureKind::SpawnRefused),
         ("IdentityUnavailable", FailureKind::IdentityUnavailable),
         ("NoProvider", FailureKind::ModelUnavailable),
         ("ContainerSetupFailed", FailureKind::ContainerSetupFailed),
@@ -169,13 +171,9 @@ mod tests {
             .copied()
             .filter(|kind| !reachable.contains(kind))
             .collect();
-        let expected: HashSet<FailureKind> = [
-            FailureKind::SpawnRefused,
-            FailureKind::Cancelled,
-            FailureKind::Unclassified,
-        ]
-        .into_iter()
-        .collect();
+        let expected: HashSet<FailureKind> = [FailureKind::Cancelled, FailureKind::Unclassified]
+            .into_iter()
+            .collect();
         assert_eq!(unreachable, expected);
     }
 
