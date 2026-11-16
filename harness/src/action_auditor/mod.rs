@@ -33,6 +33,7 @@ mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+pub mod message_eval;
 mod message_rules;
 mod review;
 mod routing;
