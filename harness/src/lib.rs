@@ -18,6 +18,7 @@ pub mod escalation;
 pub mod eval;
 pub mod failure;
 pub mod harness_adapter;
+pub mod hub;
 pub mod identity;
 pub mod impact;
 pub mod leases;
