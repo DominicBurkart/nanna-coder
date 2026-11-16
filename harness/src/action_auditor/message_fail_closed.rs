@@ -388,6 +388,40 @@ mod tests {
         assert!(only_failure(&vouched));
     }
 
+    #[tokio::test]
+    async fn the_inbound_rules_rerun_uses_the_oracle_the_wrapper_was_given() {
+        struct Known(String);
+        impl IdentifierOracle for Known {
+            fn is_known_git_object(&self, hex: &str) -> bool {
+                hex == self.0
+            }
+            fn is_known_hub_id(&self, _id: &str) -> bool {
+                false
+            }
+        }
+        let sha = "0123456789abcdef".repeat(2) + "01234567";
+        let recipient = shepherd().await;
+        let m = thread_msg("a", "s", &format!("fixed in commit {sha}"));
+        let review = InboundReview {
+            recipient: &recipient,
+            sender: scope("a", EffectClass::Ci, &[]),
+            message: &m,
+            outbound: None,
+            thread: &[],
+        };
+        let strict = wrap(Behaviour::Error)
+            .review_inbound(&review)
+            .await
+            .unwrap();
+        assert!(strict.is_block());
+        let vouched = wrap(Behaviour::Error)
+            .with_oracle(Arc::new(Known(sha)))
+            .review_inbound(&review)
+            .await
+            .unwrap();
+        assert!(only_failure(&vouched));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn wrapping_the_model_auditor_fails_closed_on_a_hung_or_failing_provider() {
         let sender = implementer().await;
