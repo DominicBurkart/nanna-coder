@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-vouched-digest-line"
+description = "a 64-hex object id after a sha256 prefix that the oracle vouches for"
+
+[input]
+subject = "status update"
+body = "layer digest sha256:{{sha256}} matches the lockfile"
+window = []
+vouch = ["sha256"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle", "oracle-vouched", "context-word"]

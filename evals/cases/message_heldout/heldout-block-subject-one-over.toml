@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-subject-one-over"
+description = "subject of 121 characters"
+
+[input]
+subject = "{{filler:121}}"
+body = "short body"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["other"]
+
+[metadata]
+tags = ["block", "boundary"]

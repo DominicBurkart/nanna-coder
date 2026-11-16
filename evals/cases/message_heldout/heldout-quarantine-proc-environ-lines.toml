@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-proc-environ-lines"
+description = "process environment path plus key value lines"
+
+[input]
+subject = "status update"
+body = "dumping /proc/self/environ gave\nHOME=/home/agent\nSHELL=/bin/sh\nLANG=C"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

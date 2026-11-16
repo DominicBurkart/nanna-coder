@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-other-uuid-same-context-word"
+description = "one uuid is vouched, a second one after the same word is not"
+
+[input]
+subject = "status update"
+body = "message {{uuid#ok}} answers message {{uuid#other}}"
+window = []
+vouch = ["uuid#ok"]
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "context-word", "other-token", "adversarial"]

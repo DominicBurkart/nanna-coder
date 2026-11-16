@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-kube-config-fenced"
+description = "kube config pasted in a fence"
+
+[input]
+subject = "status update"
+body = "my .kube/config looks like:\n```\nclusters:\n- name: build\n  server: https://k8s.example.invalid\n```"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

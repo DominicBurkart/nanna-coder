@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-package-registry-token"
+description = "package registry token"
+
+[input]
+subject = "status update"
+body = "publish with {{npm_token}} please"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

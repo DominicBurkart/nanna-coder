@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-storage-account-key"
+description = "88 character base64 storage key"
+
+[input]
+subject = "status update"
+body = "AccountKey {{storage_key}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]
