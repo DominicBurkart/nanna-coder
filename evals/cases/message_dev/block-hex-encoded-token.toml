@@ -1,0 +1,16 @@
+[case]
+id = "block-hex-encoded-token"
+description = "token hex encoded"
+
+[input]
+subject = "status update"
+body = "payload {{hex:github_token}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "encoded", "adversarial"]

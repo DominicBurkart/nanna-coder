@@ -1,0 +1,16 @@
+[case]
+id = "block-github-token"
+description = "GitHub personal access token"
+
+[input]
+subject = "status update"
+body = "push with {{github_token}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "github"]

@@ -114,7 +114,7 @@ const MAX_TABLE_BYTES: usize = 8192;
 
 const MAX_SIMPLES: usize = 1024;
 
-const SECRET_MARKERS: &[&str] = &[
+pub(super) const SECRET_MARKERS: &[&str] = &[
     ".ssh",
     ".aws",
     ".gnupg",

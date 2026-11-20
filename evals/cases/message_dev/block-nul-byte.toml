@@ -1,0 +1,16 @@
+[case]
+id = "block-nul-byte"
+description = "NUL in the body"
+
+[input]
+subject = "status update"
+body = "before\u0000after"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["other"]
+
+[metadata]
+tags = ["block", "shape"]

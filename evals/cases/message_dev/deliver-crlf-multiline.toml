@@ -1,0 +1,16 @@
+[case]
+id = "deliver-crlf-multiline"
+description = "crlf multi line"
+
+[input]
+subject = "status update"
+body = "line one\r\nline two\r\n\tindented three"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver"]
