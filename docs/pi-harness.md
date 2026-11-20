@@ -173,8 +173,8 @@ policy. The broker serialises calls with an async mutex, so a call that
 starts after an escalation is refused with `task_halted` and every call passes
 the action gate; slices 2 and 3 must keep one connection per task and read one
 request at a time. Error messages on the wire are clipped to
-`MAX_MESSAGE_BYTES` (a sixth of `MAX_OUTPUT_BYTES`, so the JSON-escaped text
-fits the reply cap) and U+2028/U+2029 are escaped in every reply line; the
+`MAX_MESSAGE_BYTES` (a seventh of `MAX_OUTPUT_BYTES`, so the JSON-escaped text
+leaves room for the envelope) and U+2028/U+2029 are escaped in every reply line; the
 executor must still frame on LF only.
 
 `ToolRegistry::scoped_for(identity)` landed with #669 and also withholds

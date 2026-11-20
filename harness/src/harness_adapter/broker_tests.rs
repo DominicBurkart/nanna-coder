@@ -1286,9 +1286,10 @@ async fn every_error_message_on_the_wire_is_clipped_on_a_character_boundary() {
 }
 
 #[test]
-fn the_message_cap_is_one_sixth_of_the_output_cap() {
-    assert_eq!(MAX_MESSAGE_BYTES, 166_666);
-    assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 6);
+fn the_message_cap_is_one_seventh_of_the_output_cap() {
+    assert_eq!(MAX_MESSAGE_BYTES, 142_857);
+    assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 7);
+    assert!(6 * std::hint::black_box(MAX_MESSAGE_BYTES) + 1_000 < MAX_OUTPUT_BYTES);
 }
 
 #[tokio::test]
@@ -1379,6 +1380,8 @@ async fn the_output_cap_is_measured_on_the_escaped_reply_line() {
     )]);
     let line = broker.handle_line(r#"{"tool":"ctl"}"#).await;
     assert!(line.len() <= 1_048_576, "{}", line.len());
+    assert!(line.len() < MAX_OUTPUT_BYTES - 100_000, "{}", line.len());
+    assert!(line.len() > 5 * MAX_MESSAGE_BYTES, "{}", line.len());
     assert_eq!(controls.len(), MAX_MESSAGE_BYTES);
 }
 
@@ -1416,5 +1419,7 @@ async fn a_bad_request_that_echoes_its_input_in_the_parse_error_is_clipped() {
     assert_eq!(reply["kind"], "bad_request");
     let text = reply["output"].as_str().unwrap();
     assert!(text.starts_with("bad request: "));
-    assert!(text.len() <= MAX_MESSAGE_BYTES, "{}", text.len());
+    assert_eq!(text.len(), MAX_MESSAGE_BYTES);
+    let wire = broker.handle_line(&line).await;
+    assert!(wire.len() <= 170_000, "{}", wire.len());
 }
