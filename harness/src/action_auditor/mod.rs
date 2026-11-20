@@ -33,7 +33,10 @@ mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+mod message_auditor;
+mod message_fail_closed;
 pub mod message_eval;
+mod message_model;
 mod message_rules;
 mod review;
 mod routing;
@@ -47,6 +50,14 @@ pub use fail_closed::{FailClosedActionAuditor, ACTION_AUDIT_TIMEOUT};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
 pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
+pub use message_auditor::{
+    is_privilege_asymmetric, message_content_hash, BoundVerdict, InboundReview, MessageAuditor,
+    OutboundReview, RecipientScope, SharedOracle, ThreadMessage, RULE_MESSAGE_AUDITOR_NAME,
+};
+pub use message_fail_closed::{FailClosedMessageAuditor, MESSAGE_AUDIT_TIMEOUT};
+pub use message_model::{
+    ModelMessageAuditor, MESSAGE_AUDITOR_FRAMING, MESSAGE_AUDITOR_RUBRIC, MESSAGE_OUTPUT_CONTRACT,
+};
 pub use message_rules::{
     EntropyThresholds, IdentifierOracle, MessageVerdict, NullOracle, RuleMessageAuditor,
     RuleSignal, RulesOutcome,
