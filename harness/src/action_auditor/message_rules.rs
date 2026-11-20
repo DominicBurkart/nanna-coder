@@ -963,6 +963,18 @@ fn credential_paths(text: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether `text` mentions a credential path ([`SECRET_MARKERS`]).
+///
+/// ```
+/// use harness::action_auditor::is_credential_path;
+///
+/// assert!(is_credential_path("home/.ssh/id_rsa"));
+/// assert!(!is_credential_path("src/main.rs"));
+/// ```
+pub fn is_credential_path(text: &str) -> bool {
+    !credential_paths(text).is_empty()
+}
+
 fn looks_like_content(text: &str, oracle: &dyn IdentifierOracle) -> bool {
     if text.contains("```") {
         return true;
