@@ -510,15 +510,11 @@ mod tests {
     }
 
     fn verdict_of(kind: Kind) -> MessageVerdict {
-        match kind {
-            Kind::Deliver => MessageVerdict::Deliver,
-            Kind::Block => MessageVerdict::Block {
-                reasons: Vec::new(),
-            },
-            Kind::Quarantine => MessageVerdict::Quarantine {
-                reasons: Vec::new(),
-            },
+        let reasons = Vec::new();
+        if kind == Kind::Quarantine {
+            return MessageVerdict::Quarantine { reasons };
         }
+        MessageVerdict::Block { reasons }
     }
 
     struct Scripted(Vec<(&'static str, Kind)>);
@@ -628,13 +624,17 @@ mod tests {
     #[test]
     fn any_closure_is_a_provider() {
         let provider = |input: &MessageInput| {
-            verdict_of(if input.body == "x" {
-                Kind::Block
-            } else {
-                Kind::Deliver
-            })
+            if input.body == "x" {
+                return verdict_of(Kind::Block);
+            }
+            MessageVerdict::Deliver
         };
-        let cases = vec![case("x", Kind::Block, false, false)];
+        let cases = vec![
+            case("x", Kind::Block, false, false),
+            case("y", Kind::Deliver, false, false),
+        ];
+        let result = score(Layer::Composed, &cases, &provider);
+        assert_eq!(result.correct, 2);
         assert!(score(Layer::Composed, &cases, &provider).zero_false_deliver());
     }
 

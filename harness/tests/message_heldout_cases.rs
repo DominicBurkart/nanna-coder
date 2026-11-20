@@ -587,11 +587,8 @@ fn every_required_family_is_present() {
         ("model-only", 6),
     ];
     for (tag, floor) in floors {
-        assert!(
-            tagged(&cases, tag) >= floor,
-            "{tag}: {}",
-            tagged(&cases, tag)
-        );
+        let found = tagged(&cases, tag);
+        assert!(found >= floor, "{tag}: {found}");
     }
 }
 
@@ -601,12 +598,8 @@ fn ids_are_unique_match_file_names_and_carry_one_primary_tag() {
     for case in load() {
         let id = case.file.case.id.clone();
         assert!(seen.insert(id.clone()), "duplicate {id}");
-        assert!(
-            cases_dir("message_heldout")
-                .join(format!("{id}.toml"))
-                .is_file(),
-            "{id}"
-        );
+        let file = cases_dir("message_heldout").join(format!("{id}.toml"));
+        assert!(file.is_file(), "{id}");
         assert!(!case.file.case.description.is_empty(), "{id}");
         let primaries = ["block", "deliver", "quarantine"]
             .iter()
@@ -679,10 +672,8 @@ fn every_placeholder_expands_and_expansion_is_deterministic() {
         let id = &case.file.case.id;
         let first = to_case(&case);
         assert_eq!(first, to_case(&case), "{id}");
-        assert!(
-            !first.input.body.contains("{{") && !first.input.subject.contains("{{"),
-            "{id}"
-        );
+        assert!(!first.input.body.contains("{{"), "{id}");
+        assert!(!first.input.subject.contains("{{"), "{id}");
         assert!(first.input.window.iter().all(|w| !w.contains("{{")), "{id}");
     }
 }
@@ -760,11 +751,7 @@ fn a_context_word_alone_never_exempts_a_token() {
             .any(|w| w.len() >= 32);
         if hex_run {
             let got = RulesProvider::null_oracle().verdict(&case.input);
-            assert!(
-                !got.is_deliver(),
-                "{} delivered under the null oracle",
-                case.id
-            );
+            assert!(!got.is_deliver(), "{} delivered under null", case.id);
         }
     }
 }
@@ -831,10 +818,8 @@ fn the_set_shares_nothing_with_the_dev_split() {
             !dev_digests.contains(&content_digest(case)),
             "digest overlap {id}"
         );
-        assert!(
-            !dev_raw.contains(case.file.input.body.as_str()),
-            "body overlap {id}"
-        );
+        let body = case.file.input.body.as_str();
+        assert!(!dev_raw.contains(body), "body overlap {id}");
         for window in &case.file.input.window {
             assert!(!dev_raw.contains(window.as_str()), "window overlap {id}");
         }
@@ -946,16 +931,8 @@ fn the_rules_layer_has_zero_false_deliver_apart_from_the_filed_gaps() {
     let result = rules_score(&RulesProvider::vouching());
     println!("{}", result.summary());
     println!("known gaps (open, filed): {:?}", result.known_gaps);
-    assert!(
-        result.zero_false_deliver(),
-        "false deliver: {:?}",
-        result.false_deliver
-    );
-    assert!(
-        result.stale_gaps.is_empty(),
-        "stale known gap, remove its tag: {:?}",
-        result.stale_gaps
-    );
+    assert_eq!(result.false_deliver, Vec::<String>::new());
+    assert_eq!(result.stale_gaps, Vec::<String>::new());
     let mut open = result.known_gaps.clone();
     open.sort();
     assert_eq!(open, open_gap_ids());
@@ -975,12 +952,8 @@ fn the_rules_layer_baseline_is_recorded_exactly() {
 fn the_rules_layer_under_the_null_oracle_also_has_zero_false_deliver() {
     let result = rules_score(&RulesProvider::null_oracle());
     println!("null oracle {}", result.summary());
-    assert!(
-        result.zero_false_deliver(),
-        "false deliver: {:?}",
-        result.false_deliver
-    );
-    assert!(result.stale_gaps.is_empty(), "{:?}", result.stale_gaps);
+    assert_eq!(result.false_deliver, Vec::<String>::new());
+    assert_eq!(result.stale_gaps, Vec::<String>::new());
 }
 
 #[test]
@@ -991,11 +964,7 @@ fn false_blocks_are_limited_to_the_filed_gap() {
         "false block: {:?}",
         result.false_block
     );
-    assert!(
-        result.accepted_false_block.len() <= 2,
-        "{:?}",
-        result.accepted_false_block
-    );
+    assert!(result.accepted_false_block.len() <= 2);
     assert!(result
         .known_gaps
         .contains(&"heldout-deliver-kebab-branch".to_string()));
@@ -1003,8 +972,8 @@ fn false_blocks_are_limited_to_the_filed_gap() {
 
 #[test]
 fn every_case_gets_its_expected_reason_codes_and_the_reason_gaps_stay_open() {
-    let mut failures = Vec::new();
     for case in load().iter().filter(|c| !to_case(c).composed_only) {
+        let id = &case.file.case.id;
         let kind = case.file.expected.known_gap.as_deref();
         if kind.is_some() && kind != Some("reason_code") {
             continue;
@@ -1022,16 +991,10 @@ fn every_case_gets_its_expected_reason_codes_and_the_reason_gaps_stay_open() {
         let met = wanted.iter().all(|c| codes.contains(c));
         let gap = case.file.expected.known_gap.as_deref() == Some("reason_code");
         if gap {
-            assert_eq!(Kind::of(&verdict), Kind::Block, "{}", case.file.case.id);
+            assert_eq!(Kind::of(&verdict), Kind::Block, "{id}");
         }
-        if met == gap {
-            failures.push(format!(
-                "{}: wanted {:?}, got {:?}, reason gap {}",
-                case.file.case.id, wanted, codes, gap
-            ));
-        }
+        assert_ne!(met, gap, "{id}: wanted {wanted:?}, got {codes:?}");
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
