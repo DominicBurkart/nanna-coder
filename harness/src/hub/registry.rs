@@ -816,6 +816,11 @@ mod tests {
             .unwrap();
         assert_eq!(stored(&store, "a").subtask, format!("fixed in {known}"));
         assert_eq!(stored(&store, "b").subtask, "[withheld: secret_leak]");
+        let uuid = "123e4567-e89b-42d3-a456-426614174000";
+        vouched
+            .register(&binding("c"), &format!("see {uuid}"), at(0))
+            .unwrap();
+        assert_eq!(stored(&store, "c").subtask, "[withheld: secret_leak]");
         let (plain_store, plain) = registry();
         plain
             .register(&binding("a"), &format!("fixed in {known}"), at(0))
@@ -868,6 +873,37 @@ mod tests {
         assert_eq!(record.ended_at, Some(at(9)));
         assert!(!registry.abandon(&sid("t"), at(10)).unwrap());
         assert_eq!(stored(&store, "t").ended_at, Some(at(9)));
+    }
+
+    #[test]
+    fn debug_names_the_type_and_nothing_else() {
+        let (_store, registry) = registry();
+        assert_eq!(format!("{registry:?}"), "SessionRegistry { .. }");
+    }
+
+    #[test]
+    fn the_flaky_store_delegates_what_it_does_not_fail() {
+        let flaky = Flaky::new();
+        let registry = SessionRegistry::new(flaky.clone());
+        registry.register(&binding("t"), "s", at(0)).unwrap();
+        assert_eq!(
+            flaky
+                .in_root(&RootId::mcp(Uuid::from_u128(1)))
+                .unwrap()
+                .len(),
+            1
+        );
+        let note = Summary::compose("a", "running", "n");
+        flaky.set_note(sid("t"), note.clone()).unwrap();
+        flaky
+            .set_status(sid("t"), SessionStatus::Running, at(1))
+            .unwrap();
+        assert_eq!(flaky.prune(at(2), &Default::default()).unwrap(), 0);
+        flaky.writes.store(true, Ordering::SeqCst);
+        assert!(flaky.set_note(sid("t"), note).is_err());
+        assert!(flaky
+            .set_status(sid("t"), SessionStatus::Failed, at(3))
+            .is_err());
     }
 
     #[test]
