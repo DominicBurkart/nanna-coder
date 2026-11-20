@@ -98,7 +98,7 @@ MUTANTS = [
     (G, 'if CONSTRUCTORS.contains(&name) {', 'if false {', S),
     (K, "output: json!(clip(message, MAX_MESSAGE_BYTES)),", "output: json!(message),", T),
     (K, "output: json!(clip(&message, MAX_MESSAGE_BYTES)),", "output: json!(message),", T),
-    (K, "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;", "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 5;", T),
+    (K, "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;", "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 5;", T),
     (K, "let _serial = core.serial.lock().await;", "", T),
     (K, "let mut end = text.len().min(max);", "let mut end = text.len();", T),
     (K, "while !text.is_char_boundary(end) {", "while false {", T),
@@ -134,6 +134,9 @@ MUTANTS = [
     (G, 'previous_ref = name == "AuditedRef" || self.aliases.contains(&name);', "previous_ref = false;", S),
     (G, "for _ in 0..4 {", "for _ in 0..1 {", S),
     (G, 'if target == "AuditedRef" || self.aliases.contains(&target) {', 'if target == "AuditedRef" {', S),
+    (K, "output: json!(clip(&message, MAX_MESSAGE_BYTES)),", "output: json!(clip(&message, MAX_MESSAGE_BYTES + 1)),", T),
+    (K, "output: json!(clip(message, MAX_MESSAGE_BYTES)),", "output: json!(clip(message, MAX_MESSAGE_BYTES + 1)),", T),
+    (K, "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;", "pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;", T),
 ]
 
 INJECTED = [

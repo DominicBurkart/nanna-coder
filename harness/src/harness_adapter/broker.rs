@@ -92,14 +92,14 @@ pub const MAX_OUTPUT_BYTES: usize = 1_000_000;
 pub const MAX_REQUEST_BYTES: usize = 1_048_576;
 
 /// Largest message the broker puts in an error reply, in bytes before JSON
-/// escaping. It is one sixth of [`MAX_OUTPUT_BYTES`] so the escaped text, at
-/// worst six bytes per control character, still fits in the reply cap.
+/// escaping. It is one seventh of [`MAX_OUTPUT_BYTES`] so the escaped text, at
+/// worst six bytes per control character, leaves room for the reply envelope.
 /// ```
 /// use harness::harness_adapter::{MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES};
 ///
-/// assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 6);
+/// assert_eq!(MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES / 7);
 /// ```
-pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;
+pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;
 
 const HALT_ERROR_TYPE: &str = "StateError";
 const HALT_NOTICE: &str = "the task was halted by the host";

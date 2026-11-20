@@ -85,7 +85,7 @@
 85 broker_bind_structural.rs 'if CONSTRUCTORS.contains(&name) {' -> 'if false {': KILLED
 86 broker.rs 'output: json!(clip(message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
 87 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
-88 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX': KILLED
+88 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX': KILLED
 89 broker.rs 'let _serial = core.serial.lock().await;' -> '': KILLED
 90 broker.rs 'let mut end = text.len().min(max);' -> 'let mut end = text.len();': KILLED
 91 broker.rs 'while !text.is_char_boundary(end) {' -> 'while false {': KILLED
@@ -122,3 +122,6 @@ a new bind_workspace caller in harness_adapter/mod.rs: KILLED
 a new registry constructor call in pr_tools.rs: KILLED
 ModelFacingLayers made pub: KILLED
 116b test_module_files.rs 'let attribute = after_hash && ...' -> 'let attribute = true;': KILLED (re-run by hand)
+124 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(clip(&message, MAX_MESSAGE_BYTES + 1)),': KILLED
+125 broker.rs 'output: json!(clip(message, MAX_MESSAGE_BYTES)),' -> 'output: json!(clip(message, MAX_MESSAGE_BYTES + 1)),': KILLED
+126 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;': KILLED
