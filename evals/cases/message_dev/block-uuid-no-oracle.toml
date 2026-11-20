@@ -1,0 +1,16 @@
+[case]
+id = "block-uuid-no-oracle"
+description = "uuid shaped key, nobody vouches"
+
+[input]
+subject = "status update"
+body = "token {{uuid}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "adversarial"]

@@ -203,7 +203,33 @@ impl ModelActionAuditor {
             .ok_or_else(|| "unterminated JSON object in reply".to_string())?;
         let value: serde_json::Value =
             serde_json::from_str(&text[start..=end]).map_err(|e| format!("invalid JSON: {e}"))?;
-        serde_json::from_value(value).map_err(|e| format!("not a verdict: {e}"))
+        let verdict: ActionVerdict =
+            serde_json::from_value(value).map_err(|e| format!("not a verdict: {e}"))?;
+        Ok(Self::without_message_codes(verdict))
+    }
+
+    fn without_message_codes(verdict: ActionVerdict) -> ActionVerdict {
+        let fix = |reasons: Vec<crate::auditor::Reason>| -> Vec<crate::auditor::Reason> {
+            reasons
+                .into_iter()
+                .map(|r| match r.code {
+                    crate::auditor::ReasonCode::SecretLeak
+                    | crate::auditor::ReasonCode::CrossScopeSteering => {
+                        crate::auditor::Reason::new(crate::auditor::ReasonCode::Other, r.detail)
+                    }
+                    _ => r,
+                })
+                .collect()
+        };
+        match verdict {
+            ActionVerdict::Allow => ActionVerdict::Allow,
+            ActionVerdict::Block { reasons } => ActionVerdict::Block {
+                reasons: fix(reasons),
+            },
+            ActionVerdict::Escalate { reasons } => ActionVerdict::Escalate {
+                reasons: fix(reasons),
+            },
+        }
     }
 
     fn unparsable(problem: &str) -> ActionVerdict {
@@ -883,6 +909,16 @@ mod tests {
         assert!(user.contains("more paths truncated"));
         assert!(user.len() < 20_000);
         assert!(!user.contains("dir999/**"));
+    }
+
+    #[test]
+    fn a_model_cannot_emit_the_message_hub_codes() {
+        for code in ["secret_leak", "cross_scope_steering"] {
+            let reply =
+                format!(r#"{{"verdict":"block","reasons":[{{"code":"{code}","detail":"x"}}]}}"#);
+            let verdict = ModelActionAuditor::parse_reply(&reply).unwrap();
+            assert_eq!(verdict.reasons()[0].code, crate::auditor::ReasonCode::Other);
+        }
     }
 
     #[test]

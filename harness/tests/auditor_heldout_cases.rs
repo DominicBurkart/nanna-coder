@@ -107,9 +107,33 @@ const EXPECTED_IDS: &[&str] = &[
     "escalate-shepherd-live-config",
 ];
 
+const EXPECTED_REASON_CODES: &[&str] = &[
+    "scope_creep",
+    "loop_mismatch",
+    "prompt_injection",
+    "unknown_identity",
+    "effect_above_ceiling",
+    "window_closed",
+    "lease_unavailable",
+    "repeated_denials",
+    "other",
+    "model_failure",
+    "secret_leak",
+    "cross_scope_steering",
+];
+
 const EXPECTED_DIGEST: u64 = 0xA24C920CB76EDCFB;
 
 const EXPECTED_CATALOG_DIGEST: u64 = 11777880805296023288;
+
+#[test]
+fn reason_codes_match_the_frozen_list() {
+    let got: Vec<&str> = harness::auditor::ReasonCode::ALL
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    assert_eq!(got, EXPECTED_REASON_CODES);
+}
 
 fn load() -> Vec<AuditorEvalCase> {
     AuditorEvalCase::discover(&heldout_dir()).expect("held-out cases parse")

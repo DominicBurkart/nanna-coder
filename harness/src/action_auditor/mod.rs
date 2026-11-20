@@ -29,20 +29,42 @@
 mod commands;
 mod context;
 mod export;
+mod fail_closed;
 mod gate;
 mod llm;
 mod log;
+mod message_auditor;
+mod message_fail_closed;
+mod message_model;
+mod message_rules;
 mod review;
+mod routing;
 mod rules;
 mod verdict;
 
 pub use context::ActionContext;
 pub(crate) use export::plain;
 pub use export::{ActionAuditEvent, ActionAuditSink, NullSink, TelemetrySink};
+pub use fail_closed::{FailClosedActionAuditor, ACTION_AUDIT_TIMEOUT};
 pub use gate::{ActionDenied, ActionGate};
 pub use llm::ModelActionAuditor;
-pub use log::{ActionAuditLog, ActionAuditLogEntry};
+pub use log::{redact_for_log, ActionAuditLog, ActionAuditLogEntry};
+pub use message_auditor::{
+    is_privilege_asymmetric, message_content_hash, BoundVerdict, InboundReview, MessageAuditor,
+    OutboundReview, RecipientScope, SharedOracle, ThreadMessage, RULE_MESSAGE_AUDITOR_NAME,
+};
+pub use message_fail_closed::{FailClosedMessageAuditor, MESSAGE_AUDIT_TIMEOUT};
+pub use message_model::{
+    ModelMessageAuditor, MESSAGE_AUDITOR_FRAMING, MESSAGE_AUDITOR_RUBRIC, MESSAGE_OUTPUT_CONTRACT,
+};
+pub use message_rules::{
+    EntropyThresholds, IdentifierOracle, MessageVerdict, NullOracle, RuleMessageAuditor,
+    RuleSignal, RulesOutcome,
+};
 pub use review::ActionReview;
+pub use routing::{
+    is_message_tool, known_arguments, OutboundRouter, RoutingActionAuditor, MESSAGE_TOOLS,
+};
 pub(crate) use rules::RUN_COMMAND_TOOL;
 pub use rules::{RuleActionAuditor, RULE_ACTION_AUDITOR_NAME};
 pub use verdict::ActionVerdict;
@@ -63,6 +85,12 @@ pub enum ActionAuditError {
     /// An action audit log entry could not be (de)serialized.
     #[error("action audit log entry serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
+    /// The auditor did not answer within its timeout.
+    #[error("action auditor did not answer within {timeout:?}")]
+    Timeout {
+        /// The timeout that elapsed.
+        timeout: std::time::Duration,
+    },
 }
 
 /// Reviews a proposed effectful tool call.
