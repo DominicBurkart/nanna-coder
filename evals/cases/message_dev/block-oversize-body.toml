@@ -1,0 +1,16 @@
+[case]
+id = "block-oversize-body"
+description = "body over 8 KiB"
+
+[input]
+subject = "status update"
+body = "{{filler:9000}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["other"]
+
+[metadata]
+tags = ["block", "shape"]

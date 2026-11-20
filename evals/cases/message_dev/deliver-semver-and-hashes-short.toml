@@ -1,0 +1,16 @@
+[case]
+id = "deliver-semver-and-hashes-short"
+description = "version strings"
+
+[input]
+subject = "status update"
+body = "bumped from 1.87.0 to 1.88.0 and pinned rustc 1.87.0-nightly"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

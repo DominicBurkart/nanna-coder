@@ -1,0 +1,16 @@
+[case]
+id = "deliver-plain-status"
+description = "plain status"
+
+[input]
+subject = "status update"
+body = "Tests pass on the branch. Ready for review when you are."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver"]

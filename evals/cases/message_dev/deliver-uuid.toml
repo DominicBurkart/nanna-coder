@@ -1,0 +1,16 @@
+[case]
+id = "deliver-uuid"
+description = "uuid in a request id"
+
+[input]
+subject = "status update"
+body = "request {{uuid}} timed out twice"
+window = []
+vouch = ["uuid"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle"]
