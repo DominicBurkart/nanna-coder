@@ -764,11 +764,7 @@ fn vouched_cases_deliver_only_because_the_oracle_vouches() {
     for case in vouched {
         let with = RulesProvider::vouching().verdict(&case.input);
         let without = RulesProvider::null_oracle().verdict(&case.input);
-        assert!(
-            !without.is_deliver(),
-            "{} delivered without the oracle",
-            case.id
-        );
+        assert!(!without.is_deliver(), "{} delivered unvouched", case.id);
         assert_eq!(
             Kind::of(&with) == Kind::Deliver,
             case.expected == Kind::Deliver,
@@ -814,10 +810,8 @@ fn the_set_shares_nothing_with_the_dev_split() {
     for case in &held {
         let id = case.file.case.id.as_str();
         assert!(!dev_ids.contains(id), "id overlap {id}");
-        assert!(
-            !dev_digests.contains(&content_digest(case)),
-            "digest overlap {id}"
-        );
+        let digest = content_digest(case);
+        assert!(!dev_digests.contains(&digest), "digest overlap {id}");
         let body = case.file.input.body.as_str();
         assert!(!dev_raw.contains(body), "body overlap {id}");
         for window in &case.file.input.window {
@@ -959,11 +953,7 @@ fn the_rules_layer_under_the_null_oracle_also_has_zero_false_deliver() {
 #[test]
 fn false_blocks_are_limited_to_the_filed_gap() {
     let result = rules_score(&RulesProvider::vouching());
-    assert!(
-        result.false_block.is_empty(),
-        "false block: {:?}",
-        result.false_block
-    );
+    assert_eq!(result.false_block, Vec::<String>::new());
     assert!(result.accepted_false_block.len() <= 2);
     assert!(result
         .known_gaps
@@ -1109,11 +1099,8 @@ fn the_scopes_reach_the_provider_for_the_model_only_family() {
     for case in model_only {
         let sender = case.input.sender.as_ref().expect("sender");
         let recipient = case.input.recipient.as_ref().expect("recipient");
-        assert!(
-            recipient.write_paths.len() >= sender.write_paths.len(),
-            "{}",
-            case.id
-        );
+        let wider = recipient.write_paths.len() >= sender.write_paths.len();
+        assert!(wider, "{}", case.id);
         assert!(
             !recipient.tools.is_empty() && !sender.effect.is_empty(),
             "{}",
@@ -1129,10 +1116,8 @@ fn degenerate_low_entropy_strings_deliver_because_they_are_below_the_entropy_thr
             body: format!("padding {text}"),
             ..MessageInput::default()
         };
-        assert!(
-            RulesProvider::null_oracle().verdict(&input).is_deliver(),
-            "{text}"
-        );
+        let verdict = RulesProvider::null_oracle().verdict(&input);
+        assert!(verdict.is_deliver(), "{text}");
     }
 }
 
