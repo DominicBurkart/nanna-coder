@@ -661,7 +661,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
   4. `FailClosedMessageAuditor` applies a 30 s timeout.
 - **Inbound** (at `msg_recv`, inside the hub; recv args carry no content, so the action gate has nothing to review):
   1. Rules are re-run against the *recipient's* context. This is cheap, and catches rule-set updates between send and receive.
-  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
+  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks, or the recipient's write paths (or read paths; an absent read scope means unrestricted) are not an exact-string subset of the sender's, the same rule as `narrows()`. The comparison can over-trigger and never under-triggers. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
 - **Verdict mapping:**
 
 | `MessageVerdict` | Outbound result | Inbound result |
@@ -709,6 +709,12 @@ A rule `Block` is final: `RulesOutcome::combine(model_verdict)` returns it uncha
   - (d) coordinates evasion of audits, gates or humans;
   - (e) misrepresents work state.
 - **Output.** Strict JSON `{"verdict":"deliver|block|quarantine","reasons":[{code,detail}]}`. Unparsable output is treated as `Quarantine`.
+  - The whole trimmed reply must be one JSON object (no prose, no code fence, unknown fields denied, at most 16 raw reasons, at most 16 KiB). Any other reply, a `deliver` with reasons, or a `block`/`quarantine` without reasons is a `Quarantine` with a fixed `Other` reason.
+  - The model may use only `SecretLeak`, `CrossScopeSteering`, `PromptInjection`, `ScopeCreep` and `Other`; any other known code is mapped to `Other`, an unknown code string is a schema violation. Reasons are de-duplicated by code.
+  - The model's `detail` text is never carried into a verdict. Each model reason gets a fixed detail for its code, so a model that quotes the message cannot put message text into the audit log, telemetry or escalation evidence. Error strings from the provider are replaced by fixed text for the same reason.
+  - Prompt sections are fixed host fences (`<<<SENDER_SCOPE`, `<<<RECIPIENT_SCOPE`, `<<<THREAD`, `<<<MESSAGE`); agent-authored text inside them goes through `fenced_untrusted_as` (`AgentText` for scopes and the tool name, `AgentMessage` for subject, body and thread), which escapes `<`, `>` and brackets, so no text can forge any fence. The thread shows the last 3 messages; at most 20 recipients are listed.
+  - Inbound, for a pair that is not privilege-asymmetric, the outbound verdict is reused only when `InboundReview.outbound` carries a `BoundVerdict` whose `message_content_hash(subject, body)` matches the stored message. A missing or mismatching binding is a `Quarantine` and the model is not called. The asymmetry test is an exact-string subset on tool patterns, so it can over-trigger but never under-trigger. The hash is the 64-bit non-cryptographic `content_hash` over a length-prefixed subject and body: it detects a changed stored message, it is not an integrity proof against a collision search.
+  - The identifier oracle is fixed per auditor at construction (`with_oracle`); a hub that needs a per-recipient oracle builds one auditor per recipient workspace.
 
 ### 8.5 Required default model (the auditor is always present)
 
@@ -754,7 +760,7 @@ pub enum MessageVerdict { Deliver, Block { reasons: Vec<Reason> }, Quarantine { 
 
 pub struct OutboundReview<'a> { pub sender: &'a SessionBinding, pub tool: &'a str, pub recipients: &'a [RecipientScope], pub subject: &'a str, pub body: &'a str, pub window: &'a [StoredMessage], pub thread: &'a [StoredMessage] }
 pub struct InboundReview<'a>  { pub recipient: &'a SessionBinding, pub sender: RecipientScope, pub message: &'a StoredMessage, pub thread: &'a [StoredMessage] }
-pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String> }
+pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String>, pub read_paths: Option<Vec<String>> }
 
 #[async_trait]
 pub trait MessageAuditor: Send + Sync {
@@ -808,6 +814,12 @@ impl ActionAuditor for RoutingActionAuditor {
 // auditor/verdict.rs: ReasonCode gains SecretLeak and CrossScopeSteering.
 // ReasonCode::ALL grows to 12; the auditor_heldout manifest/digests in
 // harness/tests/auditor_heldout_cases.rs are regenerated in the same commit.
+
+// Deviations (implemented in harness/src/action_auditor/message_auditor.rs, message_model.rs, message_fail_closed.rs):
+// `StoredMessage` does not exist yet, so `window`, `thread` and `InboundReview.message` use the view `ThreadMessage { from, from_identity, subject, body }`
+// (Debug prints lengths and hash only); `InboundReview` gains `outbound: Option<&BoundVerdict>` (`BoundVerdict { verdict, content_hash }`, standing in for `VerdictRef`);
+// `FailClosedMessageAuditor` also holds a `RuleMessageAuditor` and an oracle for the rules re-run: a rules `Block` stays `Block`, a rules `Quarantine` stays `Quarantine`,
+// a clean message becomes `Quarantine`, each with a fixed `ModelFailure` reason appended. The code lives under `action_auditor/`, next to the rules layer.
 ```
 
 Change to `tools.rs`: `inspects_content(name)` also returns true for `msg_send`, `session_set_note` and `sessions_query`. That makes the gate review them at `EffectClass::None`. It stays a fixed list, pinned by a test.
@@ -1059,7 +1071,7 @@ Issues 1–14 and 16 work on the current runtime. Issue 15 is the only pi-couple
 | D3 | What happens on a secret hit? | **Block** with the reason code only (no silent redaction). The 3rd denial escalates. Quarantine is for injection, steering and collusion. |
 | D4 | Delivery model | **Pull-first** (`msg_recv`, long-poll ≤60 s) ships on the current runtime. The `steer` doorbell comes with the pi executor. |
 | D5 | What does the librarian index contain? | **Decided:** a redacted per-session activity log (§4.1) plus metadata. No message bodies and no file contents. |
-| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case); otherwise rules plus the hash-bound outbound verdict. |
+| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case: higher `max_effect`, extra tools, or wider write or read paths); otherwise rules plus the hash-bound outbound verdict. |
 | D7 | Persistence | JSONL in `~/.local/state/nanna/`. Single writer per host process; no database dependency. |
 | D8 | What if no auditor model is configured? | **Decided:** a default model is required to use nanna and also serves the auditor. With none configured, nanna uses the highest-parameter Gemma 4 that fits the device (§8.5). |
 | D9 | How does the librarian run? | **Decided:** a built-in, non-overridable identity, broker-only, via `LaunchTarget::NoWorkspace` (G9). |
