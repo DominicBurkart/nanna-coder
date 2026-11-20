@@ -1160,6 +1160,20 @@ fn the_scopes_reach_the_provider_for_the_model_only_family() {
 }
 
 #[test]
+fn degenerate_low_entropy_strings_deliver_because_they_are_below_the_entropy_threshold() {
+    for text in ["0".repeat(40), "ab".repeat(20), "f".repeat(64)] {
+        let input = MessageInput {
+            body: format!("padding {text}"),
+            ..MessageInput::default()
+        };
+        assert!(
+            RulesProvider::null_oracle().verdict(&input).is_deliver(),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 #[should_panic(expected = "unknown generator")]
 fn a_fixture_naming_an_unknown_generator_fails_loudly() {
     expand("typo-case", "token {{gho_tokn}}");
