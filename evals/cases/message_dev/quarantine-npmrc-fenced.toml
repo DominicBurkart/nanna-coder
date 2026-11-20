@@ -1,0 +1,16 @@
+[case]
+id = "quarantine-npmrc-fenced"
+description = "npmrc contents in a fence"
+
+[input]
+subject = "status update"
+body = "the .npmrc is:\n```\nregistry=https://registry.example.invalid/\n```"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

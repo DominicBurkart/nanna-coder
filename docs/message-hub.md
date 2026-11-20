@@ -294,6 +294,21 @@ pub trait ActivityStore: Send + Sync {
 - **Single writer.** On open, the hub takes an `fs4` exclusive `try_lock` on `hub.lock` next to the files (as `budget.rs` does). If a second process opens it, the open fails with `Locked`. The hub tools then return `HubError::Unavailable`, failing closed and avoiding the double-writer bug of #684.
 - **Permissions.** Files are created with mode `0600`.
 
+**Deviations implemented in #1061 (`harness/src/hub/store/`, `session.rs`, `message.rs`):**
+
+1. `SessionRecord.note` and `SessionStore::set_note` use `Option<String>` / `String` until `Summary` (#1062) merges; that issue changes the field type and nothing else in the stores.
+2. `MessageStore` gains `get(id) -> Option<StoredMessage>` (the hub needs it to resolve a quarantined message). `StoreError` gains `NotFound` (unknown id on `set_status`, `set_note`, `set_state`) and `Duplicate` (a reused `MessageId`). No `StoreError` variant carries record content: a serde error can quote the offending text, so `Corrupt` holds only the line number.
+3. The lock is a separate `HubLock::acquire(dir)` value passed to `JsonlSessionStore::open(path, &lock)` and `JsonlMessageStore::open(path, &lock)`, so both files share one `hub.lock`. The file must sit directly in the locked directory, and a second open of the same file through the same lock also fails with `Locked`. Env overrides that put the two files in different directories need two locks (a note for #1069).
+4. `VerdictRef` is `{ log_id: String, content_hash: u64 }`. `Retention` uses `chrono::Duration` and has a `Default` of 7 days, 24 hours and 7 days.
+5. `SessionRecord` and `StoredMessage` have hand-written `Debug` impls that print ids, states and byte lengths, never `subject`, `body`, `note`, `subtask` or other agent-authored text.
+6. `append` assigns `Seq` (from 1, never reused) and ignores the `seq` the caller put in the record. The next `Seq` is persisted as a `counter` record, so it survives a prune that empties the store.
+7. `inbox` and `unread` see only `Pending` and `Delivered` messages. `ack` moves only `Delivered` messages with `seq <= upto` for that recipient to `Acked`; `Pending`, `Withheld` and `Quarantined` ones are never acked by a cursor.
+8. `outbound_window` returns the sender's newest messages in any state (a quarantined fragment still counts for split-window detection), oldest first, while the running total of subject plus body bytes stays within the budget. A `Session` recipient narrows it to that session; the group recipients are resolved by the hub, so the store returns the sender's whole window for them.
+9. Retention measures age from `sent_at` with a strict `>`: an `Acked` message uses `acked_message_ttl`, `Quarantined` is never pruned, every other state uses `unacked_message_ttl`. Session pruning is per root: a root is removed, all its sessions together, once every session is terminal and the latest `last_activity` is older than `completed_session_ttl`. `in_root` orders by `created_at`, then id. `SessionStatus::is_active` is true for `Pending`, `Running` and `WaitingOnMessages`.
+10. An empty `NANNA_SESSIONS_PATH` or `NANNA_MESSAGES_PATH` counts as unset.
+11. Durability and crash behaviour: each commit is one `write_all` plus `flush` of whole lines, and a failed write is truncated back so the next append starts on a record boundary. If the truncate fails too, the journal refuses all later appends until reopen. There is no `fsync` per append, so the log survives a process crash but not necessarily power loss. A multi-record commit (`prune`, `ack`) can be partly written after a crash; both are monotone, so replaying the partial result is safe. `open` compacts through a `0600` temporary file and an atomic rename, which also narrows a pre-existing wider file.
+12. Every commit clones the whole table (the pattern of `leases/jsonl.rs`), so a commit costs time proportional to the store size. That is acceptable for the bounded retention above and is a known limit.
+
 ---
 
 ## 5. Messages
@@ -646,7 +661,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
   4. `FailClosedMessageAuditor` applies a 30 s timeout.
 - **Inbound** (at `msg_recv`, inside the hub; recv args carry no content, so the action gate has nothing to review):
   1. Rules are re-run against the *recipient's* context. This is cheap, and catches rule-set updates between send and receive.
-  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
+  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks, or the recipient's write paths (or read paths; an absent read scope means unrestricted) are not an exact-string subset of the sender's, the same rule as `narrows()`. The comparison can over-trigger and never under-triggers. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
 - **Verdict mapping:**
 
 | `MessageVerdict` | Outbound result | Inbound result |
@@ -658,20 +673,27 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
 - **No plaintext message content in audit output.** The args of `msg_send`, `session_set_note` and `sessions_query` are the message, note or query itself. Before any append, `ActionAuditLog` (and the registry's in-memory `action_reviews`, which end up in task results) replaces them with `{redacted, keys (only the argument names the tool itself defines, from `known_arguments`; any other key is `?`, because key names are agent-controlled and can be a secret), bytes, hash}` (`redact_for_log`). The hash is the non-cryptographic 64-bit `content_hash`: it lets a reader confirm a guess of the exact content, it neither recovers it nor attests integrity. Telemetry events and escalation evidence carry no args by construction. Every other tool's entries are byte-identical to before. A test plants a token-shaped string and asserts it appears in none of the audit file, telemetry output, escalation evidence or error returned to the agent.
 - **Never silently redacting message bodies** (decision D3). Redaction changes meaning, and the sender learns nothing from it. Summaries *are* redacted, because they have no sender to inform.
 
-### 8.3 Rules layer (`harness/src/hub/audit/rules.rs`)
+### 8.3 Rules layer (`harness/src/action_auditor/message_rules.rs`)
+
+The module lives under `action_auditor` until `harness/src/hub/` exists on main, and moves to `harness/src/hub/audit/rules.rs` with the hub. It takes plain strings, not `OutboundReview`: `RuleMessageAuditor::review(subject, body, window: &[&str]) -> RulesOutcome`, where `window` is the sender's recent outbound bodies to the same recipient, oldest first. `review_field(text) -> Option<Reason>` is the §3.3 write-time check; the caller withholds the field on `Some`.
 
 Rules are checked in this order:
 1. Size and shape: subject ≤120 characters, body ≤8 KiB, valid UTF-8, no NUL.
-2. Unprintable, bidi or zero-width characters lead to `Block(PromptInjection)`.
-3. `redact_resilient(strip_unprintable(body)) != body` leads to `Block(SecretLeak)`.
+2. Unprintable, bidi or zero-width characters lead to `Block(PromptInjection)`. `\r\n` is allowed, a lone `\r` is not. A word of three or more characters that mixes ASCII letters with Cyrillic or Greek letters (homoglyph spelling) leads to the same block.
+3. With `clean = strip_unprintable(text)`, `redact_resilient(clean) != clean` leads to `Block(SecretLeak)`. The comparison is against the stripped text, so a body that merely contains `\r\n` is not a leak; stripped characters are rule 2's business.
 4. PEM blocks, `-----BEGIN … PRIVATE KEY-----` and ssh key prefixes lead to `Block(SecretLeak)`.
 5. Entropy: any token of 24 characters or more drawn from the base64/hex/urlsafe alphabets with Shannon entropy ≥ 4.0 bits/char (base64) or ≥ 3.0 (hex) leads to `Block(SecretLeak)`.
-   - Allowlist: git SHAs (40 hex characters in a sha-shaped context), UUIDs, and `sha256:` digests.
-   - Thresholds are tuned against the held-out set in §9.
-6. Decoding: base64 and hex runs of 32 characters or more are decoded once, and rules 3–5 are re-run on the result.
+   - No free-text allowlist. A 40-hex token after `commit`, a 64-hex token after `sha256:` and a UUID are credential shapes (classic GitHub tokens are 40 hex, 256-bit keys are 64, several vendors issue UUID keys), and the sender chooses the words around them, so no context word ever exempts a token. An exact token is exempt only when an `IdentifierOracle` vouches for it: `is_known_git_object(hex)` for an all-hex token, `is_known_hub_id(id)` for a UUID-shaped token. The default `NullOracle` vouches for nothing, so with it these tokens fall to the entropy and decoding rules and Block (an unvouched UUID is scored on its hex digits against the hex threshold). The oracle is a parameter (`review_with`, `review_field_with`). Real oracles are supplied where the data lives: #1071/#1072 (`git cat-file -e` in the sender's workspace; the hub's own session and message ids). Abbreviated shas of 12 hex characters or fewer are below the 24-character minimum and need no oracle.
+   - A candidate token is a maximal run of `[A-Za-z0-9+/_-]` with leading and trailing `-`, `_` and `/` removed. Purely numeric tokens and path-like tokens (two or more `/` and every segment low in capitals and digits) are skipped. A run that contains an oracle-vouched segment is evaluated without that segment.
+   - A token without a digit, `+` or `/` (an identifier such as `snake_case_name` or `CamelCaseName`) needs `letters_only_bits` = 4.5 instead of 4.0.
+   - Known limit: a random 24-character base64 token is below 4.0 bits about 4% of the time (0.3% at 28 characters), so entropy alone misses some secrets. The rules layer therefore cannot claim zero false deliver on its own: the held-out eval (#1067) scores the rules layer and the composed rules-plus-model layer separately, and the model layer (§8.4, #1066) is mandatory for every non-trivial message.
+   - Thresholds are tuned only against the dev split `evals/cases/message_dev` (the sweep is in the PR for #1065). The held-out set of §11 belongs to #1067 and is never consulted for tuning.
+6. Decoding: base64 and hex runs of 32 characters or more are decoded once, and rules 3–5 are re-run on the result, as is `injection_findings` (so an encoded injection is a `PromptInjection` block). Decoded text is not decoded again.
 7. `auditor::rules::injection_findings(body)` and `injection_findings(subject)`.
-8. The sliding window: rules 3–6 are run over the concatenation of the sender's outbound window to the same recipient.
-9. Paths matching `SECRET_MARKERS` (`action_auditor/commands.rs:117`) mentioned *together with* content-looking text lead to `Escalate`. A bare mention of a path goes to the model as a signal.
+8. The sliding window: rules 3–6 are run over the last 8 KiB of the sender's outbound window to the same recipient, concatenated with no separator, followed by the new body.
+9. Paths matching `SECRET_MARKERS` (`action_auditor/commands.rs`, widened to `pub(super)`) mentioned *together with* content-looking text lead to `Quarantine(SecretLeak)` (the outbound `Escalate`). A marker counts only at a path boundary (`process.env` and `object.keys` do not match `.env` and `.key`). Content-looking text is a code fence, three or more `key=value` lines, or a token of 16 or more characters with a digit and entropy of 3.5 or more that the oracle does not vouch for. A bare mention goes to the model as a `RuleSignal::CredentialPathMentioned`.
+
+A rule `Block` is final: `RulesOutcome::combine(model_verdict)` returns it unchanged; a rule `Quarantine` can only be kept or merged with the model's reasons. Reasons carry the rule number and place, never the matched text. `EntropyThresholds` with a non-finite value falls back to its default and `min_len` is raised to at least 8, so a bad configuration cannot disable rule 5.
 
 ### 8.4 Model layer (`harness/src/hub/audit/llm.rs`)
 
@@ -687,6 +709,12 @@ Rules are checked in this order:
   - (d) coordinates evasion of audits, gates or humans;
   - (e) misrepresents work state.
 - **Output.** Strict JSON `{"verdict":"deliver|block|quarantine","reasons":[{code,detail}]}`. Unparsable output is treated as `Quarantine`.
+  - The whole trimmed reply must be one JSON object (no prose, no code fence, unknown fields denied, at most 16 raw reasons, at most 16 KiB). Any other reply, a `deliver` with reasons, or a `block`/`quarantine` without reasons is a `Quarantine` with a fixed `Other` reason.
+  - The model may use only `SecretLeak`, `CrossScopeSteering`, `PromptInjection`, `ScopeCreep` and `Other`; any other known code is mapped to `Other`, an unknown code string is a schema violation. Reasons are de-duplicated by code.
+  - The model's `detail` text is never carried into a verdict. Each model reason gets a fixed detail for its code, so a model that quotes the message cannot put message text into the audit log, telemetry or escalation evidence. Error strings from the provider are replaced by fixed text for the same reason.
+  - Prompt sections are fixed host fences (`<<<SENDER_SCOPE`, `<<<RECIPIENT_SCOPE`, `<<<THREAD`, `<<<MESSAGE`); agent-authored text inside them goes through `fenced_untrusted_as` (`AgentText` for scopes and the tool name, `AgentMessage` for subject, body and thread), which escapes `<`, `>` and brackets, so no text can forge any fence. The thread shows the last 3 messages; at most 20 recipients are listed.
+  - Inbound, for a pair that is not privilege-asymmetric, the outbound verdict is reused only when `InboundReview.outbound` carries a `BoundVerdict` whose `message_content_hash(subject, body)` matches the stored message. A missing or mismatching binding is a `Quarantine` and the model is not called. The asymmetry test is an exact-string subset on tool patterns, so it can over-trigger but never under-trigger. The hash is the 64-bit non-cryptographic `content_hash` over a length-prefixed subject and body: it detects a changed stored message, it is not an integrity proof against a collision search.
+  - The identifier oracle is fixed per auditor at construction (`with_oracle`); a hub that needs a per-recipient oracle builds one auditor per recipient workspace.
 
 ### 8.5 Required default model (the auditor is always present)
 
@@ -732,7 +760,7 @@ pub enum MessageVerdict { Deliver, Block { reasons: Vec<Reason> }, Quarantine { 
 
 pub struct OutboundReview<'a> { pub sender: &'a SessionBinding, pub tool: &'a str, pub recipients: &'a [RecipientScope], pub subject: &'a str, pub body: &'a str, pub window: &'a [StoredMessage], pub thread: &'a [StoredMessage] }
 pub struct InboundReview<'a>  { pub recipient: &'a SessionBinding, pub sender: RecipientScope, pub message: &'a StoredMessage, pub thread: &'a [StoredMessage] }
-pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String> }
+pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String>, pub read_paths: Option<Vec<String>> }
 
 #[async_trait]
 pub trait MessageAuditor: Send + Sync {
@@ -740,7 +768,7 @@ pub trait MessageAuditor: Send + Sync {
     async fn review_outbound(&self, r: &OutboundReview<'_>) -> Result<MessageVerdict, ActionAuditError>;
     async fn review_inbound(&self, r: &InboundReview<'_>) -> Result<MessageVerdict, ActionAuditError>;
 }
-pub struct RuleMessageAuditor { /* entropy thresholds, allowlist */ }
+pub struct RuleMessageAuditor { /* entropy thresholds; IdentifierOracle passed per call */ }
 pub struct ModelMessageAuditor { /* provider, model; runs RuleMessageAuditor first */ }
 pub struct FailClosedMessageAuditor<A> { inner: A, timeout: Duration }       // error/timeout → rules re-run + Quarantine(ModelFailure)
 
@@ -777,9 +805,21 @@ impl ActionAuditor for RoutingActionAuditor {
        line "quarantine record not written" is appended so the human sees it. */
 }
 
+// action_auditor/message_rules.rs (#1065, re-exported from action_auditor): MessageVerdict (above),
+// RuleSignal, RulesOutcome { verdict, signals } with combine(model_verdict), EntropyThresholds
+// { min_len, base64_bits, hex_bits, letters_only_bits }, and RuleMessageAuditor::{new, with_thresholds,
+// review(subject, body, window: &[&str]), review_field(text) -> Option<Reason>}. The MessageAuditor trait,
+// OutboundReview and InboundReview arrive with #1066.
+
 // auditor/verdict.rs: ReasonCode gains SecretLeak and CrossScopeSteering.
 // ReasonCode::ALL grows to 12; the auditor_heldout manifest/digests in
 // harness/tests/auditor_heldout_cases.rs are regenerated in the same commit.
+
+// Deviations (implemented in harness/src/action_auditor/message_auditor.rs, message_model.rs, message_fail_closed.rs):
+// `StoredMessage` does not exist yet, so `window`, `thread` and `InboundReview.message` use the view `ThreadMessage { from, from_identity, subject, body }`
+// (Debug prints lengths and hash only); `InboundReview` gains `outbound: Option<&BoundVerdict>` (`BoundVerdict { verdict, content_hash }`, standing in for `VerdictRef`);
+// `FailClosedMessageAuditor` also holds a `RuleMessageAuditor` and an oracle for the rules re-run: a rules `Block` stays `Block`, a rules `Quarantine` stays `Quarantine`,
+// a clean message becomes `Quarantine`, each with a fixed `ModelFailure` reason appended. The code lives under `action_auditor/`, next to the rules layer.
 ```
 
 Change to `tools.rs`: `inspects_content(name)` also returns true for `msg_send`, `session_set_note` and `sessions_query`. That makes the gate review them at `EffectClass::None`. It stays a fixed list, pinned by a test.
@@ -945,7 +985,7 @@ Dependencies and known limits:
 | Pagination | Proptest: across a snapshot, the concatenation of pages equals the ranked list, with no duplicates or skips, under concurrent inserts and status changes. A cursor is never usable by another owner or root. `n <= 20` gives no cursor. Groups appear only when `n > 20`. Kani: page index arithmetic never goes out of bounds. |
 | Visibility | Every hub read with a foreign-root or unknown id returns an identical `NotVisible`, including the error text (oracle test). |
 | Reach | Table test over `none/lineage/root` × relation; `narrows()` rejects widening `message_reach`. |
-| Audit rules | Unit per rule. A held-out set `evals/cases/message_heldout/*.toml` holds ≥ 60 cases: ≥ 20 deliver, ≥ 20 block, ≥ 10 quarantine, ≥ 15 adversarial (split secrets, base64/rot13, homoglyphs, zero-width, confused deputy, collusion, fake approvals). Each case has an expected verdict per layer. `harness/tests/message_heldout_cases.rs` asserts **zero false deliver** for the rules layer and a frozen manifest with digests, mirroring `auditor_heldout_cases.rs`. |
+| Audit rules | Unit per rule. A dev split `evals/cases/message_dev/*.toml` (≥ 30 cases, tokens generated at test time) is the only data entropy thresholds are tuned on. A held-out set `evals/cases/message_heldout/*.toml` holds ≥ 60 cases: ≥ 20 deliver, ≥ 20 block, ≥ 10 quarantine, ≥ 15 adversarial (split secrets, base64/rot13, homoglyphs, zero-width, confused deputy, collusion, fake approvals). Each case has an expected verdict per layer. `harness/tests/message_heldout_cases.rs` asserts **zero false deliver** for the rules layer and a frozen manifest with digests, mirroring `auditor_heldout_cases.rs`. |
 | Model auditor | An offline scripted provider covers prompt fencing, fence forgery, unparsable output (Quarantine) and timeout (Quarantine with `ModelFailure`). Live-model scoring reuses the `model_eval`-style binary flag (`--cases evals/cases/message_heldout --max-false-allow 0`), run by humans or the release session, with **no new workflow**. |
 | Gate wiring | `msg_send` with no gate attached is refused. `RoutingActionAuditor` leaves non-message tools unchanged (regression on existing gate tests). The fixed `inspects_content` list is pinned. |
 | Single door | The `syn` structural test from §9.3. The librarian registry contains exactly `index_search` and `index_read`. |
@@ -1031,7 +1071,7 @@ Issues 1–14 and 16 work on the current runtime. Issue 15 is the only pi-couple
 | D3 | What happens on a secret hit? | **Block** with the reason code only (no silent redaction). The 3rd denial escalates. Quarantine is for injection, steering and collusion. |
 | D4 | Delivery model | **Pull-first** (`msg_recv`, long-poll ≤60 s) ships on the current runtime. The `steer` doorbell comes with the pi executor. |
 | D5 | What does the librarian index contain? | **Decided:** a redacted per-session activity log (§4.1) plus metadata. No message bodies and no file contents. |
-| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case); otherwise rules plus the hash-bound outbound verdict. |
+| D6 | Inbound model pass | Only for privilege-asymmetric pairs (the confused-deputy case: higher `max_effect`, extra tools, or wider write or read paths); otherwise rules plus the hash-bound outbound verdict. |
 | D7 | Persistence | JSONL in `~/.local/state/nanna/`. Single writer per host process; no database dependency. |
 | D8 | What if no auditor model is configured? | **Decided:** a default model is required to use nanna and also serves the auditor. With none configured, nanna uses the highest-parameter Gemma 4 that fits the device (§8.5). |
 | D9 | How does the librarian run? | **Decided:** a built-in, non-overridable identity, broker-only, via `LaunchTarget::NoWorkspace` (G9). |

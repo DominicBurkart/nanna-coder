@@ -1,0 +1,16 @@
+[case]
+id = "deliver-long-snake-identifier"
+description = "long snake case identifier"
+
+[input]
+subject = "status update"
+body = "rename render_the_final_summary_report_for_users to render_summary"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

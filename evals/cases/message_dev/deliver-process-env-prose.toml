@@ -1,0 +1,16 @@
+[case]
+id = "deliver-process-env-prose"
+description = "process.env in prose"
+
+[input]
+subject = "status update"
+body = "the script reads process.env.HOME and object.keys of the result"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

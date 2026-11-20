@@ -232,7 +232,9 @@ fn sanitize_reasons(reasons: Vec<Reason>) -> Vec<Reason> {
         .take(MAX_REASONS)
         .map(|reason| {
             let code = match reason.code {
-                ReasonCode::ModelFailure => ReasonCode::Other,
+                ReasonCode::ModelFailure
+                | ReasonCode::SecretLeak
+                | ReasonCode::CrossScopeSteering => ReasonCode::Other,
                 other => other,
             };
             Reason::new(code, clip(&reason.detail, MAX_TEXT_CHARS))
@@ -928,6 +930,20 @@ pub(crate) mod tests {
             let (whole, cut) = clip_block(&unit.repeat(4), 4);
             assert!(!cut);
             assert_eq!(whole, unit.repeat(4));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_emit_the_message_hub_codes() {
+        for code in ["secret_leak", "cross_scope_steering"] {
+            let reply =
+                format!(r#"{{"verdict":"block","reasons":[{{"code":"{code}","detail":"x"}}]}}"#);
+            let auditor = ModelAuditor::new(MockProvider::replying(&[reply.as_str()]), MODEL);
+            let outcome = auditor
+                .audit_spawn(&fitting(), &context(true))
+                .await
+                .unwrap();
+            assert_eq!(outcome.verdict.reasons()[0].code, ReasonCode::Other);
         }
     }
 

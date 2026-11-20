@@ -1,0 +1,16 @@
+[case]
+id = "block-bearer-word-in-prose"
+description = "the credential-scheme word in prose trips the shared redactor: accepted false block"
+
+[input]
+subject = "status update"
+body = "we should use {{bearer_word}} auth for the new endpoint"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "accepted-false-block"]
