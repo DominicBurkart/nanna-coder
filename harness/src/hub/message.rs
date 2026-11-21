@@ -107,6 +107,77 @@ pub enum Recipient {
     Root,
 }
 
+/// How far a session's identity card lets it message: `None` forbids
+/// `msg_send`, `Lineage` allows the parent, children, siblings and the root
+/// mailbox, `Root` allows any session in the root. The order is the
+/// permission order, so a narrowing card may only pick a value less than or
+/// equal to its base, and a card that does not state a value gets `None`.
+///
+/// ```
+/// use harness::hub::message::MessageReach;
+///
+/// assert!(MessageReach::None < MessageReach::Lineage && MessageReach::Lineage < MessageReach::Root);
+/// assert_eq!(MessageReach::default(), MessageReach::None);
+/// assert_eq!("lineage".parse::<MessageReach>(), Ok(MessageReach::Lineage));
+/// assert_eq!(MessageReach::Root.as_str(), "root");
+/// assert!("everyone".parse::<MessageReach>().is_err());
+/// ```
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageReach {
+    #[default]
+    None,
+    Lineage,
+    Root,
+}
+
+impl MessageReach {
+    /// Every value, in ascending permission order.
+    ///
+    /// ```
+    /// use harness::hub::message::MessageReach;
+    /// assert!(MessageReach::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+    /// ```
+    pub const ALL: [MessageReach; 3] = [
+        MessageReach::None,
+        MessageReach::Lineage,
+        MessageReach::Root,
+    ];
+
+    /// Stable snake_case name, identical to the serde representation.
+    ///
+    /// ```
+    /// use harness::hub::message::MessageReach;
+    /// assert_eq!(MessageReach::None.as_str(), "none");
+    /// ```
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MessageReach::None => "none",
+            MessageReach::Lineage => "lineage",
+            MessageReach::Root => "root",
+        }
+    }
+}
+
+impl fmt::Display for MessageReach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MessageReach {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MessageReach::ALL
+            .into_iter()
+            .find(|reach| reach.as_str() == s)
+            .ok_or(())
+    }
+}
+
 /// The purpose of a message.
 ///
 /// ```
@@ -224,6 +295,18 @@ impl fmt::Debug for StoredMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_reach_defaults_to_none_and_orders_by_permission() {
+        assert_eq!(MessageReach::default(), MessageReach::None);
+        assert!(MessageReach::None < MessageReach::Lineage);
+        assert!(MessageReach::Lineage < MessageReach::Root);
+        assert_eq!(MessageReach::Lineage.to_string(), "lineage");
+        assert_eq!(
+            serde_json::to_string(&MessageReach::Root).unwrap(),
+            "\"root\""
+        );
+    }
 
     fn stored() -> StoredMessage {
         StoredMessage {
