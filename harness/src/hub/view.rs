@@ -254,11 +254,8 @@ fn fence(text: &str, cap: usize, budget: &mut Budget) -> String {
 
 impl Serialize for SessionItem {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let fenced = fence(
-            self.summary.as_str(),
-            SUMMARY_FENCE_CHARS,
-            &mut Budget::new(SUMMARY_FENCE_CHARS),
-        );
+        let mut budget = Budget::new(SUMMARY_FENCE_CHARS);
+        let fenced = fence(self.summary.as_str(), SUMMARY_FENCE_CHARS, &mut budget);
         let mut out = serializer.serialize_struct("SessionItem", 4)?;
         out.serialize_field("id", &self.id)?;
         out.serialize_field("relation", &self.relation)?;
@@ -551,17 +548,6 @@ impl<'a> From<&'a SessionBinding> for Viewer<'a> {
     }
 }
 
-fn status_label(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Pending => "pending",
-        SessionStatus::Running => "running",
-        SessionStatus::WaitingOnMessages => "waiting_on_messages",
-        SessionStatus::Completed => "completed",
-        SessionStatus::Failed => "failed",
-        SessionStatus::Cancelled => "cancelled",
-    }
-}
-
 fn clean(text: &str, max_chars: usize) -> String {
     redact_resilient(&strip_unprintable(text))
         .chars()
@@ -577,8 +563,8 @@ fn clean_list(items: &[String], max_chars: usize) -> Vec<String> {
         .collect()
 }
 
-fn note_of(record: &SessionRecord) -> Option<&str> {
-    record.note.as_deref()
+fn note_of(record: &SessionRecord) -> Option<&Summary> {
+    record.note.as_ref()
 }
 
 fn visible(record: &SessionRecord, include_librarians: bool) -> bool {
@@ -686,14 +672,19 @@ impl<'a> World<'a> {
     }
 
     fn item(&self, record: &SessionRecord) -> SessionItem {
-        let text = note_of(record)
-            .filter(|note| !note.trim().is_empty())
-            .unwrap_or_else(|| record.subtask.lines().next().unwrap_or_default());
+        let summary = match note_of(record) {
+            Some(stored) => stored.clone(),
+            None => Summary::compose(
+                &record.identity,
+                record.status.label(),
+                record.subtask.lines().next().unwrap_or_default(),
+            ),
+        };
         SessionItem {
             id: record.id.clone(),
             relation: self.rank(record).relation,
             status: record.status,
-            summary: Summary::compose(&record.identity, status_label(record.status), text),
+            summary,
         }
     }
 
@@ -715,10 +706,9 @@ impl<'a> World<'a> {
             counts.active += usize::from(record.status.is_active());
             counts.waiting += usize::from(record.status == SessionStatus::WaitingOnMessages);
             counts.completed += usize::from(record.status == SessionStatus::Completed);
-            counts.failed += usize::from(matches!(
-                record.status,
-                SessionStatus::Failed | SessionStatus::Cancelled
-            ));
+            counts.failed += usize::from(
+                !record.status.is_active() && record.status != SessionStatus::Completed,
+            );
             *counts
                 .by_identity
                 .entry(clean(&record.identity, IDENTITY_CHARS))
@@ -1013,7 +1003,7 @@ fn describe_for(
     let mut budget = Budget::new(DETAIL_BUDGET_CHARS);
     let mut fenced = |text: &str, cap: usize| fence(&clean(text, usize::MAX), cap, &mut budget);
     let subtask = fenced(&record.subtask, SUBTASK_CHARS);
-    let note = note_of(record).map(|n| fenced(n, NOTE_CHARS));
+    let note = note_of(record).map(|n| fenced(n.as_str(), NOTE_CHARS));
     let result_summary = record
         .result_summary
         .as_deref()
@@ -1216,7 +1206,11 @@ mod tests {
     }
 
     fn with_note(record: &mut SessionRecord, text: &str) {
-        record.note = Some(text.to_string());
+        record.note = Some(Summary::compose(
+            &record.identity,
+            record.status.label(),
+            text,
+        ));
     }
 
     fn flat(
@@ -1457,21 +1451,15 @@ mod tests {
         let lineage = Lineage::root_child(root(1));
         let owner = caller("a", &lineage);
         let other = caller("b", &lineage);
-        let first: Vec<CursorToken> = (0..MAX_CURSORS_PER_OWNER as i64)
+        let first: Vec<CursorToken> = (0..64)
             .map(|i| table.issue(&owner.view(), &Scope::List, &some_snapshot(), 20, at(i)))
             .collect();
         let others: Vec<CursorToken> = (0..3)
             .map(|i| table.issue(&other.view(), &Scope::List, &some_snapshot(), 20, at(i)))
             .collect();
-        assert_eq!(
-            table.live_for(&owner.session, at(100)),
-            MAX_CURSORS_PER_OWNER
-        );
+        assert_eq!(table.live_for(&owner.session, at(100)), 64);
         let newest = table.issue(&owner.view(), &Scope::List, &some_snapshot(), 20, at(100));
-        assert_eq!(
-            table.live_for(&owner.session, at(100)),
-            MAX_CURSORS_PER_OWNER
-        );
+        assert_eq!(table.live_for(&owner.session, at(100)), 64);
         assert!(table
             .resolve(&owner.view(), &Scope::List, &first[0], at(101))
             .is_err());
@@ -2661,7 +2649,7 @@ mod tests {
             self.1.pass()?;
             self.0.set_status(id, s, at)
         }
-        fn set_note(&self, id: SessionId, note: String) -> Result<(), StoreError> {
+        fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError> {
             self.1.pass()?;
             self.0.set_note(id, note)
         }
@@ -2726,7 +2714,9 @@ mod tests {
         sessions
             .set_status(sid("me"), SessionStatus::Running, at(1))
             .unwrap();
-        sessions.set_note(sid("me"), "n".into()).unwrap();
+        sessions
+            .set_note(sid("me"), Summary::compose("coder", "running", "n"))
+            .unwrap();
         assert_eq!(sessions.prune(at(1), &Retention::default()).unwrap(), 0);
         assert_eq!(sessions.in_root(&root(1)).unwrap().len(), 1);
         let closed = FlakySessions(InMemorySessionStore::new(), Gate::from(0));
@@ -2877,7 +2867,7 @@ mod tests {
             [
                 "coder [running] the note",
                 "coder [running] subtask of b",
-                "coder [running] subtask of c",
+                "coder [running]",
                 "coder [failed]"
             ]
         );
@@ -2941,21 +2931,6 @@ mod tests {
             filter_hint: filter,
         };
         assert!(!format!("{group:?}").contains("secret-card"));
-    }
-
-    #[test]
-    fn status_labels_are_the_snake_case_names() {
-        for status in [
-            SessionStatus::Pending,
-            SessionStatus::Running,
-            SessionStatus::WaitingOnMessages,
-            SessionStatus::Completed,
-            SessionStatus::Failed,
-            SessionStatus::Cancelled,
-        ] {
-            let name = serde_json::to_string(&status).unwrap();
-            assert_eq!(format!("\"{}\"", status_label(status)), name);
-        }
     }
 
     async fn bound_caller() -> SessionBinding {

@@ -576,7 +576,7 @@ pub struct CursorTable { /* owner-keyed snapshots, TTL 10m, ≤64/owner */ }
 - **Rank reading.** Relations self, parent, other ancestors (nearest first), siblings and children keep their rank whatever their status; `Peer` splits into rank 5 (active) and rank 6 (terminal); within a rank, active before terminal, then newest `last_activity`, then id.
 - **Depth 1 today.** Every spawn has the root as parent, so every session in a root is a `Sibling` of every other and groups (which collapse `Peer` runs only) cannot fire in production until agent-initiated nested spawns exist. They are covered by tests with nested lineages.
 - **Bounds not enforced.** `groups` and `Counts.by_identity` are bounded only by the number of sessions and identities in the root.
-- **Stored note.** The reads go through one helper (`note_of`). While `SessionRecord.note` is a plain string the summary is composed from it; when the registry change that stores a bounded `Summary` there merges, the helper and the test setters (`with_note`) are the only places to adapt, and the stored summary must then be used as is instead of composed again.
+- **Stored note.** `SessionRecord.note` is a bounded `Summary` (composed by the registry from identity, status and the note text). `sessions_list` uses it as the item summary as is, and only composes `"{identity} [{status}] {first subtask line}"` when there is no note; `session_describe` fences it. Reads go through one helper (`note_of`).
 - **Kani.** `page_bounds` carries a `#[cfg(kani)]` proof; `cargo-kani` is not installed here and the proof has never been executed (#1087). An exhaustive test over `len <= 130, offset <= 140` and proptests over all `usize` pairs are the evidence that runs.
 
 ---
