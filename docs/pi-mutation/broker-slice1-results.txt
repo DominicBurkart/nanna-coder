@@ -1,0 +1,127 @@
+1 binding.rs 'agent.name() == identity.name()' -> 'true': KILLED
+2 binding.rs 'scope.repos == identity.scope.repos' -> 'true': KILLED
+3 binding.rs 'scope.paths == identity.scope.paths' -> 'true': KILLED
+4 binding.rs 'scope.read_paths == identity.scope.read_paths' -> 'true': KILLED
+5 binding.rs 'scope.tools == tool_patterns' -> 'true': KILLED
+6 binding.rs 'agent.max_effect() == identity.scope.max_effect' -> 'true': KILLED
+7 binding.rs 'agent.limits() == identity.limits' -> 'true': KILLED
+8 binding.rs 'agent.model() == identity.identity.model' -> 'true': KILLED
+9 binding.rs 'agent.audited_repo() == audited_repo' -> 'true': KILLED
+10 binding.rs '&& prompt_matches' -> '&& true': KILLED
+11 binding.rs '&& capabilities_allowed' -> '&& true': KILLED
+12 binding.rs '.all(|c| identity.allows_tool' -> '.any(|c| identity.allows_tool': KILLED
+13 binding.rs 'identity.allows_tool(&c.name) && identity.allows_effect(c.ef' -> 'identity.allows_tool(&c.name)': KILLED
+14 binding.rs 'identity.allows_tool(&c.name) && identity.allows_effect(c.ef' -> 'identity.allows_effect(c.effect)': KILLED
+15 binding.rs '.is_ok_and(|text| text == agent.system_prompt())' -> '.map_or(true, |text| text == agent.syste': KILLED
+16 binding.rs '!granted.contains(&name.as_str())' -> 'false': KILLED
+17 binding.rs 'registry.effect_class_of(&capability.name) == Some(capabilit' -> 'true': KILLED
+18 binding.rs 'if !same {' -> 'if same {': KILLED
+19 binding.rs 'offered.sort();' -> '': KILLED
+20 binding.rs 'let unaudited = matches!(bound, BoundIdentity::Unaudited(_))' -> 'let unaudited = false;': KILLED
+21 binding.rs 'if !agent_matches_identity(self, identity, audited_repo) {' -> 'if false {': KILLED
+22 binding.rs 'if !names_repo(audited_repo, source) {' -> 'if false {': KILLED
+23 binding.rs 'check_repo(identity, source)?;' -> 'let _ = check_repo(identity, source);': KILLED
+24 binding.rs 'layers_match(identity, workspace, &layers)?;' -> 'let _ = layers_match(identity, workspace': KILLED
+25 binding.rs 'registry_matches(self, &registry)?;' -> 'let _ = registry_matches(self, &registry': KILLED
+26 binding.rs 'model_facing_registry(workspace, Some(identity), layers)?' -> 'model_facing_registry(workspace, None, l': KILLED
+27 binding.rs 'subject.task_id.0 == workspace.task_id' -> 'true': KILLED
+28 binding.rs 'subject.max_effect == identity.scope.max_effect' -> 'true': KILLED
+29 binding.rs 'subject.paths == identity.scope.paths' -> 'true': KILLED
+30 binding.rs 'subject.repo == subject_repo(&workspace.source_repo)' -> 'true': KILLED
+31 binding.rs '.map(|c| (c.name.clone(), c.effect))' -> '.map(|c| (c.name.clone(), EffectClass::N': KILLED
+32 binding.rs 'self.capabilities == capability_snapshot(agent)' -> 'true': KILLED
+33 broker.rs 'effect <= self.max_effect' -> 'effect < self.max_effect': KILLED
+34 broker.rs 'Self::new(EffectClass::Workspace)' -> 'Self::new(EffectClass::Repository)': KILLED
+35 broker.rs 'capacity: capacity.max(1)' -> 'capacity: capacity': KILLED
+36 broker.rs 'state.0.len() >= self.capacity' -> 'state.0.len() > self.capacity': KILLED
+37 broker.rs 'state.1 += 1;' -> 'state.1 += 0;': KILLED
+38 broker.rs 'state.0.pop_front();' -> '': KILLED
+39 broker.rs 'if !bound.agent_matches(agent) {' -> 'if false {': KILLED
+40 broker.rs 'if !bound.capabilities_match(agent) {' -> 'if false {': KILLED
+41 broker.rs 'if policy.admits(capability.effect) {' -> 'if true {': KILLED
+42 broker.rs '("agent", plan.agent == core.agent)' -> '("agent", true)': KILLED
+43 broker.rs '("audited repository", plan.audited_repo == core.audited_rep' -> '("audited repository", true)': KILLED
+44 broker.rs '("model", plan.model == core.model)' -> '("model", true)': KILLED
+45 broker.rs '("image", plan.image == core.image)' -> '("image", true)': KILLED
+46 broker.rs '("limits", plan.limits == core.limits)' -> '("limits", true)': KILLED
+47 broker.rs '("scope", plan.scope == core.scope)' -> '("scope", true)': KILLED
+48 broker.rs '("broker socket", plan.broker_socket == core.broker_socket)' -> '("broker socket", true)': KILLED
+49 broker.rs 'plan.exposed_capabilities == core.capabilities,' -> 'true,': KILLED
+50 broker.rs '.filter(|name| !core.served.contains(name.as_str()))' -> '.filter(|name| core.served.contains(name': KILLED
+51 broker.rs 'verify_runtime_tools(plan, reported)?;' -> 'let _ = verify_runtime_tools(plan, repor': KILLED
+52 broker.rs 'started: core.started.fetch_add(1, Ordering::SeqCst)' -> 'started: core.started.fetch_add(0, Order': KILLED
+53 broker.rs 'args_bytes: args_text.len()' -> 'args_bytes: 0': KILLED
+54 broker.rs 'args_fingerprint: content_hash(&args_text)' -> 'args_fingerprint: String::new()': KILLED
+55 broker.rs 'record.completed = self.core.completed.fetch_add(1, Ordering' -> 'record.completed = self.core.completed.f': KILLED
+56 broker.rs 'outcome: AuditOutcome::Aborted,\n            }),' -> 'outcome: AuditOutcome::Ok,\n            }': EQUIVALENT: the default outcome is overwritten by finish() on every path including Drop
+57 broker.rs 'if self.is_halted() {' -> 'if false {': KILLED
+58 broker.rs 'if !core.served.contains(&request.tool) {' -> 'if false {': KILLED
+59 broker.rs 'core.halted.store(true, Ordering::SeqCst);' -> 'core.halted.store(false, Ordering::SeqCs': KILLED
+60 broker.rs 'if outcome.is_halt() {' -> 'if false {': KILLED
+61 broker.rs '.len() > MAX_OUTPUT_BYTES =>' -> '.len() >= MAX_OUTPUT_BYTES =>': KILLED
+62 broker.rs 'line.len() > MAX_REQUEST_BYTES' -> 'line.len() >= MAX_REQUEST_BYTES': KILLED
+63 broker.rs 'MAX_LOGGED_NAME: usize = 128' -> 'MAX_LOGGED_NAME: usize = 127': KILLED
+64 broker.rs 'if next > MAX_LOGGED_NAME' -> 'if next >= MAX_LOGGED_NAME': KILLED
+65 broker.rs 'name.escape_debug().collect()' -> 'name.chars().collect()': KILLED
+66 broker.rs 'logged_name(&request.tool)),' -> 'request.tool),': KILLED
+67 broker.rs '(ToolErrorKind::ActionBlocked, error)' -> '(ToolErrorKind::ExecutionFailed, error)': KILLED
+68 broker.rs '(ToolErrorKind::BudgetRefused, error)' -> '(ToolErrorKind::ExecutionFailed, error)': KILLED
+69 broker.rs '(ToolErrorKind::ScopeDenied, error)' -> '(ToolErrorKind::PathSecurity, error)': KILLED
+70 broker.rs '(ToolErrorKind::ProtectedPath, error)' -> '(ToolErrorKind::ScopeDenied, error)': KILLED
+71 broker.rs 'const HALT_NOTICE: &str = "the task was halted by the host";' -> 'const HALT_NOTICE: &str = "halted";': KILLED
+72 broker.rs 'const HALT_ERROR_TYPE: &str = "StateError";' -> 'const HALT_ERROR_TYPE: &str = "Other";': KILLED
+73 broker.rs 'self.finish(AuditOutcome::Aborted);' -> '': KILLED
+74 broker.rs 'BrokerOutcome::Halt(_) => AuditOutcome::Halt,' -> 'BrokerOutcome::Halt(_) => AuditOutcome::': KILLED
+75 broker.rs 'format!("bad request: {error}")' -> 'format!("bad request")': KILLED
+76 broker.rs 'self.core.registry.action_reviews()' -> 'Vec::new()': KILLED
+77 broker.rs 'tool: logged_name(tool),' -> 'tool: String::new(),': KILLED
+78 broker.rs 'format!("production hold {escalation_id} on {repo} halted th' -> 'String::new()': KILLED
+79 pi.rs 'agent: agent.name().to_string(),\n            model:' -> 'agent: String::new(),\n            model:': KILLED
+80 pi.rs 'model: agent.model().to_string(),' -> 'model: String::new(),': KILLED
+81 mod.rs '                tools: tools.iter().map(ToString::to_string)' -> '                tools: Vec::new(),': KILLED
+82 broker_bind_structural.rs 'syn::Visibility::Restricted(restricted) if restricted.path.i' -> 'syn::Visibility::Restricted(restricted) ': KILLED
+83 broker_bind_structural.rs 'if name == BIND {\n            self.binds' -> 'if name == "never" {\n            self.bi': KILLED
+84 broker_bind_structural.rs 'PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 0' -> 'PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: u': KILLED
+85 broker_bind_structural.rs 'if CONSTRUCTORS.contains(&name) {' -> 'if false {': KILLED
+86 broker.rs 'output: json!(clip(message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
+87 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(message),': KILLED
+88 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX': KILLED
+89 broker.rs 'let _serial = core.serial.lock().await;' -> '': KILLED
+90 broker.rs 'let mut end = text.len().min(max);' -> 'let mut end = text.len();': KILLED
+91 broker.rs 'while !text.is_char_boundary(end) {' -> 'while false {': KILLED
+92 broker.rs 'let text = text.replace(\'\\u{2028}\', "\\\\u2028");' -> '': KILLED
+93 broker.rs 'text.replace(\'\\u{2029}\', "\\\\u2029")' -> 'text': KILLED
+94 broker_bind_structural.rs 'if name == "AuditedRef" || in_ref || self.aliases.contains(&' -> 'if false {': KILLED
+95 test_module_files.rs '            kept.insert(name);' -> '            let _ = name;': KILLED
+96 test_module_files.rs 'skipped.difference(&kept)' -> 'skipped.iter()': KILLED
+97 test_module_files.rs 'matches!(&meta, syn::Meta::Path(path) if path.is_ident("test' -> 'matches!(&meta, syn::Meta::Path(_))': KILLED
+98 protected_audit_hook_structural.rs '.filter(|(file, _)| !skipped.contains(file))' -> '.filter(|(_, _)| true)': KILLED
+99 test_module_files.rs 'if is_exact_test_file_module(&module) {' -> 'if true {': KILLED
+100 broker.rs 'wire_text(&value.to_string()).len() > MAX_OUTPUT_BYTES' -> 'value.to_string().len() > MAX_OUTPUT_BYT': KILLED
+101 broker.rs '        wire_text(&text)' -> '        text': KILLED
+102 test_module_files.rs 'skipped.difference(&kept)' -> 'skipped.iter()': KILLED
+103 broker_bind_structural.rs 'let in_ref = name == "Self" && self.owner.last().is_some_and' -> 'let in_ref = false;': KILLED
+105 broker_bind_structural.rs '            self.aliases.insert(node.ident.to_string());' -> '': KILLED
+106 broker_bind_structural.rs '            self.aliases.insert(node.rename.to_string());' -> '': KILLED
+108 broker_bind_structural.rs '.filter(|(file, _)| !skipped.contains(file))' -> '.filter(|(_, _)| true)': KILLED
+109 test_module_files.rs 'let direct = node.path().is_ident("path");' -> 'let direct = false;': KILLED
+110 test_module_files.rs 'node.path().is_ident("cfg_attr") && assigns_path(node_tokens' -> 'false': KILLED
+111 test_module_files.rs 'self.found = self.found || attribute_assigns_path(node.token' -> '': KILLED
+112 test_module_files.rs "if previous_path && punct.as_char() == '=' {" -> 'if false {': KILLED
+113 test_module_files.rs '                if assigns_path(group.stream()) {' -> '                if false {': KILLED after the nested cfg_attr evasion fixture was added (re-run by hand)
+114 test_module_files.rs 'if !carriers.is_empty() {' -> 'if false {': KILLED
+115 test_module_files.rs 'module.content.is_none() && is_exact_cfg_test(&module.attrs)' -> 'is_exact_cfg_test(&module.attrs)': KILLED
+116 test_module_files.rs 'if (attribute && assigns_path(group.stream())) || attribute_': KILLED (script anchor updated after rustfmt; re-run by hand)
+117 test_module_files.rs "after_hash = punct.as_char() == '#' || (after_hash && punct." -> 'after_hash = false;': KILLED
+118 protected_audit_hook_structural.rs 'let skipped = skipped_files(&sources).unwrap_or_else(|reason' -> 'let skipped = skipped_files(&sources).un': KILLED
+119 broker_bind_structural.rs 'let skipped = skipped_files(&sources).unwrap_or_else(|reason' -> 'let skipped = skipped_files(&sources).un': KILLED after scan_sources and its should_panic test were added (re-run by hand)
+120 broker_bind_structural.rs 'previous_ref = name == "AuditedRef" || self.aliases.contains' -> 'previous_ref = false;': KILLED
+121 broker_bind_structural.rs 'for _ in 0..4 {' -> 'for _ in 0..1 {': KILLED
+122 broker_bind_structural.rs 'if target == "AuditedRef" || self.aliases.contains(&target) ' -> 'if target == "AuditedRef" {': KILLED
+a new bind_workspace caller in harness_adapter/mod.rs: KILLED
+a new registry constructor call in pr_tools.rs: KILLED
+ModelFacingLayers made pub: KILLED
+116b test_module_files.rs 'let attribute = after_hash && ...' -> 'let attribute = true;': KILLED (re-run by hand)
+124 broker.rs 'output: json!(clip(&message, MAX_MESSAGE_BYTES)),' -> 'output: json!(clip(&message, MAX_MESSAGE_BYTES + 1)),': KILLED
+125 broker.rs 'output: json!(clip(message, MAX_MESSAGE_BYTES)),' -> 'output: json!(clip(message, MAX_MESSAGE_BYTES + 1)),': KILLED
+126 broker.rs 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 7;' -> 'pub const MAX_MESSAGE_BYTES: usize = MAX_OUTPUT_BYTES / 6;': KILLED
