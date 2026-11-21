@@ -1,6 +1,4 @@
-use crate::action_auditor::{
-    is_message_tool, known_arguments, IdentifierOracle, RuleMessageAuditor,
-};
+use crate::action_auditor::{IdentifierOracle, RuleMessageAuditor};
 use crate::pr_tools::{redact_resilient, strip_unprintable};
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +6,6 @@ pub const MAX_TURN_BYTES: usize = 2048;
 pub const MAX_ARGS_CHARS: usize = 300;
 pub const MAX_TOOL_CHARS: usize = 64;
 pub const MAX_SUBJECT_CHARS: usize = 200;
-const MAX_KEY_CHARS: usize = 32;
 const RAW_CAP_BYTES: usize = 64 * 1024;
 const WORD_BREAK_WINDOW: usize = 64;
 
@@ -62,16 +59,6 @@ pub(super) fn process(raw: &str, limit: Limit, oracle: &dyn IdentifierOracle) ->
     }
 }
 
-fn plain_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let first = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    first
-        && key.chars().count() <= MAX_KEY_CHARS
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 fn describe(value: &serde_json::Value) -> String {
     use serde_json::Value;
     match value {
@@ -84,14 +71,6 @@ fn describe(value: &serde_json::Value) -> String {
     }
 }
 
-fn key_is_named(tool: &str, key: &str) -> bool {
-    if is_message_tool(tool) {
-        known_arguments(tool).contains(&key)
-    } else {
-        plain_key(key)
-    }
-}
-
 /// What an activity log records about a tool call's arguments: argument
 /// names and the kind and length of each value, never a value. It can only
 /// be built from the call's arguments, so a raw string cannot be logged
@@ -101,9 +80,11 @@ fn key_is_named(tool: &str, key: &str) -> bool {
 /// use harness::hub::store::ArgsSummary;
 /// use serde_json::json;
 ///
-/// let summary = ArgsSummary::from_args("write_file", &json!({"path": "src/a.rs", "content": "secret"}));
-/// assert_eq!(summary.as_str(), "content=str:6 path=str:8");
-/// let message = ArgsSummary::from_args("msg_send", &json!({"body": "hi", "sneaky": 1}));
+/// let declared = ["path", "content"];
+/// let args = json!({"path": "src/a.rs", "content": "secret", "Zx9Qw3Lm7Rt5Yp2Vb8Nc4": 1});
+/// let summary = ArgsSummary::from_args(&args, &declared);
+/// assert_eq!(summary.as_str(), "?=num content=str:6 path=str:8");
+/// let message = ArgsSummary::from_args(&json!({"body": "hi", "sneaky": 1}), &["body"]);
 /// assert_eq!(message.as_str(), "?=num body=str:2");
 /// ```
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,22 +92,26 @@ fn key_is_named(tool: &str, key: &str) -> bool {
 pub struct ArgsSummary(String);
 
 impl ArgsSummary {
-    /// Summarize `args` of the call to `tool`. For the message tools only the
-    /// argument names the tool defines are written; any other name is `?`.
-    /// For every other tool a name is written only when it is a short plain
-    /// identifier, else `?`. Non-object arguments are described as `value`.
+    /// Summarize `args`. A name is written only if the caller lists it in
+    /// `known`, the declared parameter names of the tool (a registered tool's
+    /// schema, or `known_arguments` for the message tools); any other name is
+    /// `?`, and there is no rule that lets an unlisted name through, because
+    /// a name is agent-controlled and may itself be a secret. Non-object
+    /// arguments are described as `value`.
     ///
     /// ```
     /// use harness::hub::store::ArgsSummary;
-    /// let summary = ArgsSummary::from_args("shell", &serde_json::json!("rm -rf /"));
+    /// let summary = ArgsSummary::from_args(&serde_json::json!("rm -rf /"), &[]);
     /// assert_eq!(summary.as_str(), "value=str:8");
+    /// let masked = ArgsSummary::from_args(&serde_json::json!({"path": "a"}), &[]);
+    /// assert_eq!(masked.as_str(), "?=str:1");
     /// ```
-    pub fn from_args(tool: &str, args: &serde_json::Value) -> Self {
+    pub fn from_args(args: &serde_json::Value, known: &[&str]) -> Self {
         let mut parts: Vec<String> = match args {
             serde_json::Value::Object(fields) => fields
                 .iter()
                 .map(|(key, value)| {
-                    let name = if key_is_named(tool, key) {
+                    let name = if known.contains(&key.as_str()) {
                         key.as_str()
                     } else {
                         "?"
@@ -143,7 +128,7 @@ impl ArgsSummary {
     /// The summary text.
     ///
     /// ```
-    /// let summary = harness::hub::store::ArgsSummary::from_args("t", &serde_json::json!({}));
+    /// let summary = harness::hub::store::ArgsSummary::from_args(&serde_json::json!({}), &[]);
     /// assert_eq!(summary.as_str(), "");
     /// ```
     pub fn as_str(&self) -> &str {
@@ -309,94 +294,82 @@ mod tests {
     }
 
     #[test]
-    fn message_tools_keep_only_their_known_argument_names_and_never_values() {
+    fn only_declared_names_are_written_and_values_never() {
         let body = "the deploy key is hunter2";
         let summary = ArgsSummary::from_args(
-            "msg_send",
             &json!({"to": "peer", "kind": "info", "subject": "s", "body": body, "in_reply_to": null, "extra": 1}),
+            crate::action_auditor::known_arguments("msg_send"),
         );
         assert_eq!(
             summary.as_str(),
             "?=num body=str:25 in_reply_to=null kind=str:4 subject=str:1 to=str:4"
         );
         assert!(!summary.as_str().contains("hunter2"));
-        let note = ArgsSummary::from_args("session_set_note", &json!({"note": "n", "body": "b"}));
+        let note = ArgsSummary::from_args(&json!({"note": "n", "body": "b"}), &["note"]);
         assert_eq!(note.as_str(), "?=str:1 note=str:1");
-        let query =
-            ArgsSummary::from_args("sessions_query", &json!({"query": "q", "max_results": 3}));
-        assert_eq!(query.as_str(), "max_results=num query=str:1");
-    }
-
-    #[test]
-    fn a_message_tool_key_that_is_not_pinned_is_hidden_even_if_it_looks_plain() {
-        let summary = ArgsSummary::from_args(
-            "msg_send",
-            &json!({"api_key": 1, "AKIAIOSFODNN7EXAMPLE": 2}),
-        );
-        assert_eq!(summary.as_str(), "?=num ?=num");
-    }
-
-    #[test]
-    fn other_tools_keep_short_plain_identifier_keys_with_value_lengths_only() {
-        let summary = ArgsSummary::from_args(
-            "write_file",
+        let other = ArgsSummary::from_args(
             &json!({"path": "src/a.rs", "content": "fn main() {}", "mode": 420, "force": true, "tags": ["a", "b"], "opts": {"x": 1}, "none": null}),
+            &["path", "content", "mode", "force", "tags", "opts", "none"],
         );
         assert_eq!(
-            summary.as_str(),
+            other.as_str(),
             "content=str:12 force=bool mode=num none=null opts=obj:1 path=str:8 tags=arr:2"
         );
-        assert!(!summary.as_str().contains("fn main"));
+        assert!(!other.as_str().contains("fn main"));
     }
 
     #[test]
-    fn other_tools_hide_keys_that_are_long_or_not_plain_identifiers() {
+    fn an_empty_declared_list_masks_every_name() {
+        let summary = ArgsSummary::from_args(&json!({"path": "a", "content": "b"}), &[]);
+        assert_eq!(summary.as_str(), "?=str:1 ?=str:1");
+    }
+
+    #[test]
+    fn an_identifier_shaped_secret_used_as_a_key_is_never_written() {
+        for key in [
+            "Zx9Qw3Lm7Rt5Yp2Vb8Nc4",
+            "Tq8Vn2Xk5Jm9Pb3Rw7Ch",
+            "Kd4Wm9Lp2Vx6Zq8N",
+            "a",
+            "_ok",
+            "write_file_path",
+        ] {
+            let args = json!({ key: 1, "path": "x" });
+            let summary = ArgsSummary::from_args(&args, &["path"]);
+            assert_eq!(summary.as_str(), "?=num path=str:1", "{key}");
+            let stored = summary.processed(&NullOracle);
+            assert_eq!(stored.as_str(), "?=num path=str:1", "{key}");
+        }
         let token = github_token();
-        let long = "a".repeat(MAX_KEY_CHARS + 1);
-        let exact = "a".repeat(MAX_KEY_CHARS);
+        let summary = ArgsSummary::from_args(&json!({ token.clone(): 1 }), &[]);
+        assert!(!summary.as_str().contains("ghp_"));
+    }
+
+    #[test]
+    fn a_declared_name_that_is_a_secret_is_still_run_through_the_pipeline() {
         let summary = ArgsSummary::from_args(
-            "shell",
-            &json!({ token.clone(): 1, long.clone(): 2, exact.clone(): 3, "9lives": 4, "with-dash": 5, "sp ace": 6, "_ok": 7, "": 8, "é": 9 }),
+            &json!({"AKIAIOSFODNN7EXAMPLE": 1}),
+            &["AKIAIOSFODNN7EXAMPLE"],
         );
-        let text = summary.as_str();
-        assert!(!text.contains("ghp_") && !text.contains(&long));
-        assert!(text.contains(&format!("{exact}=num")));
-        assert!(text.contains("_ok=num"));
-        assert_eq!(text.matches("?=num").count(), 7);
+        let stored = summary.processed(&NullOracle);
+        assert_eq!(stored.as_str(), "<redacted:aws-key>=num");
     }
 
     #[test]
     fn non_object_arguments_are_described_by_kind_and_length() {
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!("rm -rf /")).as_str(),
-            "value=str:8"
-        );
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!([1, 2])).as_str(),
-            "value=arr:2"
-        );
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!(null)).as_str(),
-            "value=null"
-        );
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!(5)).as_str(),
-            "value=num"
-        );
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!(true)).as_str(),
-            "value=bool"
-        );
-        assert_eq!(ArgsSummary::from_args("shell", &json!({})).as_str(), "");
-        assert_eq!(
-            ArgsSummary::from_args("shell", &json!({"s": "é"})).as_str(),
-            "s=str:1"
-        );
+        let value = |args: serde_json::Value| ArgsSummary::from_args(&args, &["value"]).0;
+        assert_eq!(value(json!("rm -rf /")), "value=str:8");
+        assert_eq!(value(json!([1, 2])), "value=arr:2");
+        assert_eq!(value(json!(null)), "value=null");
+        assert_eq!(value(json!(5)), "value=num");
+        assert_eq!(value(json!(true)), "value=bool");
+        assert_eq!(value(json!({})), "");
+        assert_eq!(value(json!({"s": "é"})), "?=str:1");
     }
 
     #[test]
     fn a_summary_serializes_as_a_bare_string_and_debug_hides_it() {
-        let summary = ArgsSummary::from_args("t", &json!({"path": "a"}));
+        let summary = ArgsSummary::from_args(&json!({"path": "a"}), &["path"]);
         assert_eq!(serde_json::to_string(&summary).unwrap(), "\"path=str:1\"");
         let back: ArgsSummary = serde_json::from_str("\"path=str:1\"").unwrap();
         assert_eq!(back, summary);
@@ -414,17 +387,5 @@ mod tests {
         let long = ArgsSummary(many.join(" "));
         assert!(long.processed(&NullOracle).as_str().chars().count() <= MAX_ARGS_CHARS);
         assert!(long.processed(&NullOracle).as_str().chars().count() > MAX_ARGS_CHARS - 20);
-    }
-
-    #[test]
-    fn plain_key_boundaries() {
-        assert!(plain_key("a"));
-        assert!(plain_key("_"));
-        assert!(plain_key("A_1"));
-        assert!(!plain_key(""));
-        assert!(!plain_key("1a"));
-        assert!(!plain_key("a-b"));
-        assert!(plain_key(&"a".repeat(32)));
-        assert!(!plain_key(&"a".repeat(33)));
     }
 }

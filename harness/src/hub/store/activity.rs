@@ -89,13 +89,14 @@ pub enum ActivityEntry {
 }
 
 impl ActivityEntry {
-    /// A `ToolCall` entry whose argument summary is built from `args`.
+    /// A `ToolCall` entry whose argument summary is built from `args`; `known`
+    /// are the declared parameter names of the tool (see [`ArgsSummary::from_args`]).
     ///
     /// ```
     /// use harness::hub::store::ActivityEntry;
     /// let session = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("s".into()));
     /// let entry = ActivityEntry::tool_call(
-    ///     session, chrono::Utc::now(), "write_file", &serde_json::json!({"path": "a"}), true,
+    ///     session, chrono::Utc::now(), "write_file", &serde_json::json!({"path": "a"}), &["path"], true,
     /// );
     /// assert!(matches!(entry, ActivityEntry::ToolCall { ok: true, .. }));
     /// ```
@@ -104,13 +105,14 @@ impl ActivityEntry {
         at: DateTime<Utc>,
         tool: &str,
         args: &serde_json::Value,
+        known: &[&str],
         ok: bool,
     ) -> Self {
         Self::ToolCall {
             session,
             at,
             tool: tool.to_string(),
-            args_summary: ArgsSummary::from_args(tool, args),
+            args_summary: ArgsSummary::from_args(args, known),
             ok,
         }
     }
@@ -674,8 +676,10 @@ mod tests {
         }
     }
 
+    const DECLARED: [&str; 7] = ["path", "content", "body", "subject", "to", "query", "note"];
+
     fn call(session: &str, tool: &str, args: serde_json::Value, secs: i64) -> ActivityEntry {
-        ActivityEntry::tool_call(sid(session), at(secs), tool, &args, true)
+        ActivityEntry::tool_call(sid(session), at(secs), tool, &args, &DECLARED, true)
     }
 
     fn turn_texts(entries: &[ActivityEntry]) -> Vec<String> {
@@ -1064,6 +1068,31 @@ mod tests {
         }
     }
 
+    const RANDOM_KEYS: [&str; 3] = [
+        "Zx9Qw3Lm7Rt5Yp2Vb8Nc4",
+        "Tq8Vn2Xk5Jm9Pb3Rw7Ch",
+        "Kd4Wm9Lp2Vx6Zq8N",
+    ];
+
+    fn undeclared_identifier_shaped_keys_never_reach_the_store<S: ActivityStore>(s: &S) {
+        for (n, key) in RANDOM_KEYS.iter().enumerate() {
+            s.append(call(
+                "a",
+                "write_file",
+                json!({ *key: "v", "path": "p" }),
+                n as i64,
+            ))
+            .unwrap();
+        }
+        let entries = s.for_session(sid("a"), usize::MAX).unwrap();
+        assert_eq!(entries.len(), 3);
+        let rendered = format!("{entries:?} {}", serde_json::to_string(&entries).unwrap());
+        for key in RANDOM_KEYS {
+            assert!(!rendered.contains(&key[..8]), "{key}");
+        }
+        assert!(rendered.contains("?=str:1 path=str:1"));
+    }
+
     macro_rules! activity_contract_tests {
         ($make:expr) => {
             activity_contract_tests!(@each $make,
@@ -1084,7 +1113,8 @@ mod tests {
                 skipping_redact_would_store_the_original_or_a_withheld_marker,
                 an_oracle_can_vouch_for_the_exact_identifier_it_is_given,
                 message_metadata_is_the_only_trace_of_a_message,
-                the_token_leaks_nowhere_in_memory
+                the_token_leaks_nowhere_in_memory,
+                undeclared_identifier_shaped_keys_never_reach_the_store
             );
         };
         (@each $make:expr, $($name:ident),+) => {
@@ -1144,6 +1174,20 @@ mod tests {
             assert!(!everything.contains(probe), "{}", planted.label);
             assert!(!everything.contains(&planted.token), "{}", planted.label);
             assert!(!everything.contains("hunter2"));
+        }
+    }
+
+    #[test]
+    fn random_argument_names_are_absent_from_the_file_across_a_reopen() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        undeclared_identifier_shaped_keys_never_reach_the_store(&store);
+        drop(store);
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.for_session(sid("a"), usize::MAX).unwrap().len(), 3);
+        let file = std::fs::read_to_string(fixture.path("activity.jsonl")).unwrap();
+        for key in RANDOM_KEYS {
+            assert!(!file.contains(&key[..8]), "{key}");
         }
     }
 
