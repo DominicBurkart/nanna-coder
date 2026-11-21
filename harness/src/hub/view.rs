@@ -2207,6 +2207,13 @@ mod tests {
             ),
             rec("grand", &l_grand, "helper", SessionStatus::Running, 11),
             rec("great", &l_great, "helper", SessionStatus::Running, 12),
+            rec(
+                "deep",
+                &under("great", &l_great),
+                "helper",
+                SessionStatus::Running,
+                13,
+            ),
         ];
         (store_of(records), caller("me", &l_me))
     }
