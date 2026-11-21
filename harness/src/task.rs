@@ -581,8 +581,28 @@ pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::fro
 
 enum RestoreAudit<'a> {
     Gate(&'a SpawnGate, std::time::Duration),
+    Sessions(&'a SpawnGate, std::time::Duration, Arc<SessionRegistry>),
     #[cfg(test)]
     Skip,
+}
+
+impl<'a> RestoreAudit<'a> {
+    fn parts(&self) -> Option<(&'a SpawnGate, std::time::Duration)> {
+        match self {
+            RestoreAudit::Gate(gate, deadline) | RestoreAudit::Sessions(gate, deadline, _) => {
+                Some((*gate, *deadline))
+            }
+            #[cfg(test)]
+            RestoreAudit::Skip => None,
+        }
+    }
+
+    fn sessions(&self) -> Option<Arc<SessionRegistry>> {
+        match self {
+            RestoreAudit::Sessions(_, _, registry) => Some(Arc::clone(registry)),
+            _ => None,
+        }
+    }
 }
 
 /// Manages task submission, scheduling and lifecycle.
@@ -678,7 +698,6 @@ impl TaskManager {
             Arc::new(EscalationLog::in_memory()),
             default_action_gate(gate_leases),
             RestoreAudit::Skip,
-            None,
         )
         .await
     }
@@ -723,36 +742,6 @@ impl TaskManager {
         spawn_gate: &SpawnGate,
         deadline: std::time::Duration,
     ) -> Result<Self, QueueStoreError> {
-        Self::restore_within_sessions(
-            max_concurrent_tasks,
-            policy,
-            store,
-            leases,
-            provider,
-            identities,
-            escalations,
-            action_gate,
-            spawn_gate,
-            deadline,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn restore_within_sessions(
-        max_concurrent_tasks: usize,
-        policy: Box<dyn SchedulingPolicy>,
-        store: Box<dyn QueueStore>,
-        leases: Arc<dyn LeaseStore>,
-        provider: Arc<dyn ModelProvider>,
-        identities: &crate::identity::IdentityCatalog,
-        escalations: impl Into<crate::escalation::EscalationPlane>,
-        action_gate: Arc<ActionGate>,
-        spawn_gate: &SpawnGate,
-        deadline: std::time::Duration,
-        sessions: Option<Arc<SessionRegistry>>,
-    ) -> Result<Self, QueueStoreError> {
         Self::restore_inner(
             max_concurrent_tasks,
             policy,
@@ -763,9 +752,25 @@ impl TaskManager {
             escalations,
             action_gate,
             RestoreAudit::Gate(spawn_gate, deadline),
-            sessions,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_within_sessions(
+        n: usize,
+        p: Box<dyn SchedulingPolicy>,
+        s: Box<dyn QueueStore>,
+        l: Arc<dyn LeaseStore>,
+        v: Arc<dyn ModelProvider>,
+        i: &crate::identity::IdentityCatalog,
+        e: impl Into<crate::escalation::EscalationPlane>,
+        a: Arc<ActionGate>,
+        g: &SpawnGate,
+        d: std::time::Duration,
+        r: Arc<SessionRegistry>,
+    ) -> Result<Self, QueueStoreError> {
+        Self::restore_inner(n, p, s, l, v, i, e, a, RestoreAudit::Sessions(g, d, r)).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -779,7 +784,6 @@ impl TaskManager {
         escalations: impl Into<crate::escalation::EscalationPlane>,
         action_gate: Arc<ActionGate>,
         audit: RestoreAudit<'_>,
-        sessions: Option<Arc<SessionRegistry>>,
     ) -> Result<Self, QueueStoreError> {
         let escalations = escalations.into();
         let manager = Self::build(
@@ -791,7 +795,7 @@ impl TaskManager {
             escalations,
             Some(action_gate),
         )?;
-        *manager.runner.sessions.write().unwrap() = sessions;
+        *manager.runner.sessions.write().unwrap() = audit.sessions();
         manager.register_catalog(identities).await;
         for queued in manager.dispatcher.queued().await {
             manager.runner.register(&queued, None).await;
@@ -807,14 +811,10 @@ impl TaskManager {
     }
 
     async fn admit_restored(&self, audit: &RestoreAudit<'_>) -> Result<(), QueueStoreError> {
-        #[cfg(not(test))]
-        let RestoreAudit::Gate(gate, deadline) = audit;
-        #[cfg(test)]
-        let (gate, deadline) = match audit {
-            RestoreAudit::Gate(gate, deadline) => (gate, deadline),
-            RestoreAudit::Skip => return Ok(()),
+        let Some((gate, deadline)) = audit.parts() else {
+            return Ok(());
         };
-        let deadline_at = tokio::time::Instant::now() + *deadline;
+        let deadline_at = tokio::time::Instant::now() + deadline;
         let (mut parked, mut deferred) = (0usize, 0usize);
         for queued in self.dispatcher.queued().await {
             let audited = tokio::time::timeout_at(deadline_at, audit_restored(gate, &queued)).await;
@@ -8857,7 +8857,7 @@ mod session_registry_tests {
             default_action_gate(Arc::new(InMemoryLeaseStore::default())),
             gate,
             RESTORE_AUDIT_DEADLINE,
-            Some(registry),
+            registry,
         )
         .await
         .unwrap()
