@@ -34,6 +34,7 @@ mod gate;
 mod llm;
 mod log;
 mod message_auditor;
+pub mod message_eval;
 mod message_fail_closed;
 mod message_model;
 mod message_rules;

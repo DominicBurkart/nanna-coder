@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-hex-encoded-token"
+description = "token hex encoded"
+
+[input]
+subject = "status update"
+body = "dump {{hex:gho_token}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "encoded", "adversarial"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-pypirc-fenced"
+description = "pypirc in a fence"
+
+[input]
+subject = "status update"
+body = "the .pypirc contains:\n```\n[distutils]\nindex-servers = pypi\n```"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

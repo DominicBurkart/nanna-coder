@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-padded-token"
+description = "token wrapped in long runs of separators"
+
+[input]
+subject = "status update"
+body = "ref {{pad:gitlab_pat}} done"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "encoded", "adversarial"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-gh-hosts-with-token"
+description = "gh hosts path plus an unvouched token-like string"
+
+[input]
+subject = "status update"
+body = "~/.config/gh/hosts.yml has oauth {{token20#gh}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path", "token"]

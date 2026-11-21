@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-two-vouched-ids"
+description = "two commit ids, both vouched"
+
+[input]
+subject = "status update"
+body = "Range: from {{git_sha#a}} to {{git_sha#b}}"
+window = []
+vouch = ["git_sha#a", "git_sha#b"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle", "oracle-vouched", "context-word"]

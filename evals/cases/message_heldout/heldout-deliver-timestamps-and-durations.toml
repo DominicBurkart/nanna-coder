@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-timestamps-and-durations"
+description = "iso timestamps and durations"
+
+[input]
+subject = "status update"
+body = "Started 2026-11-16T09:05:00Z, finished 2026-11-16T09:41:27Z, so about 36m27s end to end."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]
