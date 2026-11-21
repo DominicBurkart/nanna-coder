@@ -902,10 +902,8 @@ mod tests {
             .unwrap();
         assert_eq!(only_text(s, "a"), "use <redacted:github-token> now");
         s.append(meta("b", "password=hunter2", 0)).unwrap();
-        assert_eq!(
-            first_field(s, "b", "subject"),
-            "password=<redacted:credential>"
-        );
+        let subject = first_field(s, "b", "subject");
+        assert_eq!(subject, "password=<redacted:credential>");
         let key = "AKIAIOSFODNN7EXAMPLE";
         let hand_built: ArgsSummary = serde_json::from_value(json!(format!("{key}=num"))).unwrap();
         s.append(ActivityEntry::ToolCall {
@@ -916,10 +914,8 @@ mod tests {
             ok: true,
         })
         .unwrap();
-        assert_eq!(
-            first_field(s, "c", "args_summary"),
-            "<redacted:aws-key>=num"
-        );
+        let summary = first_field(s, "c", "args_summary");
+        assert_eq!(summary, "<redacted:aws-key>=num");
     }
 
     fn an_oracle_can_vouch_for_the_exact_identifier_it_is_given<S: ActivityStore>(s: &S) {
