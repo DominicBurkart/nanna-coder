@@ -186,22 +186,20 @@ pub(super) fn set_status_tracks_activity_and_end<S: SessionStore>(s: &S) {
     ));
 }
 
+fn note(text: &str) -> crate::hub::summary::Summary {
+    crate::hub::summary::Summary::compose("a", "running", text)
+}
+
 pub(super) fn set_note_replaces<S: SessionStore>(s: &S) {
     let r = root(1);
     s.upsert(session("a", &r, SessionStatus::Running, 0, 0))
         .unwrap();
-    s.set_note(sid("a"), "first".into()).unwrap();
-    assert_eq!(
-        s.get(sid("a")).unwrap().unwrap().note.as_deref(),
-        Some("first")
-    );
-    s.set_note(sid("a"), "second".into()).unwrap();
-    assert_eq!(
-        s.get(sid("a")).unwrap().unwrap().note.as_deref(),
-        Some("second")
-    );
+    s.set_note(sid("a"), note("first")).unwrap();
+    assert_eq!(s.get(sid("a")).unwrap().unwrap().note, Some(note("first")));
+    s.set_note(sid("a"), note("second")).unwrap();
+    assert_eq!(s.get(sid("a")).unwrap().unwrap().note, Some(note("second")));
     assert!(matches!(
-        s.set_note(sid("missing"), "n".into()),
+        s.set_note(sid("missing"), note("n")),
         Err(StoreError::NotFound)
     ));
 }
