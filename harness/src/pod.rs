@@ -128,12 +128,50 @@ async fn probe_ollama(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
+#[cfg(test)]
+const SERIAL_ENV_KEYS: [&str; 2] = ["nanna_test_bring_up_cmd_env", "nanna_pod_config_env"];
+
+#[cfg(test)]
+fn missing_lock_message(key: &str) -> String {
+    format!(
+        "test thread {:?} reached the bring-up path without serial lock `{}`: it must hold #[serial_test::serial({})]",
+        std::thread::current().name().unwrap_or("<unnamed>"),
+        key,
+        SERIAL_ENV_KEYS.join(", ")
+    )
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SERIAL_LOCKS_INHERITED: bool;
+}
+
+#[cfg(test)]
+fn require_serial_env_locks(is_locked: impl Fn(&str) -> bool) {
+    let inherited = SERIAL_LOCKS_INHERITED.try_with(|v| *v).unwrap_or(false);
+    for key in SERIAL_ENV_KEYS {
+        if !(inherited || is_locked(key)) {
+            panic!("{}", missing_lock_message(key));
+        }
+    }
+}
+
+#[cfg(test)]
+fn inherit_serial_env_locks<F: std::future::Future>(
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+    SERIAL_LOCKS_INHERITED.scope(true, fut)
+}
+
 /// Choose a bring-up command. Prefer `nix run .#start-pod` *only when a
 /// `flake.nix` is reachable from `flake_lookup_dir`* (`nix run .#start-pod`
 /// resolves the flake from CWD; a `nanna agent --work-dir <arbitrary>` run
 /// would otherwise fail with "flake not found"). Fall back to
 /// `podman play kube ${NANNA_POD_CONFIG}` when the env var is set.
 fn bring_up_command(flake_lookup_dir: &Path) -> Option<(String, Vec<String>)> {
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     // Test seam: `NANNA_TEST_BRING_UP_CMD=<path>` overrides every other
     // selection. Lets tests drive the full ensure_running success path
     // against `/usr/bin/true` + a local stub HTTP server.
@@ -213,6 +251,8 @@ async fn ensure_running_inner(
         debug!("pod ensure: skipped ({:?})", reason);
         return Ok(EnsureOutcome::Skipped(reason));
     }
+    #[cfg(test)]
+    require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
     if probe_ollama(&cfg.probe_url).await {
         debug!("pod ensure: ollama already reachable at {}", cfg.probe_url);
         return Ok(EnsureOutcome::AlreadyUp);
@@ -703,6 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
     async fn ensure_running_returns_already_up_when_probe_succeeds() {
         let url = start_ok_http_server().await;
         let cfg = EnsureConfig {
@@ -842,7 +883,7 @@ mod tests {
             if Instant::now() >= deadline {
                 break;
             }
-            if let Err(e) = tokio::spawn(body()).await {
+            if let Err(e) = tokio::spawn(inherit_serial_env_locks(body())).await {
                 failure = Some(e.to_string());
                 break;
             }
@@ -909,5 +950,100 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn missing_lock_message_names_the_thread_the_key_and_the_attribute() {
+        let msg = missing_lock_message("nanna_pod_config_env");
+        assert!(msg.contains("missing_lock_message_names_the_thread_the_key_and_the_attribute"));
+        assert!(msg.contains("without serial lock `nanna_pod_config_env`"));
+        assert!(msg
+            .contains("#[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]"));
+    }
+
+    #[test]
+    fn require_serial_env_locks_passes_when_every_key_is_held() {
+        require_serial_env_locks(|_| true);
+    }
+
+    #[test]
+    #[should_panic(expected = "nanna_pod_config_env")]
+    fn require_serial_env_locks_panics_naming_the_missing_key() {
+        require_serial_env_locks(|k| k != "nanna_pod_config_env");
+    }
+
+    #[test]
+    #[should_panic(expected = "require_serial_env_locks_panics_naming_the_thread")]
+    fn require_serial_env_locks_panics_naming_the_thread() {
+        require_serial_env_locks(|_| false);
+    }
+
+    #[test]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    fn require_serial_env_locks_accepts_the_real_serial_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawned_task_in_an_unserialised_test_is_rejected_on_a_worker_thread() {
+        let err = tokio::spawn(async {
+            assert!(std::thread::current().name() == Some("tokio-runtime-worker"));
+            require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+        })
+        .await
+        .unwrap_err();
+        assert!(err.is_panic());
+        let payload = err.into_panic();
+        let msg = payload.downcast_ref::<String>().unwrap();
+        assert!(msg.contains("without serial lock `nanna_test_bring_up_cmd_env`"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    async fn a_spawned_task_that_does_not_inherit_the_locks_is_rejected_even_under_a_serialised_test(
+    ) {
+        let err = tokio::spawn(async {
+            require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+        })
+        .await
+        .unwrap_err();
+        assert!(err.is_panic());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    async fn a_spawned_task_inheriting_the_locks_of_a_serialised_test_is_accepted_on_a_worker_thread(
+    ) {
+        tokio::spawn(inherit_serial_env_locks(async {
+            assert!(std::thread::current().name() == Some("tokio-runtime-worker"));
+            require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "without serial lock `nanna_test_bring_up_cmd_env`")]
+    fn inheriting_the_locks_from_an_unserialised_test_panics_at_the_spawn_site() {
+        drop(inherit_serial_env_locks(async {}));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(nanna_test_bring_up_cmd_env, nanna_pod_config_env)]
+    async fn an_inherited_task_does_not_leak_the_exemption_to_sibling_tasks() {
+        let inheriting = tokio::spawn(inherit_serial_env_locks(async {
+            require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+        }));
+        let sibling = tokio::spawn(async {
+            require_serial_env_locks(|key| serial_test::is_locked_serially(Some(key)));
+        });
+        inheriting.await.unwrap();
+        assert!(sibling.await.unwrap_err().is_panic());
+    }
+
+    #[test]
+    #[should_panic(expected = "must hold #[serial_test::serial")]
+    fn require_serial_env_locks_rejects_an_unserialised_test_with_the_real_locks() {
+        require_serial_env_locks(|k| serial_test::is_locked_serially(Some(k)));
     }
 }
