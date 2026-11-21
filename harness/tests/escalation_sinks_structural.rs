@@ -342,7 +342,7 @@ fn every_production_task_manager_and_gate_in_the_cli_is_built_from_a_plane() {
     );
     assert_eq!(mentions("TaskManager").get("main.rs").copied(), Some(7));
     assert_eq!(mentions("EscalationLog").get("main.rs").copied(), Some(5));
-    assert_eq!(mentions("EscalationPlane").get("task.rs").copied(), Some(5));
+    assert_eq!(mentions("EscalationPlane").get("task.rs").copied(), Some(6));
 }
 
 #[test]
