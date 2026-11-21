@@ -394,3 +394,138 @@ fn print_summary(card: &Scorecard) {
     println!("commit:             {}", card.commit);
     println!("appended to evals/scorecards/index.jsonl");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness::eval::scoring::{Scorecard, ScorecardCategory, SCORECARD_SCHEMA_VERSION};
+
+    // ── parse_category ──────────────────────────────────────────────────────
+
+    /// Each canonical variant round-trips through the CLI parser.
+    #[test]
+    fn parse_category_valid_variants() {
+        assert!(parse_category("nanna_solo").is_ok());
+        assert!(parse_category("claude_solo").is_ok());
+        assert!(parse_category("claude_mcp_claude").is_ok());
+        assert!(parse_category("claude_mcp_nanna_gemma4").is_ok());
+    }
+
+    /// An unrecognised string produces an Err.
+    #[test]
+    fn parse_category_invalid_returns_err() {
+        assert!(parse_category("not_a_real_category").is_err());
+        assert!(parse_category("").is_err());
+    }
+
+    // ── iso_now ─────────────────────────────────────────────────────────────
+
+    /// `iso_now` returns a non-empty string whose format matches the expected
+    /// UTC ISO 8601 pattern (YYYY-MM-DDTHH:MM:SSZ).
+    #[test]
+    fn iso_now_returns_expected_format() {
+        let ts = iso_now();
+        assert!(!ts.is_empty(), "iso_now must not return an empty string");
+        // Structural check: ends with Z and contains T separator.
+        assert!(ts.ends_with('Z'), "timestamp must end with Z: {ts}");
+        assert!(ts.contains('T'), "timestamp must contain T separator: {ts}");
+        // Length: "YYYY-MM-DDTHH:MM:SSZ" = 20 characters.
+        assert_eq!(ts.len(), 20, "unexpected timestamp length: {ts}");
+    }
+
+    // ── run_id_default ──────────────────────────────────────────────────────
+
+    /// The default run-id must start with "nanna-" and be followed by digits.
+    #[test]
+    fn run_id_default_prefix_and_numeric_suffix() {
+        let id = run_id_default();
+        assert!(
+            id.starts_with("nanna-"),
+            "run_id_default must start with 'nanna-': {id}"
+        );
+        let suffix = &id["nanna-".len()..];
+        assert!(
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()),
+            "run_id_default suffix must be all digits: {suffix}"
+        );
+    }
+
+    /// Two consecutive calls may produce the same run-id (same second), but
+    /// both must be non-empty and correctly formatted.
+    #[test]
+    fn run_id_default_two_calls_both_valid() {
+        let a = run_id_default();
+        let b = run_id_default();
+        for id in [&a, &b] {
+            assert!(id.starts_with("nanna-"), "invalid run-id: {id}");
+        }
+    }
+
+    // ── git_capture ─────────────────────────────────────────────────────────
+
+    /// `git --version` should succeed in any environment that has git.
+    #[test]
+    fn git_capture_version_succeeds() {
+        let out = git_capture(&["--version"]);
+        assert!(out.is_some(), "git --version should succeed");
+        let out = out.unwrap();
+        assert!(out.starts_with("git version"), "unexpected output: {out}");
+    }
+
+    /// A nonsensical sub-command returns None rather than panicking.
+    #[test]
+    fn git_capture_bad_command_returns_none() {
+        let out = git_capture(&["__no_such_subcommand_xyz__"]);
+        assert!(out.is_none(), "bad command should return None, got {out:?}");
+    }
+
+    // ── print_summary ────────────────────────────────────────────────────────
+
+    /// `print_summary` should not panic for a scorecard with no worker model.
+    #[test]
+    fn print_summary_no_worker_model() {
+        let card = Scorecard {
+            schema_version: SCORECARD_SCHEMA_VERSION,
+            date: "2026-01-01T00:00:00Z".to_string(),
+            commit: "abc1234".to_string(),
+            branch: Some("main".to_string()),
+            pr: None,
+            category: ScorecardCategory::NannaSolo,
+            orchestrator_model: "qwen3:0.6b".to_string(),
+            worker_model: None,
+            model: "qwen3:0.6b".to_string(),
+            dataset: "princeton-nlp/SWE-bench_Lite".to_string(),
+            instances_total: 300,
+            instances_attempted: 10,
+            instances_resolved: 3,
+            score_pct: 1.0,
+            is_complete: false,
+            state_dir: "/tmp/state".to_string(),
+        };
+        print_summary(&card); // must not panic
+    }
+
+    /// `print_summary` should not panic when a worker model is present.
+    #[test]
+    fn print_summary_with_worker_model() {
+        let card = Scorecard {
+            schema_version: SCORECARD_SCHEMA_VERSION,
+            date: "2026-01-01T00:00:00Z".to_string(),
+            commit: "def5678".to_string(),
+            branch: None,
+            pr: Some(42),
+            category: ScorecardCategory::ClaudeMcpNannaGemma4,
+            orchestrator_model: "claude-sonnet-5".to_string(),
+            worker_model: Some("gemma4".to_string()),
+            model: "claude-sonnet-5".to_string(),
+            dataset: "princeton-nlp/SWE-bench_Lite".to_string(),
+            instances_total: 300,
+            instances_attempted: 300,
+            instances_resolved: 150,
+            score_pct: 50.0,
+            is_complete: true,
+            state_dir: "/tmp/state2".to_string(),
+        };
+        print_summary(&card); // must not panic, worker_model branch taken
+    }
+}
