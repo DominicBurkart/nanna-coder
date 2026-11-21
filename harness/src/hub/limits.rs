@@ -70,6 +70,16 @@ fn retry_after(
 }
 
 impl Windows {
+    #[cfg(test)]
+    pub(crate) fn sender_slots(&self, sender: &SessionId) -> usize {
+        self.sender.get(sender).map_or(0, VecDeque::len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> (usize, usize) {
+        (self.sender.len(), self.root.len())
+    }
+
     pub(crate) fn held(&self, session: &SessionId) -> usize {
         self.reserved.get(session).copied().unwrap_or(0)
     }
@@ -81,10 +91,16 @@ impl Windows {
         root: &RootId,
         limits: &HubLimits,
     ) -> Result<(), HubError> {
+        self.sender.retain(|_, times| {
+            prune(times, now, SENDER_WINDOW_SECS);
+            !times.is_empty()
+        });
+        self.root.retain(|_, times| {
+            prune(times, now, ROOT_WINDOW_SECS);
+            !times.is_empty()
+        });
         let own = self.sender.entry(sender.clone()).or_default();
-        prune(own, now, SENDER_WINDOW_SECS);
         let shared = self.root.entry(root.clone()).or_default();
-        prune(shared, now, ROOT_WINDOW_SECS);
         if own.len() >= limits.per_sender_per_10m as usize {
             return Err(HubError::RateLimited(retry_after(
                 own,
@@ -170,6 +186,28 @@ mod tests {
         );
         windows.admit(at(600), &id("a"), &root, &limits).unwrap();
         windows.admit(at(0), &id("b"), &root, &limits).unwrap();
+    }
+
+    #[test]
+    fn expired_entries_are_dropped_so_the_maps_stay_bounded() {
+        let limits = HubLimits::default();
+        let mut windows = Windows::default();
+        for n in 0..50 {
+            let root = RootId::mcp(uuid::Uuid::from_u128(n));
+            windows
+                .admit(at(0), &id(&format!("s{n}")), &root, &limits)
+                .unwrap();
+        }
+        assert_eq!(windows.tracked(), (50, 50));
+        let root = RootId::mcp(uuid::Uuid::from_u128(1000));
+        windows.admit(at(600), &id("late"), &root, &limits).unwrap();
+        assert_eq!(windows.tracked(), (1, 51));
+        windows
+            .admit(at(3600), &id("later"), &root, &limits)
+            .unwrap();
+        assert_eq!(windows.tracked(), (1, 1));
+        assert_eq!(windows.sender_slots(&id("later")), 1);
+        assert_eq!(windows.sender_slots(&id("s0")), 0);
     }
 
     #[test]
