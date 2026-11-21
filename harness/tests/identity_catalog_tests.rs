@@ -2,8 +2,7 @@
 //! layers the fixture repository's `.nanna/agents/` overrides on top.
 
 use harness::effects::EffectClass;
-use harness::hub::message::MessageReach;
-use harness::identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, SystemPrompt};
+use harness::identity::{DevLoop, IdentityCatalog, IdentityError, SystemPrompt};
 use std::path::PathBuf;
 
 fn fixtures() -> PathBuf {
@@ -138,26 +137,23 @@ fn a_global_catalog_used_as_repo_root_has_no_overrides() {
 fn shipped_and_fixture_cards_keep_message_reach_none_until_the_hub_is_wired() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let dirs = [
-        root.join(".nanna/catalog"),
-        root.join(".nanna/agents"),
-        fixtures().join("global"),
+        (root.join(".nanna/catalog"), 5),
+        (root.join(".nanna/agents"), 4),
+        (fixtures().join("global"), 5),
     ];
-    let mut seen = 0;
-    for dir in dirs {
+    for (dir, floor) in dirs {
+        let mut seen = 0;
         for entry in std::fs::read_dir(&dir).expect("directory reads") {
             let path = entry.expect("entry reads").path();
             if path.extension().is_some_and(|ext| ext == "toml") {
                 let text = std::fs::read_to_string(&path).expect("card reads");
-                let card = AgentIdentity::from_toml_str(&text, &path).expect("card parses");
-                assert_eq!(
-                    card.scope.message_reach,
-                    MessageReach::None,
-                    "{}",
-                    path.display()
-                );
+                let card: toml::Table = text.parse().expect("card parses");
+                let reach = card["scope"].get("message_reach");
+                let none = reach.is_none_or(|value| value.as_str() == Some("none"));
+                assert!(none, "{} grants message reach", path.display());
                 seen += 1;
             }
         }
+        assert!(seen >= floor, "{}: only {seen} cards read", dir.display());
     }
-    assert!(seen >= 8, "only {seen} cards inspected");
 }
