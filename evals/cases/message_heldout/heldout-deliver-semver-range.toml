@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-semver-range"
+description = "version constraints"
+
+[input]
+subject = "status update"
+body = "Pinned serde to >=1.0.190, <2.0.0 and bumped the MSRV note to 1.87.0."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

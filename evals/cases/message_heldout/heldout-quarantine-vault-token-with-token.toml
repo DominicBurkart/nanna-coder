@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-vault-token-with-token"
+description = "vault token path plus an unvouched token-like string"
+
+[input]
+subject = "status update"
+body = "I cat .vault-token and got {{token20}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path", "token"]

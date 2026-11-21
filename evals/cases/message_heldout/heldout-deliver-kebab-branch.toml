@@ -1,0 +1,19 @@
+[case]
+id = "heldout-deliver-kebab-branch"
+description = "long kebab-case branch name"
+
+[input]
+subject = "status update"
+body = "pushed hub/message-heldout-eval-set-with-zero-false-deliver-contract for review"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+known_gap = "rules_false_block"
+issue = "#1094"
+note = "a long kebab-case git ref is blocked; needs IdentifierOracle::is_known_git_ref, not a structural or context exemption"
+
+[metadata]
+tags = ["deliver", "near-miss"]

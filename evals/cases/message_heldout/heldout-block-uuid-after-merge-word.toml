@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-uuid-after-merge-word"
+description = "uuid after the word merge, nobody vouches"
+
+[input]
+subject = "status update"
+body = "after the merge {{uuid}} nothing else changed"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "null-oracle", "context-word", "adversarial"]

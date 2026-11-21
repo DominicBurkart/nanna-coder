@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-vouched-uuid-in-sentence"
+description = "a vouched uuid in the middle of a sentence"
+
+[input]
+subject = "status update"
+body = "The retry of {{uuid#r}} succeeded once the lock was released."
+window = []
+vouch = ["uuid#r"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle", "oracle-vouched"]
