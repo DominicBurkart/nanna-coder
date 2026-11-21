@@ -132,3 +132,28 @@ fn a_global_catalog_used_as_repo_root_has_no_overrides() {
     let err = IdentityCatalog::load(fixtures().join("does-not-exist")).unwrap_err();
     assert!(matches!(err, IdentityError::Io { .. }), "{err}");
 }
+
+#[test]
+fn shipped_and_fixture_cards_keep_message_reach_none_until_the_hub_is_wired() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let dirs = [
+        (root.join(".nanna/catalog"), 5),
+        (root.join(".nanna/agents"), 4),
+        (fixtures().join("global"), 5),
+    ];
+    for (dir, floor) in dirs {
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).expect("directory reads") {
+            let path = entry.expect("entry reads").path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                let text = std::fs::read_to_string(&path).expect("card reads");
+                let card: toml::Table = text.parse().expect("card parses");
+                let reach = card["scope"].get("message_reach");
+                let none = reach.is_none_or(|value| value.as_str() == Some("none"));
+                assert!(none, "{} grants message reach", path.display());
+                seen += 1;
+            }
+        }
+        assert!(seen >= floor, "{}: only {seen} cards read", dir.display());
+    }
+}
