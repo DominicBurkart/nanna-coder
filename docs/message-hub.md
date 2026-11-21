@@ -547,7 +547,7 @@ pub enum Relation { SelfNode, Parent, Ancestor, Sibling, Child, Peer }
 #[derive(Serialize)] pub struct Counts { pub total: usize, pub active: usize, pub waiting: usize, pub completed: usize, pub failed: usize, pub by_identity: BTreeMap<String, usize> }
 #[derive(Serialize)] pub struct SessionItem { pub id: SessionId, pub relation: Relation, pub status: SessionStatus, pub summary: Summary /* fenced on render */ }
 #[derive(Serialize)] pub struct Group { pub identity: String, pub status: SessionStatus, pub count: usize, pub filter_hint: SessionFilter }
-#[derive(Serialize)] pub struct SessionPage { pub counts: Counts, pub groups: Vec<Group>, pub items: Vec<SessionItem>, pub cursor: Option<CursorToken>, pub new_since_snapshot: usize, pub notice: &'static str }
+#[derive(Serialize)] pub struct SessionPage { pub counts: Counts, pub groups: Vec<Group>, pub items: Vec<SessionItem>, pub cursor: Option<CursorToken>, pub new_since_snapshot: usize, pub notice: String }
 
 pub struct TreeRequest { pub of: Option<SessionId>, pub include_children: bool, pub depth: u8 /* ≤3 */, pub siblings_cursor: Option<CursorToken> }
 #[derive(Serialize)] pub struct TreeView { pub root: RootId, pub path: Vec<SessionItem>, pub siblings: Vec<SessionItem>, pub siblings_cursor: Option<CursorToken>, pub children: Vec<SessionItem>, pub children_count: usize }
@@ -556,8 +556,27 @@ pub struct TreeRequest { pub of: Option<SessionId>, pub include_children: bool, 
 
 pub const PAGE_SIZE: usize = 20;
 pub struct CursorToken(Uuid);   // opaque to agents
-pub(crate) struct CursorTable { /* owner-keyed snapshots, TTL 10m, ≤64/owner */ }
+pub struct CursorTable { /* owner-keyed snapshots, TTL 10m, ≤64/owner */ }
 ```
+
+### 6.5 As built (#1070, `harness/src/hub/view.rs`)
+
+`sessions_list`, `session_describe` and `sessions_tree` exist as pure hub-level functions over a `SessionStore` (and a `MessageStore` for the unread count) and the caller's `SessionBinding`. They are not registered as tools and not wired to the broker (#1071, #1072). Each takes an explicit `now`/clock where time matters so tests are deterministic. Where this differs from 6.1 to 6.4:
+
+- **`n` is the number of sessions matching the filter**, not the root total. Groups and a cursor appear only when more than `PAGE_SIZE` sessions match. A cursor is issued only if more than `PAGE_SIZE` items remain after groups are collapsed. `Counts` always covers the whole root (agents only, librarians only with `include_librarians`); `failed` includes `Cancelled`, `active` includes `waiting`.
+- **Groups** collapse only runs (consecutive in the chosen order) of `Peer` sessions with the same identity and status, longer than 5. They appear on the first page only. A request whose filter pins exactly one status and one identity (the `filter_hint` of a group) is an expanded view and is never grouped again.
+- **Cursors.** Every page that has a successor issues a fresh token for `(snapshot, next offset)`; presenting a token does not consume it, so a lost response can be retried. Tokens are random v4 uuids held server side. A token works only for its owner session, its root and its view (a `sessions_list` token is not a `sessions_tree` siblings token, and a siblings token is bound to its node). Unknown, expired, foreign-owner, foreign-root and wrong-view tokens all give the one error `CursorInvalid` ("cursor invalid or expired"); there is no separate `CursorExpired`. A snapshot holds the ranked ids; items are rendered from current records, so status changes show but never move an item, and sessions created later are counted in `new_since_snapshot` and never listed. An id that has disappeared is omitted.
+- **Oracle.** A session in another root and an id that does not exist both give `NotVisible` ("session not visible"), from the same code path (the id is looked up only in the caller's root). Store failures give `Unavailable` ("session store unavailable") with no partial data. No error variant carries data.
+- **Fencing.** `SessionItem` serializes its summary fenced (`FenceLabel::AgentText`); `SessionDetail` carries `subtask`, `note`, `result_summary` and each touched path already fenced, after the same strip and redact pass `Summary` uses. Identity, role, tools and write paths are cleaned and capped, not fenced. `Debug` of every output prints lengths and counts, never agent text; `CursorToken` never prints.
+- **Caps.** Page of 20; summary at most 179 characters; subtask 4000, note 500, result 2000 characters; at most 64 touched paths (120 characters each) with `touched_paths_total`; 16 Ki characters of fenced text per detail.
+- **`sessions_tree`.** The node (default: the caller) must be in the caller's root and in the store. `path` is the node then its ancestors that exist in the store (at most `MAX_DEPTH`). Siblings are all agent siblings, active first, newest first, paged with the same snapshot machinery. Children are a flat list (level by level, active first, newest first) of at most 20 with `children_count` of all descendants within `depth` (clamped to 1 to 3); with `include_children` false only direct children are counted.
+- **`unread_from_session`** in `SessionDetail` is the number of `Pending` or `Delivered` messages from the described session to the caller; no body is read into the result.
+- **`notice`** is a `String` (the fence notice is built at run time); `CursorTable` is `pub` because the public functions take it.
+- **Rank reading.** Relations self, parent, other ancestors (nearest first), siblings and children keep their rank whatever their status; `Peer` splits into rank 5 (active) and rank 6 (terminal); within a rank, active before terminal, then newest `last_activity`, then id.
+- **Depth 1 today.** Every spawn has the root as parent, so every session in a root is a `Sibling` of every other and groups (which collapse `Peer` runs only) cannot fire in production until agent-initiated nested spawns exist. They are covered by tests with nested lineages.
+- **Bounds not enforced.** `groups` and `Counts.by_identity` are bounded only by the number of sessions and identities in the root.
+- **Stored note.** The reads go through one helper (`note_of`). While `SessionRecord.note` is a plain string the summary is composed from it; when the registry change that stores a bounded `Summary` there merges, the helper and the test setters (`with_note`) are the only places to adapt, and the stored summary must then be used as is instead of composed again.
+- **Kani.** `page_bounds` carries a `#[cfg(kani)]` proof; `cargo-kani` is not installed here and the proof has never been executed (#1087). An exhaustive test over `len <= 130, offset <= 140` and proptests over all `usize` pairs are the evidence that runs.
 
 ---
 
