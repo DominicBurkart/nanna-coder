@@ -366,6 +366,8 @@ struct TaskRunner {
     sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
+    pi_route: std::sync::RwLock<Option<Arc<crate::harness_adapter::PiRoute>>>,
+    check_runner: std::sync::RwLock<Option<Arc<dyn crate::verify::CheckRunner>>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -480,7 +482,7 @@ impl RestoreRefused {
 
 #[derive(Debug)]
 pub(crate) struct AuditedIdentity {
-    identity: AgentIdentity,
+    allowed: Allowed,
 }
 
 impl AuditedIdentity {
@@ -492,9 +494,21 @@ impl AuditedIdentity {
         Self,
         Result<Option<Lineage>, LineageError>,
     ) {
-        let (request, identity) = allowed.into_parts();
+        let request = allowed.request().clone();
         let lineage = derive_lineage(&request.parent_task.id, lookup);
-        (request, Self { identity }, lineage)
+        (request, Self { allowed }, lineage)
+    }
+
+    pub(crate) fn identity(&self) -> &AgentIdentity {
+        self.allowed.identity()
+    }
+
+    pub(crate) fn repo(&self) -> &str {
+        self.allowed.repo()
+    }
+
+    pub(crate) fn allowed(&self) -> &Allowed {
+        &self.allowed
     }
 }
 
@@ -505,19 +519,92 @@ pub(crate) enum BoundIdentity {
 }
 
 impl BoundIdentity {
+    fn audited(&self) -> Option<&AuditedIdentity> {
+        match self {
+            BoundIdentity::Audited(audited) => Some(audited),
+            BoundIdentity::Unaudited(_) => None,
+        }
+    }
+
     pub(crate) fn identity(&self) -> &AgentIdentity {
         match self {
-            BoundIdentity::Audited(audited) => &audited.identity,
+            BoundIdentity::Audited(audited) => audited.identity(),
             BoundIdentity::Unaudited(identity) => identity,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_identity(self) -> AgentIdentity {
         match self {
-            BoundIdentity::Audited(audited) => audited.identity,
+            BoundIdentity::Audited(audited) => audited.allowed.into_parts().1,
             BoundIdentity::Unaudited(identity) => identity,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PiRouteRefused {
+    #[error("the pi route needs an audited identity and the task has no identity")]
+    NoIdentity,
+    #[error("the pi route needs an audited identity and the task's identity was not audited")]
+    Unaudited,
+    #[error("{0}")]
+    ScopeError(String),
+}
+
+impl PiRouteRefused {
+    fn error_type(&self) -> &'static str {
+        match self {
+            PiRouteRefused::NoIdentity | PiRouteRefused::Unaudited => "IdentityUnavailable",
+            PiRouteRefused::ScopeError(_) => "ScopeError",
+        }
+    }
+}
+
+fn require_pi_audited<'a>(
+    bound: Option<&'a BoundIdentity>,
+    repo_path: &Path,
+) -> Result<(&'a AuditedIdentity, crate::harness_adapter::AuditedRef<'a>), PiRouteRefused> {
+    use crate::harness_adapter::require_audited;
+    let bound = bound.ok_or(PiRouteRefused::NoIdentity)?;
+    let audited_ref = require_audited(bound).map_err(|_| PiRouteRefused::Unaudited)?;
+    let audited = bound.audited().ok_or(PiRouteRefused::Unaudited)?;
+    let refusal = scope_refusal(audited.repo(), repo_path);
+    let named = crate::scope::names_repo(audited.repo(), repo_path);
+    named.then_some((audited, audited_ref)).ok_or(refusal)
+}
+
+fn scope_refusal(repo: &str, checkout: &Path) -> PiRouteRefused {
+    let path = checkout.display();
+    let message = format!("the audited repository {repo} is not the checkout {path}");
+    PiRouteRefused::ScopeError(message)
+}
+
+fn pi_bind_error(e: crate::harness_adapter::BindError) -> (&'static str, String) {
+    use crate::harness_adapter::BindError;
+    let label = match &e {
+        BindError::Unaudited => "IdentityUnavailable",
+        BindError::RepoMismatch { .. } | BindError::Scope(_) => "ScopeError",
+        _ => "StateError",
+    };
+    (label, e.to_string())
+}
+
+fn pi_bind_failed<E: std::fmt::Display>(
+    label: &'static str,
+) -> impl FnOnce(E) -> (&'static str, String) {
+    move |e| (label, e.to_string())
+}
+
+enum Prepared {
+    Loop(Box<crate::tools::ToolRegistry>),
+    Pi(
+        Arc<crate::harness_adapter::PiRoute>,
+        Box<(
+            crate::harness_adapter::ResolvedAgent,
+            crate::harness_adapter::BoundWorkspace,
+        )>,
+    ),
 }
 
 async fn audit_restored(
@@ -848,6 +935,8 @@ impl TaskManager {
             sink,
             cost_accountant: std::sync::RwLock::new(cost_accountant),
             ci_client: std::sync::RwLock::new(None),
+            pi_route: std::sync::RwLock::new(None),
+            check_runner: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -973,6 +1062,42 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         client: Arc<dyn crate::backlog::GithubActionsClient>,
     ) -> Self {
         *self.runner.ci_client.write().unwrap() = Some(client);
+        self
+    }
+
+    #[doc = r#"Route every audited task on this manager through the pi executor
+instead of the in-process agent loop; `None` leaves it off. Off by default: a manager without a
+route never starts a pi container, and a task that is not audited fails
+closed once a route is set.
+
+```
+use harness::harness_adapter::{PiLimits, PiRoute, UnwiredPiExecutor};
+use harness::task::TaskManager;
+use std::sync::Arc;
+
+let route = PiRoute::new(
+    format!("nanna-pi@sha256:{}", "a".repeat(64)),
+    "/run/user/1000/nanna/broker",
+    PiLimits::default(),
+    Arc::new(UnwiredPiExecutor),
+)
+.unwrap();
+assert!(!TaskManager::new(1).has_pi_route());
+assert!(TaskManager::new(1).with_pi_route(Some(route)).has_pi_route());
+assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
+```"#]
+    pub fn with_pi_route(self, route: Option<crate::harness_adapter::PiRoute>) -> Self {
+        *self.runner.pi_route.write().unwrap() = route.map(Arc::new);
+        self
+    }
+
+    pub fn has_pi_route(&self) -> bool {
+        self.runner.pi_route.read().unwrap().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_check_runner(self, runner: Arc<dyn crate::verify::CheckRunner>) -> Self {
+        *self.runner.check_runner.write().unwrap() = Some(runner);
         self
     }
 
@@ -1623,6 +1748,38 @@ impl TaskRunner {
     }
 
     /// Mark a task `Failed` before any agent iteration ran.
+    async fn verify_checks(
+        &self,
+        task_id: &TaskId,
+        model: String,
+        identity_name: &str,
+        config: crate::verify::VerifyConfig,
+        container: Option<Arc<crate::container::ContainerHandle>>,
+    ) -> TaskStatus {
+        let injected = self.check_runner.read().unwrap().clone();
+        let runner = injected.or_else(|| {
+            container.map(|handle| {
+                Arc::new(crate::verify::ProcessCheckRunner::for_container(
+                    &handle,
+                    crate::tools::CONTAINER_WORKSPACE_DIR,
+                )) as Arc<dyn crate::verify::CheckRunner>
+            })
+        });
+        let Some(runner) = runner else {
+            return crate::verify::status_requires_container(Utc::now());
+        };
+        match crate::verify::run_verification(config, runner).await {
+            Ok(outcomes) => crate::verify::status_from_outcomes(
+                outcomes,
+                model,
+                self.cost_accountant()
+                    .task_summary(identity_name, &task_id.0),
+                Utc::now(),
+            ),
+            Err(e) => crate::verify::status_from_exec_error(e, Utc::now()),
+        }
+    }
+
     async fn fail(&self, task_id: &TaskId, error: String, error_type: &str) {
         self.progress.write().await.remove(task_id);
         self.set_status(
@@ -1686,22 +1843,52 @@ impl TaskRunner {
             .await;
             return;
         };
-        let identity = match self
+        let bound = match self
             .resolve_identity(&task_id, queued.identity_hint.as_deref(), &queued.repo_path)
             .await
         {
-            Ok(bound) => bound.map(BoundIdentity::into_identity),
+            Ok(bound) => bound,
             Err(e) => {
                 self.fail(&task_id, e, "IdentityUnavailable").await;
                 return;
             }
         };
+        let identity: Option<AgentIdentity> = bound.as_ref().map(|b| b.identity().clone());
         if let Some(identity) = &identity {
             if let Err(e) = crate::scope::check_repo(identity, &queued.repo_path) {
                 self.fail(&task_id, e.to_string(), "ScopeError").await;
                 return;
             }
         }
+        let route = self.pi_route.read().unwrap().clone();
+        let pi = match route {
+            Some(route)
+                if identity
+                    .as_ref()
+                    .is_none_or(|i| !crate::verify::is_verifier(i)) =>
+            {
+                match require_pi_audited(bound.as_ref(), &queued.repo_path) {
+                    Ok((audited, audited_ref)) => Some((route, audited, audited_ref)),
+                    Err(refused) => {
+                        self.fail(&task_id, refused.to_string(), refused.error_type())
+                            .await;
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let verifier_checks = match identity.as_ref().filter(|i| crate::verify::is_verifier(i)) {
+            Some(_) => match crate::verify::VerifyConfig::load(&queued.repo_path) {
+                Ok(config) => Some(config),
+                Err(e) => {
+                    self.fail(&task_id, e.to_string(), crate::verify::ERROR_CHECKS_INVALID)
+                        .await;
+                    return;
+                }
+            },
+            None => None,
+        };
         tracing::info!(
             task_id = %task_id,
             side = side.label(),
@@ -1797,13 +1984,60 @@ impl TaskRunner {
             workspace.set_ci_client(client);
         }
 
-        let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
-        workspace.bind_sandbox_pr(&layers.subject);
-        let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
-            Ok(registry) => registry,
-            Err(e) => {
+        if let Some(config) = verifier_checks {
+            let name = identity.as_ref().map_or("", |i| i.name());
+            let container = workspace.container_handle().cloned();
+            let status = self
+                .verify_checks(&task_id, queued.model, name, config, container)
+                .await;
+            let _ = workspace.cleanup();
+            self.progress.write().await.remove(&task_id);
+            self.set_status(&task_id, status).await;
+            return;
+        }
+
+        let prepared = match pi {
+            Some((route, audited, audited_ref)) => {
+                let layers = self.model_facing_layers(&task_id, &queued, Some(audited.identity()));
+                workspace.bind_sandbox_pr(&layers.subject);
+                registry_for(&workspace, Some(audited.identity()))
+                    .map_err(pi_bind_failed("ScopeError"))
+                    .map(|registry| {
+                        crate::harness_adapter::ScopedCapabilities::scope(
+                            registry,
+                            audited.identity(),
+                        )
+                    })
+                    .and_then(|scoped| {
+                        crate::harness_adapter::ResolvedAgent::resolve(
+                            audited.allowed(),
+                            &scoped,
+                            route.endpoint().clone(),
+                            route.image(),
+                            route.broker_socket(&task_id.0),
+                        )
+                        .map_err(pi_bind_failed("StateError"))
+                    })
+                    .and_then(|agent| {
+                        agent
+                            .bind_workspace(audited_ref, audited.repo(), &workspace, layers)
+                            .map_err(pi_bind_error)
+                            .map(|bound| Prepared::Pi(route, Box::new((agent, bound))))
+                    })
+            }
+            None => {
+                let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
+                workspace.bind_sandbox_pr(&layers.subject);
+                model_facing_registry(&workspace, identity.as_ref(), layers)
+                    .map(|registry| Prepared::Loop(Box::new(registry)))
+                    .map_err(|e| ("ScopeError", e.to_string()))
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err((label, message)) => {
                 let _ = workspace.cleanup();
-                self.fail(&task_id, e.to_string(), "ScopeError").await;
+                self.fail(&task_id, message, label).await;
                 return;
             }
         };
@@ -1834,13 +2068,39 @@ impl TaskRunner {
             app_state_id: task_id.0.clone(),
         };
 
-        let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
-        agent.set_progress_counter(Arc::clone(&progress_counter));
-        let mut run_result = agent.run(context).await;
-        let action_audit = agent
-            .tool_registry()
-            .map(crate::tools::ToolRegistry::action_reviews)
-            .unwrap_or_default();
+        let (mut run_result, action_audit) = match prepared {
+            Prepared::Pi(route, parts) => {
+                let (agent, bound) = *parts;
+                let container_name = crate::harness_adapter::pi_container_name(&task_id.0);
+                let guard = crate::harness_adapter::PiContainerGuard::arm(container_name);
+                let deadline = std::time::Duration::from_secs(agent.limits().max_wall_clock_secs);
+                let outcome = route
+                    .executor()
+                    .run(crate::harness_adapter::PiLaunch::new(
+                        &task_id.0,
+                        guard.name(),
+                        &agent,
+                        bound,
+                        &route,
+                        Arc::clone(&progress_counter),
+                        deadline,
+                    ))
+                    .await;
+                drop(guard);
+                (outcome.result, outcome.action_audit)
+            }
+            Prepared::Loop(tool_registry) => {
+                let mut agent =
+                    AgentLoop::with_tools(agent_config, entity_store, provider, *tool_registry);
+                agent.set_progress_counter(Arc::clone(&progress_counter));
+                let run_result = agent.run(context).await;
+                let action_audit = agent
+                    .tool_registry()
+                    .map(crate::tools::ToolRegistry::action_reviews)
+                    .unwrap_or_default();
+                (run_result, action_audit)
+            }
+        };
 
         let extracted = workspace.extract_changes();
         let impact_required =
@@ -4249,6 +4509,185 @@ mod identity_tests {
         assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Disabled);
         identity.scope.max_effect = EffectClass::Repository;
         assert_eq!(network_policy_for(Some(&identity)), NetworkPolicy::Enabled);
+    }
+
+    fn verifier_identity() -> AgentIdentity {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = EffectClass::Workspace;
+        identity.scope.paths = Vec::new();
+        identity.scope.tools = vec!["run_checks".parse().unwrap()];
+        identity
+    }
+
+    fn declare_checks(repo: &std::path::Path, toml: &str) {
+        std::fs::create_dir_all(repo.join(".nanna")).unwrap();
+        std::fs::write(repo.join(".nanna/verify.toml"), toml).unwrap();
+    }
+
+    const TWO_CHECKS: &str = "[[check]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n\n[[check]]\nname = \"lint\"\ncommand = \"cargo clippy\"\n";
+
+    async fn run_verifier(manager: &TaskManager, repo: &std::path::Path) -> (TaskId, Task) {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit_with_identity(
+                "Verify".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(verifier_identity()),
+            )
+            .await;
+        let task = wait_for(manager, &id, terminal).await;
+        (id, task)
+    }
+
+    #[tokio::test]
+    async fn test_verifier_without_declared_checks_refuses_to_start() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "VerifierChecksInvalid");
+        assert!(error.contains(".nanna/verify.toml"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_a_verifier_stays_on_the_verify_path_when_a_pi_route_is_set() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let route = crate::harness_adapter::PiRoute::new(
+            "nanna-pi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/run/nanna/broker",
+            crate::harness_adapter::PiLimits::default(),
+            Arc::new(crate::harness_adapter::UnwiredPiExecutor),
+        )
+        .unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_pi_route(Some(route));
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        assert_eq!(failed_with(&task.status).0, "VerifierChecksInvalid");
+    }
+
+    #[tokio::test]
+    async fn test_verifier_with_a_malformed_declaration_refuses_to_start() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), "[[check]]\nname = \"a\"\n");
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        assert_eq!(failed_with(&task.status).0, "VerifierChecksInvalid");
+    }
+
+    #[tokio::test]
+    async fn test_verifier_in_a_repository_without_a_dev_container_fails_closed() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "VerifierRequiresContainer");
+        assert!(error.contains("dev container"), "{error}");
+        assert!(!std::env::temp_dir()
+            .join(format!("nanna-task-{}", task.id.0))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn test_verifier_completes_when_every_check_passes_without_consulting_a_model() {
+        use crate::verify::test_support::{raw, ScriptedRunner};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = ScriptedRunner::new(vec![raw(Some(0), "ok", ""), raw(Some(0), "clean", "")]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (id, task) = run_verifier(&manager, repo.path()).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&id).await.unwrap();
+        assert_eq!(result.result_summary, "2/2 checks passed");
+        assert_eq!(result.qa_summary.checks.len(), 2);
+        assert_eq!(result.qa_summary.checks[0].name, "fmt");
+        assert_eq!(result.qa_summary.checks[1].output, "clean");
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.model_used, "mock");
+        assert!(result.changes_patch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_verifier_fails_naming_the_failing_check_and_keeps_every_outcome() {
+        use crate::verify::test_support::{raw, ScriptedRunner};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = ScriptedRunner::new(vec![raw(Some(0), "ok", ""), raw(Some(101), "", "boom")]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (id, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "VerificationFailed");
+        assert_eq!(error, "check `lint` failed with exit code 101");
+        assert!(manager.get_result(&id).await.is_none());
+        let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+            unreachable!()
+        };
+        assert_eq!(diagnostics.tool_call_history.len(), 2);
+        assert_eq!(
+            diagnostics.last_tool_call.as_ref().unwrap().arguments["name"],
+            "lint"
+        );
+        assert!(diagnostics
+            .last_tool_call
+            .as_ref()
+            .unwrap()
+            .result
+            .contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_verifier_reports_a_runner_error_as_its_own_failure() {
+        use crate::verify::test_support::{raw, ScriptedRunner};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner =
+            ScriptedRunner::new(vec![raw(Some(0), "ok", ""), Err("no runtime".to_string())]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "VerifierExecFailed");
+        assert!(
+            error.contains("`lint`") && error.contains("no runtime"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verifier_without_an_injected_runner_launches_through_the_container_runtime() {
+        let _held = crate::test_support::hold_path_async().await;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let config = crate::verify::VerifyConfig::parse(TWO_CHECKS).unwrap();
+        let handle = Arc::new(crate::container::ContainerHandle {
+            name: "nanna-no-such-container".to_string(),
+            runtime: crate::container::detect_runtime(),
+            port: None,
+            needs_cleanup: false,
+        });
+        let status = manager
+            .runner
+            .verify_checks(
+                &TaskId::new(),
+                "m".to_string(),
+                "verifier",
+                config,
+                Some(handle),
+            )
+            .await;
+        let (error_type, _) = failed_with(&status);
+        assert!(
+            ["VerificationFailed", "VerifierExecFailed"].contains(&error_type),
+            "{error_type}"
+        );
     }
 
     #[tokio::test]
@@ -8290,5 +8729,663 @@ mod impact_tests {
             },
         ));
         assert!(!impact_required(true, true, &protected));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pi_route_tests {
+    use super::scheduler_tests::{git_repo, wait_for};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::agent::AgentState;
+    use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
+    use crate::harness_adapter::{PiExecutor, PiLaunch, PiLimits, PiRoute, PiRunOutcome};
+    use crate::identity::{DevLoop, IdentityCatalog};
+    use crate::test_support::FakePodman;
+
+    const LABEL: &str = "github.com/example/repo";
+    const IMAGE: &str =
+        "nanna-pi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[derive(Debug, Clone, Copy)]
+    enum Mode {
+        Complete,
+        Fail,
+        CallGatedTool,
+        Hang,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        task_id: String,
+        container_name: String,
+        repo: String,
+        subtask: String,
+        capability_names: Vec<String>,
+        deadline: std::time::Duration,
+        image: String,
+        broker_socket: PathBuf,
+        endpoint: crate::harness_adapter::Endpoint,
+    }
+
+    #[derive(Debug)]
+    struct Stub {
+        mode: Mode,
+        seen: std::sync::Mutex<Vec<Seen>>,
+        started: tokio::sync::Notify,
+    }
+
+    impl Stub {
+        fn new(mode: Mode) -> Arc<Self> {
+            Arc::new(Self {
+                mode,
+                seen: std::sync::Mutex::new(Vec::new()),
+                started: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn launches(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn completed(summary: &str) -> AgentRunResult {
+        AgentRunResult {
+            final_state: AgentState::Completed,
+            iterations: 3,
+            task_completed: true,
+            result_summary: summary.to_string(),
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            token_usage: None,
+            denials: vec![],
+            action_audit: vec![],
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PiExecutor for Stub {
+        async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome {
+            let agent = launch.agent().clone();
+            self.seen.lock().unwrap().push(Seen {
+                task_id: launch.task_id().to_string(),
+                container_name: launch.container_name().to_string(),
+                repo: agent.audited_repo().to_string(),
+                subtask: agent.task_prompt().to_string(),
+                capability_names: agent
+                    .capability_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                deadline: launch.deadline(),
+                image: launch.route().image().to_string(),
+                broker_socket: agent.broker_socket().to_path_buf(),
+                endpoint: launch.route().endpoint().clone(),
+            });
+            let result = |result| PiRunOutcome {
+                result,
+                action_audit: vec![],
+            };
+            match self.mode {
+                Mode::Complete => result(Ok(completed("pi finished"))),
+                Mode::Fail => result(Err(AgentError::StateError {
+                    message: "pi container exited".to_string(),
+                    iterations_completed: 1,
+                    tool_calls_made: vec![],
+                    conversation_snapshot: vec![],
+                    last_agent_state: AgentState::Error("pi".to_string()),
+                })),
+                Mode::CallGatedTool => {
+                    let plan = crate::harness_adapter::launch_plan(
+                        &crate::harness_adapter::PiAdapter,
+                        &agent,
+                    )
+                    .unwrap();
+                    let reported = plan.exposed_capabilities.clone();
+                    let broker = crate::harness_adapter::Broker::for_agent(
+                        &agent,
+                        launch.into_binding(),
+                        crate::harness_adapter::BrokerPolicy::new(agent.max_effect()),
+                        Arc::new(crate::harness_adapter::RingAuditSink::default()),
+                    )
+                    .unwrap()
+                    .arm(&plan, &reported)
+                    .unwrap();
+                    let _ = broker
+                        .handle(crate::harness_adapter::BrokerRequest {
+                            tool: "github_pr_status".to_string(),
+                            args: serde_json::json!({}),
+                        })
+                        .await;
+                    PiRunOutcome {
+                        result: Ok(completed("pi pushed")),
+                        action_audit: broker.action_audit(),
+                    }
+                }
+                Mode::Hang => {
+                    let status = std::process::Command::new("podman")
+                        .args(["run", "--name", launch.container_name(), IMAGE])
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                    launch.progress().fetch_add(3, Ordering::Relaxed);
+                    self.started.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    fn route(stub: &Arc<Stub>) -> PiRoute {
+        PiRoute::new(
+            IMAGE,
+            "/run/user/1000/nanna/broker",
+            PiLimits::default(),
+            stub.clone() as Arc<dyn PiExecutor>,
+        )
+        .unwrap()
+    }
+
+    fn manager_with(stub: &Arc<Stub>) -> TaskManager {
+        TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_pi_route(Some(route(stub)))
+    }
+
+    fn context_with(wide: bool, model: Option<&str>) -> AuditContext {
+        let base = IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let auditor = base.get("auditor").unwrap().clone();
+        let mut implementer = base.get("rust-implementer").unwrap().clone();
+        if wide {
+            implementer.scope.paths = vec!["**".to_string()];
+            implementer.scope.tools = vec!["*".parse().unwrap()];
+        }
+        if let Some(model) = model {
+            implementer.identity.model = model.to_string();
+        }
+        let catalog = IdentityCatalog::from_identities(
+            base.iter()
+                .filter(|identity| identity.name() != "rust-implementer")
+                .cloned()
+                .chain([implementer]),
+        );
+        AuditContext::new(catalog, auditor).unwrap()
+    }
+
+    async fn allowed_for(label: &str) -> Allowed {
+        allowed_with(label, false).await
+    }
+
+    async fn allowed_with(label: &str, wide: bool) -> Allowed {
+        allowed_with_model(label, wide, None).await
+    }
+
+    async fn allowed_with_model(label: &str, wide: bool, model: Option<&str>) -> Allowed {
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", label),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        gate.check(request, &context_with(wide, model))
+            .await
+            .unwrap()
+    }
+
+    fn repo_with_origin(url: &str) -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        repo
+    }
+
+    fn provider() -> Arc<MockProvider> {
+        MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+            "agent loop ran",
+        )]))
+    }
+
+    async fn spawn(manager: &TaskManager, repo: &Path, provider: Arc<MockProvider>) -> TaskId {
+        manager
+            .submit_spawn(
+                allowed_for(LABEL).await,
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn failed(status: &TaskStatus) -> (&str, &str) {
+        match status {
+            TaskStatus::Failed {
+                error, diagnostics, ..
+            } => (diagnostics.error_type.as_str(), error.as_str()),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a failed task")]
+    fn test_the_failed_helper_rejects_a_task_that_did_not_fail() {
+        failed(&TaskStatus::Pending);
+    }
+
+    fn worktrees(repo: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count()
+    }
+
+    fn container_shaped_repo() -> tempfile::TempDir {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        std::fs::write(repo.path().join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir_all(repo.path().join(".devcontainer")).unwrap();
+        repo
+    }
+
+    async fn prefill_image(manager: &TaskManager, repo: &Path) {
+        manager
+            .runner
+            .image_cache
+            .write()
+            .await
+            .insert(repo.canonicalize().unwrap(), "pre-built:latest".to_string());
+    }
+
+    fn touching(fake: &FakePodman, id: &TaskId, repo: &Path) -> Vec<String> {
+        let repo = repo.display().to_string();
+        fake.calls()
+            .into_iter()
+            .filter(|call| call.contains(&id.0) || call.contains(&repo))
+            .collect()
+    }
+
+    async fn calls_until(fake: &FakePodman, wanted: &str) -> Vec<String> {
+        let mut attempts = 0;
+        loop {
+            let calls = fake.calls();
+            attempts += 1;
+            if attempts >= 200 || calls.iter().any(|call| call == wanted) {
+                return calls;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_off_runs_the_agent_loop_and_launches_no_container() {
+        let fake = FakePodman::install_async(None).await;
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        assert!(!manager.has_pi_route());
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let model = provider();
+        let id = spawn(&manager, repo.path(), model.clone()).await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        match task.status {
+            TaskStatus::Completed { result, .. } => {
+                assert_eq!(result.result_summary, "agent loop ran")
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+        assert_eq!(model.remaining(), 0);
+        assert!(touching(&fake, &id, repo.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_audited_task_runs_on_the_pi_executor_with_its_audited_bindings() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        assert!(manager.has_pi_route());
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let model = provider();
+        let unused = model.remaining();
+        let id = spawn(&manager, repo.path(), model.clone()).await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        match task.status {
+            TaskStatus::Completed { result, .. } => {
+                assert_eq!(result.result_summary, "pi finished");
+                assert_eq!(result.iterations, 3);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+        assert_eq!(model.remaining(), unused);
+        let launches = stub.launches();
+        assert_eq!(launches.len(), 1);
+        let seen = &launches[0];
+        assert_eq!(seen.task_id, id.0);
+        assert_eq!(seen.container_name, format!("nanna-pi-{}", id.0));
+        assert_eq!(seen.repo, LABEL);
+        assert_eq!(seen.subtask, "Add a regression test.");
+        assert_eq!(seen.deadline, std::time::Duration::from_secs(3600));
+        assert_eq!(seen.image, IMAGE);
+        assert!(!seen.capability_names.is_empty());
+        assert_eq!(
+            seen.broker_socket,
+            PathBuf::from(format!("/run/user/1000/nanna/broker/{}.sock", id.0))
+        );
+        assert_eq!(
+            seen.endpoint,
+            crate::harness_adapter::Endpoint::new("model-gateway", 11434).unwrap()
+        );
+        let removed = format!("rm -f nanna-pi-{}", id.0);
+        assert!(calls_until(&fake, &removed).await.contains(&removed));
+        assert!(touching(&fake, &id, repo.path()).contains(&removed));
+    }
+
+    #[tokio::test]
+    async fn test_the_pi_run_reads_its_action_audit_from_the_broker_registry() {
+        let _fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::CallGatedTool);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = manager
+            .submit_spawn(
+                allowed_with(LABEL, true).await,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        match task.status {
+            TaskStatus::Completed { result, .. } => {
+                assert_eq!(result.action_audit.len(), 1);
+                assert_eq!(result.action_audit[0].review.tool, "github_pr_status");
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_executor_failure_keeps_the_existing_failure_label() {
+        let _fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Fail);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = spawn(&manager, repo.path(), provider()).await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, error) = failed(&task.status);
+        assert_eq!(error_type, "StateError");
+        assert!(error.contains("pi container exited"), "{error}");
+        assert_eq!(worktrees(repo.path()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_the_unwired_executor_fails_every_audited_task_closed_and_starts_no_container() {
+        let fake = FakePodman::install_async(None).await;
+        let route = PiRoute::new(
+            IMAGE,
+            "/run/nanna/broker",
+            PiLimits::default(),
+            Arc::new(crate::harness_adapter::UnwiredPiExecutor),
+        )
+        .unwrap();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_pi_route(Some(route));
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = spawn(&manager, repo.path(), provider()).await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, _) = failed(&task.status);
+        assert_eq!(error_type, "StateError");
+        assert!(!matches!(task.status, TaskStatus::Completed { .. }));
+        let started: Vec<String> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("run") && call.contains(&id.0))
+            .collect();
+        assert!(started.is_empty(), "{started:?}");
+    }
+
+    #[tokio::test]
+    async fn test_an_agent_that_cannot_be_resolved_fails_closed_with_the_state_label() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let allowed = allowed_with_model(LABEL, false, Some("bad model")).await;
+        let model = allowed.model().to_string();
+        let id = manager
+            .submit_spawn(
+                allowed,
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                model,
+                20,
+                provider(),
+            )
+            .await
+            .unwrap();
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, error) = failed(&task.status);
+        assert_eq!(error_type, "StateError");
+        assert!(error.contains("bad model"), "{error}");
+        assert!(stub.launches().is_empty());
+        assert_eq!(worktrees(repo.path()), 1);
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("run") && call.contains(&id.0)));
+    }
+
+    #[tokio::test]
+    async fn test_a_hinted_task_is_unaudited_and_pi_refuses_it_before_any_work() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        let repo = container_shaped_repo();
+        prefill_image(&manager, repo.path()).await;
+        let id = manager
+            .submit_with_identity(
+                "Add a test.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "gemma4:e4b".to_string(),
+                20,
+                provider(),
+                Some(crate::identity::example()),
+            )
+            .await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, _) = failed(&task.status);
+        assert_eq!(error_type, "IdentityUnavailable");
+        assert!(stub.launches().is_empty());
+        let touched = touching(&fake, &id, repo.path());
+        assert!(touched.is_empty(), "{touched:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_task_with_no_identity_is_refused_by_pi_before_any_work() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = manager
+            .submit(
+                "Read only.".to_string(),
+                repo.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider(),
+            )
+            .await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, error) = failed(&task.status);
+        assert_eq!(error_type, "IdentityUnavailable");
+        assert!(error.contains("no identity"), "{error}");
+        assert!(stub.launches().is_empty());
+        assert_eq!(worktrees(repo.path()), 1);
+        assert!(touching(&fake, &id, repo.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pi_refuses_an_audited_label_that_does_not_name_the_checkout() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let queued = QueuedTask::new(
+            "Add a regression test.",
+            repo.path().to_path_buf(),
+            "HEAD",
+            "gemma4:e4b",
+            20,
+        );
+        let id = manager
+            .submit_audited(
+                queued,
+                allowed_for("github.com/example/other").await,
+                provider(),
+            )
+            .await;
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let (error_type, error) = failed(&task.status);
+        assert_eq!(error_type, "ScopeError");
+        assert!(error.contains("github.com/example/other"), "{error}");
+        assert!(stub.launches().is_empty());
+        assert_eq!(worktrees(repo.path()), 1);
+        assert!(touching(&fake, &id, repo.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_aborting_a_pi_run_removes_its_container() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Hang);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = spawn(&manager, repo.path(), provider()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), stub.started.notified())
+            .await
+            .expect("the pi executor never started");
+        let running = manager.poll(&id).await.unwrap();
+        assert!(matches!(
+            running.status,
+            TaskStatus::Running { iterations: 3, .. }
+        ));
+        let started = format!("run --name nanna-pi-{} {IMAGE}", id.0);
+        assert!(fake.calls().contains(&started), "{:?}", fake.calls());
+        let removed = format!("rm -f nanna-pi-{}", id.0);
+        assert!(!fake.calls().contains(&removed));
+        manager.cancel(&id).await.unwrap();
+        let calls = calls_until(&fake, &removed).await;
+        assert!(calls.contains(&removed), "{calls:?}");
+    }
+
+    #[test]
+    fn test_pi_route_refusals_name_their_failure_label() {
+        let audited = PiRouteRefused::NoIdentity;
+        assert_eq!(audited.error_type(), "IdentityUnavailable");
+        assert_eq!(
+            PiRouteRefused::Unaudited.error_type(),
+            "IdentityUnavailable"
+        );
+        let scope = PiRouteRefused::ScopeError("elsewhere".to_string());
+        assert_eq!(scope.error_type(), "ScopeError");
+        assert!(scope.to_string().contains("elsewhere"));
+    }
+
+    #[test]
+    fn test_every_bind_failure_keeps_a_failing_label_and_its_message() {
+        use crate::harness_adapter::BindError;
+        let scope = crate::scope::ScopeError::InvalidGlob {
+            identity: "i".to_string(),
+            field: "scope.paths",
+            pattern: "[".to_string(),
+            reason: "r".to_string(),
+        };
+        let cases = [
+            (BindError::Unaudited, "IdentityUnavailable"),
+            (
+                BindError::RepoMismatch {
+                    audited: "a".to_string(),
+                    target: "b".to_string(),
+                },
+                "ScopeError",
+            ),
+            (BindError::Scope(scope), "ScopeError"),
+            (BindError::AgentMismatch, "StateError"),
+            (BindError::LayersMismatch { field: "task id" }, "StateError"),
+            (
+                BindError::CapabilityMismatch {
+                    tool: "t".to_string(),
+                },
+                "StateError",
+            ),
+        ];
+        for (error, label) in cases {
+            let message = error.to_string();
+            assert_eq!(pi_bind_error(error), (label, message));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_bound_identity_exposes_its_audited_form_only_when_audited() {
+        let allowed = allowed_for(LABEL).await;
+        let identity = allowed.identity().clone();
+        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed, &|_| None).1);
+        assert_eq!(audited.audited().map(AuditedIdentity::repo), Some(LABEL));
+        assert!(BoundIdentity::Unaudited(identity).audited().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_require_pi_audited_admits_only_an_audited_identity_naming_the_checkout() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let allowed = allowed_for(LABEL).await;
+        let identity = allowed.identity().clone();
+        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed, &|_| None).1);
+        let (admitted, _) = require_pi_audited(Some(&audited), repo.path()).unwrap();
+        assert_eq!(admitted.identity(), &identity);
+        let other = repo_with_origin("https://github.com/example/other.git");
+        assert!(matches!(
+            require_pi_audited(Some(&audited), other.path()),
+            Err(PiRouteRefused::ScopeError(_))
+        ));
+        let unaudited = BoundIdentity::Unaudited(identity);
+        assert!(matches!(
+            require_pi_audited(Some(&unaudited), repo.path()),
+            Err(PiRouteRefused::Unaudited)
+        ));
+        assert!(matches!(
+            require_pi_audited(None, repo.path()),
+            Err(PiRouteRefused::NoIdentity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_an_audited_identity_keeps_the_proof_it_was_split_from() {
+        let allowed = allowed_for(LABEL).await;
+        let identity = allowed.identity().clone();
+        let (request, audited, _) = AuditedIdentity::split(allowed, &|_| None);
+        assert_eq!(request.subtask, "Add a regression test.");
+        assert_eq!(audited.repo(), LABEL);
+        assert_eq!(audited.identity(), &identity);
+        assert_eq!(audited.allowed().repo(), audited.repo());
+        assert_eq!(audited.allowed().request(), &request);
+        let bound = BoundIdentity::Audited(audited);
+        assert_eq!(bound.identity(), &identity);
+        assert_eq!(bound.into_identity(), identity);
     }
 }
