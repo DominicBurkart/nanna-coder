@@ -22,6 +22,7 @@ pub use sessions::{InMemorySessionStore, JsonlSessionStore};
 use super::lineage::{RootId, SessionId};
 use super::message::{DeliveryState, MessageId, Recipient, Seq, StoredMessage};
 use super::session::{SessionRecord, SessionStatus};
+use super::summary::Summary;
 use chrono::{DateTime, Duration, Utc};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -145,10 +146,11 @@ pub trait SessionStore: Send + Sync {
     /// ```
     /// use harness::hub::store::{InMemorySessionStore, SessionStore, StoreError};
     /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("x".into()));
-    /// let result = InMemorySessionStore::new().set_note(id, "n".into());
+    /// let note = harness::hub::summary::Summary::compose("a", "running", "n");
+    /// let result = InMemorySessionStore::new().set_note(id, note);
     /// assert!(matches!(result, Err(StoreError::NotFound)));
     /// ```
-    fn set_note(&self, id: SessionId, note: String) -> Result<(), StoreError>;
+    fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError>;
     /// Remove expired roots; returns the number of sessions removed.
     ///
     /// ```
