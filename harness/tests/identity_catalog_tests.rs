@@ -3,7 +3,7 @@
 
 use harness::effects::EffectClass;
 use harness::hub::message::MessageReach;
-use harness::identity::{DevLoop, IdentityCatalog, IdentityError, SystemPrompt};
+use harness::identity::{AgentIdentity, DevLoop, IdentityCatalog, IdentityError, SystemPrompt};
 use std::path::PathBuf;
 
 fn fixtures() -> PathBuf {
@@ -144,14 +144,19 @@ fn shipped_and_fixture_cards_keep_message_reach_none_until_the_hub_is_wired() {
     ];
     let mut seen = 0;
     for dir in dirs {
-        for identity in IdentityCatalog::load(&dir).expect("catalog loads").iter() {
-            assert_eq!(
-                identity.scope.message_reach,
-                MessageReach::None,
-                "{}",
-                identity.name()
-            );
-            seen += 1;
+        for entry in std::fs::read_dir(&dir).expect("directory reads") {
+            let path = entry.expect("entry reads").path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                let text = std::fs::read_to_string(&path).expect("card reads");
+                let card = AgentIdentity::from_toml_str(&text, &path).expect("card parses");
+                assert_eq!(
+                    card.scope.message_reach,
+                    MessageReach::None,
+                    "{}",
+                    path.display()
+                );
+                seen += 1;
+            }
         }
     }
     assert!(seen >= 8, "only {seen} cards inspected");

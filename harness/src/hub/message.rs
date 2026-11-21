@@ -296,6 +296,18 @@ impl fmt::Debug for StoredMessage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn message_reach_defaults_to_none_and_orders_by_permission() {
+        assert_eq!(MessageReach::default(), MessageReach::None);
+        assert!(MessageReach::None < MessageReach::Lineage);
+        assert!(MessageReach::Lineage < MessageReach::Root);
+        assert_eq!(MessageReach::Lineage.to_string(), "lineage");
+        assert_eq!(
+            serde_json::to_string(&MessageReach::Root).unwrap(),
+            "\"root\""
+        );
+    }
+
     fn stored() -> StoredMessage {
         StoredMessage {
             id: MessageId::new(),
