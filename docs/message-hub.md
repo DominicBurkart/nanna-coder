@@ -265,31 +265,40 @@ pub enum StoreError { #[error("io: {0}")] Io(#[from] io::Error), #[error("corrup
 The librarian must do *detailed* lookups of session contents (decision D5), and nanna stores no per-session activity today. Each session therefore gets an append-only activity log, `activity.jsonl` (`NANNA_ACTIVITY_PATH`, with a `*_path_from` doctest).
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)] // Debug is hand-written: ids, times, byte lengths, never text
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ActivityEntry {
-    AssistantTurn { session: SessionId, at: DateTime<Utc>, text: String /* ≤ 2 KiB per turn */ },
-    ToolCall { session: SessionId, at: DateTime<Utc>, tool: String, args_summary: String /* ≤ 300 chars */, ok: bool },
-    MessageMeta { session: SessionId, at: DateTime<Utc>, id: MessageId, direction: Direction, peer: SessionId, kind: MessageKind, subject: String },
+    AssistantTurn { session: SessionId, at: DateTime<Utc>, text: String /* ≤ 2048 bytes */ },
+    ToolCall { session: SessionId, at: DateTime<Utc>, tool: String /* ≤ 64 chars */, args_summary: ArgsSummary /* ≤ 300 chars */, ok: bool },
+    MessageMeta { session: SessionId, at: DateTime<Utc>, id: MessageId, direction: Direction, peer: SessionId, kind: MessageKind, subject: String /* ≤ 200 chars */ },
     StatusChange { session: SessionId, at: DateTime<Utc>, status: SessionStatus },
 }
 pub enum Direction { Sent, Received }
 
 pub trait ActivityStore: Send + Sync {
-    fn append(&self, e: ActivityEntry) -> Result<(), StoreError>;
-    fn for_session(&self, id: SessionId, byte_budget: usize) -> Result<Vec<ActivityEntry>, StoreError>; // newest first
+    fn append_with(&self, e: ActivityEntry, oracle: &dyn IdentifierOracle) -> Result<(), StoreError>;
+    fn append(&self, e: ActivityEntry) -> Result<(), StoreError>; // append_with(e, &NullOracle)
+    fn for_session(&self, id: SessionId, byte_budget: usize) -> Result<Vec<ActivityEntry>, StoreError>; // newest appended first
     fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError>;
+    fn forget(&self, sessions: &[SessionId]) -> Result<usize, StoreError>;
 }
 ```
+
+`InMemoryActivityStore` and `JsonlActivityStore` (in `hub/store/activity.rs`) run on the same `Engine`, journal and `HubLock` as the session and message stores.
 
 - **Writers.**
   - `ToolCall` entries come from the broker's `CallRecord`s, or from `ToolRegistry::execute`'s result on the `AgentLoop` path.
   - `AssistantTurn` entries come from the executor or `AgentLoop`.
   - `MessageMeta` and `StatusChange` entries come from the hub.
-- **Every string field is processed at write time.** It goes through `strip_unprintable`, then `redact_resilient`, then `RuleMessageAuditor::review_field`. A rule hit stores `"[withheld: <code>]"` in place of the text.
-- **Arguments are summarized, never stored raw.** `args_summary` keeps keys and paths, truncates values, and never includes `write_file` contents.
-- **Message bodies are never in the activity log**, only their metadata.
-- The activity log has the same `0600` mode, single writer and retention as the session store.
+  - Nothing is wired yet: #1069 and #1071 call the store.
+- **Every string field is processed inside `append`, so no caller can skip it.** In order: take at most 64 KiB of the raw text, `strip_unprintable`, `redact_resilient` on the whole text, cut to the field limit (on a char boundary, backing off to whitespace within 64 bytes), then `RuleMessageAuditor::review_field_with` on exactly the text that will be stored. A rule hit stores `"[withheld: <reason code>]"` in place of the text; the append succeeds and the original is never stored, logged or echoed. The cut comes after redaction (a secret cannot be split into an unrecognised fragment) and before the review (the review rejects text over 8 KiB, which would withhold every long turn). Limits: 2048 bytes for a turn, 300 chars for an argument summary, 200 chars for a subject, 64 chars for a tool name.
+- **Oracle per call (deviation).** `append_with` takes an `IdentifierOracle` like `review_field_with`, because a real oracle belongs to the logging session's workspace. `append` uses `NullOracle`.
+- **Arguments are summarized from the call, never stored raw (deviation).** `args_summary` is an `ArgsSummary`, which can only be built by `ArgsSummary::from_args(tool, &args)`; it records argument names and the kind and length of each value (`path=str:12 content=str:4096`), never a value. For the message tools only the names in `known_arguments(tool)` are written and any other key is `?`; for every other tool a key is written only if it is a plain identifier of at most 32 chars, else `?`. Non-object arguments are `value=<kind>`. The doc earlier said "keeps keys and paths, truncates values"; paths are values and are not kept. The summary then goes through the pipeline above like any other field.
+- **Message bodies are never in the activity log**, only their metadata. A test pins the exact key set of `MessageMeta`.
+- **Cost and budget (deviation).** `for_session` returns entries newest appended first (not ordered by `at`), taking entries while the running total of `ActivityEntry::cost()` (32 bytes of overhead plus the byte length of every text field) stays within the budget; the first entry that does not fit ends the list.
+- **Retention (deviation).** `prune` drops a session's whole activity when its latest `StatusChange` is terminal and its newest entry is older than `completed_session_ttl` (strict `>`). Activity entries carry no root, so this cannot mirror the registry's per-root pruning exactly, and a session that never logged a terminal status is kept. `forget(&[SessionId])` is the seam for the registry (#1069) to call for every session it prunes.
+- **Known limits.** Every commit clones the whole table (the engine's pattern), which is hotter here than for sessions; #1069 should measure before the hub appends every tool call. There is no per-session entry cap other than retention. Replay does not re-process stored text: the file is `0600` and written only by this store.
+- The activity log has the same `0600` mode, single writer and retention as the session store. An empty `NANNA_ACTIVITY_PATH` counts as unset.
 
 - **Single writer.** On open, the hub takes an `fs4` exclusive `try_lock` on `hub.lock` next to the files (as `budget.rs` does). If a second process opens it, the open fails with `Locked`. The hub tools then return `HubError::Unavailable`, failing closed and avoiding the double-writer bug of #684.
 - **Permissions.** Files are created with mode `0600`.
