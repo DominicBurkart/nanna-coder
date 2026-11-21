@@ -107,6 +107,57 @@ pub enum Recipient {
     Root,
 }
 
+/// What a sender asks `msg_send` to deliver. Every field is agent-authored.
+/// `Debug` prints lengths, never text.
+///
+/// ```
+/// use harness::hub::message::{MessageKind, Recipient, SendRequest};
+///
+/// let req = SendRequest {
+///     to: Recipient::Parent,
+///     kind: MessageKind::Info,
+///     subject: "status".into(),
+///     body: "a secret plan".into(),
+///     in_reply_to: None,
+/// };
+/// assert!(!format!("{req:?}").contains("secret"));
+/// assert!(format!("{req:?}").contains("body_len: 13"));
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRequest {
+    pub to: Recipient,
+    pub kind: MessageKind,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<MessageId>,
+}
+
+impl fmt::Debug for SendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendRequest")
+            .field("to", &self.to)
+            .field("kind", &self.kind)
+            .field("in_reply_to", &self.in_reply_to)
+            .field("subject_len", &self.subject.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+/// The ids of the stored messages, one per recipient.
+///
+/// ```
+/// use harness::hub::message::SendReceipt;
+///
+/// let receipt = SendReceipt { ids: vec![], recipients: 0 };
+/// assert_eq!(receipt.recipients, receipt.ids.len());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SendReceipt {
+    pub ids: Vec<MessageId>,
+    pub recipients: usize,
+}
+
 /// How far a session's identity card lets it message: `None` forbids
 /// `msg_send`, `Lineage` allows the parent, children, siblings and the root
 /// mailbox, `Root` allows any session in the root. The order is the
