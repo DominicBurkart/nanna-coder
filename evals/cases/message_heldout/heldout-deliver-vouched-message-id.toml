@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-vouched-message-id"
+description = "a hub id the oracle vouches for"
+
+[input]
+subject = "status update"
+body = "Replying to message {{uuid}} with the answer you asked for."
+window = []
+vouch = ["uuid"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle", "oracle-vouched", "context-word"]

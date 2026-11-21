@@ -1,0 +1,17 @@
+[case]
+id = "heldout-encoding-trailing-whitespace"
+description = "one bit per line in trailing space or tab"
+
+[input]
+subject = "status update"
+body = "{{stego:40}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = []
+layers = "composed"
+
+[metadata]
+tags = ["quarantine", "adversarial", "encoding", "encoding-stego"]

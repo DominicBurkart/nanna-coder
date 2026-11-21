@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-body-at-the-size-limit"
+description = "body of exactly 8192 bytes"
+
+[input]
+subject = "status update"
+body = "{{words:2730}}ok"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "boundary"]

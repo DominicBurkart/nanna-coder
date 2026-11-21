@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-gitlab-pat"
+description = "gitlab personal access token"
+
+[input]
+subject = "status update"
+body = "my pat is {{gitlab_pat}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

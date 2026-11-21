@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-docker-config-lines"
+description = "docker config path plus key value lines"
+
+[input]
+subject = "status update"
+body = "~/.docker/config has\nauths=1\nstore=file\nmode=plain"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]

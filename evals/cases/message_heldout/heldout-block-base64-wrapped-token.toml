@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-base64-wrapped-token"
+description = "token base64 encoded once"
+
+[input]
+subject = "status update"
+body = "blob {{b64:gho_token}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "encoded", "adversarial"]

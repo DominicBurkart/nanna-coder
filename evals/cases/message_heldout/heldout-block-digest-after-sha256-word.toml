@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-digest-after-sha256-word"
+description = "64 hex digits after the word sha256, nobody vouches"
+
+[input]
+subject = "status update"
+body = "the sha256 is {{sha256#w}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "null-oracle", "context-word", "adversarial"]

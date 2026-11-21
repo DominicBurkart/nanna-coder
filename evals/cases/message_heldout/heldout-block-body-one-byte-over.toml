@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-body-one-byte-over"
+description = "body of 8193 bytes"
+
+[input]
+subject = "status update"
+body = "{{words:2731}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["other"]
+
+[metadata]
+tags = ["block", "boundary"]
