@@ -2,6 +2,7 @@
 //! layers the fixture repository's `.nanna/agents/` overrides on top.
 
 use harness::effects::EffectClass;
+use harness::hub::message::MessageReach;
 use harness::identity::{DevLoop, IdentityCatalog, IdentityError, SystemPrompt};
 use std::path::PathBuf;
 
@@ -131,4 +132,27 @@ fn a_global_catalog_used_as_repo_root_has_no_overrides() {
     assert_eq!(same, global);
     let err = IdentityCatalog::load(fixtures().join("does-not-exist")).unwrap_err();
     assert!(matches!(err, IdentityError::Io { .. }), "{err}");
+}
+
+#[test]
+fn shipped_and_fixture_cards_keep_message_reach_none_until_the_hub_is_wired() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let dirs = [
+        root.join(".nanna/catalog"),
+        root.join(".nanna/agents"),
+        fixtures().join("global"),
+    ];
+    let mut seen = 0;
+    for dir in dirs {
+        for identity in IdentityCatalog::load(&dir).expect("catalog loads").iter() {
+            assert_eq!(
+                identity.scope.message_reach,
+                MessageReach::None,
+                "{}",
+                identity.name()
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen >= 8, "only {seen} cards inspected");
 }

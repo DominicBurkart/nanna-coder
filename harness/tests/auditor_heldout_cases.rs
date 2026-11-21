@@ -1,5 +1,6 @@
 use harness::auditor::eval::{default_catalog_dir, AuditorEvalCase};
 use harness::auditor::VerdictKind;
+use harness::hub::message::MessageReach;
 use harness::identity::IdentityCatalog;
 use std::collections::HashSet;
 use std::fs;
@@ -326,8 +327,14 @@ fn catalog_digest(dir: PathBuf) -> u64 {
     cards.sort_by(|a, b| a.identity.name.cmp(&b.identity.name));
     let mut buf = Vec::new();
     for card in cards {
+        assert_eq!(card.scope.message_reach, MessageReach::None);
+        let s = &card.scope;
+        let scope = format!(
+            "ScopeSection {{ repos: {:?}, paths: {:?}, read_paths: {:?}, max_effect: {:?}, tools: {:?} }}",
+            s.repos, s.paths, s.read_paths, s.max_effect, s.tools
+        );
         buf.extend_from_slice(
-            format!("{:?}|{:?}|{:?}", card.identity, card.scope, card.limits).as_bytes(),
+            format!("{:?}|{}|{:?}", card.identity, scope, card.limits).as_bytes(),
         );
         buf.push(0);
     }
