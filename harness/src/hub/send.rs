@@ -765,6 +765,27 @@ mod tests {
         assert_eq!(hub.windows().held(b.session()), 0);
     }
 
+    #[tokio::test]
+    async fn messages_being_sent_count_against_the_inbox_cap() {
+        let world = World::memory();
+        let (a, b) = (
+            world.bind("a", None, MessageReach::Root),
+            world.bind("b", None, MessageReach::Root),
+        );
+        let shared: Arc<dyn MessageAuditor> = Scripted::deliver();
+        let limits = HubLimits {
+            inbox_max: 1,
+            ..HubLimits::default()
+        };
+        let hub = world.hub_with(Arc::new(shared), limits);
+        hub.windows().reserve(&[b.session().clone()]);
+        let err = hub.send(&a, req(&b, "x")).await.unwrap_err();
+        assert!(matches!(err, HubError::InboxFull), "{err:?}");
+        assert_eq!(hub.windows().sender_slots(a.session()), 0);
+        hub.windows().release(&[b.session().clone()]);
+        assert!(hub.send(&a, req(&b, "x")).await.is_ok());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_concurrent_senders_never_exceed_the_rate_limit() {
         let world = World::memory();
