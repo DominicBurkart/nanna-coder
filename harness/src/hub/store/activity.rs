@@ -635,7 +635,7 @@ pub fn activity_path_from(env: Option<&str>, home: Option<&Path>) -> Option<Path
 #[cfg(test)]
 mod tests {
     use super::super::contract::*;
-    use super::super::journal::Journal;
+    use super::super::journal::{Journal, LOCK_FILE};
     use super::*;
     use crate::hub::message::MessageKind;
     use proptest::prelude::*;
@@ -1130,10 +1130,18 @@ mod tests {
             assert_eq!(entries.len(), 10);
             let mut everything = log;
             everything.push_str(&format!("{entries:?}"));
+            let mut read = 0;
             for file in std::fs::read_dir(fixture.dir.path()).unwrap() {
-                let bytes = std::fs::read(file.unwrap().path()).unwrap();
+                let path = file.unwrap().path();
+                if path.file_name().unwrap() == LOCK_FILE {
+                    continue;
+                }
+                let bytes = std::fs::read(path).unwrap();
                 everything.push_str(&String::from_utf8_lossy(&bytes));
+                read += 1;
             }
+            assert_eq!(read, 1);
+            assert!(everything.contains("assistant_turn"));
             let probe = &planted.token[..12];
             assert!(!everything.contains(probe), "{}", planted.label);
             assert!(!everything.contains(&planted.token), "{}", planted.label);
