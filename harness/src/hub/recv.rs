@@ -33,6 +33,9 @@ pub const RECV_PAGE_BYTES: usize = 32 * 1024;
 /// How often a waiting `recv` looks at the inbox again, in milliseconds.
 pub const RECV_POLL_MILLIS: i64 = 1000;
 
+/// The longest one `recv` spends reviewing, in seconds on the hub's clock; messages left over stay `Pending`.
+pub const RECV_REVIEW_BUDGET_SECS: i64 = 60;
+
 const SCAN_PAGE: usize = 64;
 const SUBJECT_RENDER_CAP: usize = 480;
 const IDENTITY_RENDER_CAP: usize = 120;
@@ -115,6 +118,7 @@ impl fmt::Debug for RecvPage {
 enum Decision {
     Deliver,
     Retire(DeliveryState, Vec<ReasonCode>),
+    Outage,
 }
 
 struct Judged {
@@ -223,20 +227,27 @@ impl MessageHub {
         let mut judged: Vec<Judged> = Vec::new();
         let queue = self.pending(to)?;
         let total = queue.len();
+        let started = self.clock.now();
+        let budget = Duration::seconds(RECV_REVIEW_BUDGET_SECS);
         for message in queue.into_iter().take(max) {
             bytes = bytes.saturating_add(message.subject.len() + message.body.len());
-            if !judged.is_empty() && bytes > RECV_PAGE_BYTES {
+            let spent = self.clock.now() - started >= budget;
+            if !judged.is_empty() && (bytes > RECV_PAGE_BYTES || spent) {
                 break;
             }
             let sender = in_root.iter().find(|rec| rec.id == message.from);
             let relation = sender.map_or(Relation::Other, |rec| relation_of(to, rec));
             let scope = sender.map_or_else(|| unknown_sender(&message), known_sender);
             let decision = self.judge(to, &message, scope).await?;
+            let outage = matches!(decision, Decision::Outage);
             judged.push(Judged {
                 message,
                 relation,
                 decision,
             });
+            if outage {
+                break;
+            }
         }
         Ok((judged, total))
     }
@@ -287,7 +298,7 @@ impl MessageHub {
                 };
                 Decision::Retire(state, codes_of(&held))
             }
-            Err(_) => Decision::Retire(DeliveryState::Quarantined, vec![ReasonCode::ModelFailure]),
+            Err(_) => Decision::Outage,
         })
     }
 
@@ -302,6 +313,12 @@ impl MessageHub {
                 Decision::Retire(state, codes) => self
                     .retire(&item.message, state, &codes)
                     .map(|()| withheld += 1),
+                Decision::Outage => {
+                    let down = [ReasonCode::ModelFailure];
+                    let state = DeliveryState::Quarantined;
+                    self.retire(&item.message, state, &down)
+                        .map(|()| withheld += 1)
+                }
             };
             if let Err(error) = step {
                 if messages.is_empty() && withheld == 0 {
@@ -458,6 +475,7 @@ mod tests {
     struct Recorder {
         say: Say,
         seen: Mutex<Vec<Seen>>,
+        tick: Option<(SimulatedClock, Duration)>,
     }
 
     impl Recorder {
@@ -465,7 +483,16 @@ mod tests {
             Self {
                 say,
                 seen: Mutex::new(Vec::new()),
+                tick: None,
             }
+        }
+
+        fn ticking(say: Say, clock: &SimulatedClock, secs: i64) -> Arc<Self> {
+            let tick = Some((clock.clone(), Duration::seconds(secs)));
+            Arc::new(Self {
+                tick,
+                ..Self::bare(say)
+            })
         }
 
         fn new(say: Say) -> Arc<Self> {
@@ -502,6 +529,9 @@ mod tests {
                 bound: r.outbound.map(|bound| bound.content_hash.clone()),
                 thread: r.thread.len(),
             });
+            if let Some((clock, step)) = &self.tick {
+                clock.advance(*step);
+            }
             match &self.say {
                 Say::Verdict(verdict) => Ok(verdict.clone()),
                 Say::Fail => Err(ActionAuditError::Timeout {
@@ -759,6 +789,24 @@ mod tests {
             card.scope.read_paths = read_paths;
             let lineage = Lineage::root_child(root.clone());
             let binding = SessionBinding::from_audited(&card, TaskId(name.to_string()), lineage);
+            self.registry
+                .register(&binding, "subtask", start())
+                .unwrap();
+            binding
+        }
+
+        fn bare_binding(&self, name: &str, effect: EffectClass) -> SessionBinding {
+            let mut card = crate::identity::example();
+            card.scope.max_effect = effect;
+            card.scope.tools = Vec::new();
+            card.scope.paths = Vec::new();
+            card.scope.read_paths = Some(Vec::new());
+            let lineage = Lineage::root_child(self.root.clone());
+            SessionBinding::from_audited(&card, TaskId(name.to_string()), lineage)
+        }
+
+        fn seat_bare(&self, name: &str, effect: EffectClass) -> SessionBinding {
+            let binding = self.bare_binding(name, effect);
             self.registry
                 .register(&binding, "subtask", start())
                 .unwrap();
@@ -1853,6 +1901,82 @@ mod tests {
             [DeliveryState::Pending, DeliveryState::Expired]
         );
         assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sender_whose_record_is_gone_is_treated_as_least_privileged_so_the_model_judges() {
+        let quarantine_reply =
+            r#"{"verdict":"quarantine","reasons":[{"code":"cross_scope_steering"}]}"#;
+        let deliver_reply = r#"{"verdict":"deliver"}"#;
+        let rows = [
+            (
+                true,
+                EffectClass::Ci,
+                quarantine_reply,
+                1usize,
+                0usize,
+                1usize,
+            ),
+            (false, EffectClass::None, deliver_reply, 0, 1, 0),
+        ];
+        for (gone, recipient_effect, reply, calls, delivered, withheld) in rows {
+            let world = World::memory();
+            let b = world.seat_bare("b", recipient_effect);
+            let a = if gone {
+                world.bare_binding("a", EffectClass::None)
+            } else {
+                world.seat_bare("a", EffectClass::None)
+            };
+            let provider = Arc::new(Counting {
+                reply: reply.to_string(),
+                calls: AtomicUsize::new(0),
+            });
+            let hub = world.hub(Arc::new(ModelMessageAuditor::new(
+                provider.clone(),
+                "scripted",
+            )));
+            world.put(&a, &b, "all green");
+            let page = hub.recv(&b, RecvRequest::default()).await.unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), calls, "gone: {gone}");
+            assert_eq!((page.messages.len(), page.withheld), (delivered, withheld));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_review_budget_leaves_the_rest_pending_and_says_how_many() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let recorder = Recorder::ticking(Say::Verdict(MessageVerdict::Deliver), &world.clock, 30);
+        let hub = world.hub(recorder.clone());
+        for n in 0..5 {
+            world.put(&a, &b, &format!("m{n}"));
+        }
+        let page = hub.recv(&b, recv_of(20)).await.unwrap();
+        assert_eq!(bodies(&page), ["m0", "m1"]);
+        assert_eq!((page.remaining, recorder.seen().len()), (3, 2));
+        let next = hub.recv(&b, recv_of(20)).await.unwrap();
+        assert_eq!(bodies(&next), ["m2", "m3"]);
+    }
+
+    #[tokio::test]
+    async fn one_auditor_outage_quarantines_one_message_per_call_not_the_page() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let recorder = Recorder::new(Say::Fail);
+        let events = Events::new();
+        let hub = world
+            .hub(recorder.clone())
+            .with_quarantine_sink(events.clone());
+        for n in 0..4 {
+            world.put(&a, &b, &format!("m{n}"));
+        }
+        let page = hub.recv(&b, recv_of(20)).await.unwrap();
+        assert_eq!(
+            (page.messages.len(), page.withheld, page.remaining),
+            (0, 1, 3)
+        );
+        assert_eq!((recorder.seen().len(), events.all().len()), (1, 1));
+        assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 3);
     }
 
     fn production_source() -> String {
