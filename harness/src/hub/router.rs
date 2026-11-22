@@ -66,16 +66,16 @@ impl BindingTable {
 
     /// The binding the host entered for `session`.
     pub fn binding(&self, session: &SessionId) -> Option<Arc<SessionBinding>> {
-        self.lock()
-            .get(session)
-            .map(|entry| Arc::clone(&entry.binding))
+        let entries = self.lock();
+        let found = entries.get(session);
+        found.map(|entry| Arc::clone(&entry.binding))
     }
 
     /// The workspace the host gave `session`, if it has recorded one.
     pub fn workspace(&self, session: &SessionId) -> Option<PathBuf> {
-        self.lock()
-            .get(session)
-            .and_then(|entry| entry.workspace.clone())
+        let entries = self.lock();
+        let found = entries.get(session);
+        found.and_then(|entry| entry.workspace.clone())
     }
 
     #[cfg(test)]
@@ -119,13 +119,19 @@ impl BindingGuard {
     }
 }
 
+fn holds(
+    entries: &HashMap<SessionId, Entry>,
+    session: &SessionId,
+    binding: &Arc<SessionBinding>,
+) -> bool {
+    let found = entries.get(session);
+    found.is_some_and(|entry| Arc::ptr_eq(&entry.binding, binding))
+}
+
 impl Drop for BindingGuard {
     fn drop(&mut self) {
         let mut entries = self.table.lock();
-        if entries
-            .get(&self.session)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.binding, &self.binding))
-        {
+        if holds(&entries, &self.session, &self.binding) {
             entries.remove(&self.session);
         }
     }
@@ -182,8 +188,8 @@ impl ProductionAuditors {
 impl AuditorProvider for ProductionAuditors {
     fn for_sender(&self, sender: &SessionBinding) -> Arc<dyn MessageAuditor> {
         let oracle = self.oracle_for(sender);
-        let model = ModelMessageAuditor::new(Arc::clone(&self.provider), self.model.clone())
-            .with_oracle(Arc::clone(&oracle));
+        let model = ModelMessageAuditor::new(Arc::clone(&self.provider), self.model.clone());
+        let model = model.with_oracle(Arc::clone(&oracle));
         Arc::new(FailClosedMessageAuditor::new(model).with_oracle(oracle))
     }
 }
@@ -194,11 +200,8 @@ fn fixed(code: ReasonCode) -> Reason {
 }
 
 fn sanitized(verdict: &MessageVerdict) -> Vec<Reason> {
-    verdict
-        .reasons()
-        .iter()
-        .map(|reason| fixed(reason.code))
-        .collect()
+    let reasons = verdict.reasons();
+    reasons.iter().map(|reason| fixed(reason.code)).collect()
 }
 
 fn refuse(detail: &str) -> ActionVerdict {
@@ -253,17 +256,17 @@ impl HubRouter {
     }
 
     fn sender(&self, review: &ActionReview) -> Option<Arc<SessionBinding>> {
-        self.table
-            .binding(&SessionId::from_task(review.task_id.clone()))
+        let id = SessionId::from_task(review.task_id.clone());
+        self.table.binding(&id)
     }
 }
 
 fn declared_only(review: &ActionReview) -> bool {
     let known = known_arguments(&review.tool);
-    review
-        .args
-        .as_object()
-        .is_some_and(|map| map.keys().all(|key| known.contains(&key.as_str())))
+    match review.args.as_object() {
+        Some(map) => map.keys().all(|key| known.contains(&key.as_str())),
+        None => false,
+    }
 }
 
 fn note_of(review: &ActionReview) -> Option<&str> {
@@ -335,15 +338,12 @@ impl OutboundRouter for HubRouter {
         let codes: Vec<ReasonCode> = reasons.iter().map(|reason| reason.code).collect();
         if review.tool == "msg_send" {
             let req = request_of(review).ok_or_else(unrecorded)?;
-            self.hub
-                .quarantine_send(&sender, &req, codes)
-                .map(drop)
-                .map_err(|_| unrecorded())
+            let stored = self.hub.quarantine_send(&sender, &req, codes);
+            stored.map(drop).map_err(|_| unrecorded())
         } else {
             let note = note_of(review).ok_or_else(unrecorded)?;
-            self.hub
-                .quarantine_note(&sender, note, codes)
-                .map_err(|_| unrecorded())
+            let noted = self.hub.quarantine_note(&sender, note, codes);
+            noted.map_err(|_| unrecorded())
         }
     }
 }
@@ -617,6 +617,10 @@ mod tests {
         }
     }
 
+    async fn call(rig: &Rig, tool: &str, args: Value) -> ToolResult<Value> {
+        rig.registry.execute(tool, args).await
+    }
+
     fn args(rig: &Rig, body: &str) -> Value {
         json!({
             "to": {"to": "session", "id": rig.peer.session()},
@@ -757,11 +761,8 @@ mod tests {
             true,
         );
         let note = json!({"note": "reading the parser"});
-        assert!(rig
-            .registry
-            .execute("session_set_note", note.clone())
-            .await
-            .is_ok());
+        let first = call(&rig, "session_set_note", note.clone()).await;
+        assert!(first.is_ok());
         assert_eq!(rig.auditor.calls(), 1);
         let out = rig.registry.execute("session_set_note", note).await;
         assert!(denied(out).is_escalation());
@@ -805,13 +806,8 @@ mod tests {
         let text = format!("{:?}{}", out, everything(&rig));
         assert!(!text.contains(&planted), "{text}");
         assert!(matches!(out, Err(ToolError::ActionDenied(_))));
-        let note = rig
-            .registry
-            .execute(
-                "session_set_note",
-                json!({"note": planted.clone(), "x": planted.clone()}),
-            )
-            .await;
+        let both = json!({"note": planted.clone(), "x": planted.clone()});
+        let note = call(&rig, "session_set_note", both).await;
         assert!(!format!("{note:?}{}", everything(&rig)).contains(&planted));
     }
 
@@ -823,10 +819,7 @@ mod tests {
             assert!(!denied(out).is_escalation());
         }
         let rig = rig(vec![], true);
-        let out = rig
-            .registry
-            .execute("session_set_note", json!({"note": 5}))
-            .await;
+        let out = call(&rig, "session_set_note", json!({"note": 5})).await;
         assert_eq!(
             denied(out).reasons()[0].detail,
             "the note argument is not valid"
@@ -850,10 +843,7 @@ mod tests {
         let out = rig.registry.execute("msg_send", args(&rig, &long)).await;
         assert!(denied(out).reasons()[0].detail.starts_with("body exceeds"));
         let note = "n".repeat(500);
-        let out = rig
-            .registry
-            .execute("session_set_note", json!({"note": note}))
-            .await;
+        let out = call(&rig, "session_set_note", json!({"note": note})).await;
         assert!(denied(out).reasons()[0].detail.starts_with("note exceeds"));
     }
 

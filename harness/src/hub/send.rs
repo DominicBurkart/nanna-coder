@@ -436,11 +436,9 @@ impl MessageHub {
             window: &[],
             thread: &[],
         };
-        self.auditors
-            .for_sender(sender)
-            .review_outbound(&review)
-            .await
-            .map_err(|_| HubError::AuditUnavailable)
+        let auditor = self.auditors.for_sender(sender);
+        let verdict = auditor.review_outbound(&review).await;
+        verdict.map_err(|_| HubError::AuditUnavailable)
     }
 
     fn store_quarantined(
