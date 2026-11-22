@@ -215,7 +215,8 @@ impl TryFrom<String> for Summary { type Error = SummaryError; /* TooLong | Unpri
 - **Kani + proptest:** `chars().count() < 180` for all inputs. Status: the Kani harness (`cut_plan_output_is_within_the_limit_and_never_over_slices`) has never been executed (`cargo-kani` is not installed on the build hosts) and is not verified in CI; the proptests are the only evidence.
 - **Valid by construction:** a cut never lands inside a redaction marker (candidates that `redact` would change are shortened further), and `compose` ends with a full validity check that falls back to the constant `[summary withheld]`, so `redact(s) == s` and every other invariant hold for every `Summary`.
 - **Deserialization re-validates:** `#[serde(try_from = "String")]` accepts a string only if it is at most 179 characters, has no unprintable or bidi characters, is unchanged by `redact`, and is whitespace-collapsed; otherwise it fails with the matching `SummaryError`.
-- **Untrusted fields are audited before peers see them (T13).** `subtask`, `note`, `result_summary` and `touched_paths` are agent- or planner-authored, and peers read them via `session_describe`, list summaries and the librarian. `register`, `finish`, `set_note` and `record_touched` run `RuleMessageAuditor::review_field` on each value before storing it. On a hit, the field is stored as `Withheld { reason }` (shown to peers as `"[withheld: secret_leak]"`) and the session itself is not blocked. `note` is also covered by the full outbound gate (it is a reviewed tool).
+- **Untrusted fields are audited before peers see them (T13).** `subtask`, `note`, `result_summary` and `touched_paths` are agent- or planner-authored, and peers read them via `session_describe`, list summaries and the librarian. `SessionRegistry` (`harness/src/hub/registry.rs`, implemented in #1069) runs `RuleMessageAuditor::review_field_with` (an `IdentifierOracle`, `NullOracle` by default) on the full value of each one in `register`, `finish`, `set_note` and `record_touched` before it is stored, and only then truncates. On a hit the field is stored as the literal string `[withheld: <code>]` (the snake_case `ReasonCode`), not as a `Withheld { reason }` value, and the session itself is not blocked. A value over 8 KiB is withheld whole by `review_field`. `subtask` and `result_summary` are then cut to 4000 characters, a touched path longer than 1024 bytes is dropped, and a note is composed with `Summary::compose` from the withheld-or-clean text. `note` is also covered by the full outbound gate (it is a reviewed tool).
+- **Implemented lifecycle (#1069).** `TaskManager::with_session_registry` is optional; without it nothing changes. `register` runs before the task is recorded, bound or queued, and a registry failure refuses the spawn (`SpawnRefused::SessionRegistry`; a backlog entry becomes a `Failed` task with error type `SessionRegistryFailed`; a restored entry is parked with `RestoreSessionRegistryFailed`). Status mirroring after the spawn is best effort: a failed write is logged without field text and never changes the task outcome. Only audited spawns get a session; `SessionBinding::from_audited` builds the binding from the proof's identity (`from_proof` stays test-only). Legal moves: `Pending -> Running`, `Pending -> Failed | Cancelled`, `Running -> Completed | Failed | Cancelled`; the first terminal status wins; `WaitingOnMessages` is refused until #1076. Terminal statuses go through `finish` (`Failed` stores `failed: <error_type>` as its summary). `touched_paths` come from `TaskResult.files_modified` plus the `path` argument of recorded tool calls (not broker `CallRecord`s, which wait for #962); a path naming a credential (`SECRET_MARKERS`, via `is_credential_path`) is dropped, the rest are reviewed, deduplicated and capped at 256. `tools` holds the card's tool patterns, not resolved tool names. `note` loads as `None` when a stored value is not a valid `Summary` (records from before the type), so replay never fails on it. Restore: an active stored record is reset to `Pending` (keeping `created_at`); a terminal one parks the entry; entries refused or parked at restore close their stale active record as `Failed`. Orphaned active records with no queue entry are not swept (the store has no listing method).
 - **Proptest:** the output never contains a string that `redact` would change, and never contains unprintable or bidi characters.
 
 ---
@@ -265,31 +266,40 @@ pub enum StoreError { #[error("io: {0}")] Io(#[from] io::Error), #[error("corrup
 The librarian must do *detailed* lookups of session contents (decision D5), and nanna stores no per-session activity today. Each session therefore gets an append-only activity log, `activity.jsonl` (`NANNA_ACTIVITY_PATH`, with a `*_path_from` doctest).
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)] // Debug is hand-written: ids, times, byte lengths, never text
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ActivityEntry {
-    AssistantTurn { session: SessionId, at: DateTime<Utc>, text: String /* ≤ 2 KiB per turn */ },
-    ToolCall { session: SessionId, at: DateTime<Utc>, tool: String, args_summary: String /* ≤ 300 chars */, ok: bool },
-    MessageMeta { session: SessionId, at: DateTime<Utc>, id: MessageId, direction: Direction, peer: SessionId, kind: MessageKind, subject: String },
+    AssistantTurn { session: SessionId, at: DateTime<Utc>, text: String /* ≤ 2048 bytes */ },
+    ToolCall { session: SessionId, at: DateTime<Utc>, tool: String /* ≤ 64 chars */, args_summary: ArgsSummary /* ≤ 300 chars */, ok: bool },
+    MessageMeta { session: SessionId, at: DateTime<Utc>, id: MessageId, direction: Direction, peer: SessionId, kind: MessageKind, subject: String /* ≤ 200 chars */ },
     StatusChange { session: SessionId, at: DateTime<Utc>, status: SessionStatus },
 }
 pub enum Direction { Sent, Received }
 
 pub trait ActivityStore: Send + Sync {
-    fn append(&self, e: ActivityEntry) -> Result<(), StoreError>;
-    fn for_session(&self, id: SessionId, byte_budget: usize) -> Result<Vec<ActivityEntry>, StoreError>; // newest first
+    fn append_with(&self, e: ActivityEntry, oracle: &dyn IdentifierOracle) -> Result<(), StoreError>;
+    fn append(&self, e: ActivityEntry) -> Result<(), StoreError>; // append_with(e, &NullOracle)
+    fn for_session(&self, id: SessionId, byte_budget: usize) -> Result<Vec<ActivityEntry>, StoreError>; // newest appended first
     fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError>;
+    fn forget(&self, sessions: &[SessionId]) -> Result<usize, StoreError>;
 }
 ```
+
+`InMemoryActivityStore` and `JsonlActivityStore` (in `hub/store/activity.rs`) run on the same `Engine`, journal and `HubLock` as the session and message stores.
 
 - **Writers.**
   - `ToolCall` entries come from the broker's `CallRecord`s, or from `ToolRegistry::execute`'s result on the `AgentLoop` path.
   - `AssistantTurn` entries come from the executor or `AgentLoop`.
   - `MessageMeta` and `StatusChange` entries come from the hub.
-- **Every string field is processed at write time.** It goes through `strip_unprintable`, then `redact_resilient`, then `RuleMessageAuditor::review_field`. A rule hit stores `"[withheld: <code>]"` in place of the text.
-- **Arguments are summarized, never stored raw.** `args_summary` keeps keys and paths, truncates values, and never includes `write_file` contents.
-- **Message bodies are never in the activity log**, only their metadata.
-- The activity log has the same `0600` mode, single writer and retention as the session store.
+  - Nothing is wired yet: #1069 and #1071 call the store.
+- **Every string field is processed inside `append`, so no caller can skip it.** In order: take at most 64 KiB of the raw text, `strip_unprintable`, `redact_resilient` on the whole text, cut to the field limit (on a char boundary, backing off to whitespace within 64 bytes), then `RuleMessageAuditor::review_field_with` on exactly the text that will be stored. A rule hit stores `"[withheld: <reason code>]"` in place of the text; the append succeeds and the original is never stored, logged or echoed. The cut comes after redaction (a secret cannot be split into an unrecognised fragment) and before the review (the review rejects text over 8 KiB, which would withhold every long turn). Limits: 2048 bytes for a turn, 300 chars for an argument summary, 200 chars for a subject, 64 chars for a tool name.
+- **Oracle per call (deviation).** `append_with` takes an `IdentifierOracle` like `review_field_with`, because a real oracle belongs to the logging session's workspace. `append` uses `NullOracle`.
+- **Arguments are summarized from the call, never stored raw (deviation).** `args_summary` is an `ArgsSummary`, which can only be built by `ArgsSummary::from_args(&args, known)`; it records argument names and the kind and length of each value (`path=str:12 content=str:4096`), never a value. A name is written only if the caller lists it in `known`, the tool's declared parameter names (the tool registry's schema, or `known_arguments(tool)` for the message tools, supplied by #1071/#1072); every other name is `?`. There is no character-class rule: a name is agent-controlled and a short random secret used as a key passes any identifier-shape test and the 24-char entropy rule. Non-object arguments are `value=<kind>`. The doc earlier said "keeps keys and paths, truncates values"; paths are values and are not kept. The summary then goes through the pipeline above like any other field. `ActivityEntry::tool_call(session, at, tool, &args, known, ok)` is the convenience constructor.
+- **Message bodies are never in the activity log**, only their metadata. A test pins the exact key set of `MessageMeta`.
+- **Cost and budget (deviation).** `for_session` returns entries newest appended first (not ordered by `at`), taking entries while the running total of `ActivityEntry::cost()` (32 bytes of overhead plus the byte length of every text field) stays within the budget; the first entry that does not fit ends the list.
+- **Retention (deviation).** `prune` drops a session's whole activity when its latest `StatusChange` is terminal and its newest entry is older than `completed_session_ttl` (strict `>`). Activity entries carry no root, so this cannot mirror the registry's per-root pruning exactly, and a session that never logged a terminal status is kept. `forget(&[SessionId])` is the seam for the registry (#1069) to call for every session it prunes.
+- **Known limits.** Every commit clones the whole table (the engine's pattern), which is hotter here than for sessions; #1069 should measure before the hub appends every tool call. There is no per-session entry cap other than retention. Replay does not re-process stored text: the file is `0600` and written only by this store.
+- The activity log has the same `0600` mode, single writer and retention as the session store. An empty `NANNA_ACTIVITY_PATH` counts as unset.
 
 - **Single writer.** On open, the hub takes an `fs4` exclusive `try_lock` on `hub.lock` next to the files (as `budget.rs` does). If a second process opens it, the open fails with `Locked`. The hub tools then return `HubError::Unavailable`, failing closed and avoiding the double-writer bug of #684.
 - **Permissions.** Files are created with mode `0600`.
@@ -547,7 +557,7 @@ pub enum Relation { SelfNode, Parent, Ancestor, Sibling, Child, Peer }
 #[derive(Serialize)] pub struct Counts { pub total: usize, pub active: usize, pub waiting: usize, pub completed: usize, pub failed: usize, pub by_identity: BTreeMap<String, usize> }
 #[derive(Serialize)] pub struct SessionItem { pub id: SessionId, pub relation: Relation, pub status: SessionStatus, pub summary: Summary /* fenced on render */ }
 #[derive(Serialize)] pub struct Group { pub identity: String, pub status: SessionStatus, pub count: usize, pub filter_hint: SessionFilter }
-#[derive(Serialize)] pub struct SessionPage { pub counts: Counts, pub groups: Vec<Group>, pub items: Vec<SessionItem>, pub cursor: Option<CursorToken>, pub new_since_snapshot: usize, pub notice: &'static str }
+#[derive(Serialize)] pub struct SessionPage { pub counts: Counts, pub groups: Vec<Group>, pub items: Vec<SessionItem>, pub cursor: Option<CursorToken>, pub new_since_snapshot: usize, pub notice: String }
 
 pub struct TreeRequest { pub of: Option<SessionId>, pub include_children: bool, pub depth: u8 /* ≤3 */, pub siblings_cursor: Option<CursorToken> }
 #[derive(Serialize)] pub struct TreeView { pub root: RootId, pub path: Vec<SessionItem>, pub siblings: Vec<SessionItem>, pub siblings_cursor: Option<CursorToken>, pub children: Vec<SessionItem>, pub children_count: usize }
@@ -556,8 +566,27 @@ pub struct TreeRequest { pub of: Option<SessionId>, pub include_children: bool, 
 
 pub const PAGE_SIZE: usize = 20;
 pub struct CursorToken(Uuid);   // opaque to agents
-pub(crate) struct CursorTable { /* owner-keyed snapshots, TTL 10m, ≤64/owner */ }
+pub struct CursorTable { /* owner-keyed snapshots, TTL 10m, ≤64/owner */ }
 ```
+
+### 6.5 As built (#1070, `harness/src/hub/view.rs`)
+
+`sessions_list`, `session_describe` and `sessions_tree` exist as pure hub-level functions over a `SessionStore` (and a `MessageStore` for the unread count) and the caller's `SessionBinding`. They are not registered as tools and not wired to the broker (#1071, #1072). Each takes an explicit `now`/clock where time matters so tests are deterministic. Where this differs from 6.1 to 6.4:
+
+- **`n` is the number of sessions matching the filter**, not the root total. Groups and a cursor appear only when more than `PAGE_SIZE` sessions match. A cursor is issued only if more than `PAGE_SIZE` items remain after groups are collapsed. `Counts` always covers the whole root (agents only, librarians only with `include_librarians`); `failed` includes `Cancelled`, `active` includes `waiting`.
+- **Groups** collapse only runs (consecutive in the chosen order) of `Peer` sessions with the same identity and status, longer than 5. They appear on the first page only. A request whose filter pins exactly one status and one identity (the `filter_hint` of a group) is an expanded view and is never grouped again.
+- **Cursors.** Every page that has a successor issues a fresh token for `(snapshot, next offset)`; presenting a token does not consume it, so a lost response can be retried. Tokens are random v4 uuids held server side. A token works only for its owner session, its root and its view (a `sessions_list` token is not a `sessions_tree` siblings token, and a siblings token is bound to its node). Unknown, expired, foreign-owner, foreign-root and wrong-view tokens all give the one error `CursorInvalid` ("cursor invalid or expired"); there is no separate `CursorExpired`. A snapshot holds the ranked ids; items are rendered from current records, so status changes show but never move an item, and sessions created later are counted in `new_since_snapshot` and never listed. An id that has disappeared is omitted.
+- **Oracle.** A session in another root and an id that does not exist both give `NotVisible` ("session not visible"), from the same code path (the id is looked up only in the caller's root). Store failures give `Unavailable` ("session store unavailable") with no partial data. No error variant carries data.
+- **Fencing.** `SessionItem` serializes its summary fenced (`FenceLabel::AgentText`); `SessionDetail` carries `subtask`, `note`, `result_summary` and each touched path already fenced, after the same strip and redact pass `Summary` uses. Identity, role, tools and write paths are cleaned and capped, not fenced. `Debug` of every output prints lengths and counts, never agent text; `CursorToken` never prints.
+- **Caps.** Page of 20; summary at most 179 characters; subtask 4000, note 500, result 2000 characters; at most 64 touched paths (120 characters each) with `touched_paths_total`; 16 Ki characters of fenced text per detail.
+- **`sessions_tree`.** The node (default: the caller) must be in the caller's root and in the store. `path` is the node then its ancestors that exist in the store (at most `MAX_DEPTH`). Siblings are all agent siblings, active first, newest first, paged with the same snapshot machinery. Children are a flat list (level by level, active first, newest first) of at most 20 with `children_count` of all descendants within `depth` (clamped to 1 to 3); with `include_children` false only direct children are counted.
+- **`unread_from_session`** in `SessionDetail` is the number of `Pending` or `Delivered` messages from the described session to the caller; no body is read into the result.
+- **`notice`** is a `String` (the fence notice is built at run time); `CursorTable` is `pub` because the public functions take it.
+- **Rank reading.** Relations self, parent, other ancestors (nearest first), siblings and children keep their rank whatever their status; `Peer` splits into rank 5 (active) and rank 6 (terminal); within a rank, active before terminal, then newest `last_activity`, then id.
+- **Depth 1 today.** Every spawn has the root as parent, so every session in a root is a `Sibling` of every other and groups (which collapse `Peer` runs only) cannot fire in production until agent-initiated nested spawns exist. They are covered by tests with nested lineages.
+- **Bounds not enforced.** `groups` and `Counts.by_identity` are bounded only by the number of sessions and identities in the root.
+- **Stored note.** `SessionRecord.note` is a bounded `Summary` (composed by the registry from identity, status and the note text). `sessions_list` uses it as the item summary as is, and only composes `"{identity} [{status}] {first subtask line}"` when there is no note; `session_describe` fences it. Reads go through one helper (`note_of`).
+- **Kani.** `page_bounds` carries a `#[cfg(kani)]` proof; `cargo-kani` is not installed here and the proof has never been executed (#1087). An exhaustive test over `len <= 130, offset <= 140` and proptests over all `usize` pairs are the evidence that runs.
 
 ---
 
@@ -903,6 +932,13 @@ impl From<HubError> for ToolError { /* InvalidArguments for caller errors, Execu
 pub enum MessageReach { None, Lineage, Root }   // new card field scope.message_reach, narrows downward only
 ```
 
+Send path as built (#1071a; `harness/src/hub/{send,limits,reach,oracle,error}.rs`), deviating from the sketch above:
+- `MessageHub::new(sessions, messages, auditors, clock, limits)` replaces the builder. `auditors` is an `AuditorProvider` (`for_sender(&SessionBinding)`), so a sender-specific oracle (the git-object oracle runs `git -C <the sender's own workspace> cat-file -e <hex>`, fixed argument vector, `GIT_*` scrubbed, hex-validated input, injectable `GitRunner`) can be attached; an `Arc<dyn MessageAuditor>` is a constant provider. The `HubIdOracle` answers only for session and message ids of the sender's own root, so a guess at another root's id is not exempted. Mapping a session to its workspace, and the production wiring, are #1072.
+- `send` reviews the message itself through the `MessageAuditor` (outbound path) and maps the verdict: `Deliver` stores `Pending` records; `Block` returns `HubError::Blocked(codes)` (reason codes and fixed rephrase advice, never text; the call stays retriable); `Quarantine` stores `Quarantined` records (never pruned) whose `outbound_verdict.content_hash` is the hash of the ORIGINAL and whose subject and body hold no suspect text: when the reasons include `SecretLeak` the text is the fixed marker `[withheld: secret_leak; N bytes]`; for any other reason it is `strip_unprintable`, then `redact_resilient`, capped at 2048 bytes, then `review_field_with` (a hit stores `[withheld: <code>]`). Residual: a quarantine for a non-secret reason (for example `CrossScopeSteering`) whose text carries a secret that is neither recognised by the redactor nor flagged by the field review keeps up to 2 KiB of it; a human release delivers only this stored text, never the original, tells the `QuarantineSink` (ids, codes, hash, body length) and returns `HubError::Quarantined`; an auditor error returns `HubError::AuditUnavailable`. Nothing is delivered on any error.
+- Limits: 8192 body bytes, 120 subject characters, 30 messages per sender per 10 minutes (one count per `send`, whatever the fan-out; counted before the review, so a blocked attempt uses a slot), 2000 per root per hour (this aggregate bounds a sender that spreads over many sessions of one root), 256 unread per recipient (counting sends in flight), fan-out 20, thread depth 32. Windows are in memory and reset on restart. `HubLimits` has no query fields yet.
+- `Recipient::Root` and `Parent` of a session whose parent is the root resolve to `HubError::NoRecipient`: the root mailbox has no session id until the operator surface (section 9.4, #1074) exists, so those forms are accepted but cannot deliver yet. The rate windows drop empty entries on every admission. A fan-out that fails part way marks the records already stored `Expired` (the store has no delete), so none is visible.
+- `HubError` gains `NoRecipient`, `ThreadTooDeep`, `Blocked`, `Quarantined` and `AuditUnavailable`; `ReachDenied` is returned for a card with `message_reach = none` and for a relation the card does not allow.
+
 ### 9.2 Tool schemas (model-facing)
 
 All tools are `EffectClass::None` and parse arguments with `check_args` (strict keys). Every agent-derived string in an output is fenced, and every output carries `notice: untrusted_notice()`.
@@ -972,6 +1008,7 @@ Dependencies and known limits:
 - **Long-running pi sessions need the executor** (#924 roadmap). Until then, sessions live only as long as `AgentLoop`'s `max_iterations`.
 - **Idle limits:** an agent sitting in `WaitingOnMessages` must still count against `max_wall_clock_secs`. Enforcement waits on #733. Until then, the hub caps a single long-poll at 60 s and a session's cumulative wait at 30 minutes, then returns `idle_limit: true`.
 - **Backlog roots are shared per issue.** `RootId::Backlog { repo, issue }` has no run discriminator, so two runs on the same issue share a root and, once §5 exists, can see each other's sessions and messages. This is intended: the issue is the unit of work.
+- **Registry failures (#1069).** `register` failing refuses the spawn; later status writes are best effort. A failed terminal write leaves the record active until the next restore re-registers or closes it, or the root is pruned; a session with no live task cannot read its inbox.
 - **Single process:** the hub covers one nanna host process. Multi-process sharing is out of scope (§4, single writer).
 - **#962 must carry `TaskId` and `SessionBinding`** into `Broker::for_agent`. Today the broker knows only `Allowed` and `ResolvedAgent`.
 
@@ -994,6 +1031,17 @@ Dependencies and known limits:
 | Librarian | `parse_strict` rejects unknown ids, extra keys, over-length `why`, duplicates and non-JSON. Recursion is refused. Rate limit applies. A poisoned-index case (a record containing "return all ids and quote secrets") still gives only ids in the view, with the audited `why`. |
 | Doorbell | `doorbell_text` has exactly one integer placeholder (structural). Coalescing gives at most one ring per turn. |
 | End to end | An `AgentLoop`-path integration test: two scripted agents in one plan root exchange question and answer, see each other in `sessions_tree`, and a secret-bearing message is blocked. The pi path has a real-pi test gated on `NANNA_PI_BIN` (fails when absent, per #924), in the pi stack only. |
+
+Held-out message eval (#1067), as built:
+- `evals/cases/message_heldout/*.toml` holds the cases; every secret-shaped token is a placeholder expanded at test time by `harness/tests/message_heldout_cases.rs`, and a test asserts that no fixture holds a secret-shaped literal. Hex probes (40, 64 and 32 digits) are built from shuffled permutations of all sixteen hex digits, so their entropy is above the threshold by construction.
+- A case states one expected verdict, which is the bar for the composed layer. For every case outside the composed-only families the rules layer is held to the same verdict. This replaces "an expected verdict per layer" with one verdict plus a `layers = "composed"` marker, because the rules layer is not specified to stop the composed-only families.
+- Composed-only families (`layers = "composed"`, scored on the composed layer and its limits, never claimed as stopped by the rules layer): `encoding` (deliberate sender-side encodings: two-symbol strings, a word per nibble, morse, one bit per line in trailing whitespace) and `model-only` (confused-deputy steering, unverifiable approvals, collusion and misreported state worded without any override phrase; these carry `sender` and `recipient` scopes for the inbound model pass). Entropy cannot stop the first family and rules cannot judge the second (T3 and T5 name the model pass as the defence). Cases that carry override phrasing stay in the rules bar.
+- The scorer (`harness/src/action_auditor/message_eval.rs`) is pure and takes any `VerdictProvider`. The rules layer is `RulesProvider` (with a vouching oracle, or `NullOracle`). `ModelMessageAuditor` (#1066) is on main and its async `MessageAuditor` plugs in through a blocking `VerdictProvider` adapter (unit tests drive it with a scripted model: plumbing only). The composed score is reported only from a run with the real default model.
+- The `--cases ... --max-false-allow 0` live-model flag is deferred to the PR that wires the composed layer, because the fixture expander lives in the test file and the binary cannot load these cases yet.
+- Known gaps are strict. A case may carry `known_gap` (`rules_false_deliver`, `rules_false_block` or `reason_code`), `issue` and `note` in `[expected]`. The scorer reports every open gap by count and id; a gap that starts passing is reported as stale and fails the test, so the tag must then be removed; a case without the tag that fails fails the zero-false-deliver test. No rule or threshold is touched by #1067. Filed gaps: the eight non-English injection phrasings (#1093, `rules_false_deliver`), the long kebab-case git ref (#1094, `rules_false_block`), the decoded-run injection reported as `secret_leak` instead of `prompt_injection` (#1095, `reason_code`).
+- Rules-only baseline on the frozen set: 96 scored, 87 correct, 9 known gaps (8 false deliver, 1 false block), 0 unfiled false deliver. The cases that need the composed layer (`model-only`, `encoding` and the eight `rules_false_deliver` cases, 21 in all) are reported UNSCORED-composed. Composed-layer zero-false-deliver is NOT yet demonstrated: only a run with the real default model can show it; scripted providers prove plumbing, not behaviour.
+- `evals/freezes/message_heldout.toml` records the freeze time, the per-case content digests and the file sha256 at freeze; a test checks the content digests, so a frozen case cannot change silently.
+- The thresholds were tuned on `message_dev` only. The case set and its digest were frozen before the rules layer was first run on it; any later change to a case is a new manifest.
 
 Formal methods:
 - Kani harnesses (`#[cfg(kani)]`) for `Summary` length, cursor and page arithmetic, and the monotone order of `MessageReach` under `narrows`.

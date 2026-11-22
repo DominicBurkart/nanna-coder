@@ -1,8 +1,9 @@
 use super::lineage::{Lineage, SessionId};
+use super::summary::Summary;
 use crate::effects::EffectClass;
 use crate::identity::DevLoop;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Lifecycle state of a session.
 ///
@@ -26,6 +27,25 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
+    /// The snake_case name used in storage and in summaries.
+    ///
+    /// ```
+    /// use harness::hub::session::SessionStatus;
+    ///
+    /// assert_eq!(SessionStatus::WaitingOnMessages.label(), "waiting_on_messages");
+    /// assert_eq!(SessionStatus::Running.label(), "running");
+    /// ```
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionStatus::Pending => "pending",
+            SessionStatus::Running => "running",
+            SessionStatus::WaitingOnMessages => "waiting_on_messages",
+            SessionStatus::Completed => "completed",
+            SessionStatus::Failed => "failed",
+            SessionStatus::Cancelled => "cancelled",
+        }
+    }
+
     /// True while the session has not reached a terminal status.
     ///
     /// ```
@@ -57,9 +77,9 @@ pub enum SessionKind {
     Librarian,
 }
 
-/// One session as the hub stores it. `note` is a plain string until the
-/// bounded `Summary` type lands, at which point the field type changes and
-/// the stores need no other edit.
+/// One session as the hub stores it. `note` is a bounded [`Summary`]; a
+/// stored note that is not a valid summary (a record written before the type
+/// existed) loads as `None` rather than failing the replay.
 ///
 /// ```
 /// use chrono::Utc;
@@ -106,13 +126,21 @@ pub struct SessionRecord {
     pub tools: Vec<String>,
     pub write_paths: Vec<String>,
     pub subtask: String,
-    pub note: Option<String>,
+    #[serde(default, deserialize_with = "lenient_note")]
+    pub note: Option<Summary>,
     pub result_summary: Option<String>,
     pub touched_paths: Vec<String>,
     pub status: SessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+pub(crate) fn lenient_note<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Summary>, D::Error> {
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|text| Summary::try_from(text).ok()))
 }
 
 impl std::fmt::Debug for SessionRecord {
@@ -128,7 +156,10 @@ impl std::fmt::Debug for SessionRecord {
             .field("last_activity", &self.last_activity)
             .field("ended_at", &self.ended_at)
             .field("subtask_bytes", &self.subtask.len())
-            .field("note_bytes", &self.note.as_ref().map(String::len))
+            .field(
+                "note_bytes",
+                &self.note.as_ref().map(|note| note.as_str().len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -152,7 +183,7 @@ mod tests {
             tools: vec!["tool-SECRET".into()],
             write_paths: vec!["path-SECRET".into()],
             subtask: "subtask-SECRET".into(),
-            note: Some("note-SECRET".into()),
+            note: Some(Summary::compose("coder", "running", "note-SECRET")),
             result_summary: Some("result-SECRET".into()),
             touched_paths: vec!["touched-SECRET".into()],
             status: SessionStatus::Running,
@@ -178,11 +209,57 @@ mod tests {
     }
 
     #[test]
+    fn labels_equal_the_serde_names() {
+        use SessionStatus::*;
+        for status in [
+            Pending,
+            Running,
+            WaitingOnMessages,
+            Completed,
+            Failed,
+            Cancelled,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{}\"", status.label())
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_note_that_is_not_a_valid_summary_loads_as_none() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["note"] = serde_json::json!("api_key=hunter2hunter2hunter2   spaced");
+        let loaded: SessionRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(loaded.note, None);
+        assert!(!format!("{loaded:?}").contains("hunter2"));
+        value["note"] = serde_json::json!("x".repeat(500));
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value.clone())
+                .unwrap()
+                .note,
+            None
+        );
+        value.as_object_mut().unwrap().remove("note");
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value.clone())
+                .unwrap()
+                .note,
+            None
+        );
+        value["note"] = serde_json::json!("coder [running] fine");
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap().note,
+            Some(Summary::compose("coder", "running", "fine"))
+        );
+    }
+
+    #[test]
     fn debug_of_a_session_record_never_prints_agent_authored_text() {
         let debug = format!("{:?}", record());
         assert!(!debug.contains("SECRET"), "{debug}");
         assert!(debug.contains("subtask_bytes: 14"), "{debug}");
-        assert!(debug.contains("note_bytes: Some(11)"), "{debug}");
+        assert!(debug.contains("note_bytes: Some(27)"), "{debug}");
     }
 
     #[test]

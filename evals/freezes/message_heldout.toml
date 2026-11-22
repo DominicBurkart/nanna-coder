@@ -1,0 +1,548 @@
+frozen_at = "2026-11-16T08:23:09Z"
+amended_after_freeze = "known_gap, issue and note fields only"
+amended_ids = ["heldout-block-injection-base64-encoded", "heldout-block-injection-chinese", "heldout-block-injection-french", "heldout-block-injection-german", "heldout-block-injection-hex-encoded", "heldout-block-injection-italian", "heldout-block-injection-japanese", "heldout-block-injection-portuguese", "heldout-block-injection-russian", "heldout-block-injection-spanish", "heldout-deliver-kebab-branch"]
+
+[[case]]
+id = "heldout-block-assignment-style-token"
+content_fnv = "1e00c830a85992d5"
+sha256_at_freeze = "adea12a030f7e0fedd38c2807a9d86ce63e497ef2c00a16540ade8c26395eb8e"
+
+[[case]]
+id = "heldout-block-bare-uuid"
+content_fnv = "73ceced5607ce629"
+sha256_at_freeze = "078916837cd016c0a4929e9b4bbc99b3a7b669c0c8318a7b324cb8efcf76fefc"
+
+[[case]]
+id = "heldout-block-base64-wrapped-token"
+content_fnv = "f31d2c2375fd9f9e"
+sha256_at_freeze = "8c0ba275ffb3ae058c41108b7d4b83f0b39295dd880aaeb8652e0cd45f420946"
+
+[[case]]
+id = "heldout-block-bidi-isolate"
+content_fnv = "b203b05ca0ec803b"
+sha256_at_freeze = "7e137b8c307b93c8ea5ca7b19a99c9466b3094ff09a3ffaa1c47dbd0e67d66fe"
+
+[[case]]
+id = "heldout-block-body-one-byte-over"
+content_fnv = "77980b82b3411237"
+sha256_at_freeze = "1e767e2fdaa7b4f27d4e637897feb2f2ce00fdba692279ba84113d16311a38bc"
+
+[[case]]
+id = "heldout-block-collusion-hide-from-auditor"
+content_fnv = "90f2e7af3fada3cb"
+sha256_at_freeze = "0ffef66cd9ba3eb3e0ba73f0464807cfe4370264769bcd8e523cc268a24037c1"
+
+[[case]]
+id = "heldout-block-confused-deputy-release-push"
+content_fnv = "88ffb0ab04d09f9a"
+sha256_at_freeze = "c267a4e57202db62dfb0b3d5aee9a6536e34da9b811bc93b6c7f0698f6978827"
+
+[[case]]
+id = "heldout-block-confused-deputy-rewrite-workflows"
+content_fnv = "17c80db3754d8d7c"
+sha256_at_freeze = "62623519cafe567d7afe0d211cf92455aca7b2e1b69250a241d6f91426427732"
+
+[[case]]
+id = "heldout-block-container-auth-config"
+content_fnv = "2c202b70f360c3db"
+sha256_at_freeze = "a19f5041ddaa69069d2d736b15f0cecb82bedbdf103fc787746b93a667d65480"
+
+[[case]]
+id = "heldout-block-control-character"
+content_fnv = "8b819560e787e533"
+sha256_at_freeze = "15a6a943ef9a5bf6ac5eae9605d36ea8aef56397cf9a2acf3ea4a0120896d239"
+
+[[case]]
+id = "heldout-block-cyrillic-homoglyph-word"
+content_fnv = "710192770527d28c"
+sha256_at_freeze = "9262b653aeff2b168e868a424368079d34bc7ecbf5a9b7f245c82cc66027539f"
+
+[[case]]
+id = "heldout-block-database-url"
+content_fnv = "a8a00e6777650f7c"
+sha256_at_freeze = "71b4731c702c71da96bde25cff4a2b841aee60bd7d3993e1e37777f008274a33"
+
+[[case]]
+id = "heldout-block-digest-after-sha256-prefix"
+content_fnv = "6a6b0bbd946468f1"
+sha256_at_freeze = "2cdb75471d418f81e414127e16080e9c066dd9a062684fd744a0476344887a60"
+
+[[case]]
+id = "heldout-block-digest-after-sha256-word"
+content_fnv = "25cc908852212cfa"
+sha256_at_freeze = "5b1988c36c99cc2006d880feddcff9dbef822a3032b9ea64aa8800f89841802a"
+
+[[case]]
+id = "heldout-block-ec-private-key"
+content_fnv = "28745b73a64b8cf4"
+sha256_at_freeze = "6da65623fb9c4324c1e60dbb4551a9a782ec8c18d358106351eaec313f57d998"
+
+[[case]]
+id = "heldout-block-fake-cto-ticket-approval"
+content_fnv = "4e3b310fe0c45e8a"
+sha256_at_freeze = "3aff6e85317105b378374d5796dba033b789325e806476591307d9317a987004"
+
+[[case]]
+id = "heldout-block-fake-maintenance-mode"
+content_fnv = "4df383e07145ad68"
+sha256_at_freeze = "491b7d8b2a664a995de3acf2083dafe82596d2b8d1d7f96a377d2759742d60d0"
+
+[[case]]
+id = "heldout-block-fake-operator-approval"
+content_fnv = "f72839dcd8d64dfb"
+sha256_at_freeze = "ec1cd6d2e9f1a61c6fa00dda6121d35cd48e3c050ffc6c854c5e6a88dc77e58a"
+
+[[case]]
+id = "heldout-block-gitlab-pat"
+content_fnv = "15da5f74516e52a3"
+sha256_at_freeze = "fb733e9c3baa5d53673c1c7988fbd75e05099163703d1f76f45f8ea9885f1358"
+
+[[case]]
+id = "heldout-block-google-api-key"
+content_fnv = "9f49917b6a8ea3d1"
+sha256_at_freeze = "eda737583ebd3962827c5e8044bf2ebb45f53cae769c93b9415d9d93e08b85a1"
+
+[[case]]
+id = "heldout-block-greek-homoglyph-word"
+content_fnv = "498d8b51223fcad8"
+sha256_at_freeze = "286d9e3f3e3ee45964d8164f7b07fa384bf11a0d5d6f43acd9f237f684b149d6"
+
+[[case]]
+id = "heldout-block-hex-after-commit-word"
+content_fnv = "ad0c3f317d0d6586"
+sha256_at_freeze = "8a98b49520d0a058b287f3147ae1e452d2575ecee0bbb715d923b387772ccbe2"
+
+[[case]]
+id = "heldout-block-hex-after-hash-word"
+content_fnv = "400c7488a4262ef7"
+sha256_at_freeze = "4a12a6b5ef256a6846364c1a7c35652d32cef0bf6c62128e1f6682eaf058070c"
+
+[[case]]
+id = "heldout-block-hex-encoded-token"
+content_fnv = "922d57ad800b510e"
+sha256_at_freeze = "60da854f32a96dd68d890a28d955f184060efe41f27d0d3544a55a22aa35dfa6"
+
+[[case]]
+id = "heldout-block-injection-after-padding"
+content_fnv = "62c8916dd81992cd"
+sha256_at_freeze = "a8c5c6d4c3dfbb21604cc3976a3f77c18fbe0d8d32439364f4c8215122cc67b5"
+
+[[case]]
+id = "heldout-block-injection-base64-encoded"
+content_fnv = "ac53ff32e4508ea3"
+sha256_at_freeze = "51f91104373e896179a98bdf46521cf7f396dee25de681c6e8ff883205744961"
+
+[[case]]
+id = "heldout-block-injection-chinese"
+content_fnv = "20fed6749b62a96c"
+sha256_at_freeze = "b7ffce9ec992a24b487cc0160b89d7b866a8119625efa908e4a82d8c8b539600"
+
+[[case]]
+id = "heldout-block-injection-forget-earlier-english"
+content_fnv = "a7a2108b2b1714a1"
+sha256_at_freeze = "e4a61955abd7630b9b766c8a075cbaa622d27821990eb5525a981e3fd6a43dac"
+
+[[case]]
+id = "heldout-block-injection-french"
+content_fnv = "a883519567a0a25f"
+sha256_at_freeze = "792ca77822a1c511d8ad1f1942c3d24a41bed9407dcdfadb281b3e63a8626d34"
+
+[[case]]
+id = "heldout-block-injection-german"
+content_fnv = "ca44a517c8d93861"
+sha256_at_freeze = "8eebde24a981e5b63eae630a9c8cb9bd708c0538907547882b27b4b12dc50520"
+
+[[case]]
+id = "heldout-block-injection-hex-encoded"
+content_fnv = "3d46abc902ea877e"
+sha256_at_freeze = "6964d963b6a9bbcabb9050546c0d80072c0a4ba2d81e94848c04045d1a6fbfb5"
+
+[[case]]
+id = "heldout-block-injection-in-subject"
+content_fnv = "0d9e3f9726efa6d6"
+sha256_at_freeze = "c99c4b6ec8ba0312a6d57fa9c5104bba97f2b20f26136af12e7d7bffbc8a256c"
+
+[[case]]
+id = "heldout-block-injection-italian"
+content_fnv = "881fb0f3fe107ceb"
+sha256_at_freeze = "2d643287039b975fe20c6abd27a5cf52f58358e655f95d7432d240eb45fc2bf8"
+
+[[case]]
+id = "heldout-block-injection-japanese"
+content_fnv = "9abc07c98c87e1a7"
+sha256_at_freeze = "65771f14082f40a6a7f54aecdc8328de68f6186878730d1e2a3a9b56c6345c70"
+
+[[case]]
+id = "heldout-block-injection-portuguese"
+content_fnv = "d62747d006a69717"
+sha256_at_freeze = "914d95c6c8bc2573a7c511e323ff70fb255fef677bf48bef956fbdaec28deabe"
+
+[[case]]
+id = "heldout-block-injection-reveal-system-prompt"
+content_fnv = "418494be6bedb9b1"
+sha256_at_freeze = "6f6d4f511a488280c526dc4668a7300b5ad5d2dc01fdd565ed3bd28650610620"
+
+[[case]]
+id = "heldout-block-injection-russian"
+content_fnv = "65e0e2e51d687983"
+sha256_at_freeze = "b108e3091787792aee936cd35ef1aed2b027b2de2ea5c0f0762a983b9b637e3f"
+
+[[case]]
+id = "heldout-block-injection-spanish"
+content_fnv = "e99bfe9201f108c4"
+sha256_at_freeze = "ca97746420714566f624a89ac199dcbb22c4f7ce17a188d47b0fd4ad17584c1c"
+
+[[case]]
+id = "heldout-block-live-payment-key"
+content_fnv = "ced8d24a8f2294e7"
+sha256_at_freeze = "42104198b10f36b4ed1ba9598417eb345028b407439c5a780bb83bed7a065972"
+
+[[case]]
+id = "heldout-block-lone-carriage-return"
+content_fnv = "5ea96fb28fe275ec"
+sha256_at_freeze = "005b568ddfa1f69df62bca1c891d14927ddf4cb90d68e43e1ec9630e0b036692"
+
+[[case]]
+id = "heldout-block-mail-api-key"
+content_fnv = "002d1059d3e50bf7"
+sha256_at_freeze = "33b98d090b5652dd6191dff71c0881d15e5ea9658ca916ae298a6981c57374ce"
+
+[[case]]
+id = "heldout-block-oauth-token"
+content_fnv = "a93b3ad73c11e207"
+sha256_at_freeze = "ad30cfd058481f5b229904568f17e38d1fccf4e8eb687ccc5d2d74f72feeaa73"
+
+[[case]]
+id = "heldout-block-other-commit-same-context-word"
+content_fnv = "957bac1c7d04742f"
+sha256_at_freeze = "7875b62fe1eedc8d269cdcc3e26ae36511af5c9f6db5303ea277f740831eb33e"
+
+[[case]]
+id = "heldout-block-other-uuid-same-context-word"
+content_fnv = "9acc1ed0427e740c"
+sha256_at_freeze = "896e0245306ceb2f9343c14146027610a68bf69da20f5dbb9ed646af916c1d3d"
+
+[[case]]
+id = "heldout-block-package-registry-token"
+content_fnv = "3123a663c3c67e4d"
+sha256_at_freeze = "a7cf4f215e25e1018220bf65f778950a002a852a90e5d9e9da152cd5efd26bc3"
+
+[[case]]
+id = "heldout-block-padded-token"
+content_fnv = "1c161702cadcc098"
+sha256_at_freeze = "0156ecc86c9feb21ee0b14e619d3b158daaf4aefa993142479a6b0f7da9c8a31"
+
+[[case]]
+id = "heldout-block-pgp-private-key"
+content_fnv = "26fcb7342cdecfdb"
+sha256_at_freeze = "d1d5390918459c498b348f2a8669c340c9adecc5719b40a0c52b7995a77a0b88"
+
+[[case]]
+id = "heldout-block-rot13-token"
+content_fnv = "18951e779e5609e1"
+sha256_at_freeze = "42d0fe9c591180d45d8e0b46b6f6c9a98fef87ceb057233045b8c9847d3e3620"
+
+[[case]]
+id = "heldout-block-secret-in-window-only"
+content_fnv = "bf2b92ad759c2b72"
+sha256_at_freeze = "ef09f77ec5a6a4d46fc8808ea29a13fece6ca94f3c33c5c90189700ca9071d44"
+
+[[case]]
+id = "heldout-block-secret-split-in-three"
+content_fnv = "4648e54d645bd29c"
+sha256_at_freeze = "89b63d36f4ee5a4f5eb447126bc526ea04b7e74d83f2e4e529ddf7c2ea998622"
+
+[[case]]
+id = "heldout-block-secret-split-over-five-messages"
+content_fnv = "f75c52e7df075e53"
+sha256_at_freeze = "8b8d6ac08cd9268d4785f8336799ac9be2313e2979d015b53ee8bf247f4a9c6b"
+
+[[case]]
+id = "heldout-block-storage-account-key"
+content_fnv = "344010626da6b1aa"
+sha256_at_freeze = "b6a030fd68ffbf0964719081dcf3983c1b3e9651e436449c355408bb2f53eb77"
+
+[[case]]
+id = "heldout-block-subject-one-over"
+content_fnv = "1fee84d122175d7e"
+sha256_at_freeze = "2af48f1187443911f104961409a8ae9c2e992ea24b0e0831698a4abcf198a953"
+
+[[case]]
+id = "heldout-block-token-in-subject"
+content_fnv = "61e379b8e0424ec3"
+sha256_at_freeze = "69f90809533f7effdb4ab69c9255c3851a368d1ccff6bdb65ef3d3026c4836ac"
+
+[[case]]
+id = "heldout-block-uuid-after-head-word"
+content_fnv = "ad74c5b715687e57"
+sha256_at_freeze = "0bbeb8c22e7b531228c9cb2635e7d2c9e979fe0cb1b22a0cb4e9d8261229d16b"
+
+[[case]]
+id = "heldout-block-uuid-after-merge-word"
+content_fnv = "ddc1ca4424a22c13"
+sha256_at_freeze = "9b2b9d5ccbc74ef58682d3684636e412dbc53cf1154a3018540a1cfa7c177cd2"
+
+[[case]]
+id = "heldout-block-zero-width-in-token"
+content_fnv = "4269164dedeedd46"
+sha256_at_freeze = "4426e221a5fb3fbc13f3fddb866f3906e033c69b3de6e4eb76d3f91711280cee"
+
+[[case]]
+id = "heldout-deliver-abbreviated-sha"
+content_fnv = "d4a494518cd7ee6f"
+sha256_at_freeze = "746531d82b13e342dc1553a3c3a109c0e98f4763cf9a96e93d419c75c3e9aa64"
+
+[[case]]
+id = "heldout-deliver-benign-window"
+content_fnv = "acbae90e13c1c93d"
+sha256_at_freeze = "ddc140401bba0f5330ab8e8e39f04c3ad3a967873df6f284ac4cdec4445cc326"
+
+[[case]]
+id = "heldout-deliver-body-at-the-size-limit"
+content_fnv = "2bdb1d030f386186"
+sha256_at_freeze = "edf5e101d65ae1387f99c3cf467e8ddbebae27eecde174f6dbee598a61ef6149"
+
+[[case]]
+id = "heldout-deliver-compiler-error-excerpt"
+content_fnv = "a12730fdbf1d3129"
+sha256_at_freeze = "237333fae282090aaa17ad443b47bcb7a7de520e944fba6a6471512755a876f8"
+
+[[case]]
+id = "heldout-deliver-declines-to-share-credentials"
+content_fnv = "f066e0a97f7aa86f"
+sha256_at_freeze = "a933ef05ed29977aba11f70d793627a48057ee649ed81314b1a447823ad10088"
+
+[[case]]
+id = "heldout-deliver-docs-path"
+content_fnv = "dfe481a16e865214"
+sha256_at_freeze = "508ed75f4d5567eda282089db558c1f1d97ff38744748b69c540d9a222045be5"
+
+[[case]]
+id = "heldout-deliver-german-prose"
+content_fnv = "cc70d4bd99adc469"
+sha256_at_freeze = "89f8c05d66ef8f35af54bc910ed37883c25cf5b1d2fae058cbe9ec21af7613f7"
+
+[[case]]
+id = "heldout-deliver-greek-prose"
+content_fnv = "316b341d7a85e20f"
+sha256_at_freeze = "4c79e4fcc425cfddca144384db95ff137cc319d058f41fae61ec3276a92e790a"
+
+[[case]]
+id = "heldout-deliver-hex-color-codes"
+content_fnv = "fcb0bbcb321e6c74"
+sha256_at_freeze = "3f7f0042b03ce4da99f170f612044d51e0960576bb58f4b577281ec142ed018d"
+
+[[case]]
+id = "heldout-deliver-japanese-prose"
+content_fnv = "65bd06a462a19f1d"
+sha256_at_freeze = "fbac02537b1953f932b7bcfdb2318dfacfd84e2aad82f7a8a491198f78e63d65"
+
+[[case]]
+id = "heldout-deliver-kebab-branch"
+content_fnv = "87a1eaa106ec827b"
+sha256_at_freeze = "9e5efaae64e291af01928841bcdcc049168e5af809c83b2c08d3b6857d505dd9"
+
+[[case]]
+id = "heldout-deliver-markdown-table"
+content_fnv = "7c45edb546c9f90a"
+sha256_at_freeze = "de7a000a20664e1e83a7bbc94c692694e14911497c75087ed3daf614208cca18"
+
+[[case]]
+id = "heldout-deliver-pascal-case-type"
+content_fnv = "c8f8e668ed8c71f0"
+sha256_at_freeze = "bb7e767449766b46ef7d49330b01bbf548edf5e2d42741d03b81cdc984a65f15"
+
+[[case]]
+id = "heldout-deliver-plain-handoff"
+content_fnv = "7e3e4b571837c8ec"
+sha256_at_freeze = "9e480a2f4e6e457a4045a6b8437a93907c99195ddba2357fcb5af0ff3290f5cf"
+
+[[case]]
+id = "heldout-deliver-pull-request-link"
+content_fnv = "91b2cb647fc96b13"
+sha256_at_freeze = "15bac37a77d64a3b15ae3242852398ecc6e17177c691ee92863d7f32061d903c"
+
+[[case]]
+id = "heldout-deliver-registry-image-tag"
+content_fnv = "b212c1470b3887be"
+sha256_at_freeze = "be788bfc630b5ac439b17f462b9736e34c601f44f3d26751beffa3d0774ee73b"
+
+[[case]]
+id = "heldout-deliver-semver-range"
+content_fnv = "bf5c09e6623a34dd"
+sha256_at_freeze = "bc4866b85b1ca609a4fcbbd63515bfbf56725a84e3b626fdd53681fab693c483"
+
+[[case]]
+id = "heldout-deliver-shell-pipeline"
+content_fnv = "44e37f2a13e5c57a"
+sha256_at_freeze = "14ade78f4173fc348966e810d84975abe1628b6a5405c4a56653e77bdd46b42d"
+
+[[case]]
+id = "heldout-deliver-small-json"
+content_fnv = "c80e9545be7a3c6c"
+sha256_at_freeze = "7a6041ef063921bd2d2f1b4baae33f82a037a52791e5d3413d0e43a9dc92ec69"
+
+[[case]]
+id = "heldout-deliver-snake-case-list"
+content_fnv = "f990c30a8bd522fb"
+sha256_at_freeze = "1b9ae6b05c67908fd389017787514b0ddccfd9986e84e880989f0a536bbd07db"
+
+[[case]]
+id = "heldout-deliver-subject-at-the-limit"
+content_fnv = "037ca0cfc40deaf7"
+sha256_at_freeze = "b8b7cd9b7ce8eed8a8d820d51e268226e22787f9c0b0503a7d704bfadb1f7648"
+
+[[case]]
+id = "heldout-deliver-timestamps-and-durations"
+content_fnv = "35d995ba6bd4dbab"
+sha256_at_freeze = "f7f5b095a8055b5933c1efbd51e8dd5d0c808ffdc6d0a52528dbd4aa7fdfcc85"
+
+[[case]]
+id = "heldout-deliver-two-vouched-ids"
+content_fnv = "0d3d8cf4974824d8"
+sha256_at_freeze = "fd447cda4cce911c1889a1e1715541665b9799791bc5bceda04bf5f9a6f57ee0"
+
+[[case]]
+id = "heldout-deliver-url-with-query"
+content_fnv = "405b102fa902ce1e"
+sha256_at_freeze = "e8e246a1309a3b8381ea7bc4bb0ed34583e0b463ba7cd5c4be001df239f42457"
+
+[[case]]
+id = "heldout-deliver-vouched-commit-reference"
+content_fnv = "c640445246dc867a"
+sha256_at_freeze = "34a839611c7c2e3c09bdb948ba2c4d687043f82cec29708f0a54b701f06c1608"
+
+[[case]]
+id = "heldout-deliver-vouched-digest-line"
+content_fnv = "d4807c9bb1ad6a1c"
+sha256_at_freeze = "ce1c263a22e4ce57614466bec293a56402a8d6d7b2ad4167ef4faf1128396989"
+
+[[case]]
+id = "heldout-deliver-vouched-message-id"
+content_fnv = "27d820796b8904fe"
+sha256_at_freeze = "4be679d6a00325b2b53f21f642e3475beb941c446ffb004f79bedad1040c3e75"
+
+[[case]]
+id = "heldout-deliver-vouched-uuid-in-sentence"
+content_fnv = "3cdbbe7e4f78c9f5"
+sha256_at_freeze = "17ea01c6573eed309889a3cf77936b7f35441db8514af0b30b06a4a0e5f59c58"
+
+[[case]]
+id = "heldout-encoding-binary-string"
+content_fnv = "9dc2f9a4ad740100"
+sha256_at_freeze = "8d185c61f316cc21c7b0f15493287f601761f5e4d20b54e69fa2d5f5212565ef"
+
+[[case]]
+id = "heldout-encoding-morse-digits"
+content_fnv = "fa599b46c994cc6a"
+sha256_at_freeze = "5c270e95ce56581b25530ecb5f5ff4c3e1a05ab2f7a891c72fa7f733069cba97"
+
+[[case]]
+id = "heldout-encoding-trailing-whitespace"
+content_fnv = "1788f68d3293b04e"
+sha256_at_freeze = "9c046ab0eea45256f558b4a6ced36791f7e9f7a795f5a960d85df5a6e5c966a3"
+
+[[case]]
+id = "heldout-encoding-two-emoji-string"
+content_fnv = "187714eab2b57b47"
+sha256_at_freeze = "ff70b60c3c7bf9553ef9d0be00585b204f58f053c710c2ae4f471d68e27b9205"
+
+[[case]]
+id = "heldout-encoding-two-letter-string"
+content_fnv = "c86fd5fc0c65a625"
+sha256_at_freeze = "ffb285f78d1e8d5acb8cf43f25bc98e0f86b7a67ef0c1e72f2ecfdffa5e5f2ea"
+
+[[case]]
+id = "heldout-encoding-word-list"
+content_fnv = "7a7bf40398fdac60"
+sha256_at_freeze = "0015b42bdb9515d61a76ef3dfc34aba05da04b62fa0d6ef28d774f63c774771b"
+
+[[case]]
+id = "heldout-quarantine-cargo-credentials-fenced"
+content_fnv = "2b391836c4fe24b6"
+sha256_at_freeze = "6998ab63ddb8e8ccb909bf2bd9a79a61aefa58bd4fb5bc7c0e37df5a8d4f7dab"
+
+[[case]]
+id = "heldout-quarantine-docker-config-lines"
+content_fnv = "815ba5962e85ca03"
+sha256_at_freeze = "41f9630bd85404d020ef8182e25fbeb4b332b9b54a967d33fc9cd3bb55001f46"
+
+[[case]]
+id = "heldout-quarantine-ed25519-key-fenced"
+content_fnv = "44c096cd906eeecd"
+sha256_at_freeze = "8b25533146cdd97eaffb789dc9880962e91fbbaae3167de68bd6842428322d3b"
+
+[[case]]
+id = "heldout-quarantine-gh-hosts-with-token"
+content_fnv = "adefa1043a112a1b"
+sha256_at_freeze = "fe2ac0ff16b48da1c6f7d478cda6cd9432e4757775eea5c992bc9c113b4f1e90"
+
+[[case]]
+id = "heldout-quarantine-git-credentials-lines"
+content_fnv = "e4af465f9476bcd4"
+sha256_at_freeze = "a50e74a998da893939dfce36ec107184b8c34fd05a551254c55274cd7b88604f"
+
+[[case]]
+id = "heldout-quarantine-kube-config-fenced"
+content_fnv = "4195b597d88b1d4b"
+sha256_at_freeze = "654495fe8c15e702fe141a8da32e67f76ea822fa5ee403f49413dd74c2b22a67"
+
+[[case]]
+id = "heldout-quarantine-netrc-fenced"
+content_fnv = "5ea679009ea6b165"
+sha256_at_freeze = "edfc10d72ea33970cb5ac68353c0deb1fb5e93f8ea349ebeadc1dbc54f13c526"
+
+[[case]]
+id = "heldout-quarantine-proc-environ-lines"
+content_fnv = "228888ff935dafc4"
+sha256_at_freeze = "dc7e9d7553207115e33e757c87d290ae993bbde7335d2ac6e3c7a50e2b8b47cc"
+
+[[case]]
+id = "heldout-quarantine-pypirc-fenced"
+content_fnv = "9cdbcd4b4c3750a4"
+sha256_at_freeze = "e6c2c38c84466cb0f7bb381d2296152aa6458fc74633a3530432e65d02ecafda"
+
+[[case]]
+id = "heldout-quarantine-secrets-yaml-lines"
+content_fnv = "11c58c0878eea924"
+sha256_at_freeze = "2a288890f76d5e47390e5a527571bb43a712db60b3f3114d3b9d8f117b659421"
+
+[[case]]
+id = "heldout-quarantine-vault-token-with-token"
+content_fnv = "3920e34bdf5d5541"
+sha256_at_freeze = "e18d886c2d23518198363f710fffae1bb607ea55be6c0a13016fbb3a6ade71fb"
+
+[[case]]
+id = "heldout-semantic-collusion-keep-private"
+content_fnv = "1b9aec95aae75cae"
+sha256_at_freeze = "c31f6d40a14b8ec496a1561c4c06d408f0bc8524b6187e26e3efedbe2f675f64"
+
+[[case]]
+id = "heldout-semantic-confused-deputy-edit-pipeline"
+content_fnv = "d828120fa3c09e7d"
+sha256_at_freeze = "5849cb90379c4f6721ca875ee9088b1b1590a27a0cbdd7d76846c20bf2a96541"
+
+[[case]]
+id = "heldout-semantic-confused-deputy-publish"
+content_fnv = "b731b59d80db6552"
+sha256_at_freeze = "b2bf8b978e6a6c257910576f8c9ba80c9e3bbbde86124b29cb2df0b6c71ad15e"
+
+[[case]]
+id = "heldout-semantic-confused-deputy-read-settings"
+content_fnv = "f44db583ed2f9b8f"
+sha256_at_freeze = "509f3bfd54327d680c4c7ff0b6c6ca970dad45ea85e9db613498ab9fa86bc1c5"
+
+[[case]]
+id = "heldout-semantic-deception-about-state"
+content_fnv = "12d9f31969a45cff"
+sha256_at_freeze = "9a208b5a5748d06c750785bd07f5dfb4c7096b8fbdde47793b0e947b245e0563"
+
+[[case]]
+id = "heldout-semantic-fake-approval-legal"
+content_fnv = "5d74750699882716"
+sha256_at_freeze = "c7e63f077de0e9fc795a7a557e26fce818b6a1766a41683d22371dde539e67dd"
+
+[[case]]
+id = "heldout-semantic-fake-approval-verbal"
+content_fnv = "297e58e816763b86"
+sha256_at_freeze = "7fb202ec102028eeb7a5cbf7f44fec1260ad424b1eb2ff05fd5c6b0799ec9123"
