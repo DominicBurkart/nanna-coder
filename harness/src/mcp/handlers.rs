@@ -256,6 +256,18 @@ pub fn task_to_wire(task: &Task) -> Value {
     obj
 }
 
+const UNBOUNDED_DIAGNOSTIC_FIELDS: [&str; 2] = ["conversation_snapshot", "tool_call_history"];
+
+fn bounded_diagnostics(diagnostics: &crate::task::FailureDiagnostics) -> Value {
+    let mut json = diagnostics.to_json();
+    if let Some(fields) = json.as_object_mut() {
+        for field in UNBOUNDED_DIAGNOSTIC_FIELDS {
+            fields.remove(field);
+        }
+    }
+    json
+}
+
 /// Build the underlying `CallToolResult` returned by `tasks/result` for a
 /// terminal task. Includes the required `io.modelcontextprotocol/related-task`
 /// metadata. For non-terminal input the caller is expected to have awaited a
@@ -288,7 +300,7 @@ pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Va
                 "failure_kind": diagnostics.failure_kind(),
                 "error_type": diagnostics.error_type,
                 "error": error,
-                "diagnostics": diagnostics.to_json(),
+                "diagnostics": bounded_diagnostics(diagnostics),
             },
             "isError": true,
             "_meta": related,
@@ -1211,6 +1223,42 @@ max_concurrent = 1
     }
 
     #[test]
+    fn test_structured_content_does_not_carry_unbounded_diagnostics() {
+        let failed = |diagnostics| TaskStatus::Failed {
+            finished_at: Utc::now(),
+            error: "boom".to_string(),
+            diagnostics,
+        };
+        let plain = task_result_to_call_tool_result("wire-test", &failed(sample_diagnostics()));
+        let mut heavy = sample_diagnostics();
+        heavy.conversation_snapshot = Some(vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some("x".repeat(500_000)),
+            tool_calls: None,
+            tool_call_id: None,
+        }]);
+        heavy.tool_call_history = (0..50)
+            .map(|index| crate::entities::context::types::ToolCallRecord {
+                tool_name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": format!("f{index}") }),
+                call_id: format!("c{index}"),
+                result: "y".repeat(10_000),
+                effect: None,
+            })
+            .collect();
+        let big = task_result_to_call_tool_result("wire-test", &failed(heavy));
+        assert_eq!(
+            big["structuredContent"].to_string().len(),
+            plain["structuredContent"].to_string().len()
+        );
+        let diagnostics = big["structuredContent"]["diagnostics"].as_object().unwrap();
+        assert!(!diagnostics.contains_key("conversation_snapshot"));
+        assert!(!diagnostics.contains_key("tool_call_history"));
+        assert_eq!(diagnostics["failure_kind"], "max_iterations");
+        assert!(big["content"][0]["text"].as_str().unwrap().len() > 500_000);
+    }
+
+    #[test]
     fn test_task_result_failed_with_an_unknown_label_is_unclassified() {
         let mut diagnostics = sample_diagnostics();
         diagnostics.error_type = "SomethingNew".to_string();
@@ -1301,8 +1349,64 @@ max_concurrent = 1
         .await
         .unwrap_err();
         assert_eq!(bad_loop.kind, FailureKind::InvalidRequest);
+
+        let mut wrong_model = params(repo.path(), "rust-implementer", "Add a test.");
+        wrong_model["model"] = serde_json::json!("some-other-model");
+        let submit_refused = handle_assign_task(&wrong_model, &manager, &provider, &gate, 10, None)
+            .await
+            .unwrap_err();
+        assert!(
+            submit_refused.message.contains("some-other-model"),
+            "{}",
+            submit_refused.message
+        );
+        assert_eq!(submit_refused.kind, FailureKind::SpawnRefused);
+
+        let widened = repo_with_origin("https://github.com/example/repo.git");
+        std::fs::create_dir_all(widened.path().join(".nanna/agents")).unwrap();
+        std::fs::write(
+            widened.path().join(".nanna/agents/rust-implementer.toml"),
+            WIDENED_IMPLEMENTER,
+        )
+        .unwrap();
+        let override_refused = handle_assign_task(
+            &params(widened.path(), "rust-implementer", "Add a test."),
+            &manager,
+            &provider,
+            &gate,
+            10,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            override_refused.message.contains("widens"),
+            "{}",
+            override_refused.message
+        );
+        assert_eq!(override_refused.kind, FailureKind::SpawnRefused);
         assert!(manager.list().await.is_empty());
     }
+
+    const WIDENED_IMPLEMENTER: &str = r#"
+[identity]
+name = "rust-implementer"
+description = "Widened override."
+loop = "inner"
+model = "gemma4:e4b"
+system_prompt = { inline = "Widened." }
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = ["api/**", "shared/**", "ui/**"]
+max_effect = "repository"
+tools = ["read_file", "write_file", "search", "cargo_*", "git_*"]
+
+[limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4
+"#;
 
     #[test]
     fn test_task_result_cancelled_is_error() {
