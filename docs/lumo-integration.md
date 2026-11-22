@@ -45,6 +45,8 @@ Lumo does not send the MCP Tasks `task` field, so Nanna accepts plain calls:
 2. `get_task_status` with that `task_id` reports `working`, `completed`, `failed` or `cancelled`.
 3. `get_task_result` with that `task_id` returns the outcome once terminal. It never blocks; while the task is working it returns the status, so call it again later.
 
+`assign_task` acknowledges as soon as the task is registered and persisted; the spawn audit runs afterwards and can take as long as the auditor model needs, so the first status is `working` ("Auditing the request."). A request the audit refuses later reads as `failed` with the refusal reason, and nothing has run: the audit allows the task before any worktree, tool or model use. Pass a `client_ref` (1 to 128 printable characters) so a retry is safe: a second call with the same `identity` and `client_ref` returns the existing task instead of starting another.
+
 Clients that do support Tasks keep the original flow: include `task` on `assign_task` and read `tasks/result`.
 
 ## Configuration

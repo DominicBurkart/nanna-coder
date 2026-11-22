@@ -89,11 +89,15 @@ fn provider(calls: Vec<ChatResponse>) -> Arc<dyn ModelProvider> {
     Arc::new(Script(Mutex::new(script)))
 }
 
-fn gate() -> SpawnGate {
+fn gate() -> Arc<SpawnGate> {
     let catalog = IdentityCatalog::load(CATALOG).unwrap();
     let auditor = catalog.get("auditor").unwrap().clone();
     let context = AuditContext::new(catalog, auditor).unwrap();
-    SpawnGate::new(Box::new(RuleAuditor::new()), AuditLog::in_memory(), context)
+    Arc::new(SpawnGate::new(
+        Box::new(RuleAuditor::new()),
+        AuditLog::in_memory(),
+        context,
+    ))
 }
 
 fn git(repo: &Path, args: &[&str]) {
