@@ -1384,6 +1384,15 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         tasks.values().cloned().collect()
     }
 
+    pub async fn list_for_identity(&self, identity: &str) -> Vec<Task> {
+        let tasks = self.runner.tasks.read().await;
+        tasks
+            .values()
+            .filter(|t| t.identity_hint.as_deref() == Some(identity))
+            .cloned()
+            .collect()
+    }
+
     /// Cancel a queued or running task. A queued task leaves the queue and
     /// the store; a running one is aborted and its slot handed to the next
     /// entry.

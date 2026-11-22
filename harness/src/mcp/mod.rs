@@ -1,5 +1,6 @@
 pub mod client;
 pub mod handlers;
+pub mod introspect;
 pub mod jsonrpc;
 pub mod plan;
 
@@ -264,6 +265,13 @@ impl NannaMcpServer {
                 }
             }
         ])
+        .as_array()
+        .cloned()
+        .into_iter()
+        .flatten()
+        .chain(introspect::tool_definitions().as_array().cloned().into_iter().flatten())
+        .collect::<Vec<Value>>()
+        .into()
     }
 
     async fn handle_tools_call(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
@@ -344,6 +352,26 @@ impl NannaMcpServer {
                     None => {
                         JsonRpcResponse::error(id, -32602, format!("Task not found: {task_id}"))
                     }
+                }
+            }
+            name if introspect::is_introspection_tool(name) => {
+                if task_field.is_some() {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        format!("Tool '{name}' does not support task augmentation"),
+                    );
+                }
+                let outcome = match name {
+                    "list_identities" => Ok(introspect::list_identities(&self.spawn_gate)),
+                    "describe_identity" => {
+                        introspect::describe_identity(&self.spawn_gate, &tool_params)
+                    }
+                    _ => introspect::list_tasks(&self.task_manager, &tool_params).await,
+                };
+                match outcome {
+                    Ok(result) => JsonRpcResponse::success(id, result),
+                    Err(msg) => JsonRpcResponse::error(id, -32602, msg),
                 }
             }
             "plan_task" => {
@@ -579,7 +607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_returns_the_four_base_tools() {
+    async fn test_tools_list_returns_the_base_tools() {
         let server = make_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -591,8 +619,11 @@ mod tests {
         assert!(resp.error.is_none());
         let tools = &resp.result.unwrap()["tools"];
         let arr = tools.as_array().unwrap();
-        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.len(), 7);
         let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"list_identities"));
+        assert!(names.contains(&"describe_identity"));
+        assert!(names.contains(&"list_tasks"));
         assert!(names.contains(&"assign_task"));
         assert!(names.contains(&"onboard_repo"));
         assert!(names.contains(&"get_task_status"));
@@ -681,7 +712,7 @@ mod tests {
             .unwrap();
         let v = parse_response(&bytes);
         assert_eq!(v["id"], 2);
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 7);
     }
 
     #[tokio::test]
@@ -1327,5 +1358,230 @@ mod tests {
             body["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
             task_id.as_str()
         );
+    }
+
+    async fn call_tool(
+        server: &NannaMcpServer,
+        name: &str,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        server
+            .handle_request(tools_call(
+                90,
+                serde_json::json!({ "name": name, "arguments": args }),
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_list_identities_hides_the_auditor_and_every_prompt() {
+        let resp = call_tool(&make_server(), "list_identities", serde_json::json!({})).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let body = text_json(&result);
+        let cards = body["identities"].as_array().unwrap();
+        let names: Vec<&str> = cards.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "deployer",
+                "incident-responder",
+                "pr-shepherd",
+                "rust-implementer"
+            ]
+        );
+        let raw = result["content"][0]["text"].as_str().unwrap();
+        assert!(!raw.contains("system_prompt"), "{raw}");
+        assert!(!raw.contains("auditor"), "{raw}");
+        let card = cards
+            .iter()
+            .find(|c| c["name"] == "rust-implementer")
+            .unwrap();
+        assert_eq!(card["loop"], "inner");
+        assert_eq!(card["max_effect"], "repository");
+        assert_eq!(card["scope"]["repos"][0], "github.com/example/repo");
+        assert!(card["scope"]["paths"].is_array());
+        assert!(card["scope"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "read_file"));
+        assert!(card["limits"]["max_iterations"].is_number());
+        assert!(card["model"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_describe_identity_returns_one_card_without_the_prompt() {
+        let resp = call_tool(
+            &make_server(),
+            "describe_identity",
+            serde_json::json!({ "name": "pr-shepherd" }),
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let card = text_json(&result);
+        assert_eq!(card["name"], "pr-shepherd");
+        assert_eq!(card["max_effect"], "ci");
+        let raw = result["content"][0]["text"].as_str().unwrap();
+        assert!(!raw.contains("system_prompt"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn test_describe_identity_unknown_name_lists_known_names_but_not_the_auditor() {
+        for name in ["ghost", "auditor"] {
+            let resp = call_tool(
+                &make_server(),
+                "describe_identity",
+                serde_json::json!({ "name": name }),
+            )
+            .await;
+            let error = resp.error.unwrap();
+            assert_eq!(error.code, -32602);
+            assert!(
+                error.message.contains("rust-implementer"),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains("pr-shepherd"), "{}", error.message);
+            assert!(!error.message.contains("auditor,"), "{}", error.message);
+            assert!(!error.message.contains(", auditor"), "{}", error.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_identity_requires_a_name() {
+        let resp = call_tool(&make_server(), "describe_identity", serde_json::json!({})).await;
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_describe_identity_with_repo_path_shows_the_per_repo_card() {
+        let repo = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/repo"
+        );
+        let global = text_json(
+            &call_tool(
+                &make_server(),
+                "describe_identity",
+                serde_json::json!({ "name": "rust-implementer" }),
+            )
+            .await
+            .result
+            .unwrap(),
+        );
+        let layered = text_json(
+            &call_tool(
+                &make_server(),
+                "describe_identity",
+                serde_json::json!({ "name": "rust-implementer", "repo_path": repo }),
+            )
+            .await
+            .result
+            .unwrap(),
+        );
+        assert_ne!(global["scope"]["paths"], layered["scope"]["paths"]);
+        assert_eq!(layered["scope"]["paths"], serde_json::json!(["api/**"]));
+        assert!(!layered.to_string().contains("business logic"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_tolerates_no_tasks() {
+        let resp = call_tool(&make_server(), "list_tasks", serde_json::json!({})).await;
+        let body = text_json(&resp.result.unwrap());
+        assert_eq!(body["tasks"], serde_json::json!([]));
+    }
+
+    async fn assign_as(server: &NannaMcpServer, identity: &str, description: &str) -> String {
+        let resp = call_tool(
+            server,
+            "assign_task",
+            serde_json::json!({
+                "description": description,
+                "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(),
+                "identity": identity,
+            }),
+        )
+        .await;
+        text_json(&resp.result.expect("assign accepted"))["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn list_tasks_with(
+        server: &NannaMcpServer,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        text_json(&call_tool(server, "list_tasks", args).await.result.unwrap())["tasks"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_filters_by_identity_and_status() {
+        let server = queued_server();
+        let a = assign_as(&server, "rust-implementer", "implement the thing").await;
+        let b = assign_as(&server, "pr-shepherd", &"x".repeat(500)).await;
+
+        let all = list_tasks_with(&server, serde_json::json!({})).await;
+        assert_eq!(all.as_array().unwrap().len(), 2);
+
+        let only_a = list_tasks_with(
+            &server,
+            serde_json::json!({ "identity": "rust-implementer" }),
+        )
+        .await;
+        assert_eq!(only_a.as_array().unwrap().len(), 1);
+        assert_eq!(only_a[0]["id"], a.as_str());
+        assert_eq!(only_a[0]["identity_hint"], "rust-implementer");
+        assert_eq!(only_a[0]["status"], "working");
+        assert!(only_a[0]["created_at"].is_string());
+        assert!(only_a[0]["updated_at"].is_string());
+
+        let only_b =
+            list_tasks_with(&server, serde_json::json!({ "identity": "pr-shepherd" })).await;
+        assert_eq!(only_b[0]["id"], b.as_str());
+        assert_eq!(
+            only_b[0]["description"].as_str().unwrap().chars().count(),
+            200
+        );
+
+        let working = list_tasks_with(&server, serde_json::json!({ "status": "working" })).await;
+        assert_eq!(working.as_array().unwrap().len(), 2);
+
+        let failed = list_tasks_with(&server, serde_json::json!({ "status": "failed" })).await;
+        assert!(failed.as_array().unwrap().is_empty());
+
+        let none = list_tasks_with(
+            &server,
+            serde_json::json!({ "identity": "rust-implementer", "status": "failed" }),
+        )
+        .await;
+        assert!(none.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_rejects_an_unknown_status() {
+        let resp = call_tool(
+            &make_server(),
+            "list_tasks",
+            serde_json::json!({ "status": "bogus" }),
+        )
+        .await;
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("working"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn test_introspection_tools_reject_task_augmentation() {
+        for name in ["list_identities", "describe_identity", "list_tasks"] {
+            let resp = make_server()
+                .handle_request(tools_call(
+                    91,
+                    serde_json::json!({ "name": name, "arguments": {"name": "x"}, "task": {} }),
+                ))
+                .await;
+            assert_eq!(resp.error.unwrap().code, -32601, "{name}");
+        }
     }
 }

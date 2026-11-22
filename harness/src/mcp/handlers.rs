@@ -78,6 +78,8 @@ pub async fn handle_assign_task(
         .ok_or_else(|| "Missing required field: identity".to_string())?
         .to_string();
 
+    ensure_known_repo(&repo_path)?;
+
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
     let repo_gate = spawn_gate
         .for_repo(&repo_path)
@@ -126,6 +128,17 @@ pub async fn handle_assign_task(
     // so the CreateTaskResult body is built directly rather than re-reading
     // the task (which would introduce an unreachable not-found branch).
     Ok(initial_task_wire(&task_id.0, ttl))
+}
+
+fn ensure_known_repo(repo_path: &Path) -> Result<(), String> {
+    if repo_path.is_absolute() && repo_path.join(".git").exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown_repo: `{}` (the path as the nanna server sees it) is not an existing git repository. \
+         repo_path must be an absolute path on the server's filesystem: `~` is not expanded and relative paths are not accepted.",
+        repo_path.display()
+    ))
 }
 
 /// Build the MCP Tasks `Task` object returned inside a `CreateTaskResult` for a
@@ -181,7 +194,7 @@ pub async fn handle_onboard_repo(params: &Value) -> Result<Value, String> {
 
 /// Map an internal [`TaskStatus`] to the MCP Tasks wire status string and an
 /// optional human-readable `statusMessage`.
-fn wire_status(status: &TaskStatus) -> (&'static str, Option<String>) {
+pub(crate) fn wire_status(status: &TaskStatus) -> (&'static str, Option<String>) {
     match status {
         TaskStatus::Pending => ("working", Some("Task is queued.".to_string())),
         TaskStatus::Running { iterations, .. } => (
@@ -582,6 +595,53 @@ mod tests {
         let codes: Vec<_> = log[0].verdict.reasons().iter().map(|r| r.code).collect();
         assert!(codes.contains(&crate::auditor::ReasonCode::LoopMismatch));
         assert!(codes.contains(&crate::auditor::ReasonCode::EffectAboveCeiling));
+    }
+
+    async fn assert_unknown_repo(path: &str) {
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let params = serde_json::json!({
+            "description": "d", "repo_path": path, "identity": "rust-implementer"
+        });
+        let err = handle_assign_task(&params, &manager, &provider, &gate, 20, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown_repo"), "{err}");
+        assert!(err.contains(path), "{err}");
+        assert!(err.contains('~'), "{err}");
+        assert!(err.contains("relative"), "{err}");
+        assert!(manager.list().await.is_empty());
+        assert!(gate.log().entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_a_missing_repo_before_the_gate() {
+        assert_unknown_repo("/nonexistent/nanna/repo").await;
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_a_plain_file_as_repo_before_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_unknown_repo(file.to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_a_non_git_directory_before_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_unknown_repo(dir.path().to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_a_tilde_path_before_the_gate() {
+        assert_unknown_repo("~/code/some-repo").await;
+    }
+
+    #[tokio::test]
+    async fn test_assign_task_rejects_a_relative_path_before_the_gate() {
+        assert_unknown_repo("some/relative/repo").await;
     }
 
     #[tokio::test]
