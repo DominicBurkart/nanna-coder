@@ -26,7 +26,8 @@ Lumo ──stdio──> scripts/lumo-mcp.sh ──podman exec -i──> nanna mc
 2. Your identity catalog exists in `~/.config/nanna/agents` (or `$XDG_CONFIG_HOME/nanna/agents`, or the directory in `NANNA_CATALOG_SRC`) and holds at least `auditor.toml`.
 3. `scripts/lumo-mcp.sh --install-catalog` has been run (see [Installing the catalog](#installing-the-catalog)). The launcher refuses to start without the volume.
 4. `scripts/lumo-repos.sh` has been run. It creates one podman volume per repository named by the catalog and clones the repository into it (see [Repositories](#repositories)). The launcher refuses to start if any of those volumes is missing.
-5. `podman` is on the `PATH` of the desktop session. Lumo is a GUI app and inherits the login session's `PATH`, not your shell's.
+5. Optional, for the cargo tools: `scripts/lumo-cargo-vendor.sh` has been run (see [Cargo tools and the sandbox](#cargo-tools-and-the-sandbox)). Without it the daemon still starts; the cargo tools are simply absent.
+6. `podman` is on the `PATH` of the desktop session. Lumo is a GUI app and inherits the login session's `PATH`, not your shell's.
 
 ## Installing the catalog
 
@@ -69,7 +70,7 @@ The wrapper must `exec` the launcher with no extra stdout output and pass its ar
 ```
 scripts/lumo-mcp.sh                 # what Lumo runs: ensure the daemon, then bridge stdio to it
 scripts/lumo-mcp.sh --start         # ensure the daemon is running and its socket is open
-scripts/lumo-mcp.sh --status        # running?, image freshness, socket, task counts
+scripts/lumo-mcp.sh --status        # running?, image freshness, socket, task counts, cargo-home volume
 scripts/lumo-mcp.sh --stop          # stop and remove the container; the nanna-state volume is kept
 scripts/lumo-mcp.sh --restart       # stop, remove, start (picks up a new image or new settings)
 scripts/lumo-mcp.sh --install-catalog
@@ -124,6 +125,46 @@ Lumo must pass `repo_path` as the in-container path `/repos/<name>`, for example
 
 The launcher passes `-v <volume>:<container path>[:ro]` and nothing else. Podman labels its own named volumes. Credentials never go into an image or argv.
 
+## Cargo tools and the sandbox
+
+Plain-path tasks never execute repository code. The cargo tools (`cargo_check`, `cargo_test`, `cargo_build`) do: `build.rs`, proc macros and test binaries from the repository under test run inside the daemon container. They are therefore offered only when real containment is available, and only to a card that lists the tool by exact name (`*` and `cargo_*` never grant them).
+
+### Vendoring dependencies
+
+```
+scripts/lumo-cargo-vendor.sh              # every repository of your catalog
+scripts/lumo-cargo-vendor.sh marigold     # one repository
+scripts/lumo-mcp.sh --restart             # the daemon mounts the volume only when it is created
+```
+
+`lumo-cargo-vendor.sh` runs one throwaway networked container from the harness image with the repository volumes mounted read-only and runs `cargo vendor` into the named volume `nanna-cargo-home` (override with `NANNA_CARGO_VOLUME`, read by both scripts). It is the only step with network access. Repositories are copied inside that container first, because marigold commits no `Cargo.lock`: the repository volumes are never written. Run it again whenever dependencies change.
+
+When the volume exists, the launcher mounts it read-only at `/cargo` and sets `CARGO_HOME=/cargo`, `CARGO_NET_OFFLINE=true` and `NANNA_SANDBOX_HIDE=/repos:/etc/nanna:/state` (the repository, config and state mounts). The launcher never creates the volume and never mounts it writable. When it does not exist the daemon starts without the mount and without these variables, a one-line stderr notice names `scripts/lumo-cargo-vendor.sh`, and the cargo tools are absent; the reason is reported through `ToolRegistry::tools_unavailable()`. `--status` shows whether the volume exists and whether the running daemon was started with it:
+
+```
+cargo-home: present (nanna-cargo-home); daemon started WITHOUT it; run scripts/lumo-mcp.sh --restart to mount it
+```
+
+Because the daemon is created once, vendoring after the daemon started needs a `--restart` (it replaces only the container; `nanna-state` is kept and a running task is reported as failed with `DaemonRestarted`).
+
+### Ephemeral lockfile
+
+A repository that commits a `Cargo.lock` is built with `--frozen`. One without a lockfile (marigold) is built with `--offline`, and nanna gives the run an empty `Cargo.lock` owned by the task's uid that is removed afterwards, so it never reaches the patch.
+
+### What the sandbox contains
+
+Each cargo run goes through the `nanna-sandbox` helper, which, in order: refuses unless root, sets CPU, file-size and core rlimits, drops all groups and switches to a per-task unprivileged uid, unshares user, net, ipc, uts and mount namespaces, mounts an empty tmpfs over each hidden path, sets `PR_SET_NO_NEW_PRIVS`, changes directory and execs. The parent runs it with a cleared environment (PATH, CARGO_HOME, CARGO_NET_OFFLINE, CARGO_TARGET_DIR, HOME, TMPDIR, CARGO_INCREMENTAL, CARGO_TERM_COLOR, LANG; no tokens, no `NANNA_*`), a per-task scratch directory (mode 0700, never inside `/repos`), a wall-clock timeout (default 900 s) that kills the process group and then every process of the uid, and output capped at 256 KiB per stream. The new network namespace holds only `lo`, so the network and host loopback services such as Ollama are unreachable. If containment is unavailable (not root, no unshare, missing helper, failed self-test) the tools are not registered; nothing falls back to unsandboxed execution.
+
+### Residual risks
+
+- A hostile build script runs as an unprivileged uid. It cannot write the repository volumes, read root-only files, reach the network, or see `/repos`, `/etc/nanna` or `/state`.
+- It can still read world-readable files in the daemon container (its own worktree, other tasks' worktrees under `/tmp`, anything mode 644/755) and `/proc/<pid>/cmdline` of daemon processes. It can write its own scratch directory and the ephemeral `Cargo.lock`.
+- There is no PID namespace: stray processes are reaped by killing the uid, and uids come from a 40000-wide range, so concurrent tasks could in theory collide.
+- Build and test output is untrusted text returned to the model (a prompt-injection surface), and files that `build.rs` or tests generate in the worktree are untrusted.
+- Hiding `/repos` breaks build scripts that run `git` on the worktree.
+- The host kernel's user-namespace attack surface is exposed to repository code.
+- Heavy tiers (kani, aeneas with Lean) are not in the default image; they need a separate per-capability sandbox image.
+
 ## What Lumo may do
 
 Every `assign_task` runs under an identity card from your catalog, and the card is the capability envelope: its repositories, paths, effect ceiling, tools and limits. Lumo must pass `"identity": "<name>"` on every `assign_task`; it gets no more and no less than that card allows. `auditor` audits every spawn and action. Which identities exist is decided by your `~/.config/nanna/agents`, not by this repository; to change what Lumo can do, edit the card, run `--install-catalog` and `--restart`.
@@ -153,6 +194,7 @@ The launcher reads these environment variables. Those that shape the container o
 | `NANNA_HARNESS_IMAGE` | `$NANNA_REGISTRY/harness:$NANNA_TAG` |
 | `NANNA_CONFIG_VOLUME` | `nanna-lumo-config` |
 | `NANNA_STATE_VOLUME` | `nanna-state` |
+| `NANNA_CARGO_VOLUME` | `nanna-cargo-home` (mounted read-only at `/cargo` only if it exists; also read by `lumo-cargo-vendor.sh`) |
 | `NANNA_DAEMON_NAME` | `nanna-daemon` |
 | `NANNA_DAEMON_SOCKET` | `/run/nanna/mcp.sock` |
 | `NANNA_DAEMON_WAIT_SECS` | `30` |
@@ -175,6 +217,10 @@ The launcher reads these environment variables. Those that shape the container o
 - **`mcp-attach` says it cannot reach the daemon**: `scripts/lumo-mcp.sh --status`, then `--start`.
 - **Tasks vanished after a restart**: they are in `/state/results` for 14 days; check `--status` and that the `nanna-state` volume still exists (`podman volume ls`). A task that was running when the daemon died shows as `failed` with `DaemonRestarted`.
 - **`--status` shows `STALE`**: a newer image exists; `--restart` when no task you care about is running.
+- **A card lists `cargo_check` but the tool is absent**: the daemon was started without the cargo-home volume (a stderr notice said so), or the volume lacks `config.toml`, or containment is unavailable. Run `scripts/lumo-mcp.sh --status`; if it says `absent` or `WITHOUT it`, run `scripts/lumo-cargo-vendor.sh` then `--restart`. The reason is in `tools_unavailable`.
+- **`lumo-cargo-vendor.sh` says a repository volume is missing**: run `scripts/lumo-repos.sh --only <name>` first.
+- **A cargo task fails offline with a missing crate**: a dependency changed since vendoring; run `scripts/lumo-cargo-vendor.sh <name>` again and `--restart`.
+- **A `build.rs` that runs `git` fails**: `/repos` is hidden inside the sandbox by design.
 - **`lumo-repos.sh` says credentials are not supported**: the repository is private or unreachable anonymously. It is skipped; use `NANNA_REPOS` to leave it out.
 - **`assign_task` fails scope or repository checks**: `repo_path` must be `/repos/<name>` exactly as in the table above, and the identity's `scope.repos` must name the repository.
 - **A refresh fails with a fast-forward error**: the checkout has diverged. Remove the volume (`podman volume rm nanna-repo-<name>`) and run `lumo-repos.sh --only <name>` again.
@@ -182,7 +228,7 @@ The launcher reads these environment variables. Those that shape the container o
 
 ## Tests
 
-`tests/integration/test-lumo-mcp.sh` checks the launcher against a stateful fake `podman`: the exact daemon argv (named volumes only, config read-only, state mounted, no ports or relabelling), the bridge argv, attach to a running daemon, restart of a stopped one, the creation race, a late or missing socket, `--start`, `--stop`, `--restart`, `--status` (including a stale image), `--install-catalog` (exactly the files present, refusal without `auditor.toml`, refusal while the daemon exists, symlinks, default source), fail-closed startup and `NANNA_REPOS`.
+`tests/integration/test-lumo-mcp.sh` checks the launcher against a stateful fake `podman`: the exact daemon argv (named volumes only, config read-only, state mounted, no ports or relabelling), the bridge argv, attach to a running daemon, restart of a stopped one, the creation race, a late or missing socket, `--start`, `--stop`, `--restart`, `--status` (including a stale image and the cargo-home volume present, absent, mounted or not), the read-only cargo mount with `CARGO_HOME`, `CARGO_NET_OFFLINE` and the sandbox hide list matching the real mounts, startup without the cargo-home volume, `lumo-cargo-vendor.sh --help` consistency, `--install-catalog` (exactly the files present, refusal without `auditor.toml`, refusal while the daemon exists, symlinks, default source), fail-closed startup and `NANNA_REPOS`.
 
 `tests/integration/test-lumo-repos.sh` checks `lumo-repos.sh`: the volume list derived from the catalog, clone for new volumes and fetch for existing ones, `--only` and `--list`, named-volume-only mounts, no credentials or SELinux changes in argv, cleanup after a failed clone.
 
