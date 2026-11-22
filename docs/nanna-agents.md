@@ -38,7 +38,7 @@ cp -r .nanna/catalog/. ~/.config/nanna/agents/
 
 ## Identities
 
-Names are exact; inchworm flows reference them verbatim.
+Names are exact; the flows in `inchworm.toml` reference them verbatim.
 
 | Name | Loop | Flow step | Writes (`paths`) | Ceiling | Tools |
 | --- | --- | --- | --- | --- | --- |

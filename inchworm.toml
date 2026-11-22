@@ -1,3 +1,13 @@
+[offramp]
+default = "noop"
+
+[auditor]
+runs_in = { kind = "nanna", identity = "auditor" }
+on_failure = "block"
+
+[merge]
+allow = false
+
 [[flow]]
 name = "issue"
 trigger = { kind = "label", label = "inchworm" }
@@ -23,6 +33,7 @@ forbid_paths = [
   "codecov.yml",
   ".nanna/**",
   ".inchworm/**",
+  "inchworm.toml",
   ".devcontainer/**",
 ]
 
