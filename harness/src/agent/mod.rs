@@ -515,6 +515,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         !self.progress.refused
             && self.progress.write_calls == 0
             && !self.write_tool_names().is_empty()
+            && !self.reaches_repository()
+    }
+
+    fn reaches_repository(&self) -> bool {
+        !self
+            .tool_names_where(|class| class >= crate::effects::EffectClass::Repository)
+            .is_empty()
     }
 
     fn read_tool_names(&self) -> Vec<String> {
@@ -3301,7 +3308,14 @@ mod tests {
     }
 
     fn write_capable_registry(root: &std::path::Path) -> ToolRegistry {
-        crate::tools::create_tool_registry(root)
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = crate::effects::EffectClass::Workspace;
+        identity.scope.paths = vec!["**".to_string()];
+        identity.scope.tools = ["write_file", "read_file", "search", "list_directory"]
+            .iter()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        crate::tools::create_tool_registry_for(root, &identity).unwrap()
     }
 
     fn read_only_registry(root: &std::path::Path) -> ToolRegistry {
@@ -3645,6 +3659,32 @@ mod tests {
         let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 50);
         let err = agent.run(progress_context()).await.unwrap_err();
         assert!(matches!(err, AgentError::NoProgress { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_does_not_guard_a_card_that_can_reach_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::tools::create_tool_registry(dir.path());
+        assert!(registry.get_tool("write_file").is_some());
+        assert!(registry.get_tool("github_pr_status").is_some());
+        let mut agent = progress_agent(vec![plain_response("PR is green.")], registry, 2);
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_machine_does_not_guard_a_card_that_can_reach_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::tools::create_tool_registry(dir.path());
+        let mut agent = progress_agent(
+            wrap_with_state_machine_responses(vec![plain_response("PR is green.")]),
+            registry,
+            2,
+        );
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
     }
 }
 

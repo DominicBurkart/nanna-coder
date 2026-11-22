@@ -6958,6 +6958,24 @@ mod identity_tests {
     }
 
     #[tokio::test]
+    async fn test_a_pr_shepherd_task_ending_with_a_plain_summary_completes() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status");
+        let gate = crate::auditor::test_support::fixture_gate();
+        let empty = crate::identity::IdentityCatalog::default();
+        let provider = MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+            "The PR is green and ready to merge.",
+        )]));
+        let (manager, _store) = restore_audited(&[&entry], &empty, &gate, provider).await;
+        let done = wait_for(&manager, &entry.id, terminal).await;
+        assert!(
+            matches!(done.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            done.status
+        );
+    }
+
+    #[tokio::test]
     async fn test_the_restore_audit_is_bound_to_the_real_target_repository() {
         let repo = repo_with_origin("git@github.com:example/repo.git");
         let entry = stored_entry(repo.path(), Some("pr-shepherd"), "Check PR status").with_origin(
