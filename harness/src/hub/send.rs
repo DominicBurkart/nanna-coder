@@ -369,10 +369,8 @@ impl MessageHub {
                 body_len: req.body.len(),
             };
             if self.sink.quarantined(&event).is_err() {
-                tracing::error!(
-                    recipients = to.len(),
-                    "quarantine escalation was not delivered"
-                );
+                let count = to.len();
+                tracing::error!(count, "quarantine escalation was not delivered");
             }
             return Err(HubError::Quarantined {
                 recipients: to.len(),
@@ -398,7 +396,8 @@ mod tests {
     use crate::hub::registry::SessionRegistry;
     use crate::hub::session::SessionStatus;
     use crate::hub::store::{
-        HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, StoreError,
+        HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, Retention,
+        StoreError,
     };
     use crate::leases::SimulatedClock;
     use crate::task::TaskId;
@@ -1341,6 +1340,9 @@ mod tests {
         assert!(matches!(err, HubError::ThreadTooDeep), "{err:?}");
     }
 
+    type Page = Result<Vec<StoredMessage>, StoreError>;
+    type Count = Result<usize, StoreError>;
+
     struct Failing {
         inner: InMemoryMessageStore,
         fail_at: AtomicUsize,
@@ -1358,12 +1360,7 @@ mod tests {
         fn get(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
             self.inner.get(id)
         }
-        fn inbox(
-            &self,
-            to: SessionId,
-            after: Option<Seq>,
-            limit: usize,
-        ) -> Result<Vec<StoredMessage>, StoreError> {
+        fn inbox(&self, to: SessionId, after: Option<Seq>, limit: usize) -> Page {
             self.inner.inbox(to, after, limit)
         }
         fn ack(&self, to: SessionId, upto: Seq) -> Result<(), StoreError> {
@@ -1372,24 +1369,29 @@ mod tests {
         fn unread(&self, to: SessionId) -> Result<usize, StoreError> {
             self.inner.unread(to)
         }
-        fn outbound_window(
-            &self,
-            from: SessionId,
-            to: Recipient,
-            bytes: usize,
-        ) -> Result<Vec<StoredMessage>, StoreError> {
+        fn outbound_window(&self, from: SessionId, to: Recipient, bytes: usize) -> Page {
             self.inner.outbound_window(from, to, bytes)
         }
         fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError> {
             self.inner.set_state(id, s)
         }
-        fn prune(
-            &self,
-            now: chrono::DateTime<Utc>,
-            policy: &crate::hub::store::Retention,
-        ) -> Result<usize, StoreError> {
+        fn prune(&self, now: chrono::DateTime<Utc>, policy: &Retention) -> Count {
             self.inner.prune(now, policy)
         }
+    }
+
+    #[test]
+    fn the_failing_store_passes_everything_else_through() {
+        let store = Failing {
+            inner: InMemoryMessageStore::new(),
+            fail_at: AtomicUsize::new(99),
+            appends: AtomicUsize::new(0),
+        };
+        let who = SessionId::from_task(TaskId("w".into()));
+        assert!(store.get(MessageId::new()).unwrap().is_none());
+        assert!(store.inbox(who.clone(), None, 1).unwrap().is_empty());
+        store.ack(who, Seq::new(1)).unwrap();
+        assert_eq!(store.prune(start(), &Retention::default()).unwrap(), 0);
     }
 
     #[tokio::test]
