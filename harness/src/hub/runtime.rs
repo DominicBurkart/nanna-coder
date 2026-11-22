@@ -1,18 +1,19 @@
 //! The production assembly of the message hub: the stores, the one session registry and the hub.
 
+use super::oracle::SystemGit;
 use super::registry::SessionRegistry;
+use super::router::{BindingTable, HubRouter, ProductionAuditors};
 use super::send::{AuditorProvider, MessageHub};
 use super::store::{
     messages_path_from, sessions_path_from, HubLock, JsonlMessageStore, JsonlSessionStore,
     MessageStore, SessionStore, StoreError,
 };
-use crate::action_auditor::{FailClosedMessageAuditor, MessageAuditor, ModelMessageAuditor};
 use crate::leases::{Clock, SystemClock};
 use crate::scheduler::QueueStoreError;
 use crate::task::{RestoreParts, TaskManager, RESTORE_AUDIT_DEADLINE};
 use model::ModelProvider;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Where the session and message journals live.
 ///
@@ -50,9 +51,17 @@ impl HubPaths {
     }
 }
 
+pub(crate) type AuditorFactory = Box<
+    dyn FnOnce(
+        &Arc<dyn SessionStore>,
+        &Arc<dyn MessageStore>,
+        &Arc<BindingTable>,
+    ) -> Arc<dyn AuditorProvider>,
+>;
+
 struct Parts {
     registry: Arc<SessionRegistry>,
-    hub: Arc<MessageHub>,
+    router: Arc<HubRouter>,
     _locks: Vec<Arc<HubLock>>,
 }
 
@@ -116,14 +125,26 @@ impl HubRuntime {
     /// Locked or unreadable stores give an unavailable runtime and a loud error log, so the
     /// host still starts without a hub.
     pub fn open(paths: &HubPaths, provider: Arc<dyn ModelProvider>, model: &str) -> Self {
-        let auditor = FailClosedMessageAuditor::new(ModelMessageAuditor::new(provider, model));
-        let auditors: Arc<dyn MessageAuditor> = Arc::new(auditor);
-        HubRuntime::open_with(paths, Arc::new(auditors), Arc::new(SystemClock))
+        let model = model.to_string();
+        let factory: AuditorFactory = Box::new(move |sessions, messages, table| {
+            let (sessions, messages) = (Arc::clone(sessions), Arc::clone(messages));
+            let table = Arc::clone(table);
+            let auditors = ProductionAuditors::new(
+                provider,
+                &model,
+                sessions,
+                messages,
+                table,
+                Arc::new(SystemGit),
+            );
+            Arc::new(auditors)
+        });
+        HubRuntime::open_with(paths, factory, Arc::new(SystemClock))
     }
 
     pub(crate) fn open_with(
         paths: &HubPaths,
-        auditors: Arc<dyn AuditorProvider>,
+        auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
     ) -> Self {
         match open_stores(paths) {
@@ -144,9 +165,11 @@ impl HubRuntime {
     pub(crate) fn assemble(
         sessions: Arc<dyn SessionStore>,
         messages: Arc<dyn MessageStore>,
-        auditors: Arc<dyn AuditorProvider>,
+        auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let table = BindingTable::new();
+        let auditors = auditors(&sessions, &messages, &table);
         let registry = Arc::new(SessionRegistry::new(Arc::clone(&sessions)));
         let hub = MessageHub::new(
             sessions,
@@ -159,7 +182,7 @@ impl HubRuntime {
         Self {
             parts: Some(Parts {
                 registry,
-                hub: Arc::new(hub),
+                router: Arc::new(HubRouter::new(Arc::new(hub), table)),
                 _locks: Vec::new(),
             }),
         }
@@ -172,7 +195,16 @@ impl HubRuntime {
 
     /// The hub, when available.
     pub fn hub(&self) -> Option<Arc<MessageHub>> {
-        self.parts.as_ref().map(|parts| Arc::clone(&parts.hub))
+        self.parts.as_ref().map(|parts| parts.router.hub())
+    }
+
+    /// The router the action gates hold weakly: dangling when the runtime is unavailable, so
+    /// every message tool is blocked.
+    pub fn router_weak(&self) -> Weak<HubRouter> {
+        match &self.parts {
+            Some(parts) => Arc::downgrade(&parts.router),
+            None => Weak::new(),
+        }
     }
 
     /// The one session registry, when available.
@@ -185,7 +217,7 @@ impl HubRuntime {
         match &self.parts {
             Some(parts) => manager
                 .with_session_registry(Arc::clone(&parts.registry))
-                .with_hub(Arc::clone(&parts.hub)),
+                .with_hub(Arc::clone(&parts.router)),
             None => manager,
         }
     }
@@ -198,7 +230,7 @@ impl HubRuntime {
                 let manager =
                     TaskManager::restore_within_sessions(parts, RESTORE_AUDIT_DEADLINE, registry)
                         .await?;
-                Ok(manager.with_hub(Arc::clone(&hub_parts.hub)))
+                Ok(manager.with_hub(Arc::clone(&hub_parts.router)))
             }
             None => TaskManager::restore_without_sessions(parts, RESTORE_AUDIT_DEADLINE).await,
         }
@@ -206,13 +238,18 @@ impl HubRuntime {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::action_auditor::{FailClosedMessageAuditor, MessageAuditor, ModelMessageAuditor};
     use crate::hub::store::{InMemoryMessageStore, InMemorySessionStore};
     use std::fs;
 
     fn provider() -> Arc<dyn ModelProvider> {
         Arc::new(model::OllamaProvider::new(model::OllamaConfig::default()).unwrap())
+    }
+
+    pub(crate) fn constant_auditors(auditor: Arc<dyn MessageAuditor>) -> AuditorFactory {
+        Box::new(move |_, _, _| Arc::new(auditor))
     }
 
     fn paths(dir: &Path) -> HubPaths {
@@ -311,6 +348,33 @@ mod tests {
     }
 
     #[test]
+    fn the_auditors_and_the_router_share_one_binding_table() {
+        let seen: Arc<std::sync::Mutex<Option<Arc<BindingTable>>>> = Arc::default();
+        let capture = seen.clone();
+        let auditor = FailClosedMessageAuditor::new(ModelMessageAuditor::new(provider(), "m"));
+        let shared: Arc<dyn MessageAuditor> = Arc::new(auditor);
+        let factory: AuditorFactory = Box::new(move |_, _, table| {
+            *capture.lock().unwrap() = Some(Arc::clone(table));
+            Arc::new(shared)
+        });
+        let runtime = HubRuntime::assemble(
+            Arc::new(InMemorySessionStore::new()),
+            Arc::new(InMemoryMessageStore::new()),
+            factory,
+            Arc::new(SystemClock),
+        );
+        let router = runtime.router_weak().upgrade().unwrap();
+        let given = seen.lock().unwrap().clone().unwrap();
+        assert!(Arc::ptr_eq(&given, &router.table()));
+        assert!(Arc::ptr_eq(&router.hub(), &runtime.hub().unwrap()));
+    }
+
+    #[test]
+    fn an_unavailable_runtime_has_a_dangling_router() {
+        assert!(HubRuntime::unavailable().router_weak().upgrade().is_none());
+    }
+
+    #[test]
     fn an_unavailable_runtime_attaches_nothing() {
         let manager = HubRuntime::unavailable().attach(TaskManager::new(0));
         assert!(manager.hub().is_none());
@@ -318,15 +382,11 @@ mod tests {
 
     #[test]
     fn an_available_runtime_attaches_its_hub() {
+        let auditor = FailClosedMessageAuditor::new(ModelMessageAuditor::new(provider(), "m"));
         let runtime = HubRuntime::assemble(
             Arc::new(InMemorySessionStore::new()),
             Arc::new(InMemoryMessageStore::new()),
-            Arc::new(
-                Arc::new(FailClosedMessageAuditor::new(ModelMessageAuditor::new(
-                    provider(),
-                    "m",
-                ))) as Arc<dyn MessageAuditor>,
-            ),
+            constant_auditors(Arc::new(auditor)),
             Arc::new(SystemClock),
         );
         let manager = runtime.attach(TaskManager::new(0));
