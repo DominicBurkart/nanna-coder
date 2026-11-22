@@ -61,14 +61,14 @@ let
     nativeBuildInputs = commonNativeBuildInputs;
     nativeCheckInputs = [ pkgs.jq ];
 
-    cargoBuildCommand = "cargo build --release --bin nanna";
+    cargoBuildCommand = "cargo build --release --bin nanna --bin nanna-sandbox";
     cargoCheckCommand = "cargo check --bin nanna";
     cargoTestCommand = "cargo test --package harness";
 
-    # Install only the nanna binary
     installPhase = ''
       mkdir -p $out/bin
       cp target/release/nanna $out/bin/
+      cp target/release/nanna-sandbox $out/bin/
     '';
   };
 
