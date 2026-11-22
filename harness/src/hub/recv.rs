@@ -702,6 +702,14 @@ mod tests {
             self.inner.get(id)
         }
 
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            self.inner.update(id, change)
+        }
+
         fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
             let call = self.in_roots.fetch_add(1, Ordering::SeqCst) + 1;
             if call == self.fail_in_root_at.load(Ordering::SeqCst) {
@@ -751,7 +759,7 @@ mod tests {
     struct World {
         sessions: Arc<InMemorySessionStore>,
         messages: Arc<dyn MessageStore>,
-        registry: SessionRegistry,
+        registry: Arc<SessionRegistry>,
         clock: SimulatedClock,
         root: RootId,
     }
@@ -760,7 +768,7 @@ mod tests {
         fn new(messages: Arc<dyn MessageStore>) -> Self {
             let sessions = Arc::new(InMemorySessionStore::new());
             Self {
-                registry: SessionRegistry::new(sessions.clone()),
+                registry: Arc::new(SessionRegistry::new(sessions.clone())),
                 sessions,
                 messages,
                 clock: SimulatedClock::new(start()),
@@ -830,6 +838,7 @@ mod tests {
                 Arc::new(auditor),
                 Arc::new(self.clock.clone()),
                 HubLimits::default(),
+                self.registry.clone(),
             )
         }
 
@@ -1656,6 +1665,7 @@ mod tests {
             Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
             Arc::new(StuckClock(world.clock.clone())),
             HubLimits::default(),
+            world.registry.clone(),
         );
         let waiting = RecvRequest {
             wait_secs: 30,
@@ -1737,7 +1747,11 @@ mod tests {
             Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
             Arc::new(SimulatedClock::new(start())),
             HubLimits::default(),
+            Arc::new(registry),
         );
+        flaky
+            .update(ids[0].session().clone(), Box::new(Some))
+            .unwrap();
         let before = flaky.in_roots.load(Ordering::SeqCst);
         flaky.fail_in_root_at.store(before + 2, Ordering::SeqCst);
         let page = hub.recv(&ids[0], RecvRequest::default()).await.unwrap();
@@ -1753,12 +1767,14 @@ mod tests {
             in_roots: AtomicUsize::new(0),
             fail_in_root_at: AtomicUsize::new(1),
         });
+        let registry = Arc::new(SessionRegistry::new(flaky.clone()));
         let hub = MessageHub::new(
             flaky,
             Arc::new(InMemoryMessageStore::new()),
             Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
             Arc::new(SimulatedClock::new(start())),
             HubLimits::default(),
+            registry,
         );
         let binding = SessionBinding::from_audited(
             &crate::identity::example(),

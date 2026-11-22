@@ -2647,6 +2647,14 @@ mod tests {
             self.1.pass()?;
             self.0.in_root(root)
         }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            self.1.pass()?;
+            self.0.update(id, change)
+        }
         fn set_status(
             &self,
             id: SessionId,
@@ -3007,5 +3015,50 @@ mod tests {
             session_describe(&store, &messages, &binding, &sid("t-foreign")).err(),
             Some(ViewError::NotVisible)
         );
+    }
+
+    #[test]
+    fn a_note_cleared_through_the_registry_returns_the_summary_to_the_first_subtask_line() {
+        let r = root(1);
+        let lineage = Lineage::root_child(r);
+        let store = std::sync::Arc::new(InMemorySessionStore::new());
+        let registry = crate::hub::registry::SessionRegistry::new(store.clone());
+        let bound = SessionBinding::from_audited(
+            &crate::identity::example(),
+            TaskId("t".into()),
+            lineage.clone(),
+        );
+        registry
+            .register(&bound, "fix the parser\nthen the lexer", at(0))
+            .unwrap();
+        let request = ListRequest {
+            filter: everything(),
+            order: ListOrder::Recent,
+            cursor: None,
+        };
+        let shown = |store: &InMemorySessionStore| {
+            let page = list(store, &CursorTable::new(), &caller("t", &lineage), &request).unwrap();
+            page.items[0].summary.as_str().to_string()
+        };
+        assert_eq!(shown(&store), "rust-implementer [pending] fix the parser");
+        registry
+            .set_note(&sid("t"), "reading the lexer", at(1))
+            .unwrap();
+        assert_eq!(
+            shown(&store),
+            "rust-implementer [pending] reading the lexer"
+        );
+        registry.set_note(&sid("t"), "  \n ", at(2)).unwrap();
+        assert_eq!(shown(&store), "rust-implementer [pending] fix the parser");
+    }
+
+    #[test]
+    fn the_flaky_session_store_passes_updates_until_its_gate_closes() {
+        let r = root(1);
+        let record = flat("a", &r, "coder", SessionStatus::Running, 0);
+        let flaky = FlakySessions(store_of(vec![record]), Gate::from(1));
+        flaky.update(sid("a"), Box::new(Some)).unwrap();
+        let closed = flaky.update(sid("a"), Box::new(Some));
+        assert!(matches!(closed, Err(StoreError::Locked)));
     }
 }
