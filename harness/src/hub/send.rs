@@ -282,6 +282,29 @@ impl MessageHub {
         Ok(thread)
     }
 
+    fn inbox_check(&self, windows: &Windows, to: &[SessionRecord]) -> Result<(), HubError> {
+        for rec in to {
+            let unread = self.messages.unread(rec.id.clone())?;
+            if unread + windows.held(&rec.id) >= self.limits.inbox_max {
+                return Err(HubError::InboxFull);
+            }
+        }
+        Ok(())
+    }
+
+    fn note_precheck(&self, sender: &SessionBinding) -> Result<(), HubError> {
+        let (session, root) = (sender.session(), sender.lineage().root());
+        let windows = self.windows();
+        windows.check(self.clock.now(), session, root, &self.limits)
+    }
+
+    fn precheck(&self, sender: &SessionBinding, to: &[SessionRecord]) -> Result<(), HubError> {
+        let windows = self.windows();
+        self.inbox_check(&windows, to)?;
+        let (session, root) = (sender.session(), sender.lineage().root());
+        windows.check(self.clock.now(), session, root, &self.limits)
+    }
+
     fn reserve(
         &self,
         sender: &SessionBinding,
@@ -289,12 +312,7 @@ impl MessageHub {
     ) -> Result<Reservation<'_>, HubError> {
         let now = self.clock.now();
         let mut windows = self.windows();
-        for rec in to {
-            let unread = self.messages.unread(rec.id.clone())?;
-            if unread + windows.held(&rec.id) >= self.limits.inbox_max {
-                return Err(HubError::InboxFull);
-            }
-        }
+        self.inbox_check(&windows, to)?;
         windows.admit(now, sender.session(), sender.lineage().root(), &self.limits)?;
         let held: Vec<SessionId> = to.iter().map(|rec| rec.id.clone()).collect();
         windows.reserve(&held);
@@ -405,6 +423,7 @@ impl MessageHub {
         req: &SendRequest,
     ) -> Result<MessageVerdict, HubError> {
         let prepared = self.prepare(sender, req)?;
+        self.precheck(sender, &prepared.to)?;
         let (verdict, _) = self.review_prepared(sender, req, &prepared).await?;
         Ok(verdict)
     }
@@ -421,6 +440,7 @@ impl MessageHub {
                 max: NOTE_MAX_CHARS,
             });
         }
+        self.note_precheck(sender)?;
         let in_root = self.sessions.in_root(sender.lineage().root())?;
         let scopes: Vec<RecipientScope> = in_root
             .iter()

@@ -549,6 +549,14 @@ mod tests {
     }
 
     fn rig(replies: Vec<Result<MessageVerdict, ()>>, bound: bool) -> Rig {
+        rig_with(replies, bound, Default::default())
+    }
+
+    fn rig_with(
+        replies: Vec<Result<MessageVerdict, ()>>,
+        bound: bool,
+        limits: crate::hub::limits::HubLimits,
+    ) -> Rig {
         let sessions = Arc::new(InMemorySessionStore::new());
         let messages = Arc::new(InMemoryMessageStore::new());
         let session_registry = Arc::new(SessionRegistry::new(sessions.clone()));
@@ -563,7 +571,7 @@ mod tests {
             messages.clone(),
             Arc::new(shared),
             Arc::new(SimulatedClock::new(at())),
-            Default::default(),
+            limits,
             session_registry,
         )
         .with_quarantine_sink(sink.clone());
@@ -894,6 +902,113 @@ mod tests {
         let second = auditors.for_sender(&sender);
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(!first.name().is_empty());
+    }
+
+    fn limited(sender: u32, root: u32, inbox: usize) -> crate::hub::limits::HubLimits {
+        crate::hub::limits::HubLimits {
+            per_sender_per_10m: sender,
+            per_root_per_hour: root,
+            inbox_max: inbox,
+            ..Default::default()
+        }
+    }
+
+    fn send_request(rig: &Rig) -> SendRequest {
+        serde_json::from_value(args(rig, "hello")).unwrap()
+    }
+
+    fn gate_review(tool: &str, args: Value) -> ActionReview {
+        ActionReview {
+            identity: "x".into(),
+            task_id: TaskId("sender".into()),
+            tool: tool.into(),
+            args,
+            effect_class: EffectClass::None,
+            prior_actions: vec![],
+        }
+    }
+
+    async fn gate_verdict(rig: &Rig, tool: &str, args: Value) -> ActionVerdict {
+        let (review, cx) = (gate_review(tool, args), gate_context());
+        rig.router.review(&review, &cx).await.unwrap()
+    }
+
+    fn gate_context() -> ActionContext<'static> {
+        ActionContext {
+            max_effect: EffectClass::None,
+            window: None,
+            lease: crate::leases::LeaseContext::default(),
+            now: Utc::now(),
+            task: "",
+        }
+    }
+
+    async fn assert_refused_without_review(rig: &Rig, tool: &str, args: Value, detail: &str) {
+        let before = rig.auditor.calls();
+        for _ in 0..3 {
+            let verdict = gate_verdict(rig, tool, args.clone()).await;
+            let ActionVerdict::Block { reasons } = verdict else {
+                unreachable!()
+            };
+            assert!(
+                reasons[0].detail.starts_with(detail),
+                "{}",
+                reasons[0].detail
+            );
+        }
+        assert_eq!(rig.auditor.calls(), before);
+    }
+
+    #[tokio::test]
+    async fn a_sender_over_its_window_gets_no_gate_review() {
+        let rig = rig_with(vec![], true, limited(2, 100, 100));
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        let out = args(&rig, "again");
+        assert_refused_without_review(&rig, "msg_send", out, "rate limited").await;
+    }
+
+    #[tokio::test]
+    async fn a_root_over_its_hourly_cap_gets_no_gate_review() {
+        let rig = rig_with(vec![], true, limited(100, 1, 100));
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        let out = args(&rig, "again");
+        assert_refused_without_review(&rig, "msg_send", out, "rate limited").await;
+    }
+
+    #[tokio::test]
+    async fn a_full_recipient_inbox_gets_no_gate_review() {
+        let rig = rig_with(vec![], true, limited(100, 100, 1));
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        let out = args(&rig, "again");
+        assert_refused_without_review(&rig, "msg_send", out, "recipient inbox full").await;
+    }
+
+    #[tokio::test]
+    async fn a_note_over_the_window_or_the_root_cap_gets_no_gate_review() {
+        let note = json!({"note": "reading"});
+        let rig = rig_with(vec![], true, limited(1, 100, 100));
+        rig.hub.set_note(&rig.sender, "first").unwrap();
+        assert_refused_without_review(&rig, "session_set_note", note.clone(), "rate limited").await;
+        let rig = rig_with(vec![], true, limited(100, 1, 100));
+        rig.hub.set_note(&rig.sender, "first").unwrap();
+        assert_refused_without_review(&rig, "session_set_note", note, "rate limited").await;
+    }
+
+    #[tokio::test]
+    async fn the_gate_review_takes_no_slot_and_no_inbox_room() {
+        let rig = rig_with(vec![], true, limited(2, 100, 3));
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        for _ in 0..5 {
+            let verdict = gate_verdict(&rig, "msg_send", args(&rig, "hello")).await;
+            assert!(matches!(verdict, ActionVerdict::Allow));
+            let noted = gate_verdict(&rig, "session_set_note", json!({"note": "x"})).await;
+            assert!(matches!(noted, ActionVerdict::Allow));
+        }
+        rig.hub.send(&rig.sender, send_request(&rig)).await.unwrap();
+        let over = rig.hub.send(&rig.sender, send_request(&rig)).await;
+        assert!(matches!(over, Err(HubError::RateLimited(_))), "{over:?}");
+        assert_eq!(unread(&rig), 2);
     }
 
     #[test]

@@ -3834,7 +3834,7 @@ mod scheduler_tests {
         pred: impl Fn(&TaskStatus) -> bool,
     ) -> Task {
         let mut last = None;
-        for _ in 0..500 {
+        for _ in 0..200 {
             let task = manager.poll(id).await.unwrap();
             if pred(&task.status) {
                 return task;

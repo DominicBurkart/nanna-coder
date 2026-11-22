@@ -58,6 +58,16 @@ fn prune(times: &mut VecDeque<DateTime<Utc>>, now: DateTime<Utc>, secs: i64) {
     }
 }
 
+fn live(
+    times: Option<&VecDeque<DateTime<Utc>>>,
+    now: DateTime<Utc>,
+    secs: i64,
+) -> VecDeque<DateTime<Utc>> {
+    let floor = now - Duration::seconds(secs);
+    let all = times.cloned().unwrap_or_default();
+    all.into_iter().filter(|at| *at > floor).collect()
+}
+
 fn retry_after(
     times: &VecDeque<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -120,6 +130,32 @@ impl Windows {
         Ok(())
     }
 
+    pub(crate) fn check(
+        &self,
+        now: DateTime<Utc>,
+        sender: &SessionId,
+        root: &RootId,
+        limits: &HubLimits,
+    ) -> Result<(), HubError> {
+        let own = live(self.sender.get(sender), now, SENDER_WINDOW_SECS);
+        let shared = live(self.root.get(root), now, ROOT_WINDOW_SECS);
+        if own.len() >= limits.per_sender_per_10m as usize {
+            return Err(HubError::RateLimited(retry_after(
+                &own,
+                now,
+                SENDER_WINDOW_SECS,
+            )));
+        }
+        if shared.len() >= limits.per_root_per_hour as usize {
+            return Err(HubError::RateLimited(retry_after(
+                &shared,
+                now,
+                ROOT_WINDOW_SECS,
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn reserve(&mut self, recipients: &[SessionId]) {
         for id in recipients {
             *self.reserved.entry(id.clone()).or_default() += 1;
@@ -150,6 +186,48 @@ mod tests {
 
     fn id(name: &str) -> SessionId {
         SessionId::from_task(TaskId(name.into()))
+    }
+
+    #[test]
+    fn check_never_consumes_a_slot_and_matches_admit() {
+        let limits = HubLimits {
+            per_sender_per_10m: 2,
+            per_root_per_hour: 3,
+            ..HubLimits::default()
+        };
+        let (a, b, root) = (id("a"), id("b"), RootId::mcp(uuid::Uuid::nil()));
+        let mut windows = Windows::default();
+        for _ in 0..5 {
+            assert!(windows.check(at(0), &a, &root, &limits).is_ok());
+        }
+        assert_eq!(windows.tracked(), (0, 0));
+        windows.admit(at(0), &a, &root, &limits).unwrap();
+        windows.admit(at(1), &a, &root, &limits).unwrap();
+        assert!(matches!(
+            windows.check(at(2), &a, &root, &limits),
+            Err(HubError::RateLimited(_))
+        ));
+        assert!(windows.check(at(2), &b, &root, &limits).is_ok());
+        windows.admit(at(2), &b, &root, &limits).unwrap();
+        assert!(matches!(
+            windows.check(at(3), &b, &root, &limits),
+            Err(HubError::RateLimited(_))
+        ));
+        assert_eq!(windows.sender_slots(&a), 2);
+    }
+
+    #[test]
+    fn check_counts_only_the_live_window_with_a_strict_boundary() {
+        let limits = HubLimits {
+            per_sender_per_10m: 1,
+            ..HubLimits::default()
+        };
+        let (a, root) = (id("a"), RootId::mcp(uuid::Uuid::nil()));
+        let mut windows = Windows::default();
+        windows.admit(at(0), &a, &root, &limits).unwrap();
+        assert!(windows.check(at(599), &a, &root, &limits).is_err());
+        assert!(windows.check(at(600), &a, &root, &limits).is_ok());
+        assert_eq!(windows.sender_slots(&a), 1);
     }
 
     #[test]
