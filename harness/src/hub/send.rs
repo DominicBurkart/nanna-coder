@@ -210,6 +210,11 @@ impl MessageHub {
         stored.map_err(note_error)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registry(&self) -> &Arc<SessionRegistry> {
+        &self.registry
+    }
+
     /// Send quarantine events to `sink`.
     pub fn with_quarantine_sink(mut self, sink: Arc<dyn QuarantineSink>) -> Self {
         self.sink = sink;

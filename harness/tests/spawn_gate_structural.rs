@@ -1193,6 +1193,7 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "default_provider",
             "escalations",
             "escalator",
+            "hub",
             "identities",
             "image_cache",
             "leases",

@@ -371,6 +371,7 @@ struct TaskRunner {
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
     sessions: std::sync::RwLock<Option<Arc<SessionRegistry>>>,
+    hub: std::sync::RwLock<Option<Arc<crate::hub::send::MessageHub>>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -579,6 +580,19 @@ async fn audit_restored(
 
 pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Everything a restore needs except the audit deadline and the session registry.
+pub struct RestoreParts<'a> {
+    pub max_concurrent_tasks: usize,
+    pub policy: Box<dyn SchedulingPolicy>,
+    pub store: Box<dyn QueueStore>,
+    pub leases: Arc<dyn LeaseStore>,
+    pub provider: Arc<dyn ModelProvider>,
+    pub identities: &'a crate::identity::IdentityCatalog,
+    pub escalations: crate::escalation::EscalationPlane,
+    pub action_gate: Arc<ActionGate>,
+    pub spawn_gate: &'a SpawnGate,
+}
+
 enum RestoreAudit<'a> {
     Gate(&'a SpawnGate, std::time::Duration),
     Sessions(&'a SpawnGate, std::time::Duration, Arc<SessionRegistry>),
@@ -756,21 +770,63 @@ impl TaskManager {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn restore_within_sessions(
-        n: usize,
-        p: Box<dyn SchedulingPolicy>,
-        s: Box<dyn QueueStore>,
-        l: Arc<dyn LeaseStore>,
-        v: Arc<dyn ModelProvider>,
-        i: &crate::identity::IdentityCatalog,
-        e: impl Into<crate::escalation::EscalationPlane>,
-        a: Arc<ActionGate>,
-        g: &SpawnGate,
-        d: std::time::Duration,
-        r: Arc<SessionRegistry>,
+    pub(crate) async fn restore_without_sessions(
+        parts: RestoreParts<'_>,
+        deadline: std::time::Duration,
     ) -> Result<Self, QueueStoreError> {
-        Self::restore_inner(n, p, s, l, v, i, e, a, RestoreAudit::Sessions(g, d, r)).await
+        let RestoreParts {
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            escalations,
+            action_gate,
+            spawn_gate,
+        } = parts;
+        Self::restore_inner(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            escalations,
+            action_gate,
+            RestoreAudit::Gate(spawn_gate, deadline),
+        )
+        .await
+    }
+
+    pub(crate) async fn restore_within_sessions(
+        parts: RestoreParts<'_>,
+        deadline: std::time::Duration,
+        registry: Arc<SessionRegistry>,
+    ) -> Result<Self, QueueStoreError> {
+        let RestoreParts {
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            escalations,
+            action_gate,
+            spawn_gate,
+        } = parts;
+        Self::restore_inner(
+            max_concurrent_tasks,
+            policy,
+            store,
+            leases,
+            provider,
+            identities,
+            escalations,
+            action_gate,
+            RestoreAudit::Sessions(spawn_gate, deadline, registry),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -927,6 +983,7 @@ impl TaskManager {
             cost_accountant: std::sync::RwLock::new(cost_accountant),
             ci_client: std::sync::RwLock::new(None),
             sessions: std::sync::RwLock::new(None),
+            hub: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -939,6 +996,17 @@ impl TaskManager {
     pub fn with_session_registry(self, registry: Arc<SessionRegistry>) -> Self {
         *self.runner.sessions.write().unwrap() = Some(registry);
         self
+    }
+
+    /// Keep `hub` alive for the life of this manager.
+    pub fn with_hub(self, hub: Arc<crate::hub::send::MessageHub>) -> Self {
+        *self.runner.hub.write().unwrap() = Some(hub);
+        self
+    }
+
+    /// The hub this manager was attached to, if any.
+    pub fn hub(&self) -> Option<Arc<crate::hub::send::MessageHub>> {
+        self.runner.hub.read().unwrap().clone()
     }
 
     /// Deliver protected-path violations from every task's workspace to `hook`.
@@ -8847,15 +8915,17 @@ mod session_registry_tests {
             queue.insert(entry).unwrap();
         }
         TaskManager::restore_within_sessions(
-            0,
-            Box::new(HybridPolicy::default()),
-            Box::new(queue),
-            Arc::new(InMemoryLeaseStore::default()),
-            provider(),
-            &fixture_catalog(),
-            Arc::new(EscalationLog::in_memory()),
-            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
-            gate,
+            RestoreParts {
+                max_concurrent_tasks: 0,
+                policy: Box::new(HybridPolicy::default()),
+                store: Box::new(queue),
+                leases: Arc::new(InMemoryLeaseStore::default()),
+                provider: provider(),
+                identities: &fixture_catalog(),
+                escalations: Arc::new(EscalationLog::in_memory()).into(),
+                action_gate: default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+                spawn_gate: gate,
+            },
             RESTORE_AUDIT_DEADLINE,
             registry,
         )
@@ -9041,5 +9111,171 @@ mod session_registry_tests {
         let manager = restore_with(&[&hostile], registry, &gate).await;
         let status = manager.poll(&hostile.id).await.unwrap().status;
         assert!(matches!(status, TaskStatus::Failed { .. }), "{status:?}");
+    }
+
+    mod hub_wiring {
+        use super::*;
+        use crate::action_auditor::{
+            FailClosedMessageAuditor, MessageAuditor, ModelMessageAuditor,
+        };
+        use crate::hub::lineage::SessionBinding;
+        use crate::hub::runtime::{HubPaths, HubRuntime};
+        use crate::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+
+        fn runtime() -> (Arc<InMemorySessionStore>, HubRuntime) {
+            let store = Arc::new(InMemorySessionStore::new());
+            let auditor = FailClosedMessageAuditor::new(ModelMessageAuditor::new(provider(), "m"));
+            let auditors: Arc<dyn MessageAuditor> = Arc::new(auditor);
+            let runtime = HubRuntime::assemble(
+                store.clone(),
+                Arc::new(InMemoryMessageStore::new()),
+                Arc::new(auditors),
+                Arc::new(crate::leases::SystemClock),
+            );
+            (store, runtime)
+        }
+
+        async fn binding(manager: &TaskManager, id: &TaskId) -> SessionBinding {
+            let lineage = manager.poll(id).await.unwrap().lineage.unwrap();
+            SessionBinding::from_proof(&allowed(MCP_PARENT).await, id.clone(), lineage)
+        }
+
+        #[tokio::test]
+        async fn the_manager_and_the_hub_hold_the_same_registry_instance() {
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(0));
+            let shared = runtime.registry().unwrap();
+            assert!(Arc::ptr_eq(
+                &shared,
+                &manager.runner.session_registry().unwrap()
+            ));
+            assert!(Arc::ptr_eq(&shared, manager.hub().unwrap().registry()));
+        }
+
+        #[tokio::test]
+        async fn a_cancel_through_the_manager_is_seen_by_the_hub_and_keeps_its_note() {
+            let repo = repo();
+            let (store, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(0));
+            let id = spawn(&manager, repo.path(), MCP_PARENT).await.unwrap();
+            let caller = binding(&manager, &id).await;
+            let hub = manager.hub().unwrap();
+            let noted = hub.set_note(&caller, "reading the parser").unwrap();
+            assert!(noted.is_some());
+            assert_eq!(session(&store, &id).note, noted);
+            manager.cancel(&id).await.unwrap();
+            let record = session(&store, &id);
+            assert_eq!(record.status, SessionStatus::Cancelled);
+            assert!(record.ended_at.is_some());
+            assert_eq!(record.note, noted);
+            let late = hub.set_note(&caller, "too late").unwrap_err();
+            assert!(matches!(
+                late,
+                crate::hub::error::HubError::RecipientInactive
+            ));
+            let after = session(&store, &id);
+            assert_eq!(after.status, SessionStatus::Cancelled);
+            assert_eq!(after.ended_at, record.ended_at);
+            assert_eq!(after.note, noted);
+        }
+
+        #[tokio::test]
+        async fn a_run_that_completes_stays_terminal_when_the_hub_writes_a_note_after_it() {
+            let repo = repo();
+            let (store, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let id = spawn(&manager, repo.path(), MCP_PARENT).await.unwrap();
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            let caller = binding(&manager, &id).await;
+            let hub = manager.hub().unwrap();
+            assert!(hub.set_note(&caller, "late note").is_err());
+            let record = session(&store, &id);
+            assert_eq!(record.status, SessionStatus::Completed);
+            assert!(record.ended_at.is_some());
+            assert_eq!(record.result_summary.as_deref(), Some("all done"));
+            assert_eq!(record.note, None);
+        }
+
+        #[tokio::test]
+        async fn a_restore_through_the_runtime_registers_in_the_shared_registry() {
+            let repo = repo();
+            let kept = entry(repo.path(), "Check PR status");
+            let (store, runtime) = runtime();
+            let manager = restore_via(&runtime, &[&kept]).await;
+            assert_eq!(session(&store, &kept.id).status, SessionStatus::Pending);
+            let shared = runtime.registry().unwrap();
+            assert!(Arc::ptr_eq(
+                &shared,
+                &manager.runner.session_registry().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &manager.hub().unwrap(),
+                &runtime.hub().unwrap()
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_restore_through_an_unavailable_runtime_registers_no_session_and_no_hub() {
+            let repo = repo();
+            let kept = entry(repo.path(), "Check PR status");
+            let manager = restore_via(&HubRuntime::unavailable(), &[&kept]).await;
+            assert!(manager.hub().is_none());
+            assert!(manager.runner.session_registry().is_none());
+            assert!(manager.poll(&kept.id).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn a_manager_that_is_never_attached_has_no_hub() {
+            assert!(TaskManager::new(0).hub().is_none());
+            let delegate = TaskManager::new(0).with_action_policy(
+                crate::windows::WindowSet::default(),
+                None,
+                crate::action_auditor::ActionAuditLog::in_memory(),
+            );
+            assert!(delegate.hub().is_none());
+            assert!(delegate.runner.session_registry().is_none());
+        }
+
+        #[tokio::test]
+        async fn the_runtime_over_real_files_shares_the_registry_end_to_end() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = HubPaths {
+                sessions: dir.path().join("sessions.jsonl"),
+                messages: dir.path().join("messages.jsonl"),
+            };
+            let opened = HubRuntime::open(&paths, provider(), "m");
+            assert!(opened.is_available());
+            let repo = repo();
+            let manager = opened.attach(TaskManager::new(0));
+            let id = spawn(&manager, repo.path(), MCP_PARENT).await.unwrap();
+            let caller = binding(&manager, &id).await;
+            assert!(manager.hub().unwrap().set_note(&caller, "x").is_ok());
+            assert!(std::fs::read_to_string(&paths.sessions)
+                .unwrap()
+                .contains(&id.0));
+        }
+
+        async fn restore_via(runtime: &HubRuntime, entries: &[&QueuedTask]) -> TaskManager {
+            let queue = InMemoryQueueStore::default();
+            for entry in entries {
+                queue.insert(entry).unwrap();
+            }
+            let gate = crate::auditor::test_support::fixture_gate();
+            runtime
+                .restore(RestoreParts {
+                    max_concurrent_tasks: 0,
+                    policy: Box::new(HybridPolicy::default()),
+                    store: Box::new(queue),
+                    leases: Arc::new(InMemoryLeaseStore::default()),
+                    provider: provider(),
+                    identities: &fixture_catalog(),
+                    escalations: Arc::new(EscalationLog::in_memory()).into(),
+                    action_gate: default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+                    spawn_gate: &gate,
+                })
+                .await
+                .unwrap()
+        }
     }
 }
