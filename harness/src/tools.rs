@@ -3466,6 +3466,13 @@ pub fn create_container_tool_registry_guarded(
             }
         }
     }
+    if crate::lean_tool::lean_project_dir(workspace_root).is_some() {
+        registry.register(Box::new(crate::lean_tool::LeanCheckTool::new(
+            workspace_root.to_path_buf(),
+            container_handle.clone(),
+            container_working_dir,
+        )));
+    }
     registry
 }
 
