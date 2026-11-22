@@ -82,6 +82,7 @@ pub fn daemon_restarted_status(now: DateTime<Utc>, iterations: usize) -> TaskSta
         error: "the daemon restarted while this task was running and no result was recorded; resubmit the task (retryable)".to_string(),
         diagnostics: FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "DaemonRestarted".to_string(),
             iterations_completed: iterations,
             last_tool_call: None,
@@ -964,6 +965,7 @@ mod tests {
                 qa_summary: Default::default(),
                 budget: Default::default(),
                 changes: capture,
+                tools_unavailable: vec![],
             },
         }
     }
