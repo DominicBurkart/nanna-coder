@@ -87,6 +87,9 @@ if env -i PATH="$WORK/nopodman" HOME="$WORK" "$BASH" "$SCRIPT" > /dev/null 2> "$
 else
   grep -qi 'podman' "$WORK/err" || fail "missing-podman error must mention podman"
 fi
+: > "$FAKE_PODMAN_LOG"
+if run_repos NANNA_LUMO_CARD="$WORK/none.toml" "$BASH" "$SCRIPT" > /dev/null 2>&1; then fail "an unreadable card must fail"; fi
+[[ ! -s "$FAKE_PODMAN_LOG" ]] || fail "an unreadable card must not reach podman"
 if "$BASH" "$SCRIPT" --bogus > /dev/null 2>&1; then fail "unknown flag must be rejected"; fi
 
 if [[ $FAILED -eq 0 ]]; then echo "PASS: lumo-repos"; fi

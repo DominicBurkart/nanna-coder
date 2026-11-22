@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CARD="${NANNA_LUMO_CARD:-$SCRIPT_DIR/lumo-config/agents/lumo.toml}"
 VOLUME_PREFIX="${NANNA_REPO_VOLUME_PREFIX:-nanna-repo-}"
-GIT_IMAGE="${NANNA_REPOS_IMAGE:-docker.io/alpine/git:latest}"
+GIT_IMAGE="${NANNA_REPOS_IMAGE:-docker.io/library/rust:1-bookworm}"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 require_podman() {
@@ -31,7 +31,8 @@ card_slugs() {
 declare -a NAMES=() VOLUMES=() SLUGS=()
 
 load_repos() {
-  local slug name
+  local slug name slugs
+  slugs="$(card_slugs)" || exit 2
   while IFS= read -r slug; do
     if [[ ! "$slug" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
       printf 'refusing malformed repository slug in the card: %s\n' "$slug" >&2
@@ -42,7 +43,7 @@ load_repos() {
     NAMES+=("$name")
     VOLUMES+=("$VOLUME_PREFIX$name")
     SLUGS+=("$slug")
-  done < <(card_slugs)
+  done <<< "$slugs"
 }
 
 list_repos() {

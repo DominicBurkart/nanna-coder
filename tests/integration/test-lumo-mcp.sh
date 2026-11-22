@@ -15,7 +15,7 @@ cat > "$WORK/bin/podman" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_PODMAN_LOG"
 case "${1:-} ${2:-}" in
-  "volume exists") [[ -e "$FAKE_VOLUME_FLAG" ]]; exit $? ;;
+  "volume exists") if [[ "${3:-}" == nanna-repo-* ]]; then [[ -e "$FAKE_VOLUME_DIR/$3" ]]; else [[ -e "$FAKE_VOLUME_FLAG" ]]; fi; exit $? ;;
   "volume rm") rm -f "$FAKE_VOLUME_FLAG"; exit 0 ;;
   "volume create") touch "$FAKE_VOLUME_FLAG"; exit 0 ;;
   "volume import") cat > "$FAKE_IMPORT_TAR"; exit 0 ;;
@@ -24,12 +24,15 @@ printf '%s\n' "$@" > "$FAKE_PODMAN_ARGV"
 cat
 FAKE
 chmod +x "$WORK/bin/podman"
-export FAKE_PODMAN_ARGV="$WORK/argv" FAKE_PODMAN_LOG="$WORK/log" FAKE_VOLUME_FLAG="$WORK/volume" FAKE_IMPORT_TAR="$WORK/import.tar"
+export FAKE_PODMAN_ARGV="$WORK/argv" FAKE_PODMAN_LOG="$WORK/log" FAKE_VOLUME_FLAG="$WORK/volume" FAKE_IMPORT_TAR="$WORK/import.tar" FAKE_VOLUME_DIR="$WORK/volumes"
+mkdir -p "$FAKE_VOLUME_DIR"
+REPOS="marigold personal-site-actix nanna-coder one_track"
+for r in $REPOS; do touch "$FAKE_VOLUME_DIR/nanna-repo-$r"; done
 : > "$FAKE_PODMAN_LOG"
 
 run_launcher() {
   env -i FAKE_PODMAN_ARGV="$FAKE_PODMAN_ARGV" FAKE_PODMAN_LOG="$FAKE_PODMAN_LOG" FAKE_VOLUME_FLAG="$FAKE_VOLUME_FLAG" \
-    FAKE_IMPORT_TAR="$FAKE_IMPORT_TAR" PATH="$WORK/bin:/usr/bin:/bin" HOME="$WORK/home" "$@"
+    FAKE_IMPORT_TAR="$FAKE_IMPORT_TAR" FAKE_VOLUME_DIR="$FAKE_VOLUME_DIR" PATH="$WORK/bin:/usr/bin:/bin" HOME="$WORK/home" "$@"
 }
 
 touch "$FAKE_VOLUME_FLAG"
@@ -37,9 +40,16 @@ ping='{"jsonrpc":"2.0","id":1,"method":"ping"}'
 run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > "$WORK/out"
 [[ "$(cat "$WORK/out")" == "$ping" ]] || fail "stdin must pass through to the container unchanged"
 
-expected=$'run\n--rm\n-i\n--pod\nnanna-coder-pod\n-v\nnanna-lumo-config:/etc/nanna:ro\n-e\nNANNA_CONFIG_DIR=/etc/nanna\nghcr.io/dominicburkart/nanna-coder/harness:latest\n/bin/nanna\nmcp-serve\n--model\ngemma4:e4b'
+expected=$'run\n--rm\n-i\n--pod\nnanna-coder-pod\n-v\nnanna-lumo-config:/etc/nanna:ro\n-v\nnanna-repo-marigold:/repos/marigold\n-v\nnanna-repo-personal-site-actix:/repos/personal-site-actix\n-v\nnanna-repo-nanna-coder:/repos/nanna-coder\n-v\nnanna-repo-one_track:/repos/one_track\n-e\nNANNA_CONFIG_DIR=/etc/nanna\nghcr.io/dominicburkart/nanna-coder/harness:latest\n/bin/nanna\nmcp-serve\n--model\ngemma4:e4b'
 [[ "$(cat "$FAKE_PODMAN_ARGV")" == "$expected" ]] || fail "default argv mismatch: $(cat "$FAKE_PODMAN_ARGV")"
 ! grep -q 'security-opt\|label=\|:z\|:Z' "$FAKE_PODMAN_ARGV" || fail "must never alter SELinux labelling or separation"
+! grep -q 'privileged\|--userns\|--cap-add' "$FAKE_PODMAN_ARGV" || fail "must not widen container privileges"
+mapfile -t vmounts < <(awk 'prev=="-v"{print} {prev=$0}' "$FAKE_PODMAN_ARGV")
+[[ ${#vmounts[@]} -eq 5 ]] || fail "expected the config volume plus one volume per card repo, got ${#vmounts[@]}"
+for v in "${vmounts[@]}"; do
+  [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*:/[A-Za-z0-9_/.-]+(:ro)?$ ]] || fail "mount must be a named volume, got: $v"
+  [[ "$v" != *'~'* && "$v" != *HOME* ]] || fail "mount must not reference the home directory: $v"
+done
 ! grep -q "$WORK/home" "$FAKE_PODMAN_ARGV" || fail "must not mount any host path into the container"
 
 run_launcher NANNA_MODEL=qwen3:0.6b NANNA_TAG=v1 NANNA_REGISTRY=reg.example/ns NANNA_POD=mypod NANNA_CONFIG_VOLUME=othervol \
@@ -57,6 +67,31 @@ else
   grep -q -- '--install-config' "$WORK/err" || fail "missing-volume error must point at --install-config"
 fi
 [[ ! -e "$FAKE_PODMAN_ARGV" ]] || fail "no container may start without the capability config"
+touch "$FAKE_VOLUME_FLAG"
+
+rm -f "$FAKE_VOLUME_DIR/nanna-repo-marigold"
+if run_launcher "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2> "$WORK/err"; then
+  fail "must fail closed when a repo volume named by the card is missing"
+else
+  [[ $? -eq 3 ]] || fail "missing repo volume must exit 3"
+  grep -q 'lumo-repos.sh' "$WORK/err" || fail "missing-repo error must point at lumo-repos.sh"
+  grep -q 'nanna-repo-marigold' "$WORK/err" || fail "missing-repo error must name the volume"
+fi
+[[ ! -e "$FAKE_PODMAN_ARGV" ]] || fail "no container may start with a missing repo volume"
+
+run_launcher NANNA_REPOS=nanna-coder,personal-site-actix "$BASH" "$LAUNCHER" < /dev/null > /dev/null
+grep -qx 'nanna-repo-nanna-coder:/repos/nanna-coder' "$FAKE_PODMAN_ARGV" || fail "NANNA_REPOS must keep the named repos"
+! grep -q 'marigold\|one_track' "$FAKE_PODMAN_ARGV" || fail "NANNA_REPOS must drop unnamed repos"
+if run_launcher NANNA_REPOS=bogus "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2>&1; then
+  fail "NANNA_REPOS naming a repo outside the card must be rejected"
+fi
+touch "$FAKE_VOLUME_DIR/nanna-repo-marigold"
+
+rm -f "$FAKE_PODMAN_ARGV"
+if run_launcher NANNA_LUMO_CARD="$WORK/no-such-card.toml" "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2>&1; then
+  fail "an unreadable card must fail closed"
+fi
+[[ ! -e "$FAKE_PODMAN_ARGV" ]] || fail "no container may start when the repo list cannot be read"
 
 : > "$FAKE_PODMAN_LOG"
 run_launcher "$BASH" "$LAUNCHER" --install-config > /dev/null
