@@ -211,34 +211,8 @@ mod tests {
     use crate::hub::store::{InMemoryMessageStore, InMemorySessionStore};
     use std::fs;
 
-    struct Offline;
-
-    #[async_trait::async_trait]
-    impl ModelProvider for Offline {
-        async fn chat(
-            &self,
-            _request: model::types::ChatRequest,
-        ) -> model::ModelResult<model::types::ChatResponse> {
-            Err(model::ModelError::ServiceUnavailable {
-                message: "offline".to_string(),
-            })
-        }
-
-        async fn list_models(&self) -> model::ModelResult<Vec<model::types::ModelInfo>> {
-            Ok(Vec::new())
-        }
-
-        async fn health_check(&self) -> model::ModelResult<()> {
-            Ok(())
-        }
-
-        fn provider_name(&self) -> &'static str {
-            "offline"
-        }
-    }
-
     fn provider() -> Arc<dyn ModelProvider> {
-        Arc::new(Offline)
+        Arc::new(model::OllamaProvider::new(model::OllamaConfig::default()).unwrap())
     }
 
     fn paths(dir: &Path) -> HubPaths {

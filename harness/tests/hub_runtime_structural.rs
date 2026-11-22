@@ -15,9 +15,8 @@ struct Target {
     members: &'static [&'static str],
 }
 
-#[derive(Default)]
 struct Scan {
-    target: Option<Target>,
+    target: Target,
     stack: Vec<String>,
     found: Vec<String>,
 }
@@ -29,14 +28,12 @@ impl Scan {
     }
 
     fn hits(&self, owner: Option<&syn::Ident>, member: &syn::Ident) -> bool {
-        let Some(target) = self.target else {
-            return false;
-        };
+        let target = self.target;
         owner.is_some_and(|o| o == target.owner) && target.members.iter().any(|name| member == name)
     }
 
     fn path(&mut self, path: &syn::Path) {
-        let Some(target) = self.target else { return };
+        let target = self.target;
         let segments: Vec<&syn::Ident> = path.segments.iter().map(|s| &s.ident).collect();
         for pair in segments.windows(2) {
             if self.hits(Some(pair[0]), pair[1]) {
@@ -46,7 +43,7 @@ impl Scan {
     }
 
     fn tokens(&mut self, stream: TokenStream) {
-        let Some(target) = self.target else { return };
+        let target = self.target;
         let flat: Vec<TokenTree> = stream.into_iter().collect();
         for (index, token) in flat.iter().enumerate() {
             match token {
@@ -107,11 +104,7 @@ impl<'ast> Visit<'ast> for Scan {
             if let syn::Type::Path(ty) = &*qself.ty {
                 let owner = ty.path.segments.last().map(|s| &s.ident);
                 if self.hits(owner, &last.ident) {
-                    self.note(&format!(
-                        "<{}>::{}",
-                        self.target.map_or("", |t| t.owner),
-                        last.ident
-                    ));
+                    self.note(&format!("<{}>::{}", self.target.owner, last.ident));
                 }
             }
         }
@@ -123,7 +116,8 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        if let (Some(target), syn::Type::Path(ty)) = (self.target, &*node.ty) {
+        if let syn::Type::Path(ty) = &*node.ty {
+            let target = self.target;
             if ty
                 .path
                 .segments
@@ -143,7 +137,7 @@ impl<'ast> Visit<'ast> for Scan {
 
 impl Scan {
     fn use_tree(&mut self, tree: &syn::UseTree) {
-        let Some(target) = self.target else { return };
+        let target = self.target;
         match tree {
             syn::UseTree::Rename(rename) if rename.ident == target.owner => {
                 self.note(&format!("rename of {}", target.owner));
@@ -158,8 +152,9 @@ impl Scan {
 fn scan(text: &str, target: Target) -> Vec<String> {
     let file = syn::parse_file(text).expect("source parses");
     let mut scan = Scan {
-        target: Some(target),
-        ..Scan::default()
+        target,
+        stack: Vec::new(),
+        found: Vec::new(),
     };
     scan.visit_file(&file);
     scan.found
