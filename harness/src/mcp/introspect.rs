@@ -1,6 +1,7 @@
 use super::handlers::{text_tool_result, wire_status};
+use super::resolve::{self, Refusal};
 use crate::auditor::SpawnGate;
-use crate::identity::{AgentIdentity, IdentityCatalog, AUDITOR_IDENTITY};
+use crate::identity::{AgentIdentity, AUDITOR_IDENTITY};
 use crate::task::{Task, TaskManager};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -49,6 +50,8 @@ pub fn is_introspection_tool(name: &str) -> bool {
 fn card(identity: &AgentIdentity) -> Value {
     json!({
         "name": identity.name(),
+        "role": role(identity.name()),
+        "assignable": resolve::is_assignable(identity.name()),
         "description": identity.identity.description,
         "loop": identity.identity.dev_loop.to_string(),
         "model": identity.identity.model,
@@ -63,33 +66,77 @@ fn card(identity: &AgentIdentity) -> Value {
     })
 }
 
-fn visible(catalog: &IdentityCatalog) -> impl Iterator<Item = &AgentIdentity> {
-    catalog.iter().filter(|i| i.name() != AUDITOR_IDENTITY)
+fn role(name: &str) -> &'static str {
+    if name == AUDITOR_IDENTITY {
+        "auditor"
+    } else {
+        "agent"
+    }
 }
 
 pub fn list_identities(gate: &SpawnGate) -> Value {
-    let cards: Vec<Value> = visible(gate.context().catalog()).map(card).collect();
+    let cards: Vec<Value> = gate.context().catalog().iter().map(card).collect();
     text_tool_result(&json!({ "identities": cards }))
 }
 
-pub fn describe_identity(gate: &SpawnGate, params: &Value) -> Result<Value, String> {
+pub fn annotate_assign_task(tools: &mut Value, gate: &SpawnGate) {
+    let catalog = gate.context().catalog();
+    let assignable = resolve::assignable_identities(catalog);
+    let listing: Vec<String> = assignable
+        .iter()
+        .map(|card| {
+            format!(
+                "{} (max_effect {}; repos: {})",
+                card.name(),
+                card.scope.max_effect,
+                if card.scope.repos.is_empty() {
+                    "none".to_string()
+                } else {
+                    card.scope.repos.join(", ")
+                }
+            )
+        })
+        .collect();
+    let description = format!(
+        "Name of an assignable agent identity. The task runs under that identity's scope (tools, effect ceiling, paths, repos). Optional when exactly one identity is assignable. Assignable identities: {}.",
+        if listing.is_empty() { "none".to_string() } else { listing.join("; ") }
+    );
+    let names: Vec<&str> = assignable.iter().map(|card| card.name()).collect();
+    let Some(tool) = tools
+        .as_array_mut()
+        .and_then(|list| list.iter_mut().find(|t| t["name"] == "assign_task"))
+    else {
+        return;
+    };
+    let property = &mut tool["inputSchema"]["properties"]["identity"];
+    property["description"] = Value::String(description);
+    if !names.is_empty() {
+        property["enum"] = json!(names);
+    }
+}
+
+pub fn describe_identity(gate: &SpawnGate, params: &Value) -> Result<Value, Refusal> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .filter(|n| !n.is_empty())
         .ok_or_else(|| "Missing required argument: name".to_string())?;
     let global = gate.context().catalog();
-    let known = || {
-        visible(global)
+    let unknown = || {
+        let known = resolve::assignable_identities(global)
+            .iter()
             .map(|i| i.name())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", ");
+        Refusal::new(
+            "unknown_identity",
+            format!("Unknown identity `{name}`; known identities: {known}"),
+            "Pass one of the names in assignable_identities.",
+        )
+        .with("assignable_identities", resolve::identity_summaries(global))
     };
-    if name == AUDITOR_IDENTITY || global.get(name).is_none() {
-        return Err(format!(
-            "Unknown identity `{name}`; known identities: {}",
-            known()
-        ));
+    if global.get(name).is_none() {
+        return Err(unknown());
     }
     let layered;
     let catalog = match params.get("repo_path").and_then(Value::as_str) {
@@ -102,9 +149,7 @@ pub fn describe_identity(gate: &SpawnGate, params: &Value) -> Result<Value, Stri
         }
         None => global,
     };
-    let identity = catalog
-        .get(name)
-        .ok_or_else(|| format!("Unknown identity `{name}`; known identities: {}", known()))?;
+    let identity = catalog.get(name).ok_or_else(unknown)?;
     Ok(text_tool_result(&card(identity)))
 }
 
@@ -118,19 +163,25 @@ fn task_row(task: &Task) -> Value {
         "status": wire_status(&task.status).0,
         "created_at": task.created_at.to_rfc3339(),
         "updated_at": task.last_updated_at.to_rfc3339(),
+        "identity": task.identity_hint,
         "identity_hint": task.identity_hint,
         "description": truncate(&task.description),
     })
 }
 
-pub async fn list_tasks(manager: &TaskManager, params: &Value) -> Result<Value, String> {
+pub async fn list_tasks(manager: &TaskManager, params: &Value) -> Result<Value, Refusal> {
     let status = match params.get("status").and_then(Value::as_str) {
         Some(s) if STATUSES.contains(&s) => Some(s),
         Some(other) => {
-            return Err(format!(
-                "Unknown status `{other}`; expected one of: {}",
-                STATUSES.join(", ")
-            ))
+            return Err(Refusal::new(
+                "invalid_arguments",
+                format!(
+                    "Unknown status `{other}`; expected one of: {}",
+                    STATUSES.join(", ")
+                ),
+                "Pass one of valid_statuses or omit `status`.",
+            )
+            .with("valid_statuses", json!(STATUSES)))
         }
         None => None,
     };
