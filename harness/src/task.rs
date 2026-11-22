@@ -9333,7 +9333,7 @@ mod session_registry_tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            false
+            table.is_empty()
         }
 
         fn done() -> Vec<model::types::ChatResponse> {
@@ -9527,6 +9527,7 @@ mod session_registry_tests {
 
         #[tokio::test]
         async fn the_routed_constructor_reaches_a_live_router_for_message_tools_only() {
+            use crate::action_auditor::ActionVerdict::Block as B;
             let (_, runtime) = runtime();
             let gate = TaskManager::action_policy_gate_routed(
                 Arc::new(InMemoryLeaseStore::default()),
@@ -9535,17 +9536,12 @@ mod session_registry_tests {
                 crate::action_auditor::ActionAuditLog::in_memory(),
                 runtime.router_weak(),
             );
-            let verdict = gate.run_gate(&review("msg_send"), &context_at()).await;
-            let crate::action_auditor::ActionVerdict::Block { reasons } = verdict else {
-                panic!("expected a block");
-            };
+            let v = gate.run_gate(&review("msg_send"), &context_at()).await;
+            let B { reasons } = v else { unreachable!() };
             assert_eq!(reasons[0].detail, "no session is bound to this call");
-            let sessions = gate
-                .run_gate(&review("sessions_query"), &context_at())
-                .await;
-            let crate::action_auditor::ActionVerdict::Block { reasons } = sessions else {
-                panic!("expected a block");
-            };
+            let (rq, cx) = (review("sessions_query"), context_at());
+            let q = gate.run_gate(&rq, &cx).await;
+            let B { reasons } = q else { unreachable!() };
             assert_eq!(
                 reasons[0].detail,
                 "message router does not handle this message tool"

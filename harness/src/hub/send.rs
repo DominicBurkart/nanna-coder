@@ -493,12 +493,7 @@ impl MessageHub {
 
     /// Tell the sink a note was quarantined by the gate. A note has no recipients, so nothing is
     /// stored: the event carries the hash and length only.
-    pub fn quarantine_note(
-        &self,
-        sender: &SessionBinding,
-        note: &str,
-        codes: Vec<ReasonCode>,
-    ) -> Result<(), HubError> {
+    pub fn quarantine_note(&self, sender: &SessionBinding, note: &str, codes: Vec<ReasonCode>) {
         let event = QuarantineEvent {
             ids: Vec::new(),
             from: sender.session().clone(),
@@ -509,7 +504,6 @@ impl MessageHub {
         if self.sink.quarantined(&event).is_err() {
             tracing::error!("note quarantine escalation was not delivered");
         }
-        Ok(())
     }
 
     /// Send `req` from `sender`. Every failure leaves nothing delivered.

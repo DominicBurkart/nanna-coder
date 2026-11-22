@@ -342,8 +342,8 @@ impl OutboundRouter for HubRouter {
             stored.map(drop).map_err(|_| unrecorded())
         } else {
             let note = note_of(review).ok_or_else(unrecorded)?;
-            let noted = self.hub.quarantine_note(&sender, note, codes);
-            noted.map_err(|_| unrecorded())
+            self.hub.quarantine_note(&sender, note, codes);
+            Ok(())
         }
     }
 }
@@ -425,12 +425,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Recording(Mutex<Vec<QuarantineEvent>>);
+    struct Recording(Mutex<Vec<QuarantineEvent>>, std::sync::atomic::AtomicBool);
 
     impl QuarantineSink for Recording {
         fn quarantined(&self, event: &QuarantineEvent) -> Result<(), String> {
             self.0.lock().unwrap().push(event.clone());
-            Ok(())
+            match self.1.load(Ordering::SeqCst) {
+                true => Err("sink down".to_string()),
+                false => Ok(()),
+            }
         }
     }
 
@@ -635,10 +638,10 @@ mod tests {
     }
 
     fn denied(result: ToolResult<Value>) -> crate::action_auditor::ActionDenied {
-        match result {
-            Err(ToolError::ActionDenied(denied)) => denied,
-            other => panic!("expected a denial, got {other:?}"),
-        }
+        use ToolError::ActionDenied as Den;
+        let error = result.unwrap_err();
+        let Den(denied) = error else { unreachable!() };
+        denied
     }
 
     fn quarantine(code: ReasonCode, detail: &str) -> MessageVerdict {
@@ -845,6 +848,52 @@ mod tests {
         let note = "n".repeat(500);
         let out = call(&rig, "session_set_note", json!({"note": note})).await;
         assert!(denied(out).reasons()[0].detail.starts_with("note exceeds"));
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_is_down_does_not_stop_a_note_quarantine_from_halting() {
+        let rig = rig(
+            vec![Ok(MessageVerdict::Quarantine { reasons: vec![] })],
+            true,
+        );
+        rig.sink.1.store(true, Ordering::SeqCst);
+        let out = call(&rig, "session_set_note", json!({"note": "x"})).await;
+        assert!(denied(out).is_escalation());
+        assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_tools_declare_themselves_and_the_routing_auditor_names_its_default() {
+        let rig = rig(vec![], true);
+        let mut names: Vec<String> = rig
+            .registry
+            .get_definitions()
+            .iter()
+            .map(|definition| definition.function.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["msg_send", "session_set_note"]);
+        let routing = RoutingActionAuditor::new(Arc::downgrade(&rig.router), rig.default.clone());
+        assert_eq!(routing.name(), "counting");
+    }
+
+    #[test]
+    fn the_production_auditors_build_one_auditor_per_sender() {
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let registry = SessionRegistry::new(sessions.clone());
+        let sender = binding(&registry, "mine", &RootId::mcp(Uuid::from_u128(3)));
+        let auditors = ProductionAuditors::new(
+            Arc::new(model::OllamaProvider::new(model::OllamaConfig::default()).unwrap()),
+            "m",
+            sessions,
+            Arc::new(InMemoryMessageStore::new()),
+            BindingTable::new(),
+            Arc::new(Runner(Mutex::new(Vec::new()))),
+        );
+        let first = auditors.for_sender(&sender);
+        let second = auditors.for_sender(&sender);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!first.name().is_empty());
     }
 
     #[test]
