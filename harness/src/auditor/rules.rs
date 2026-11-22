@@ -283,17 +283,22 @@ fn needed_effect(request: &SpawnRequest, identity: &AgentIdentity) -> (EffectCla
     let ceiling = identity.scope.max_effect;
     let mut needed = request.requested_effect;
     let mut reasons = Vec::new();
+    let inferred = RuleAuditor::implied_effect(&request.subtask);
     if request.requested_effect > ceiling {
-        reasons.push(Reason::new(
-            ReasonCode::EffectAboveCeiling,
-            format!(
+        let detail = match &inferred {
+            Some((implied, phrase)) if *implied >= request.requested_effect => format!(
+                "needs `{implied}` (inferred from {phrase:?} in the task text; requested_effect can only raise it, never lower it); `{}` is capped at `{ceiling}` - rephrase the task or choose an identity with a higher ceiling",
+                identity.name()
+            ),
+            _ => format!(
                 "requested `{}` but `{}` is capped at `{ceiling}`",
                 request.requested_effect,
                 identity.name()
             ),
-        ));
+        };
+        reasons.push(Reason::new(ReasonCode::EffectAboveCeiling, detail));
     }
-    if let Some((implied, phrase)) = RuleAuditor::implied_effect(&request.subtask) {
+    if let Some((implied, phrase)) = inferred {
         if implied > ceiling && implied > request.requested_effect {
             reasons.push(Reason::new(ReasonCode::ScopeCreep, format!("subtask says {phrase:?}, which needs `{implied}`; `{}` is capped at `{ceiling}`", identity.name())));
         }
@@ -494,6 +499,82 @@ pub(crate) mod tests {
             verdict.reasons()[1].detail,
             "cards that do reach `ci`: deployer, pr-shepherd"
         );
+    }
+
+    fn derived(text: &str, caller: Option<EffectClass>) -> SpawnRequest {
+        SpawnRequest::derive_tightened(
+            &catalog(true),
+            crate::auditor::TaskSummary::new("task-1", "Parent task", "github.com/example/repo"),
+            "rust-implementer",
+            text,
+            caller,
+            None,
+        )
+    }
+
+    fn ceiling_detail(text: &str, caller: Option<EffectClass>) -> String {
+        let verdict = RuleAuditor::new().evaluate(&derived(text, caller), &context(true));
+        assert_eq!(verdict.kind(), VerdictKind::Block);
+        verdict
+            .reasons()
+            .iter()
+            .find(|reason| reason.code == ReasonCode::EffectAboveCeiling)
+            .expect("an effect_above_ceiling reason")
+            .detail
+            .clone()
+    }
+
+    const TEXT_IMPLIED_CI: &str = "Trigger the CI pipeline for the branch.";
+    const TEXT_IMPLIED_CI_MESSAGE: &str = "needs `ci` (inferred from \"Trigger the CI pipeline\" in the task text; requested_effect can only raise it, never lower it); `rust-implementer` is capped at `repository` - rephrase the task or choose an identity with a higher ceiling";
+
+    #[test]
+    fn text_implied_effect_is_named_when_the_caller_omitted_the_field() {
+        assert_eq!(
+            ceiling_detail(TEXT_IMPLIED_CI, None),
+            TEXT_IMPLIED_CI_MESSAGE
+        );
+    }
+
+    #[test]
+    fn text_implied_effect_is_named_when_the_caller_asked_for_less() {
+        assert_eq!(
+            ceiling_detail(TEXT_IMPLIED_CI, Some(EffectClass::Workspace)),
+            TEXT_IMPLIED_CI_MESSAGE
+        );
+    }
+
+    #[test]
+    fn caller_request_is_blamed_only_when_it_exceeds_what_the_text_implies() {
+        assert_eq!(
+            ceiling_detail(TEXT_IMPLIED_CI, Some(EffectClass::Production)),
+            "requested `production` but `rust-implementer` is capped at `repository`"
+        );
+        assert_eq!(
+            ceiling_detail("Add a test.", Some(EffectClass::Ci)),
+            "requested `ci` but `rust-implementer` is capped at `repository`"
+        );
+    }
+
+    #[test]
+    fn effective_effect_is_the_stricter_of_caller_and_text_for_every_caller_value() {
+        let texts = [
+            "Add a test.",
+            TEXT_IMPLIED_CI,
+            "Push the branch to origin.",
+            "Deploy build 42 to production.",
+        ];
+        for text in texts {
+            let implied =
+                RuleAuditor::implied_effect(text).map_or(EffectClass::None, |(effect, _)| effect);
+            assert_eq!(derived(text, None).requested_effect, implied);
+            for caller in EffectClass::ALL {
+                assert_eq!(
+                    derived(text, Some(caller)).requested_effect,
+                    caller.max(implied),
+                    "{text} / {caller}"
+                );
+            }
+        }
     }
 
     #[test]

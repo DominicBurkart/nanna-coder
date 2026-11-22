@@ -212,7 +212,7 @@ impl NannaMcpServer {
                         },
                         "requested_effect": {
                             "type": "string",
-                            "description": "Effect class the task is expected to reach (none, workspace, repository, ci, sandbox, production). The auditor refuses it when it exceeds the identity's ceiling. Defaults to the identity's ceiling."
+                            "description": "Effect class the task is expected to reach (none, workspace, repository, ci, sandbox, production). It can only raise, never lower, the effect the task text implies (for example pushing a branch implies repository). Omitted means the effect implied by the task text (none when it implies nothing). The auditor refuses the task when the resulting effect exceeds the identity's ceiling."
                         },
                         "dev_loop": {
                             "type": "string",
