@@ -181,9 +181,10 @@ impl MessageHub {
                 page.all_peers_waiting = self.peers_waiting(to);
                 return Ok(page);
             }
-            let step = left.min(RECV_POLL_MILLIS);
-            self.clock.sleep(Duration::milliseconds(step)).await;
-            left -= step;
+            self.clock
+                .sleep(Duration::milliseconds(RECV_POLL_MILLIS))
+                .await;
+            left -= RECV_POLL_MILLIS;
         }
     }
 
