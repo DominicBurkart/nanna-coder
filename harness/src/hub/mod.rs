@@ -3,6 +3,7 @@ pub mod limits;
 pub mod lineage;
 pub mod message;
 pub mod oracle;
+pub mod query;
 pub mod reach;
 pub mod recv;
 pub mod registry;
