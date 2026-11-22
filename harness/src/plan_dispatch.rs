@@ -548,7 +548,9 @@ fn settle(status: Option<TaskStatus>, task: TaskId) -> ChildState {
             diagnostics: Box::new(diagnostics),
         },
         Some(TaskStatus::Cancelled { .. }) => ChildState::Cancelled(task),
-        Some(TaskStatus::Pending | TaskStatus::Running { .. }) => ChildState::Running(task),
+        Some(TaskStatus::Auditing | TaskStatus::Pending | TaskStatus::Running { .. }) => {
+            ChildState::Running(task)
+        }
         None => ChildState::Lost(task),
     }
 }
