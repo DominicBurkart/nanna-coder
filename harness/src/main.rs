@@ -1686,11 +1686,28 @@ fn resolve_escalation_plane_with(
     )?)
 }
 
+fn resolve_audit_timeout(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+    Ok(harness::task::audit_timeout_from(lookup)?)
+}
+
 fn build_spawn_gate(
     catalog: &IdentityCatalog,
     log: harness::auditor::AuditLog,
     hook: Box<dyn harness::auditor::SpawnEscalationHook>,
     model: Option<(std::sync::Arc<dyn model::ModelProvider>, String)>,
+) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
+    let timeout = resolve_audit_timeout(&|key| std::env::var_os(key))?;
+    build_spawn_gate_with(catalog, log, hook, model, timeout)
+}
+
+fn build_spawn_gate_with(
+    catalog: &IdentityCatalog,
+    log: harness::auditor::AuditLog,
+    hook: Box<dyn harness::auditor::SpawnEscalationHook>,
+    model: Option<(std::sync::Arc<dyn model::ModelProvider>, String)>,
+    timeout: std::time::Duration,
 ) -> Result<harness::auditor::SpawnGate, Box<dyn std::error::Error>> {
     use harness::auditor::{AuditContext, Auditor, FailClosedModelAuditor, RuleAuditor, SpawnGate};
     use harness::identity::AUDITOR_IDENTITY;
@@ -1700,7 +1717,9 @@ fn build_spawn_gate(
     })?;
     let context = AuditContext::new(catalog.clone(), auditor.clone())?;
     let spawn_auditor: Box<dyn Auditor> = match model {
-        Some((provider, name)) => Box::new(FailClosedModelAuditor::new(provider, name)),
+        Some((provider, name)) => {
+            Box::new(FailClosedModelAuditor::new(provider, name).with_timeout(timeout))
+        }
         None => Box::new(RuleAuditor::new()),
     };
     Ok(SpawnGate::with_hook(spawn_auditor, log, context, hook))
@@ -3313,6 +3332,118 @@ mod tests {
             text,
         );
         gate.check(request).await
+    }
+
+    fn audit_env(value: Option<&'static str>) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |key| {
+            (key == "NANNA_AUDIT_TIMEOUT_SECS")
+                .then(|| value.map(std::ffi::OsString::from))
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn the_audit_timeout_defaults_to_sixty_seconds() {
+        let timeout = resolve_audit_timeout(&audit_env(None)).unwrap();
+        assert_eq!(timeout, std::time::Duration::from_secs(60));
+        assert_eq!(timeout, harness::auditor::MODEL_AUDIT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_audit_timeout_env_value_is_honoured_across_the_accepted_range() {
+        for (raw, secs) in [("1", 1), ("240", 240), (" 90 ", 90), ("3600", 3600)] {
+            let timeout = resolve_audit_timeout(&audit_env(Some(raw))).unwrap();
+            assert_eq!(timeout, std::time::Duration::from_secs(secs), "{raw}");
+        }
+    }
+
+    #[test]
+    fn invalid_audit_timeouts_are_startup_errors_naming_the_variable() {
+        for raw in [
+            "0",
+            "3601",
+            "-5",
+            "abc",
+            "",
+            "1.5",
+            "60s",
+            "99999999999999999999",
+        ] {
+            let err = resolve_audit_timeout(&audit_env(Some(raw)))
+                .err()
+                .unwrap_or_else(|| panic!("{raw:?} must be rejected"));
+            assert!(
+                err.to_string().contains("NANNA_AUDIT_TIMEOUT_SECS"),
+                "{raw}"
+            );
+        }
+    }
+
+    struct SlowProvider {
+        inner: std::sync::Arc<RecordingProvider>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl model::ModelProvider for SlowProvider {
+        async fn chat(
+            &self,
+            request: model::types::ChatRequest,
+        ) -> model::ModelResult<model::types::ChatResponse> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.chat(request).await
+        }
+
+        async fn list_models(&self) -> model::ModelResult<Vec<model::types::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> model::ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "slow"
+        }
+    }
+
+    fn slow_gate(
+        delay_secs: u64,
+        timeout: std::time::Duration,
+    ) -> (
+        harness::auditor::SpawnGate,
+        std::sync::Arc<RecordingProvider>,
+    ) {
+        let inner = RecordingProvider::replying(vec![Ok(ALLOW.to_string())]);
+        let provider = std::sync::Arc::new(SlowProvider {
+            inner: inner.clone(),
+            delay: std::time::Duration::from_secs(delay_secs),
+        });
+        let gate = build_spawn_gate_with(
+            &fixture_catalog(),
+            harness::auditor::AuditLog::in_memory(),
+            spawn_escalation_hook(&quiet_plane()),
+            Some((
+                provider as std::sync::Arc<dyn model::ModelProvider>,
+                "m".into(),
+            )),
+            timeout,
+        )
+        .unwrap();
+        (gate, inner)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_model_slower_than_the_default_is_refused_but_passes_under_the_configured_timeout() {
+        let default = resolve_audit_timeout(&audit_env(None)).unwrap();
+        let (gate, _) = slow_gate(90, default);
+        let refused = check(&gate, BENIGN).await.unwrap_err();
+        assert!(refused.to_string().contains("no reply within 60s"));
+
+        let configured = resolve_audit_timeout(&audit_env(Some("120"))).unwrap();
+        let (gate, inner) = slow_gate(90, configured);
+        assert!(check(&gate, BENIGN).await.is_ok());
+        assert_eq!(inner.auditor_calls(), 1);
     }
 
     #[tokio::test]

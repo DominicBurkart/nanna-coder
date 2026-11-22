@@ -571,6 +571,29 @@ async fn audit_restored(
 
 pub const RESTORE_AUDIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
+pub const AUDIT_TIMEOUT_ENV: &str = "NANNA_AUDIT_TIMEOUT_SECS";
+const AUDIT_TIMEOUT_RANGE_SECS: std::ops::RangeInclusive<u64> = 1..=3600;
+
+pub fn audit_timeout_from(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::time::Duration, String> {
+    let Some(raw) = lookup(AUDIT_TIMEOUT_ENV) else {
+        return Ok(crate::auditor::MODEL_AUDIT_TIMEOUT);
+    };
+    raw.to_str()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|secs| AUDIT_TIMEOUT_RANGE_SECS.contains(secs))
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "{AUDIT_TIMEOUT_ENV} must be a whole number of seconds between {} and {}, got {:?}",
+                AUDIT_TIMEOUT_RANGE_SECS.start(),
+                AUDIT_TIMEOUT_RANGE_SECS.end(),
+                raw
+            )
+        })
+}
+
 enum RestoreAudit<'a> {
     Gate(&'a SpawnGate, std::time::Duration),
     #[cfg(test)]
@@ -696,7 +719,7 @@ impl TaskManager {
             escalations,
             action_gate,
             spawn_gate,
-            RESTORE_AUDIT_DEADLINE,
+            audit_timeout_from(&|key| std::env::var_os(key)).unwrap_or(RESTORE_AUDIT_DEADLINE),
         )
         .await
     }
