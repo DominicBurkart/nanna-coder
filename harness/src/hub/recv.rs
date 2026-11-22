@@ -2044,6 +2044,10 @@ mod tests {
         let flaky = Flaky::new();
         let policy = crate::hub::store::Retention::default();
         assert_eq!(flaky.prune(start(), &policy).unwrap(), 0);
+        assert!(flaky.get(MessageId::new()).unwrap().is_none());
+        let nobody = SessionId::from_task(TaskId("nobody".into()));
+        flaky.ack(nobody, Seq::new(1)).unwrap();
+        assert_eq!(Recorder::deliver().name(), "recorder");
         let sessions = FlakySessions {
             inner: InMemorySessionStore::new(),
             in_roots: AtomicUsize::new(0),
