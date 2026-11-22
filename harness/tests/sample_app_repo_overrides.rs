@@ -84,7 +84,11 @@ fn call(tool: &str, arguments: Value) -> ChatResponse {
 fn provider(calls: Vec<ChatResponse>) -> Arc<dyn ModelProvider> {
     let mut script = vec![message(Some("Plan: do it"), None, FinishReason::Stop)];
     script.extend(calls);
-    script.push(message(Some("performed"), None, FinishReason::Stop));
+    script.push(message(
+        Some("CANNOT: this scripted run has nothing more to change."),
+        None,
+        FinishReason::Stop,
+    ));
     script.push(message(Some("COMPLETE - done"), None, FinishReason::Stop));
     Arc::new(Script(Mutex::new(script)))
 }

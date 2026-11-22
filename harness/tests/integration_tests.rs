@@ -1486,6 +1486,7 @@ async fn test_agent_loop_tool_call_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -1554,6 +1555,7 @@ async fn test_agent_loop_multi_tool_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -1612,6 +1614,7 @@ async fn test_agent_loop_error_recovery_integration() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -1667,6 +1670,7 @@ async fn test_context_entity_stored_after_agent_run() {
         verbose: false,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -1814,6 +1818,7 @@ async fn test_e2e_agent_with_containerized_ollama() {
         verbose: true,
         system_prompt: "You are a helpful assistant. Use the echo tool when asked to echo something. After using the tool, respond with a brief summary.".to_string(),
         model_name: E2E_MODEL.to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -1980,7 +1985,9 @@ async fn test_e2e_task_lifecycle_success() {
 
     let manager = Arc::new(TaskManager::default());
     let provider: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
-        wrap_with_state_machine_responses(vec![make_stop_response("Task completed successfully")]),
+        wrap_with_state_machine_responses(vec![make_stop_response(
+            "CANNOT: Task completed successfully",
+        )]),
     ));
 
     let task_id = submit_audited(
@@ -2087,10 +2094,10 @@ async fn test_e2e_multiple_concurrent_tasks_complete_independently() {
 
     let manager = Arc::new(TaskManager::default());
     let provider_a: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
-        wrap_with_state_machine_responses(vec![make_stop_response("Result for task A")]),
+        wrap_with_state_machine_responses(vec![make_stop_response("CANNOT: Result for task A")]),
     ));
     let provider_b: Arc<dyn ModelProvider> = Arc::new(SequenceMockProvider::new(
-        wrap_with_state_machine_responses(vec![make_stop_response("Result for task B")]),
+        wrap_with_state_machine_responses(vec![make_stop_response("CANNOT: Result for task B")]),
     ));
 
     let repo_path = repo_dir.path().to_path_buf();
@@ -2176,6 +2183,7 @@ async fn test_state_machine_follows_architecture_with_tools() {
         verbose: true,
         system_prompt: "You are a helpful assistant.".to_string(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -2251,6 +2259,7 @@ async fn test_state_machine_query_loop() {
         verbose: true,
         system_prompt: String::new(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {
@@ -2307,6 +2316,7 @@ async fn test_state_machine_multi_perform_iterations() {
         verbose: true,
         system_prompt: String::new(),
         model_name: "test-model".to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {

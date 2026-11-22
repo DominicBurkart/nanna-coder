@@ -1609,6 +1609,7 @@ async fn run_agent(
         verbose,
         system_prompt: build_session_system_prompt(workspace_root),
         model_name: model.to_string(),
+        ..Default::default()
     };
 
     // Match the eval-runner shape: prompt enters via `user_prompt`, not via

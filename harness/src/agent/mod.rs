@@ -48,6 +48,9 @@ const COMPLETION_TEMPERATURE: f32 = 0.2;
 const DECISION_TEMPERATURE: f32 = 0.3;
 const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
 const MAX_TOOL_ITERATIONS: usize = 10;
+const FILE_EDIT_TOOLS: &[&str] = &["write_file"];
+const DEFAULT_MAX_NO_PROGRESS_NUDGES: usize = 2;
+const MAX_NO_PROGRESS_MESSAGE_CHARS: usize = 500;
 
 /// Errors that can occur in the agent
 #[derive(Error, Debug)]
@@ -78,6 +81,15 @@ pub enum AgentError {
     #[error("Wall-clock limit of {limit_secs}s exceeded after {iterations_completed} iterations")]
     WallClockExceeded {
         limit_secs: u64,
+        iterations_completed: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+        conversation_snapshot: Vec<ChatMessage>,
+        last_agent_state: AgentState,
+    },
+    #[error("Agent made no progress: it stopped {nudges} time(s) after being prompted without changing any files. Last message: {last_message}")]
+    NoProgress {
+        nudges: usize,
+        last_message: String,
         iterations_completed: usize,
         tool_calls_made: Vec<ToolCallRecord>,
         conversation_snapshot: Vec<ChatMessage>,
@@ -119,6 +131,13 @@ impl AgentError {
                 last_agent_state,
             }
             | AgentError::WallClockExceeded {
+                tool_calls_made,
+                conversation_snapshot,
+                iterations_completed,
+                last_agent_state,
+                ..
+            }
+            | AgentError::NoProgress {
                 tool_calls_made,
                 conversation_snapshot,
                 iterations_completed,
@@ -208,6 +227,7 @@ pub struct AgentConfig {
     pub verbose: bool,
     pub system_prompt: String,
     pub model_name: String,
+    pub max_no_progress_nudges: usize,
 }
 
 impl Default for AgentConfig {
@@ -217,6 +237,7 @@ impl Default for AgentConfig {
             verbose: false,
             system_prompt: String::new(),
             model_name: DEFAULT_MODEL.to_string(),
+            max_no_progress_nudges: DEFAULT_MAX_NO_PROGRESS_NUDGES,
         }
     }
 }
@@ -339,6 +360,30 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
     conversation_history: Vec<ChatMessage>,
     progress_counter: Option<Arc<AtomicUsize>>,
     state_history: Vec<AgentState>,
+    progress: ProgressGuard,
+}
+
+#[derive(Debug, Default)]
+struct ProgressGuard {
+    write_calls: usize,
+    nudges: usize,
+    refused: bool,
+}
+
+enum StopVerdict {
+    Accept,
+    Nudge,
+    GiveUp,
+}
+
+fn is_refusal(text: &str) -> bool {
+    let head = text.trim_start();
+    head.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CANNOT:"))
+}
+
+fn bounded_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
 
 impl AgentLoop<InMemoryEntityStore> {
@@ -363,6 +408,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             conversation_history: Vec::new(),
             progress_counter: None,
             state_history: Vec::new(),
+            progress: ProgressGuard::default(),
         }
     }
 
@@ -447,6 +493,88 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         }
     }
 
+    fn tool_names_where(&self, keep: impl Fn(crate::effects::EffectClass) -> bool) -> Vec<String> {
+        match &self.tool_registry {
+            Some(registry) => registry
+                .by_class()
+                .into_iter()
+                .filter(|(class, _)| keep(*class))
+                .flat_map(|(_, names)| names.into_iter().map(str::to_string))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn write_tool_names(&self) -> Vec<String> {
+        let mut names = self.tool_names_where(|class| class > crate::effects::EffectClass::None);
+        names.retain(|name| FILE_EDIT_TOOLS.contains(&name.as_str()));
+        names
+    }
+
+    fn is_guarded(&self) -> bool {
+        !self.progress.refused
+            && self.progress.write_calls == 0
+            && !self.write_tool_names().is_empty()
+    }
+
+    fn read_tool_names(&self) -> Vec<String> {
+        self.tool_names_where(|class| class == crate::effects::EffectClass::None)
+    }
+
+    fn reset_progress(&mut self) {
+        self.progress = ProgressGuard::default();
+    }
+
+    fn note_tool_call(&mut self, name: &str) {
+        let writes = FILE_EDIT_TOOLS.contains(&name)
+            && self
+                .tool_registry
+                .as_ref()
+                .and_then(|registry| registry.effect_class_of(name))
+                .is_some_and(|class| class > crate::effects::EffectClass::None);
+        if writes {
+            self.progress.write_calls += 1;
+        }
+    }
+
+    fn nudge_text(&self) -> String {
+        let writers = self.write_tool_names().join(", ");
+        let readers = self.read_tool_names().join(", ");
+        format!(
+            "You have not changed any files. Do not describe what you will do. \
+             Call a tool now. To change files use: {writers}. To inspect the code first use: {readers}. \
+             If the task truly cannot be done, answer with exactly one sentence starting with `CANNOT:` that says why."
+        )
+    }
+
+    fn judge_stop(&mut self, text: &str) -> StopVerdict {
+        if !self.is_guarded() {
+            return StopVerdict::Accept;
+        }
+        if is_refusal(text) {
+            self.progress.refused = true;
+            return StopVerdict::Accept;
+        }
+        if self.progress.nudges < self.config.max_no_progress_nudges {
+            self.progress.nudges += 1;
+            let nudge = self.nudge_text();
+            self.conversation_history.push(ChatMessage::user(nudge));
+            return StopVerdict::Nudge;
+        }
+        StopVerdict::GiveUp
+    }
+
+    fn no_progress_error(&self, last_message: &str) -> AgentError {
+        self.enrich_error(AgentError::NoProgress {
+            nudges: self.progress.nudges,
+            last_message: bounded_chars(last_message.trim(), MAX_NO_PROGRESS_MESSAGE_CHARS),
+            iterations_completed: self.iterations,
+            tool_calls_made: vec![],
+            conversation_snapshot: vec![],
+            last_agent_state: AgentState::PlanningEntityModification,
+        })
+    }
+
     pub fn wall_clock_exceeded(&self, limit_secs: u64) -> AgentError {
         AgentError::WallClockExceeded {
             limit_secs,
@@ -497,6 +625,19 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 conversation_snapshot: conversation,
                 last_agent_state: state,
             },
+            AgentError::NoProgress {
+                nudges,
+                last_message,
+                iterations_completed,
+                ..
+            } => AgentError::NoProgress {
+                nudges,
+                last_message,
+                iterations_completed,
+                tool_calls_made: tool_calls,
+                conversation_snapshot: conversation,
+                last_agent_state: state,
+            },
         }
     }
 
@@ -517,6 +658,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     pub async fn run(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.iterations = 0;
         self.state_history.clear();
+        self.reset_progress();
 
         // Initialize conversation history from context
         self.conversation_history.clear();
@@ -830,6 +972,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     /// Task Complete? (ARCHITECTURE.md) — determine whether the user's
     /// request has been fully satisfied.
     async fn check_task_completion(&self, context: &AgentContext) -> AgentResult<bool> {
+        if self.progress.refused {
+            return Ok(true);
+        }
         if let Some(provider) = &self.llm_provider {
             use crate::entities::EntityQuery;
 
@@ -1055,6 +1200,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         };
 
         self.iterations = 0;
+        self.reset_progress();
         let mut total_usage = Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -1088,6 +1234,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let choice = response.choices.into_iter().next().unwrap();
             let finish_reason = choice.finish_reason.clone();
             let tool_calls = choice.message.tool_calls.clone();
+            let stop_text = choice.message.content.clone().unwrap_or_default();
             self.conversation_history.push(choice.message);
 
             self.iterations += 1;
@@ -1099,7 +1246,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let is_tool_calls = matches!(finish_reason, Some(FinishReason::ToolCalls));
 
             if is_stop {
-                return Ok(self.complete_tool_loop(&context, total_usage).await);
+                match self.judge_stop(&stop_text) {
+                    StopVerdict::Accept => {
+                        return Ok(self.complete_tool_loop(&context, total_usage).await)
+                    }
+                    StopVerdict::Nudge => continue,
+                    StopVerdict::GiveUp => return Err(self.no_progress_error(&stop_text)),
+                }
             }
             if !is_tool_calls {
                 return Err(self.enrich_error(bare_state_error("Unexpected finish reason")));
@@ -1162,6 +1315,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let name = tool_call.function.name.clone();
             let args = tool_call.function.arguments.clone();
             let call_id = tool_call.id.clone();
+            self.note_tool_call(&name);
             let registry = match self.tool_registry.as_ref() {
                 Some(r) => r,
                 None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
@@ -1235,6 +1389,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 self.conversation_history.push(choice.message.clone());
 
                 for tc in &tool_calls {
+                    self.note_tool_call(&tc.function.name);
                     let result = self
                         .tool_registry
                         .as_ref()
@@ -1260,9 +1415,19 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     }
                 }
             } else {
+                let stop_text = choice.message.content.clone().unwrap_or_default();
                 self.conversation_history.push(choice.message);
-                break;
+                match self.judge_stop(&stop_text) {
+                    StopVerdict::Accept => break,
+                    StopVerdict::Nudge => continue,
+                    StopVerdict::GiveUp => return Err(self.no_progress_error(&stop_text)),
+                }
             }
+        }
+
+        if self.is_guarded() {
+            let last = extract_result_summary(&self.conversation_history);
+            return Err(self.no_progress_error(&last));
         }
 
         self.performed_actions += 1;
@@ -3133,6 +3298,353 @@ mod tests {
             msg.contains("No tool registry"),
             "expected no-tool-registry diagnostic, got: {msg}"
         );
+    }
+
+    fn write_capable_registry(root: &std::path::Path) -> ToolRegistry {
+        crate::tools::create_tool_registry(root)
+    }
+
+    fn read_only_registry(root: &std::path::Path) -> ToolRegistry {
+        crate::tools::create_tool_registry(root).read_only_unscoped()
+    }
+
+    fn nudge_messages(agent: &AgentLoop) -> Vec<String> {
+        agent
+            .conversation_history()
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .filter_map(|m| m.content.clone())
+            .filter(|c| c.contains("CANNOT:"))
+            .collect()
+    }
+
+    fn progress_context() -> AgentContext {
+        AgentContext {
+            user_prompt: "add a unit test".to_string(),
+            conversation_history: vec![ChatMessage::user("add a unit test")],
+            app_state_id: "np".to_string(),
+        }
+    }
+
+    fn progress_agent(
+        responses: Vec<ChatResponse>,
+        registry: ToolRegistry,
+        nudges: usize,
+    ) -> AgentLoop {
+        let config = AgentConfig {
+            max_iterations: 20,
+            max_no_progress_nudges: nudges,
+            ..Default::default()
+        };
+        AgentLoop::with_tools(
+            config,
+            InMemoryEntityStore::new(),
+            MockProvider::new(responses),
+            registry,
+        )
+    }
+
+    fn write_call() -> ChatResponse {
+        tool_call_response(
+            "write_file",
+            serde_json::json!({"path": "t.txt", "content": "work"}),
+        )
+    }
+
+    #[test]
+    fn default_allows_two_no_progress_nudges() {
+        assert_eq!(AgentConfig::default().max_no_progress_nudges, 2);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_nudges_a_write_capable_agent_that_only_announces_then_accepts_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![
+                plain_response("I will add a unit test."),
+                write_call(),
+                plain_response("done"),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.result_summary, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.txt")).unwrap(),
+            "work"
+        );
+        let nudges = nudge_messages(&agent);
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("write_file"), "{}", nudges[0]);
+        assert!(nudges[0].contains("read_file"), "{}", nudges[0]);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_fails_with_no_progress_after_exactly_the_configured_nudges() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "I will do it. ".repeat(200);
+        let mut agent = progress_agent(
+            vec![
+                plain_response("first"),
+                plain_response("second"),
+                plain_response(&long),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        assert_eq!(nudge_messages(&agent).len(), 2);
+        match &err {
+            AgentError::NoProgress {
+                nudges,
+                last_message,
+                conversation_snapshot,
+                ..
+            } => {
+                assert_eq!(*nudges, 2);
+                assert!(
+                    last_message.chars().count() <= 500,
+                    "{}",
+                    last_message.len()
+                );
+                assert!(last_message.starts_with("I will do it."));
+                assert!(!conversation_snapshot.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().chars().count() < 800);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_zero_nudges_fails_at_the_first_empty_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![plain_response("I will do it")],
+            write_capable_registry(dir.path()),
+            0,
+        );
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::NoProgress { nudges: 0, .. }),
+            "{err:?}"
+        );
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_accepts_a_cannot_answer_without_nudging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![plain_response("  cannot: the file does not exist.")],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.result_summary, "  cannot: the file does not exist.");
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_does_not_guard_a_read_only_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![plain_response("Looks fine to me.")],
+            read_only_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_accepts_the_first_stop_after_a_write_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![write_call(), plain_response("done")],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_a_read_only_tool_call_does_not_count_as_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let mut agent = progress_agent(
+            vec![
+                tool_call_response("read_file", serde_json::json!({"path": "a.txt"})),
+                plain_response("I will add a test"),
+                write_call(),
+                plain_response("done"),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(nudge_messages(&agent).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn state_machine_nudges_a_write_capable_agent_that_only_announces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            wrap_with_state_machine_responses(vec![
+                plain_response("I will add a unit test."),
+                write_call(),
+                plain_response("done"),
+            ]),
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.txt")).unwrap(),
+            "work"
+        );
+        let nudges = nudge_messages(&agent);
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("write_file"), "{}", nudges[0]);
+    }
+
+    #[tokio::test]
+    async fn state_machine_fails_with_no_progress_after_exactly_the_configured_nudges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            wrap_with_state_machine_responses(vec![
+                plain_response("one"),
+                plain_response("two"),
+                plain_response("three"),
+            ]),
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let err = agent.run(progress_context()).await.unwrap_err();
+        assert_eq!(nudge_messages(&agent).len(), 2);
+        match &err {
+            AgentError::NoProgress {
+                nudges,
+                last_message,
+                conversation_snapshot,
+                ..
+            } => {
+                assert_eq!(*nudges, 2);
+                assert_eq!(last_message, "three");
+                assert!(!conversation_snapshot.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn state_machine_accepts_a_cannot_answer_as_completion_without_nudging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![
+                plain_response("Plan: execute the task"),
+                plain_response("CANNOT: the target file does not exist."),
+                plain_response("INCOMPLETE"),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(
+            result.result_summary,
+            "CANNOT: the target file does not exist."
+        );
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_machine_does_not_guard_a_read_only_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            wrap_with_state_machine_responses(vec![plain_response("Looks fine.")]),
+            read_only_registry(dir.path()),
+            2,
+        );
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_machine_accepts_the_first_stop_after_a_write_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            wrap_with_state_machine_responses(vec![write_call(), plain_response("done")]),
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    fn repo_tool_only_registry(root: &std::path::Path) -> ToolRegistry {
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = crate::effects::EffectClass::Repository;
+        identity.scope.tools = vec![
+            "read_file".parse().unwrap(),
+            "github_pr_status".parse().unwrap(),
+        ];
+        crate::tools::create_tool_registry_for(root, &identity).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_loop_does_not_guard_an_agent_without_a_file_editing_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = repo_tool_only_registry(dir.path());
+        assert!(registry.get_tool("github_pr_status").is_some());
+        assert!(registry.get_tool("write_file").is_none());
+        let mut agent = progress_agent(vec![plain_response("Looks fine.")], registry, 2);
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_a_build_tool_call_does_not_count_as_progress_and_the_nudge_names_only_editors(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![
+                tool_call_response("cargo_check", serde_json::json!({})),
+                plain_response("I will add a test"),
+                write_call(),
+                plain_response("done"),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        let nudges = nudge_messages(&agent);
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("write_file"), "{}", nudges[0]);
+        assert!(!nudges[0].contains("cargo_"), "{}", nudges[0]);
+        assert!(!nudges[0].contains("github_"), "{}", nudges[0]);
+    }
+
+    #[tokio::test]
+    async fn state_machine_fails_when_the_inner_budget_runs_out_without_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut responses = vec![plain_response("Plan: execute the task")];
+        responses.extend((0..12).map(|i| plain_response(&format!("I will do it {i}"))));
+        responses.push(plain_response("COMPLETE"));
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 50);
+        let err = agent.run(progress_context()).await.unwrap_err();
+        assert!(matches!(err, AgentError::NoProgress { .. }), "{err:?}");
     }
 }
 

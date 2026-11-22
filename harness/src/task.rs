@@ -2220,6 +2220,7 @@ impl TaskRunner {
                     .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
             ),
             model_name: queued.model.clone(),
+            ..Default::default()
         };
         let context = AgentContext {
             user_prompt: queued.description.clone(),
@@ -2432,6 +2433,7 @@ fn agent_error_type(error: &AgentError) -> &'static str {
         AgentError::StateError { .. } => "StateError",
         AgentError::TaskCheckFailed { .. } => "TaskCheckFailed",
         AgentError::WallClockExceeded { .. } => "WallClockExceeded",
+        AgentError::NoProgress { .. } => "NoProgress",
     }
 }
 
@@ -3961,7 +3963,9 @@ mod scheduler_tests {
                 .map_err(|e| ModelError::Unknown {
                     message: e.to_string(),
                 })?;
-            Ok(stop_response("COMPLETE - task done"))
+            Ok(stop_response(
+                "CANNOT: this scripted task has nothing to change.",
+            ))
         }
 
         async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
@@ -6034,7 +6038,7 @@ mod identity_tests {
     fn untouched_provider() -> Arc<MockProvider> {
         MockProvider::new(wrap_with_state_machine_responses(vec![
             tool_call_response("github_pr_status", serde_json::json!({})),
-            stop_response("done"),
+            stop_response("CANNOT: this scripted task has nothing to change."),
         ]))
     }
 
@@ -7217,9 +7221,10 @@ mod identity_tests {
         let repo = repo_with_origin("https://github.com/example/repo");
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         manager.register_identity(scoped_identity()).await;
-        let provider: Arc<dyn ModelProvider> = MockProvider::new(
-            wrap_with_state_machine_responses(vec![stop_response("done")]),
-        );
+        let provider: Arc<dyn ModelProvider> =
+            MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
+                "CANNOT: this scripted task has nothing to change.",
+            )]));
         let id = manager
             .submit_task(
                 queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string())),
@@ -8227,7 +8232,7 @@ mod spawn_tests {
 
     fn provider() -> Arc<dyn ModelProvider> {
         MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
-            "done",
+            "CANNOT: this scripted task has nothing to change.",
         )]))
     }
 
@@ -9329,6 +9334,35 @@ mod identity_limit_tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_a_write_capable_task_that_only_announces_fails_with_no_progress() {
+        let repo = repo_with_limits(100, 600);
+        let manager = manager().await;
+        let script = vec![
+            stop_response("Plan: add a unit test"),
+            stop_response("This task requires modifying lib.rs. I will add a unit test."),
+            stop_response("I will add a unit test now."),
+            stop_response("I will add the unit test."),
+        ];
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(script);
+        let entry = queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string()));
+        let id = manager.submit_task(entry, provider).await;
+        let task = finished(&manager, &id).await;
+        let (error_type, diagnostics) = failed(&task);
+        assert_eq!(error_type, "NoProgress");
+        assert!(diagnostics.tool_call_history.is_empty());
+        let message = match &task.status {
+            TaskStatus::Failed { error, .. } => error.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(message.contains("I will add the unit test."), "{message}");
+        let (code, retryable, fix) = crate::mcp::results::classify_failure(error_type, &message);
+        assert_eq!(code, "no_progress");
+        assert!(retryable);
+        assert!(fix.contains("name the file"), "{fix}");
+        assert!(manager.get_result(&id).await.is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_a_run_past_the_card_wall_clock_fails_keeping_partial_changes_and_cleaning_up() {
         let repo = repo_with_limits(100, 30);
@@ -9362,7 +9396,7 @@ mod identity_limit_tests {
         let repo = repo_with_limits(100, 30);
         let manager = manager().await;
         let provider: Arc<dyn ModelProvider> = MockProvider::new(
-            wrap_with_state_machine_responses(vec![stop_response("nothing to change")]),
+            wrap_with_state_machine_responses(vec![stop_response("CANNOT: nothing to change.")]),
         );
         let entry = queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string()));
         let id = manager.submit_task(entry, provider).await;

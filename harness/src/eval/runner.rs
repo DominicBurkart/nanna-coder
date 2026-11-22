@@ -410,6 +410,7 @@ async fn run_agent_in_process(
         verbose: config.verbose,
         system_prompt: String::new(),
         model_name: config.model_name.clone(),
+        ..Default::default()
     };
 
     let tool_registry = create_tool_registry_in_checkout(work_dir)?;

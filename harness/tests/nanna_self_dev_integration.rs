@@ -141,6 +141,7 @@ async fn run_single_attempt(runtime: &ContainerRuntime, image_ref: &str) -> Resu
              `cargo test --workspace` inside the container."
         ),
         model_name: E2E_MODEL.to_string(),
+        ..Default::default()
     };
 
     let context = AgentContext {

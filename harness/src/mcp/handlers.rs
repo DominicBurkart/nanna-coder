@@ -619,7 +619,7 @@ mod tests {
     fn plan_responses() -> Vec<ChatResponse> {
         vec![
             stop_response("Plan: execute the task"),
-            stop_response("performed"),
+            stop_response("CANNOT: this scripted task has nothing to change."),
             stop_response("COMPLETE - task done"),
         ]
     }
