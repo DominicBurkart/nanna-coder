@@ -122,6 +122,7 @@ pub struct ToolRegistry {
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
     pr_binding: crate::pr_binding::PrBindingCell,
+    tools_unavailable: Vec<crate::exec_capabilities::ToolsUnavailable>,
 }
 
 struct ProductionHold {
@@ -168,6 +169,7 @@ impl ToolRegistry {
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
             pr_binding: crate::pr_binding::PrBindingCell::new(),
+            tools_unavailable: Vec::new(),
         }
     }
 
@@ -315,7 +317,42 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
+        for entry in &mut self.tools_unavailable {
+            entry.tools.retain(|t| *t != name);
+        }
+        self.tools_unavailable
+            .retain(|entry| !entry.tools.is_empty());
         self.tools.insert(name, tool);
+    }
+
+    pub fn tools_unavailable(&self) -> &[crate::exec_capabilities::ToolsUnavailable] {
+        &self.tools_unavailable
+    }
+
+    pub fn register_exec_capabilities(
+        &mut self,
+        workspace_root: &std::path::Path,
+        identity: &AgentIdentity,
+        env: &crate::exec_capabilities::Environment,
+    ) {
+        let plan = crate::exec_capabilities::plan(identity, workspace_root, env);
+        if !plan.granted.is_empty() {
+            if let Some(config) = crate::exec_sandbox::SandboxConfig::from_environment(env) {
+                let sandbox = std::sync::Arc::new(crate::exec_sandbox::SandboxedCargo::new(
+                    config,
+                    workspace_root.to_path_buf(),
+                ));
+                for name in plan.granted {
+                    if let Some(verb) = CargoVerb::from_tool(name) {
+                        self.register(Box::new(SandboxedCargoTool::new(
+                            verb,
+                            std::sync::Arc::clone(&sandbox),
+                        )));
+                    }
+                }
+            }
+        }
+        self.tools_unavailable.extend(plan.unavailable);
     }
 
     pub fn get_tool(&self, name: &str) -> Option<&dyn Tool> {
@@ -1869,6 +1906,101 @@ fn run_cargo_argv(
     }))
 }
 
+fn cargo_build_definition() -> ToolDefinition {
+    ToolDefinition {
+        function: FunctionDefinition {
+            name: "cargo_build".to_string(),
+            description: "Build the cargo project inside the dev container.".to_string(),
+            parameters: JsonSchema {
+                schema_type: SchemaType::Object,
+                properties: Some({
+                    let mut props = HashMap::new();
+                    props.insert(
+                        "package".to_string(),
+                        PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: Some(
+                                "Package to build (omit for entire workspace)".to_string(),
+                            ),
+                            items: None,
+                        },
+                    );
+                    props.insert(
+                        "release".to_string(),
+                        PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: Some("Set to 'true' to build in release mode".to_string()),
+                            items: None,
+                        },
+                    );
+                    props
+                }),
+                required: None,
+            },
+        },
+    }
+}
+
+fn cargo_test_definition() -> ToolDefinition {
+    ToolDefinition {
+        function: FunctionDefinition {
+            name: "cargo_test".to_string(),
+            description: "Run cargo tests inside the dev container.".to_string(),
+            parameters: JsonSchema {
+                schema_type: SchemaType::Object,
+                properties: Some({
+                    let mut props = HashMap::new();
+                    props.insert(
+                        "package".to_string(),
+                        PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: Some(
+                                "Package to test (omit for entire workspace)".to_string(),
+                            ),
+                            items: None,
+                        },
+                    );
+                    props.insert(
+                        "test_filter".to_string(),
+                        PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: Some("Test name filter (substring match)".to_string()),
+                            items: None,
+                        },
+                    );
+                    props
+                }),
+                required: None,
+            },
+        },
+    }
+}
+
+fn cargo_check_definition() -> ToolDefinition {
+    ToolDefinition {
+        function: FunctionDefinition {
+            name: "cargo_check".to_string(),
+            description: "Run cargo check (type and borrow checking without compilation) inside the dev container.".to_string(),
+            parameters: JsonSchema {
+                schema_type: SchemaType::Object,
+                properties: Some({
+                    let mut props = HashMap::new();
+                    props.insert(
+                        "package".to_string(),
+                        PropertySchema {
+                            schema_type: SchemaType::String,
+                            description: Some("Package to check (omit for entire workspace)".to_string()),
+                            items: None,
+                        },
+                    );
+                    props
+                }),
+                required: None,
+            },
+        },
+    }
+}
+
 pub struct CargoBuildTool {
     container_handle: std::sync::Arc<crate::container::ContainerHandle>,
     working_dir: Option<String>,
@@ -1893,40 +2025,7 @@ impl Tool for CargoBuildTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            function: FunctionDefinition {
-                name: "cargo_build".to_string(),
-                description: "Build the cargo project inside the dev container.".to_string(),
-                parameters: JsonSchema {
-                    schema_type: SchemaType::Object,
-                    properties: Some({
-                        let mut props = HashMap::new();
-                        props.insert(
-                            "package".to_string(),
-                            PropertySchema {
-                                schema_type: SchemaType::String,
-                                description: Some(
-                                    "Package to build (omit for entire workspace)".to_string(),
-                                ),
-                                items: None,
-                            },
-                        );
-                        props.insert(
-                            "release".to_string(),
-                            PropertySchema {
-                                schema_type: SchemaType::String,
-                                description: Some(
-                                    "Set to 'true' to build in release mode".to_string(),
-                                ),
-                                items: None,
-                            },
-                        );
-                        props
-                    }),
-                    required: None,
-                },
-            },
-        }
+        cargo_build_definition()
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
@@ -1966,38 +2065,7 @@ impl Tool for CargoTestTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            function: FunctionDefinition {
-                name: "cargo_test".to_string(),
-                description: "Run cargo tests inside the dev container.".to_string(),
-                parameters: JsonSchema {
-                    schema_type: SchemaType::Object,
-                    properties: Some({
-                        let mut props = HashMap::new();
-                        props.insert(
-                            "package".to_string(),
-                            PropertySchema {
-                                schema_type: SchemaType::String,
-                                description: Some(
-                                    "Package to test (omit for entire workspace)".to_string(),
-                                ),
-                                items: None,
-                            },
-                        );
-                        props.insert(
-                            "test_filter".to_string(),
-                            PropertySchema {
-                                schema_type: SchemaType::String,
-                                description: Some("Test name filter (substring match)".to_string()),
-                                items: None,
-                            },
-                        );
-                        props
-                    }),
-                    required: None,
-                },
-            },
-        }
+        cargo_test_definition()
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
@@ -2038,28 +2106,7 @@ impl Tool for CargoCheckTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            function: FunctionDefinition {
-                name: "cargo_check".to_string(),
-                description: "Run cargo check (type and borrow checking without compilation) inside the dev container.".to_string(),
-                parameters: JsonSchema {
-                    schema_type: SchemaType::Object,
-                    properties: Some({
-                        let mut props = HashMap::new();
-                        props.insert(
-                            "package".to_string(),
-                            PropertySchema {
-                                schema_type: SchemaType::String,
-                                description: Some("Package to check (omit for entire workspace)".to_string()),
-                                items: None,
-                            },
-                        );
-                        props
-                    }),
-                    required: None,
-                },
-            },
-        }
+        cargo_check_definition()
     }
 
     async fn execute(&self, args: Value) -> ToolResult<Value> {
@@ -2071,6 +2118,97 @@ impl Tool for CargoCheckTool {
 
     fn name(&self) -> &str {
         "cargo_check"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoVerb {
+    Check,
+    Test,
+    Build,
+}
+
+impl CargoVerb {
+    pub fn from_tool(name: &str) -> Option<Self> {
+        match name {
+            "cargo_check" => Some(Self::Check),
+            "cargo_test" => Some(Self::Test),
+            "cargo_build" => Some(Self::Build),
+            _ => None,
+        }
+    }
+
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::Check => "cargo_check",
+            Self::Test => "cargo_test",
+            Self::Build => "cargo_build",
+        }
+    }
+
+    pub fn argv(self, args: &Value) -> ToolResult<Vec<String>> {
+        let package = args.get("package").and_then(|v| v.as_str());
+        reject_option_like("package", package)?;
+        let mut argv = match self {
+            Self::Check => cargo_check_args(package),
+            Self::Test => {
+                let filter = args.get("test_filter").and_then(|v| v.as_str());
+                reject_option_like("test_filter", filter)?;
+                cargo_test_args(package, filter)
+            }
+            Self::Build => {
+                let release = args.get("release").and_then(|v| v.as_str()) == Some("true");
+                cargo_build_args(package, release)
+            }
+        };
+        argv.insert(2, "--offline".to_string());
+        Ok(argv)
+    }
+}
+
+pub struct SandboxedCargoTool {
+    verb: CargoVerb,
+    sandbox: std::sync::Arc<crate::exec_sandbox::SandboxedCargo>,
+}
+
+impl SandboxedCargoTool {
+    pub fn new(
+        verb: CargoVerb,
+        sandbox: std::sync::Arc<crate::exec_sandbox::SandboxedCargo>,
+    ) -> Self {
+        Self { verb, sandbox }
+    }
+}
+
+#[async_trait]
+impl Tool for SandboxedCargoTool {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        match self.verb {
+            CargoVerb::Check => cargo_check_definition(),
+            CargoVerb::Test => cargo_test_definition(),
+            CargoVerb::Build => cargo_build_definition(),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let argv = self.verb.argv(&args)?;
+        let sandbox = std::sync::Arc::clone(&self.sandbox);
+        tokio::task::spawn_blocking(move || sandbox.run_json(&argv))
+            .await
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })?
+            .map_err(|e| ToolError::ExecutionFailed {
+                message: e.to_string(),
+            })
+    }
+
+    fn name(&self) -> &str {
+        self.verb.tool_name()
     }
 }
 
@@ -3378,6 +3516,10 @@ fn create_tool_registry_with_scope(
     )));
     if let Some(identity) = pr_identity {
         crate::pr_tools::register_guarded(&mut registry, workspace_root, identity, &protected);
+        if crate::exec_capabilities::wants_exec_tools(identity) {
+            let env = crate::exec_capabilities::Environment::detect();
+            registry.register_exec_capabilities(workspace_root, identity, &env);
+        }
     }
     registry
 }
@@ -6547,6 +6689,112 @@ mod tests {
         let seen = auditor.seen_prior.lock().unwrap();
         assert_eq!(seen[0], Vec::<EffectClass>::new());
         assert_eq!(seen[1], vec![EffectClass::Repository]);
+    }
+
+    mod exec_capability_gating {
+        use super::*;
+        use crate::exec_capabilities::tests::{fixture, identity_with, ready_environment};
+
+        fn registry_for(
+            tools: &str,
+            env: &crate::exec_capabilities::Environment,
+            root: &std::path::Path,
+        ) -> ToolRegistry {
+            let identity = identity_with(tools);
+            let mut registry =
+                create_tool_registry_with_scope(root, None, None, ProtectedPaths::for_repo(root));
+            registry.register_exec_capabilities(root, &identity, env);
+            registry.scoped_for(&identity)
+        }
+
+        #[test]
+        fn a_card_naming_the_cargo_tools_receives_them() {
+            let f = fixture();
+            let env = ready_environment(f.bin.path(), f.home.path());
+            let registry = registry_for(
+                "\"read_file\", \"cargo_check\", \"cargo_test\", \"cargo_build\"",
+                &env,
+                f.repo.path(),
+            );
+            for name in ["cargo_check", "cargo_test", "cargo_build"] {
+                let tool = registry.get_tool(name).unwrap_or_else(|| panic!("{name}"));
+                assert_eq!(tool.effect_class(), EffectClass::Workspace);
+            }
+            assert!(registry.tools_unavailable().is_empty());
+        }
+
+        #[test]
+        fn read_only_cards_receive_no_exec_tool_even_when_everything_is_in_place() {
+            let f = fixture();
+            let env = ready_environment(f.bin.path(), f.home.path());
+            for tools in [
+                "\"read_file\", \"search\", \"list_directory\", \"git_diff\", \"git_status\"",
+                "\"*\"",
+                "\"cargo_*\"",
+                "\"read_file\"",
+            ] {
+                let registry = registry_for(tools, &env, f.repo.path());
+                for name in ["cargo_check", "cargo_test", "cargo_build", "run_command"] {
+                    assert!(registry.get_tool(name).is_none(), "{tools}: {name}");
+                }
+                assert!(registry.tools_unavailable().is_empty(), "{tools}");
+            }
+        }
+
+        #[test]
+        fn a_missing_prerequisite_leaves_the_tools_absent_and_says_why() {
+            let f = fixture();
+            let mut env = ready_environment(f.bin.path(), f.home.path());
+            env.offline = false;
+            let registry = registry_for("\"cargo_check\", \"read_file\"", &env, f.repo.path());
+            assert!(registry.get_tool("cargo_check").is_none());
+            assert!(registry.get_tool("read_file").is_some());
+            let unavailable = registry.tools_unavailable();
+            assert_eq!(unavailable.len(), 1);
+            assert_eq!(unavailable[0].tools, vec!["cargo_check"]);
+            assert!(unavailable[0].reason.contains("CARGO_NET_OFFLINE"));
+        }
+
+        #[test]
+        fn registering_a_tool_by_other_means_clears_its_unavailable_entry() {
+            let f = fixture();
+            let mut env = ready_environment(f.bin.path(), f.home.path());
+            env.is_root = false;
+            let identity = identity_with("\"cargo_check\"");
+            let mut registry = ToolRegistry::new();
+            registry.register_exec_capabilities(f.repo.path(), &identity, &env);
+            assert_eq!(registry.tools_unavailable().len(), 1);
+            registry.register(StubTool::boxed("cargo_check", EffectClass::Workspace));
+            assert!(registry.tools_unavailable().is_empty());
+        }
+
+        #[test]
+        fn sandboxed_argv_is_offline_and_rejects_option_like_arguments() {
+            let argv = CargoVerb::Check
+                .argv(&serde_json::json!({"package": "marigold-core"}))
+                .unwrap();
+            assert_eq!(
+                argv,
+                ["cargo", "check", "--offline", "--package", "marigold-core"]
+            );
+            let argv = CargoVerb::Test
+                .argv(&serde_json::json!({"test_filter": "parses"}))
+                .unwrap();
+            assert_eq!(argv, ["cargo", "test", "--offline", "parses"]);
+            let argv = CargoVerb::Build
+                .argv(&serde_json::json!({"release": "true"}))
+                .unwrap();
+            assert_eq!(argv, ["cargo", "build", "--offline", "--release"]);
+            for verb in [CargoVerb::Check, CargoVerb::Test, CargoVerb::Build] {
+                assert!(verb
+                    .argv(&serde_json::json!({"package": "--manifest-path=/x"}))
+                    .is_err());
+            }
+            assert!(CargoVerb::Test
+                .argv(&serde_json::json!({"test_filter": "--nocapture"}))
+                .is_err());
+            assert!(CargoVerb::from_tool("cargo_bench").is_none());
+        }
     }
 }
 

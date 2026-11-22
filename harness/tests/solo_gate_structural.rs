@@ -48,6 +48,7 @@ const TOOL_TABLE: &[(&str, Solo)] = &[
     ("CargoCheckTool", Solo::Local),
     ("CargoDenyTool", Solo::Local),
     ("CargoRunTool", Solo::Local),
+    ("SandboxedCargoTool", Solo::Local),
     ("CargoTestTool", Solo::Local),
     ("CiLogsTool", Solo::Read),
     ("CiStatusTool", Solo::Read),
