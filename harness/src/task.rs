@@ -616,6 +616,7 @@ pub struct TaskManager {
     runner: Arc<TaskRunner>,
     dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
     closes: std::sync::RwLock<HashMap<TaskId, String>>,
+    changes_lost: std::sync::RwLock<std::collections::HashSet<TaskId>>,
 }
 
 impl TaskManager {
@@ -919,6 +920,7 @@ impl TaskManager {
             runner,
             dispatcher,
             closes: std::sync::RwLock::new(HashMap::new()),
+            changes_lost: std::sync::RwLock::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1504,9 +1506,25 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     }
 
     pub fn set_closes(&self, task_id: &TaskId, closes: String) {
+        if let Some(store) = self
+            .runner
+            .results
+            .read()
+            .expect("result store lock poisoned")
+            .clone()
+        {
+            store.set_closes(task_id, closes.clone());
+        }
         if let Ok(mut map) = self.closes.write() {
             map.insert(task_id.clone(), closes);
         }
+    }
+
+    pub fn changes_not_retained(&self, task_id: &TaskId) -> bool {
+        self.changes_lost
+            .read()
+            .map(|lost| lost.contains(task_id))
+            .unwrap_or(false)
     }
 
     pub fn closes(&self, task_id: &TaskId) -> Option<String> {
@@ -1546,7 +1564,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             tracing::info!(removed, "Pruned expired task results");
         }
         let reader = Arc::clone(&store);
-        let persisted = tokio::task::spawn_blocking(move || reader.load_all())
+        let persisted = tokio::task::spawn_blocking(move || reader.load_all_records())
             .await
             .unwrap_or_default();
         *self
@@ -1555,9 +1573,24 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             .write()
             .expect("result store lock poisoned") = Some(store);
         let mut loaded = 0;
-        for mut task in persisted {
+        for record in persisted {
+            let crate::result_store::LoadedRecord {
+                mut task,
+                closes,
+                changes_lost,
+            } = record;
             if self.runner.tasks.read().await.contains_key(&task.id) {
                 continue;
+            }
+            if let Some(closes) = closes {
+                if let Ok(mut map) = self.closes.write() {
+                    map.insert(task.id.clone(), closes);
+                }
+            }
+            if changes_lost {
+                if let Ok(mut lost) = self.changes_lost.write() {
+                    lost.insert(task.id.clone());
+                }
             }
             let interrupted = matches!(task.status, TaskStatus::Running { .. });
             if interrupted {
