@@ -256,6 +256,11 @@ fn protected_failure(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum TaskStatus {
+    /// Accepted and persisted, with the spawn audit not yet settled. The run
+    /// reviews the request through the spawn gate before it creates a
+    /// worktree, calls a tool or calls a model; a refusal ends the task as
+    /// `Failed` without any of those having happened.
+    Auditing,
     /// Accepted and queued (possibly parked) until the scheduler starts it.
     Pending,
     Running {
@@ -359,6 +364,9 @@ struct TaskRunner {
     /// Identities bound to one task at submission; they take precedence over
     /// the shared catalog and are consumed when the task starts.
     bound: RwLock<HashMap<TaskId, BoundIdentity>>,
+    pending_audits: RwLock<HashMap<TaskId, PendingAudit>>,
+    client_refs: RwLock<HashMap<(String, String), TaskId>>,
+    intake: Mutex<()>,
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
@@ -366,6 +374,20 @@ struct TaskRunner {
     sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
+}
+
+/// What [`TaskManager::submit_for_audit`] did with a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    /// The registered task, or the earlier task the `client_ref` names.
+    pub task_id: TaskId,
+    /// `false` when the `client_ref` matched an existing task.
+    pub created: bool,
+}
+
+struct PendingAudit {
+    gate: Arc<SpawnGate>,
+    request: crate::auditor::SpawnRequest,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -533,15 +555,17 @@ async fn audit_restored(
     let gate = gate
         .for_repo(&queued.repo_path)
         .map_err(RestoreRefused::Overrides)?;
-    let request = gate.request(
-        TaskSummary::new(
-            format!("restore-{}", queued.id.0),
-            queued.description.clone(),
-            repo,
-        ),
-        hint,
+    let summary = TaskSummary::new(
+        format!("restore-{}", queued.id.0),
         queued.description.clone(),
+        repo,
     );
+    let request = match (queued.requested_effect, queued.dev_loop) {
+        (None, None) => gate.request(summary, hint, queued.description.clone()),
+        (effect, dev_loop) => {
+            gate.request_with_caller(summary, hint, queued.description.clone(), effect, dev_loop)
+        }
+    };
     Ok(AuditedIdentity::split(gate.check(request).await?, &|_| None).1)
 }
 
@@ -751,6 +775,9 @@ impl TaskManager {
         let deadline_at = tokio::time::Instant::now() + *deadline;
         let (mut parked, mut deferred) = (0usize, 0usize);
         for queued in self.dispatcher.queued().await {
+            self.runner
+                .set_status(&queued.id, TaskStatus::Auditing)
+                .await;
             let audited = tokio::time::timeout_at(deadline_at, audit_restored(gate, &queued)).await;
             match audited {
                 Err(_) => {
@@ -768,7 +795,10 @@ impl TaskManager {
                         .bound
                         .write()
                         .await
-                        .insert(queued.id, BoundIdentity::Audited(identity));
+                        .insert(queued.id.clone(), BoundIdentity::Audited(identity));
+                    self.runner
+                        .set_status(&queued.id, TaskStatus::Pending)
+                        .await;
                 }
                 Ok(Err(refused)) if refused.is_infrastructure() => {
                     parked += 1;
@@ -842,6 +872,9 @@ impl TaskManager {
             identities: RwLock::new(HashMap::new()),
             audit: std::sync::Mutex::new(None),
             bound: RwLock::new(HashMap::new()),
+            pending_audits: RwLock::new(HashMap::new()),
+            client_refs: RwLock::new(HashMap::new()),
+            intake: Mutex::new(()),
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
             escalator: std::sync::RwLock::new(None),
@@ -1228,6 +1261,68 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             .await)
     }
 
+    /// Accept a spawn request for asynchronous audit and return at once.
+    ///
+    /// The request is validated for lineage, registered as an
+    /// [`TaskStatus::Auditing`] task and persisted to the queue store; no
+    /// [`Allowed`] proof exists yet and none is needed to register. The proof
+    /// is minted inside the run (`TaskRunner::audit_pending`) before the
+    /// worktree, any tool or any model is touched, and a refusal ends the task
+    /// as `Failed`. A `client_ref` already used with the same identity
+    /// returns the existing task and registers nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_for_audit(
+        &self,
+        gate: Arc<SpawnGate>,
+        request: crate::auditor::SpawnRequest,
+        repo_path: PathBuf,
+        branch: String,
+        model: String,
+        max_iterations: usize,
+        client_ref: Option<String>,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Result<Submission, LineageError> {
+        let lineage = {
+            let tasks = self.runner.tasks.read().await;
+            derive_lineage(&request.parent_task.id, &|id| {
+                tasks.get(id).and_then(|t| t.lineage.clone())
+            })?
+        };
+        let identity = request.identity.clone();
+        let _intake = self.runner.intake.lock().await;
+        if let Some(existing) = match client_ref.as_deref() {
+            Some(key) => self.runner.find_by_client_ref(&identity, key).await,
+            None => None,
+        } {
+            return Ok(Submission {
+                task_id: existing,
+                created: false,
+            });
+        }
+        let queued = QueuedTask::new(
+            request.subtask.clone(),
+            repo_path,
+            branch,
+            model,
+            max_iterations,
+        )
+        .with_identity_hint(Some(identity))
+        .with_lineage(lineage)
+        .with_client_ref(client_ref)
+        .with_audited_request(Some(request.requested_effect), Some(request.dev_loop));
+        let task_id = queued.id.clone();
+        self.runner
+            .pending_audits
+            .write()
+            .await
+            .insert(task_id.clone(), PendingAudit { gate, request });
+        let task_id = self.submit_task(queued, provider).await;
+        Ok(Submission {
+            task_id,
+            created: true,
+        })
+    }
+
     /// Submit a task that, when `identity` is present, runs under exactly that
     /// identity, bound to this task alone: it is neither added to nor looked
     /// up in the shared catalog, so no other task can change what it runs as.
@@ -1445,6 +1540,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         if dequeued {
             self.runner.bound.write().await.remove(task_id);
         }
+        self.runner.pending_audits.write().await.remove(task_id);
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -1552,13 +1648,18 @@ impl TaskRunner {
     /// Record a queued entry as a `Pending` task and open its status watch.
     /// The receiver is retained as a keep-alive (see `StatusSenders`).
     async fn register(&self, queued: &QueuedTask, provider: Option<Arc<dyn ModelProvider>>) {
+        let initial = if self.pending_audits.read().await.contains_key(&queued.id) {
+            TaskStatus::Auditing
+        } else {
+            TaskStatus::Pending
+        };
         let task = Task {
             id: queued.id.clone(),
             description: queued.description.clone(),
             repo_path: queued.repo_path.clone(),
             branch: queued.branch.clone(),
             model: queued.model.clone(),
-            status: TaskStatus::Pending,
+            status: initial.clone(),
             created_at: queued.submitted_at,
             last_updated_at: queued.submitted_at,
             ttl_ms: None,
@@ -1572,8 +1673,14 @@ impl TaskRunner {
                     .unwrap_or_else(|| Lineage::root_child(RootId::legacy(queued.id.clone()))),
             ),
         };
+        if let (Some(identity), Some(client_ref)) = (&queued.identity_hint, &queued.client_ref) {
+            self.client_refs
+                .write()
+                .await
+                .insert((identity.clone(), client_ref.clone()), queued.id.clone());
+        }
         self.tasks.write().await.insert(queued.id.clone(), task);
-        let (tx, rx) = watch::channel(TaskStatus::Pending);
+        let (tx, rx) = watch::channel(initial);
         self.status_senders
             .write()
             .await
@@ -1601,11 +1708,66 @@ impl TaskRunner {
         if status.is_terminal() {
             self.release_leases(task_id);
             self.bound.write().await.remove(task_id);
+            self.pending_audits.write().await.remove(task_id);
         }
         let senders = self.status_senders.read().await;
         if let Some((tx, _keepalive)) = senders.get(task_id) {
             let _ = tx.send(status);
         }
+    }
+
+    async fn find_by_client_ref(&self, identity: &str, client_ref: &str) -> Option<TaskId> {
+        self.client_refs
+            .read()
+            .await
+            .get(&(identity.to_string(), client_ref.to_string()))
+            .cloned()
+    }
+
+    async fn audit_pending(&self, queued: &QueuedTask) -> Result<(), (String, &'static str)> {
+        let Some(PendingAudit { gate, request }) =
+            self.pending_audits.write().await.remove(&queued.id)
+        else {
+            return Ok(());
+        };
+        let repo_gate = gate.for_repo(&queued.repo_path).map_err(|e| {
+            (
+                format!("repo-local identity overrides rejected: {e}"),
+                "SpawnRefused",
+            )
+        })?;
+        let allowed = repo_gate.check(request).await.map_err(|refused| {
+            let kind = match refused {
+                Refused::AuditFailed(_) => "SpawnAuditFailed",
+                Refused::Verdict { .. } => "SpawnRefused",
+            };
+            (refused.to_string(), kind)
+        })?;
+        if !crate::scope::names_repo(allowed.repo(), &queued.repo_path) {
+            let refused = SpawnRefused::RepoMismatch {
+                audited: allowed.repo().to_string(),
+                target: queued.repo_path.display().to_string(),
+            };
+            return Err((refused.to_string(), "SpawnRefused"));
+        }
+        if queued.model != allowed.model() {
+            let refused = SpawnRefused::ModelMismatch {
+                audited: allowed.model().to_string(),
+                requested: queued.model.clone(),
+            };
+            return Err((refused.to_string(), "SpawnRefused"));
+        }
+        crate::scope::check_repo(allowed.identity(), &queued.repo_path)
+            .map_err(|e| (e.to_string(), "SpawnRefused"))?;
+        let (_, identity, _) = {
+            let tasks = self.tasks.read().await;
+            AuditedIdentity::split(allowed, &|id| tasks.get(id).and_then(|t| t.lineage.clone()))
+        };
+        self.bound
+            .write()
+            .await
+            .insert(queued.id.clone(), BoundIdentity::Audited(identity));
+        Ok(())
     }
 
     /// Give back every lease the task holds. A store failure is logged: the
@@ -1695,6 +1857,10 @@ impl TaskRunner {
             .await;
             return;
         };
+        if let Err((error, error_type)) = self.audit_pending(&queued).await {
+            self.fail(&task_id, error, error_type).await;
+            return;
+        }
         let identity = match self
             .resolve_identity(&task_id, queued.identity_hint.as_deref(), &queued.repo_path)
             .await
@@ -5856,6 +6022,270 @@ mod identity_tests {
         let task = manager.poll(&entry.id).await.unwrap();
         assert_eq!(failed_with(&task.status).0, "RestoreRefused");
         assert!(store.load().unwrap().is_empty());
+    }
+
+    async fn submit_unaudited(
+        manager: &TaskManager,
+        gate: &Arc<SpawnGate>,
+        repo: &std::path::Path,
+        text: &str,
+        client_ref: Option<&str>,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Submission {
+        let request = gate.request(
+            TaskSummary::new(
+                format!("mcp-{}", Uuid::new_v4()),
+                text.to_string(),
+                "example/repo".to_string(),
+            ),
+            "rust-implementer",
+            text,
+        );
+        manager
+            .submit_for_audit(
+                Arc::clone(gate),
+                request,
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                client_ref.map(str::to_string),
+                provider,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn restore_from(
+        store: &InMemoryQueueStore,
+        gate: &SpawnGate,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TaskManager {
+        TaskManager::restore_with_escalations(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+            &fixture_catalog(),
+            Arc::new(EscalationLog::in_memory()),
+            default_action_gate(Arc::new(InMemoryLeaseStore::default())),
+            gate,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_an_auditing_entry_is_persisted_and_reaudited_on_restore_never_run_on_trust() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let store = InMemoryQueueStore::default();
+        let first = TaskManager::with_stores(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
+        )
+        .unwrap();
+        let hanging = Arc::new(model_gate(Box::new(PendingAuditor)));
+        let provider = untouched_provider();
+        let before = provider.remaining();
+        let as_provider = provider.clone() as Arc<dyn ModelProvider>;
+        let hostile = submit_unaudited(
+            &first,
+            &hanging,
+            repo.path(),
+            HOSTILE,
+            Some("ref-hostile"),
+            as_provider.clone(),
+        )
+        .await;
+        let benign = submit_unaudited(
+            &first,
+            &hanging,
+            repo.path(),
+            "Check PR status",
+            Some("ref-benign"),
+            as_provider,
+        )
+        .await;
+        assert!(hostile.created && benign.created);
+        let task = first.poll(&hostile.task_id).await.unwrap();
+        assert!(
+            matches!(task.status, TaskStatus::Auditing),
+            "{:?}",
+            task.status
+        );
+        assert!(first.runner.bound.read().await.is_empty());
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted
+            .iter()
+            .all(|entry| entry.identity_hint.as_deref() == Some("rust-implementer")));
+        assert_eq!(
+            persisted
+                .iter()
+                .filter_map(|entry| entry.client_ref.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["ref-benign", "ref-hostile"].into_iter().collect()
+        );
+        drop(first);
+
+        let gate = crate::auditor::test_support::fixture_gate();
+        let restored =
+            restore_from(&store, &gate, provider.clone() as Arc<dyn ModelProvider>).await;
+
+        let refused = restored.poll(&hostile.task_id).await.unwrap();
+        let (error_type, error) = failed_with(&refused.status);
+        assert_eq!(error_type, "RestoreRefused");
+        assert!(error.contains("spawn refused"), "{error}");
+
+        let allowed = restored.poll(&benign.task_id).await.unwrap();
+        assert!(
+            matches!(allowed.status, TaskStatus::Pending),
+            "{:?}",
+            allowed.status
+        );
+        let (audited, _) = restored.bound_identity_of(&benign.task_id).await.unwrap();
+        assert!(audited);
+        assert!(restored.bound_identity_of(&hostile.task_id).await.is_none());
+        assert_eq!(gate.log().entries().unwrap().len(), 2);
+
+        let again = submit_unaudited(
+            &restored,
+            &Arc::new(model_gate(Box::new(PendingAuditor))),
+            repo.path(),
+            "Check PR status",
+            Some("ref-benign"),
+            provider.clone() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        assert!(!again.created);
+        assert_eq!(again.task_id, benign.task_id);
+        assert_eq!(provider.remaining(), before);
+    }
+
+    #[tokio::test]
+    async fn test_restore_audits_the_callers_effect_and_loop_the_live_path_audited() {
+        use crate::effects::EffectClass;
+        use crate::identity::DevLoop;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let store = InMemoryQueueStore::default();
+        let first = TaskManager::with_stores(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(store.clone()),
+            Arc::new(InMemoryLeaseStore::default()),
+        )
+        .unwrap();
+        let hanging = Arc::new(model_gate(Box::new(PendingAuditor)));
+        let provider = untouched_provider();
+        let before = provider.remaining();
+        let mut ids = Vec::new();
+        for (effect, dev_loop) in [
+            (Some(EffectClass::Production), None),
+            (None, Some(DevLoop::Outer)),
+            (Some(EffectClass::Workspace), Some(DevLoop::Inner)),
+        ] {
+            let request = hanging.request_with_caller(
+                TaskSummary::new(
+                    format!("mcp-{}", Uuid::new_v4()),
+                    "Add a test.".to_string(),
+                    "example/repo".to_string(),
+                ),
+                "rust-implementer",
+                "Add a test.",
+                effect,
+                dev_loop,
+            );
+            let submitted = first
+                .submit_for_audit(
+                    Arc::clone(&hanging),
+                    request,
+                    repo.path().to_path_buf(),
+                    "HEAD".to_string(),
+                    "mock".to_string(),
+                    20,
+                    None,
+                    provider.clone() as Arc<dyn ModelProvider>,
+                )
+                .await
+                .unwrap();
+            ids.push(submitted.task_id);
+        }
+        drop(first);
+        let gate = crate::auditor::test_support::fixture_gate();
+        let restored =
+            restore_from(&store, &gate, provider.clone() as Arc<dyn ModelProvider>).await;
+        for refused in &ids[..2] {
+            let task = restored.poll(refused).await.unwrap();
+            assert_eq!(failed_with(&task.status).0, "RestoreRefused");
+            assert!(restored.bound_identity_of(refused).await.is_none());
+        }
+        let allowed = restored.poll(&ids[2]).await.unwrap();
+        assert!(
+            matches!(allowed.status, TaskStatus::Pending),
+            "{:?}",
+            allowed.status
+        );
+        let log = gate.log().entries().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].request.requested_effect, EffectClass::Production);
+        assert_eq!(log[1].request.dev_loop, DevLoop::Outer);
+        assert_eq!(log[2].request.requested_effect, EffectClass::Workspace);
+        assert_eq!(log[2].request.dev_loop, DevLoop::Inner);
+        assert_eq!(provider.remaining(), before);
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_unaudited_submission_fails_with_the_reason_before_any_model_call() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::default();
+        let gate = Arc::new(crate::auditor::test_support::fixture_gate());
+        let provider = untouched_provider();
+        let before = provider.remaining();
+        let submitted = submit_unaudited(
+            &manager,
+            &gate,
+            repo.path(),
+            HOSTILE,
+            None,
+            provider.clone() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        let status = manager.wait_terminal(&submitted.task_id).await.unwrap();
+        let (error_type, error) = failed_with(&status);
+        assert_eq!(error_type, "SpawnRefused");
+        assert!(error.contains("spawn refused"), "{error}");
+        assert_eq!(provider.remaining(), before);
+        assert!(manager.runner.bound.read().await.is_empty());
+        assert!(manager.runner.pending_audits.read().await.is_empty());
+        assert!(manager.runner.progress.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_an_auditing_task_drops_its_pending_audit() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let manager = TaskManager::with_stores(
+            0,
+            Box::new(HybridPolicy::default()),
+            Box::new(InMemoryQueueStore::default()),
+            Arc::new(InMemoryLeaseStore::default()),
+        )
+        .unwrap();
+        let gate = Arc::new(model_gate(Box::new(PendingAuditor)));
+        let submitted = submit_unaudited(
+            &manager,
+            &gate,
+            repo.path(),
+            "Check PR status",
+            None,
+            untouched_provider() as Arc<dyn ModelProvider>,
+        )
+        .await;
+        assert_eq!(manager.runner.pending_audits.read().await.len(), 1);
+        manager.cancel(&submitted.task_id).await.unwrap();
+        assert!(manager.runner.pending_audits.read().await.is_empty());
     }
 
     #[tokio::test]

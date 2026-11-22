@@ -524,6 +524,7 @@ fn the_set_of_submit_and_enqueue_functions_is_pinned() {
             "mcp/client.rs: NannaMcpClient::submit_task (pub)",
             "scheduler/dispatch.rs: Dispatcher::enqueue (pub)",
             "task.rs: TaskManager::submit_audited (pub(restricted))",
+            "task.rs: TaskManager::submit_for_audit (pub)",
             "task.rs: TaskManager::submit_spawn (pub)",
             "task.rs: TaskManager::submit_task (pub(restricted))",
             "task.rs: TaskManager::submit_bound (private)",
@@ -558,9 +559,13 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         ("backlog.rs: ManagerSink::enqueue uses submit_audited", 1),
         ("backlog.rs: backlog_sync uses enqueue", 1),
         ("main.rs: run_delegate uses submit_task", 1),
-        ("mcp/handlers.rs: handle_assign_task uses submit_spawn", 1),
+        (
+            "mcp/handlers.rs: handle_assign_task uses submit_for_audit",
+            1,
+        ),
         ("plan_dispatch.rs: TaskManager::start uses submit_spawn", 1),
         ("task.rs: TaskManager::submit_audited uses submit_task", 1),
+        ("task.rs: TaskManager::submit_for_audit uses submit_task", 1),
         ("task.rs: TaskManager::submit_spawn uses submit_bound", 1),
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
         ("task.rs: TaskManager::submit_bound uses submit_task", 1),
@@ -623,10 +628,213 @@ fn dominates(calls: &Calls, first: &str, then: &str) -> bool {
         })
 }
 
+fn functions_calling(name: &str) -> BTreeSet<String> {
+    scan_all()
+        .into_iter()
+        .flat_map(|scan| {
+            let file = scan.file.clone();
+            scan.sequences
+                .into_iter()
+                .filter(|(_, calls)| calls.iter().any(|(called, _)| called == name))
+                .map(move |(function, _)| format!("{file}: {function}"))
+        })
+        .collect()
+}
+
 #[test]
-fn the_mcp_assign_path_checks_the_gate_on_every_path_to_submitting() {
+fn the_mcp_assign_path_only_registers_for_audit_and_can_neither_check_mint_nor_dispatch() {
     let calls = calls_in("handle_assign_task", "mcp/handlers.rs");
-    assert!(dominates(&calls, "check", "submit_spawn"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(name, _)| name == "submit_for_audit")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "check",
+        "submit_spawn",
+        "submit_task",
+        "submit_bound",
+        "submit_audited",
+        "enqueue",
+        "split",
+        "insert",
+    ] {
+        assert!(
+            calls.iter().all(|(name, _)| name != forbidden),
+            "handle_assign_task must not call {forbidden}: the proof is minted only inside the run"
+        );
+    }
+    let register = calls_in("TaskManager::submit_for_audit", "task.rs");
+    assert!(register.iter().any(|(name, _)| name == "submit_task"));
+    assert!(
+        dominates(&register, "insert", "submit_task"),
+        "submit_for_audit must record the pending audit before the entry is queued: an entry without one would be resolved from the shared catalog and run without a proof"
+    );
+    for forbidden in [
+        "check",
+        "split",
+        "submit_spawn",
+        "submit_bound",
+        "submit_audited",
+    ] {
+        assert!(
+            register.iter().all(|(name, _)| name != forbidden),
+            "submit_for_audit registers a request for a proof and must not mint or consume one: {forbidden}"
+        );
+    }
+}
+
+struct FieldOps {
+    field: &'static str,
+    owner: Vec<String>,
+    function: Vec<String>,
+    ops: BTreeMap<String, usize>,
+}
+
+fn rooted_at_field(expr: &syn::Expr, field: &str) -> bool {
+    match expr {
+        syn::Expr::Field(access) => {
+            matches!(&access.member, syn::Member::Named(name) if plain(&name.to_string()) == field)
+        }
+        syn::Expr::MethodCall(call) => rooted_at_field(&call.receiver, field),
+        syn::Expr::Await(awaited) => rooted_at_field(&awaited.base, field),
+        syn::Expr::Paren(paren) => rooted_at_field(&paren.expr, field),
+        syn::Expr::Reference(reference) => rooted_at_field(&reference.expr, field),
+        _ => false,
+    }
+}
+
+impl<'ast> Visit<'ast> for FieldOps {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        self.owner.push(type_name(&node.self_ty));
+        syn::visit::visit_item_impl(self, node);
+        self.owner.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        self.function.push(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+        self.function.pop();
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        self.function.push(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+        self.function.pop();
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if let Some(function) = self.function.last() {
+            if rooted_at_field(&node.receiver, self.field) {
+                let owner = self.owner.last().cloned().unwrap_or_default();
+                let qualified = if owner.is_empty() {
+                    function.clone()
+                } else {
+                    format!("{owner}::{function}")
+                };
+                *self
+                    .ops
+                    .entry(format!(
+                        "task.rs: {qualified} {}.{}",
+                        self.field, node.method
+                    ))
+                    .or_default() += 1;
+            }
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn field_ops(source: &str, field: &'static str) -> BTreeMap<String, usize> {
+    let syntax = syn::parse_file(source).unwrap();
+    let mut visitor = FieldOps {
+        field,
+        owner: Vec::new(),
+        function: Vec::new(),
+        ops: BTreeMap::new(),
+    };
+    visitor.visit_file(&syntax);
+    visitor.ops
+}
+
+#[test]
+fn every_pending_audit_is_recorded_only_at_registration_and_consumed_or_dropped_on_every_exit() {
+    assert_eq!(
+        field_ops(&task_source(), "pending_audits"),
+        counts(&[
+            ("task.rs: TaskManager::cancel pending_audits.remove", 1),
+            ("task.rs: TaskManager::cancel pending_audits.write", 1),
+            ("task.rs: TaskManager::submit_for_audit pending_audits.insert", 1),
+            ("task.rs: TaskManager::submit_for_audit pending_audits.write", 1),
+            ("task.rs: TaskRunner::audit_pending pending_audits.remove", 1),
+            ("task.rs: TaskRunner::audit_pending pending_audits.write", 1),
+            ("task.rs: TaskRunner::register pending_audits.contains_key", 1),
+            ("task.rs: TaskRunner::register pending_audits.read", 1),
+            ("task.rs: TaskRunner::set_status pending_audits.remove", 1),
+            ("task.rs: TaskRunner::set_status pending_audits.write", 1),
+        ]),
+        "the pending-audit map gained, lost or moved an operation: the single insert is submit_for_audit, and every entry must leave through audit_pending (consumed), set_status (terminal) or cancel"
+    );
+}
+
+#[test]
+fn the_pending_audit_scanner_sees_chained_operations_and_skips_test_code() {
+    let ops = field_ops(
+        "impl R { fn f(&self) { self.runner.pending_audits.write().await.insert(1, 2); } }          #[cfg(test)] mod tests { impl R { fn g(&self) { self.pending_audits.write(); } } }",
+        "pending_audits",
+    );
+    assert_eq!(
+        ops,
+        counts(&[
+            ("task.rs: R::f pending_audits.insert", 1),
+            ("task.rs: R::f pending_audits.write", 1),
+        ])
+    );
+}
+
+#[test]
+fn the_run_mints_the_proof_before_any_worktree_tool_or_model_use() {
+    let audit = calls_in("TaskRunner::audit_pending", "task.rs");
+    assert!(dominates(&audit, "check", "split"));
+    assert!(dominates(&audit, "check", "insert"));
+    assert!(dominates(&audit, "check", "check_repo"));
+    assert_eq!(
+        functions_calling("audit_pending"),
+        expected(&["task.rs: TaskRunner::run"]),
+        "audit_pending is the only place a request registered for audit becomes a proof; only the run may call it"
+    );
+    let run = calls_in("TaskRunner::run", "task.rs");
+    for execution in [
+        "resolve_identity",
+        "get_or_build_image",
+        "start_task_sidecars",
+        "create_with_container_and_sidecars",
+        "create",
+        "with_tools",
+        "run",
+    ] {
+        assert!(
+            dominates(&run, "audit_pending", execution),
+            "TaskRunner::run must call audit_pending before {execution} on every path"
+        );
+    }
 }
 
 #[test]
@@ -674,8 +882,9 @@ fn the_name_submit_task_is_called_only_by_the_audited_binders_and_the_gated_mcp_
             "main.rs: run_delegate uses submit_task",
             "task.rs: TaskManager::submit_audited uses submit_task",
             "task.rs: TaskManager::submit_bound uses submit_task",
+            "task.rs: TaskManager::submit_for_audit uses submit_task",
         ]),
-        "the only production callers of TaskManager::submit_task are submit_bound and submit_audited; run_delegate calls NannaMcpClient::submit_task, which reaches submit_spawn through the gated in-process server; the scan matches by method name only, so it cannot tell the two submit_task methods apart and any new caller of either must be reviewed here"
+        "the only production callers of TaskManager::submit_task are submit_bound, submit_audited and submit_for_audit (which registers a request for a run-time audit and holds no proof); run_delegate calls NannaMcpClient::submit_task, which reaches submit_spawn through the gated in-process server; the scan matches by method name only, so it cannot tell the two submit_task methods apart and any new caller of either must be reviewed here"
     );
 }
 
@@ -688,7 +897,25 @@ fn restore_audits_every_persisted_entry_before_the_dispatcher_starts() {
     assert!(admit.iter().any(|(name, _)| name == "cancel"));
     assert!(admit.iter().all(|(name, _)| name != "dispatch"));
     let audit = calls_in("audit_restored", "task.rs");
-    assert!(dominates(&audit, "request", "check"));
+    let check_at = audit
+        .iter()
+        .position(|(name, _)| name == "check")
+        .expect("audit_restored must call check");
+    assert!(
+        audit[check_at].1.is_empty(),
+        "audit_restored must call check unconditionally"
+    );
+    let builders: Vec<usize> = audit
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| name == "request" || name == "request_with_caller")
+        .map(|(at, _)| at)
+        .collect();
+    assert!(!builders.is_empty());
+    assert!(
+        builders.iter().all(|at| *at < check_at),
+        "every request audit_restored builds must precede the check"
+    );
 }
 
 #[test]
@@ -839,11 +1066,13 @@ fn the_audit_token_is_minted_only_where_the_gate_proof_is_consumed() {
             "task.rs: TaskManager::submit_audited constructs BoundIdentity::Audited",
             "task.rs: TaskManager::submit_spawn constructs AuditedIdentity::split",
             "task.rs: TaskManager::submit_spawn constructs BoundIdentity::Audited",
+            "task.rs: TaskRunner::audit_pending constructs AuditedIdentity::split",
+            "task.rs: TaskRunner::audit_pending constructs BoundIdentity::Audited",
             "task.rs: audit_restored constructs AuditedIdentity::split",
             "task.rs: token shape: derives Debug",
             "task.rs: token shape: split is private",
         ]),
-        "the audited-identity token may only be created from a gate proof in submit_spawn, submit_audited and audit_restored"
+        "the audited-identity token may only be created from a gate proof in submit_spawn, submit_audited, audit_restored and TaskRunner::audit_pending (the run-time audit behind assign_task)"
     );
 }
 
@@ -1023,6 +1252,7 @@ fn every_production_mention_of_the_bound_identity_map_is_counted_per_function() 
             ("task.rs: TaskManager::cancel", 1),
             ("task.rs: TaskManager::submit_audited", 1),
             ("task.rs: TaskManager::submit_bound", 1),
+            ("task.rs: TaskRunner::audit_pending", 1),
             ("task.rs: TaskRunner::resolve_identity", 1),
             ("task.rs: TaskRunner::set_status", 1),
         ]),
@@ -1043,6 +1273,8 @@ fn every_production_operation_on_the_bound_identity_map_is_counted_per_function(
             ("task.rs: TaskManager::submit_audited bound.write", 1),
             ("task.rs: TaskManager::submit_bound bound.insert", 1),
             ("task.rs: TaskManager::submit_bound bound.write", 1),
+            ("task.rs: TaskRunner::audit_pending bound.insert", 1),
+            ("task.rs: TaskRunner::audit_pending bound.write", 1),
             ("task.rs: TaskRunner::resolve_identity bound.remove", 1),
             ("task.rs: TaskRunner::resolve_identity bound.write", 1),
             ("task.rs: TaskRunner::set_status bound.remove", 1),
@@ -1067,6 +1299,7 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
             "task.rs: TaskManager::admit_restored",
             "task.rs: TaskManager::submit_audited",
             "task.rs: TaskManager::submit_bound",
+            "task.rs: TaskRunner::audit_pending",
         ]),
         "an insert into `runner.bound` was added or moved: give the new site a remove path (terminal status, cancel, or consumption by resolve_identity) and update this list in the same change"
     );
@@ -1189,13 +1422,16 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "bound",
             "build_locks",
             "ci_client",
+            "client_refs",
             "cost_accountant",
             "default_provider",
             "escalations",
             "escalator",
             "identities",
             "image_cache",
+            "intake",
             "leases",
+            "pending_audits",
             "progress",
             "providers",
             "sink",
