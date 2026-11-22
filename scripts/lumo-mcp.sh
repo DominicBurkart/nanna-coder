@@ -59,6 +59,34 @@ if ! podman volume exists "$CONFIG_VOLUME" > /dev/null 2>&1; then
   exit 3
 fi
 
+declare -a repo_mounts=()
+declare -a wanted=()
+if [[ -n "${NANNA_REPOS:-}" ]]; then
+  IFS=',' read -r -a wanted <<< "$NANNA_REPOS"
+fi
+declare -A seen=()
+repo_list="$("$BASH" "$SCRIPT_DIR/lumo-repos.sh" --list)" || exit 3
+while IFS=$'\t' read -r name volume _slug; do
+  if [[ ${#wanted[@]} -gt 0 ]]; then
+    keep=0
+    for w in "${wanted[@]}"; do
+      if [[ "$w" == "$name" ]]; then keep=1; seen[$w]=1; fi
+    done
+    [[ $keep -eq 1 ]] || continue
+  fi
+  if ! podman volume exists "$volume" > /dev/null 2>&1; then
+    printf 'repository volume %s is missing; refusing to start without it. Run: %s/lumo-repos.sh --only %s\n' "$volume" "$SCRIPT_DIR" "$name" >&2
+    exit 3
+  fi
+  repo_mounts+=(-v "$volume:/repos/$name")
+done <<< "$repo_list"
+for w in "${wanted[@]}"; do
+  if [[ -z "${seen[$w]:-}" ]]; then
+    printf 'NANNA_REPOS names %s, which is not a repository in the lumo card\n' "$w" >&2
+    exit 2
+  fi
+done
+
 exec podman run --rm -i --pod "$POD" \
-  -v "$CONFIG_VOLUME:/etc/nanna:ro" -e NANNA_CONFIG_DIR=/etc/nanna \
+  -v "$CONFIG_VOLUME:/etc/nanna:ro" "${repo_mounts[@]}" -e NANNA_CONFIG_DIR=/etc/nanna \
   "$IMAGE" /bin/nanna mcp-serve --model "$MODEL"
