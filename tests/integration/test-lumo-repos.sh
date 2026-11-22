@@ -26,16 +26,31 @@ exit 0
 FAKE
 chmod +x "$WORK/bin/podman"
 export FAKE_PODMAN_LOG="$WORK/log" FAKE_VOLUME_DIR="$WORK/volumes"
+CATALOG="$WORK/catalog"
+mkdir -p "$CATALOG/prompts"
+cat > "$CATALOG/auditor.toml" <<'CARD'
+[identity]
+name = "auditor"
+
+[scope]
+repos = ["github.com/DominicBurkart/marigold", "github.com/DominicBurkart/personal-site-actix", "github.com/DominicBurkart/nanna-coder"]
+CARD
+cat > "$CATALOG/one-track-api.toml" <<'CARD'
+[scope]
+repos = ["github.com/1-Track/one_track", "github.com/DominicBurkart/marigold"]
+CARD
+printf '[identity]\nname = "no-repos"\n' > "$CATALOG/no-repos.toml"
+printf 'repos = ["github.com/evil/ignored"]\n' > "$CATALOG/prompts/note.md"
 : > "$FAKE_PODMAN_LOG"
 
 run_repos() {
-  env -i FAKE_PODMAN_LOG="$FAKE_PODMAN_LOG" FAKE_VOLUME_DIR="$FAKE_VOLUME_DIR" FAKE_FAIL_MATCH="${FAKE_FAIL_MATCH:-}" \
+  env -i FAKE_PODMAN_LOG="$FAKE_PODMAN_LOG" FAKE_VOLUME_DIR="$FAKE_VOLUME_DIR" FAKE_FAIL_MATCH="${FAKE_FAIL_MATCH:-}" NANNA_CATALOG_SRC="$CATALOG" \
     PATH="$WORK/bin:/usr/bin:/bin" HOME="$WORK/home" "$@"
 }
 
 listing="$(run_repos "$BASH" "$SCRIPT" --list)"
 expected=$'marigold\tnanna-repo-marigold\tgithub.com/DominicBurkart/marigold\npersonal-site-actix\tnanna-repo-personal-site-actix\tgithub.com/DominicBurkart/personal-site-actix\nnanna-coder\tnanna-repo-nanna-coder\tgithub.com/DominicBurkart/nanna-coder\none_track\tnanna-repo-one_track\tgithub.com/1-Track/one_track'
-[[ "$listing" == "$expected" ]] || fail "--list must show name, volume and slug for each card repo, got: $listing"
+[[ "$listing" == "$expected" ]] || fail "--list must show the de-duplicated union of the catalog's repos, got: $listing"
 [[ ! -s "$FAKE_PODMAN_LOG" ]] || fail "--list must not call podman"
 
 : > "$FAKE_PODMAN_LOG"
@@ -63,7 +78,7 @@ run_repos "$BASH" "$SCRIPT" --only marigold > /dev/null 2>&1 || fail "--only mus
 [[ "$(grep -c 'fetch --prune' "$FAKE_PODMAN_LOG")" -eq 1 ]] || fail "--only must touch exactly one repo"
 grep -q 'nanna-repo-marigold' "$FAKE_PODMAN_LOG" || fail "--only marigold must touch the marigold volume"
 ! grep -q 'nanna-repo-one_track' "$FAKE_PODMAN_LOG" || fail "--only must not touch other volumes"
-if run_repos "$BASH" "$SCRIPT" --only bogus > /dev/null 2>&1; then fail "--only with a repo outside the card must be rejected"; fi
+if run_repos "$BASH" "$SCRIPT" --only bogus > /dev/null 2>&1; then fail "--only with a repo outside the catalog must be rejected"; fi
 
 ! grep -q 'security-opt\|label=\|:z\|:Z\|privileged' "$FAKE_PODMAN_LOG" || fail "must never alter SELinux labelling or privileges"
 ! grep -qi 'token\|password\|ghp_\|@github.com' "$FAKE_PODMAN_LOG" || fail "credentials must never appear in argv"
@@ -88,8 +103,16 @@ else
   grep -qi 'podman' "$WORK/err" || fail "missing-podman error must mention podman"
 fi
 : > "$FAKE_PODMAN_LOG"
-if run_repos NANNA_LUMO_CARD="$WORK/none.toml" "$BASH" "$SCRIPT" > /dev/null 2>&1; then fail "an unreadable card must fail"; fi
-[[ ! -s "$FAKE_PODMAN_LOG" ]] || fail "an unreadable card must not reach podman"
+if run_repos NANNA_CATALOG_SRC="$WORK/none" "$BASH" "$SCRIPT" > /dev/null 2>&1; then fail "a missing catalog must fail"; fi
+[[ ! -s "$FAKE_PODMAN_LOG" ]] || fail "a missing catalog must not reach podman"
+mkdir -p "$WORK/bare"
+printf '[identity]\nname = "x"\n' > "$WORK/bare/x.toml"
+if run_repos NANNA_CATALOG_SRC="$WORK/bare" "$BASH" "$SCRIPT" --list > /dev/null 2>&1; then fail "a catalog naming no repository must fail"; fi
+mkdir -p "$WORK/home/.config/nanna/agents" "$WORK/xdg/nanna/agents"
+printf 'repos = ["github.com/o/home-repo"]\n' > "$WORK/home/.config/nanna/agents/a.toml"
+printf 'repos = ["github.com/o/xdg-repo"]\n' > "$WORK/xdg/nanna/agents/a.toml"
+env -i PATH="/usr/bin:/bin" HOME="$WORK/home" "$BASH" "$SCRIPT" --list | grep -q '^home-repo' || fail "the default catalog is ~/.config/nanna/agents"
+env -i PATH="/usr/bin:/bin" HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/xdg" "$BASH" "$SCRIPT" --list | grep -q '^xdg-repo' || fail "XDG_CONFIG_HOME must override the home default"
 if "$BASH" "$SCRIPT" --bogus > /dev/null 2>&1; then fail "unknown flag must be rejected"; fi
 
 if [[ $FAILED -eq 0 ]]; then echo "PASS: lumo-repos"; fi
