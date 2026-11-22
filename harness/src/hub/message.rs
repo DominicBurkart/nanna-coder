@@ -107,6 +107,128 @@ pub enum Recipient {
     Root,
 }
 
+/// What a sender asks `msg_send` to deliver. Every field is agent-authored.
+/// `Debug` prints lengths, never text.
+///
+/// ```
+/// use harness::hub::message::{MessageKind, Recipient, SendRequest};
+///
+/// let req = SendRequest {
+///     to: Recipient::Parent,
+///     kind: MessageKind::Info,
+///     subject: "status".into(),
+///     body: "a secret plan".into(),
+///     in_reply_to: None,
+/// };
+/// assert!(!format!("{req:?}").contains("secret"));
+/// assert!(format!("{req:?}").contains("body_len: 13"));
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRequest {
+    pub to: Recipient,
+    pub kind: MessageKind,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<MessageId>,
+}
+
+impl fmt::Debug for SendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendRequest")
+            .field("to", &self.to)
+            .field("kind", &self.kind)
+            .field("in_reply_to", &self.in_reply_to)
+            .field("subject_len", &self.subject.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+/// The ids of the stored messages, one per recipient.
+///
+/// ```
+/// use harness::hub::message::SendReceipt;
+///
+/// let receipt = SendReceipt { ids: vec![], recipients: 0 };
+/// assert_eq!(receipt.recipients, receipt.ids.len());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SendReceipt {
+    pub ids: Vec<MessageId>,
+    pub recipients: usize,
+}
+
+/// How far a session's identity card lets it message: `None` forbids
+/// `msg_send`, `Lineage` allows the parent, children, siblings and the root
+/// mailbox, `Root` allows any session in the root. The order is the
+/// permission order, so a narrowing card may only pick a value less than or
+/// equal to its base, and a card that does not state a value gets `None`.
+///
+/// ```
+/// use harness::hub::message::MessageReach;
+///
+/// assert!(MessageReach::None < MessageReach::Lineage && MessageReach::Lineage < MessageReach::Root);
+/// assert_eq!(MessageReach::default(), MessageReach::None);
+/// assert_eq!("lineage".parse::<MessageReach>(), Ok(MessageReach::Lineage));
+/// assert_eq!(MessageReach::Root.as_str(), "root");
+/// assert!("everyone".parse::<MessageReach>().is_err());
+/// ```
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageReach {
+    #[default]
+    None,
+    Lineage,
+    Root,
+}
+
+impl MessageReach {
+    /// Every value, in ascending permission order.
+    ///
+    /// ```
+    /// use harness::hub::message::MessageReach;
+    /// assert!(MessageReach::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+    /// ```
+    pub const ALL: [MessageReach; 3] = [
+        MessageReach::None,
+        MessageReach::Lineage,
+        MessageReach::Root,
+    ];
+
+    /// Stable snake_case name, identical to the serde representation.
+    ///
+    /// ```
+    /// use harness::hub::message::MessageReach;
+    /// assert_eq!(MessageReach::None.as_str(), "none");
+    /// ```
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MessageReach::None => "none",
+            MessageReach::Lineage => "lineage",
+            MessageReach::Root => "root",
+        }
+    }
+}
+
+impl fmt::Display for MessageReach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MessageReach {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MessageReach::ALL
+            .into_iter()
+            .find(|reach| reach.as_str() == s)
+            .ok_or(())
+    }
+}
+
 /// The purpose of a message.
 ///
 /// ```
@@ -224,6 +346,35 @@ impl fmt::Debug for StoredMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_of_a_send_request_prints_lengths_and_no_text() {
+        let request = SendRequest {
+            to: Recipient::Parent,
+            kind: MessageKind::Info,
+            subject: "subject-SECRET".into(),
+            body: "body-SECRET".into(),
+            in_reply_to: None,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(
+            debug.contains("subject_len: 14") && debug.contains("body_len: 11"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn message_reach_defaults_to_none_and_orders_by_permission() {
+        assert_eq!(MessageReach::default(), MessageReach::None);
+        assert!(MessageReach::None < MessageReach::Lineage);
+        assert!(MessageReach::Lineage < MessageReach::Root);
+        assert_eq!(MessageReach::Lineage.to_string(), "lineage");
+        assert_eq!(
+            serde_json::to_string(&MessageReach::Root).unwrap(),
+            "\"root\""
+        );
+    }
 
     fn stored() -> StoredMessage {
         StoredMessage {

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-pascal-case-type"
+description = "long PascalCase type name"
+
+[input]
+subject = "status update"
+body = "The new FailClosedMessageAuditorWithTimeoutBudget type lives next to the router."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

@@ -34,6 +34,7 @@ mod gate;
 mod llm;
 mod log;
 mod message_auditor;
+pub mod message_eval;
 mod message_fail_closed;
 mod message_model;
 mod message_rules;
@@ -58,8 +59,8 @@ pub use message_model::{
     ModelMessageAuditor, MESSAGE_AUDITOR_FRAMING, MESSAGE_AUDITOR_RUBRIC, MESSAGE_OUTPUT_CONTRACT,
 };
 pub use message_rules::{
-    EntropyThresholds, IdentifierOracle, MessageVerdict, NullOracle, RuleMessageAuditor,
-    RuleSignal, RulesOutcome,
+    is_credential_path, EntropyThresholds, IdentifierOracle, MessageVerdict, NullOracle,
+    RuleMessageAuditor, RuleSignal, RulesOutcome,
 };
 pub use review::ActionReview;
 pub use routing::{

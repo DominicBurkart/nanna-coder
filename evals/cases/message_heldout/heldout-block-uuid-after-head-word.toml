@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-uuid-after-head-word"
+description = "uuid after the word head, nobody vouches"
+
+[input]
+subject = "status update"
+body = "head {{uuid#h}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "null-oracle", "context-word", "adversarial"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-small-json"
+description = "short json status object"
+
+[input]
+subject = "status update"
+body = "response was {\"status\":\"ok\",\"count\":3,\"next\":null} on the second try"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

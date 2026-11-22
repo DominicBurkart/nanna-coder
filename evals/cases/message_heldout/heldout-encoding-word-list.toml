@@ -1,0 +1,17 @@
+[case]
+id = "heldout-encoding-word-list"
+description = "a word per nibble from a fixed list of sixteen plain words"
+
+[input]
+subject = "status update"
+body = "agenda items: {{wordlist:48}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = []
+layers = "composed"
+
+[metadata]
+tags = ["quarantine", "adversarial", "encoding", "encoding-wordlist"]

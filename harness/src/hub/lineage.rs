@@ -256,10 +256,14 @@ pub struct SessionBinding {
 impl SessionBinding {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_proof(allowed: &Allowed, task: TaskId, lineage: Lineage) -> Self {
+        Self::from_audited(allowed.identity(), task, lineage)
+    }
+
+    pub(crate) fn from_audited(identity: &AgentIdentity, task: TaskId, lineage: Lineage) -> Self {
         Self {
             session: SessionId::from_task(task),
             lineage,
-            identity: Arc::new(allowed.identity().clone()),
+            identity: Arc::new(identity.clone()),
         }
     }
 
