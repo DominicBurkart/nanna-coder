@@ -154,7 +154,7 @@ async fn run(
         &manager,
         &model,
         &gate(),
-        Path::new("/nonexistent/nanna/repos"),
+        &harness::mcp::resolve::AssignContext::new("/nonexistent/nanna/repos"),
         20,
         None,
     )
@@ -261,7 +261,7 @@ async fn a_widened_sample_app_override_fails_the_assignment_closed() {
         &manager,
         &model,
         &gate(),
-        Path::new("/nonexistent/nanna/repos"),
+        &harness::mcp::resolve::AssignContext::new("/nonexistent/nanna/repos"),
         20,
         None,
     )

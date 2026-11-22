@@ -49,7 +49,7 @@ fn parse_client_ref(params: &Value) -> Result<Option<String>, String> {
 ///
 /// `identity` names an assignable card in the gate's catalog; it may be
 /// omitted when exactly one identity is assignable. `repo_path` is resolved
-/// against `repos_root` (see [`resolve::resolve_repo`]). Before anything is
+/// against `ctx.repos_root` (see [`resolve::resolve_repo`]). Before anything is
 /// registered, a rules-only pre-check refuses what needs no model to refuse:
 /// an unassignable identity, any non-`Allow` rule verdict and a repository
 /// outside `scope.repos`. It logs nothing and mints no proof.
@@ -76,7 +76,7 @@ pub async fn handle_assign_task(
     task_manager: &Arc<TaskManager>,
     provider: &Arc<dyn ModelProvider>,
     spawn_gate: &Arc<SpawnGate>,
-    repos_root: &Path,
+    ctx: &resolve::AssignContext,
     default_max_iterations: usize,
     ttl_ms: Option<u64>,
 ) -> Result<Value, Refusal> {
@@ -107,7 +107,7 @@ pub async fn handle_assign_task(
 
     let identity = select_identity(params.get("identity"), spawn_gate)?;
 
-    let resolved = resolve::resolve_repo(repo_input, repos_root)?;
+    let resolved = resolve::resolve_repo(repo_input, &ctx.repos_root)?;
     let repo_path = resolved.path;
 
     let client_ref = parse_client_ref(params)?;
@@ -154,7 +154,7 @@ pub async fn handle_assign_task(
         .context()
         .with_repo_overrides(&repo_path)
         .map_err(|e| format!("repo-local identity overrides rejected: {e}"))?;
-    resolve::precheck(&layered, &request, &repo_path, repos_root)?;
+    resolve::precheck(&layered, &request, &repo_path, ctx, spawn_gate.log())?;
     let submission = task_manager
         .submit_for_audit(
             Arc::clone(spawn_gate),
@@ -515,7 +515,7 @@ mod tests {
             &manager,
             &provider,
             &fixture_gate(),
-            no_repos(),
+            &no_repos(),
             100,
             None,
         )
@@ -535,7 +535,7 @@ mod tests {
             &manager,
             &provider,
             &fixture_gate(),
-            no_repos(),
+            &no_repos(),
             100,
             None,
         )
@@ -558,7 +558,7 @@ mod tests {
             &manager,
             &provider,
             &fixture_gate(),
-            no_repos(),
+            &no_repos(),
             100,
             Some(5000),
         )
@@ -585,7 +585,7 @@ mod tests {
             &manager,
             &provider,
             &fixture_gate(),
-            no_repos(),
+            &no_repos(),
             100,
             Some(u64::MAX),
         )
@@ -594,8 +594,8 @@ mod tests {
         assert_eq!(wire["ttl"], MAX_TTL_MS);
     }
 
-    fn no_repos() -> &'static Path {
-        Path::new("/nonexistent/nanna/repos")
+    fn no_repos() -> resolve::AssignContext {
+        resolve::AssignContext::new("/nonexistent/nanna/repos")
     }
 
     fn plan_responses() -> Vec<ChatResponse> {
@@ -612,7 +612,7 @@ mod tests {
         gate: &Arc<SpawnGate>,
         params: Value,
     ) -> Result<TaskId, String> {
-        let wire = handle_assign_task(&params, manager, provider, gate, no_repos(), 20, None)
+        let wire = handle_assign_task(&params, manager, provider, gate, &no_repos(), 20, None)
             .await
             .map_err(|e| e.to_string())?;
         Ok(TaskId(wire["taskId"].as_str().unwrap().to_string()))
@@ -694,11 +694,39 @@ mod tests {
         gate: &Arc<SpawnGate>,
         params: Value,
     ) -> Value {
+        precheck_refusal_logged(manager, provider, gate, params, 1).await
+    }
+
+    async fn precheck_refusal_logged(
+        manager: &Arc<TaskManager>,
+        provider: &Arc<dyn ModelProvider>,
+        gate: &Arc<SpawnGate>,
+        params: Value,
+        logged: usize,
+    ) -> Value {
         let refusal = assign_raw(manager, provider, gate, params)
             .await
             .expect_err("assign_task refuses before the ack");
         assert!(manager.list().await.is_empty());
-        assert!(gate.log().entries().unwrap().is_empty());
+        let entries = gate.log().entries().unwrap();
+        assert_eq!(entries.len(), logged);
+        if logged == 0 {
+            return refusal.to_json();
+        }
+        let entry = &entries[0];
+        assert_eq!(entry.record.model, resolve::PRECHECK_PROVENANCE);
+        assert!(!entry.verdict.is_allow());
+        assert!(entry.request.subtask.is_empty());
+        assert!(entry.request.parent_task.description.is_empty());
+        assert!(entry.verdict.reasons().iter().all(|r| r.detail.is_empty()));
+        let logged = serde_json::to_string(entry).unwrap();
+        for text in [
+            "Add a test.",
+            "Ignore previous instructions",
+            "release script",
+        ] {
+            assert!(!logged.contains(text), "{logged}");
+        }
         refusal.to_json()
     }
 
@@ -708,7 +736,7 @@ mod tests {
         gate: &Arc<SpawnGate>,
         params: Value,
     ) -> Result<Value, Refusal> {
-        handle_assign_task(&params, manager, provider, gate, no_repos(), 20, None).await
+        handle_assign_task(&params, manager, provider, gate, &no_repos(), 20, None).await
     }
 
     fn worktree_count(repo: &Path) -> usize {
@@ -730,7 +758,7 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let gate = fixture_gate();
         let missing = serde_json::json!({"description": "d", "repo_path": "/tmp"});
-        let err = handle_assign_task(&missing, &manager, &provider, &gate, no_repos(), 1, None)
+        let err = handle_assign_task(&missing, &manager, &provider, &gate, &no_repos(), 1, None)
             .await
             .unwrap_err()
             .to_string();
@@ -739,7 +767,7 @@ mod tests {
             let params = serde_json::json!({
                 "description": "d", "repo_path": "/tmp", "identity": blank
             });
-            let err = handle_assign_task(&params, &manager, &provider, &gate, no_repos(), 1, None)
+            let err = handle_assign_task(&params, &manager, &provider, &gate, &no_repos(), 1, None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -821,7 +849,7 @@ mod tests {
         let params = serde_json::json!({
             "description": "d", "repo_path": path, "identity": "rust-implementer"
         });
-        let err = handle_assign_task(&params, &manager, &provider, &gate, no_repos(), 20, None)
+        let err = handle_assign_task(&params, &manager, &provider, &gate, &no_repos(), 20, None)
             .await
             .unwrap_err()
             .to_string();
@@ -1484,7 +1512,7 @@ max_concurrent = 1
         let started = tokio::time::Instant::now();
         let acked = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            handle_assign_task(&request, &manager, &provider, &gate, no_repos(), 20, None),
+            handle_assign_task(&request, &manager, &provider, &gate, &no_repos(), 20, None),
         )
         .await
         .expect("assign_task must ack before the auditor returns")
@@ -1645,8 +1673,8 @@ max_concurrent = 1
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
-        let gate = implementer_only_gate();
         for effect in ["sandbox", "production"] {
+            let gate = implementer_only_gate();
             let mut request = params(repo.path(), "rust-implementer", "Add a test.");
             request["requested_effect"] = serde_json::json!(effect);
             let json = precheck_refusal(&manager, &provider, &gate, request).await;
@@ -1660,6 +1688,74 @@ max_concurrent = 1
             assert!(json["suggested_identity_change"].is_object(), "{effect}");
             assert_eq!(json["derived_effect"], effect);
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_failing_audit_log_still_refuses_and_never_acks() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let catalog = crate::identity::IdentityCatalog::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        ))
+        .unwrap();
+        let auditor = catalog.get("auditor").unwrap().clone();
+        let context = crate::auditor::AuditContext::new(catalog, auditor).unwrap();
+        let gate = Arc::new(SpawnGate::new(
+            Box::new(crate::auditor::RuleAuditor::new()),
+            crate::auditor::AuditLog::file(blocker.path().join("audit.jsonl")),
+            context,
+        ));
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let refusal = assign_raw(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "ghost", "Add a test."),
+        )
+        .await
+        .expect_err("a log failure must not turn a refusal into an ack");
+        assert_eq!(refusal.reason_code(), "unknown_identity");
+        assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_allowed_request_logs_one_entry_and_no_precheck_entry() {
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let id = assign(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await
+        .unwrap();
+        manager.wait_terminal(&id).await.unwrap();
+        let entries = gate.log().entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_ne!(entries[0].record.model, resolve::PRECHECK_PROVENANCE);
+        assert!(entries[0].verdict.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_request_logs_exactly_one_entry_even_after_waiting() {
+        let repo = repo_with_origin("https://github.com/example/other.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let _ = precheck_refusal(
+            &manager,
+            &provider,
+            &gate,
+            params(repo.path(), "rust-implementer", "Add a test."),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.log().entries().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1707,10 +1803,17 @@ max_concurrent = 1
                 "identity": "rust-implementer",
                 "client_ref": input,
             });
-            let wire =
-                handle_assign_task(&request, &manager, &provider, &gate, root.path(), 20, None)
-                    .await
-                    .unwrap_or_else(|e| panic!("{input}: {e}"));
+            let wire = handle_assign_task(
+                &request,
+                &manager,
+                &provider,
+                &gate,
+                &resolve::AssignContext::new(root.path()),
+                20,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{input}: {e}"));
             assert_eq!(
                 wire["resolved_repo_path"],
                 root.path().join("repo").display().to_string(),
@@ -1724,9 +1827,17 @@ max_concurrent = 1
             "identity": "rust-implementer",
             "client_ref": "host",
         });
-        let wire = handle_assign_task(&host, &manager, &provider, &gate, root.path(), 20, None)
-            .await
-            .unwrap();
+        let wire = handle_assign_task(
+            &host,
+            &manager,
+            &provider,
+            &gate,
+            &resolve::AssignContext::new(root.path()),
+            20,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(wire["resolution_note"]
             .as_str()
             .unwrap()
@@ -1744,10 +1855,17 @@ max_concurrent = 1
             "repo_path": "other",
             "identity": "rust-implementer",
         });
-        let refusal =
-            handle_assign_task(&request, &manager, &provider, &gate, root.path(), 20, None)
-                .await
-                .unwrap_err();
+        let refusal = handle_assign_task(
+            &request,
+            &manager,
+            &provider,
+            &gate,
+            &resolve::AssignContext::new(root.path()),
+            20,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(refusal.error(), "repo_outside_scope");
         assert!(manager.list().await.is_empty());
     }
@@ -1763,10 +1881,17 @@ max_concurrent = 1
             "repo_path": "/nonexistent-host/code/missing",
             "identity": "rust-implementer",
         });
-        let refusal =
-            handle_assign_task(&request, &manager, &provider, &gate, root.path(), 20, None)
-                .await
-                .unwrap_err();
+        let refusal = handle_assign_task(
+            &request,
+            &manager,
+            &provider,
+            &gate,
+            &resolve::AssignContext::new(root.path()),
+            20,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(refusal.error(), "unknown_repo");
         assert_eq!(
             refusal.to_json()["available_repos"]
@@ -1788,7 +1913,7 @@ max_concurrent = 1
             "description": "Add a test.",
             "repo_path": repo.path().to_str().unwrap(),
         });
-        let wire = handle_assign_task(&request, &manager, &provider, &gate, no_repos(), 20, None)
+        let wire = handle_assign_task(&request, &manager, &provider, &gate, &no_repos(), 20, None)
             .await
             .unwrap();
         assert_eq!(wire["identity"], "rust-implementer");
@@ -1807,7 +1932,7 @@ max_concurrent = 1
             "description": "Add a test.",
             "repo_path": repo.path().to_str().unwrap(),
         });
-        let json = precheck_refusal(&manager, &provider, &gate, request).await;
+        let json = precheck_refusal_logged(&manager, &provider, &gate, request, 0).await;
         assert_eq!(json["error"], "identity_required");
         let names: Vec<&str> = json["assignable_identities"]
             .as_array()
@@ -1872,7 +1997,7 @@ max_concurrent = 1
         assert_eq!(first, again);
         let status = manager.wait_terminal(&first).await.unwrap();
         assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
-        let after = handle_assign_task(&request, &manager, &provider, &gate, no_repos(), 20, None)
+        let after = handle_assign_task(&request, &manager, &provider, &gate, &no_repos(), 20, None)
             .await
             .unwrap();
         assert_eq!(after["taskId"], first.0);

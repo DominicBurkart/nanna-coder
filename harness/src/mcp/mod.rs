@@ -20,7 +20,7 @@ pub struct NannaMcpServer {
     default_max_iterations: usize,
     planner_model: Option<String>,
     plans: Arc<plan::PlanRegistry>,
-    repos_root: std::path::PathBuf,
+    assign: resolve::AssignContext,
 }
 
 impl NannaMcpServer {
@@ -40,12 +40,12 @@ impl NannaMcpServer {
             default_max_iterations,
             planner_model: None,
             plans: Arc::new(plan::PlanRegistry::default()),
-            repos_root: resolve::repos_root(),
+            assign: resolve::AssignContext::new(resolve::repos_root()),
         }
     }
 
     pub fn with_repos_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
-        self.repos_root = root.into();
+        self.assign = resolve::AssignContext::new(root);
         self
     }
 
@@ -319,7 +319,7 @@ impl NannaMcpServer {
                     &self.task_manager,
                     &self.provider,
                     &self.spawn_gate,
-                    &self.repos_root,
+                    &self.assign,
                     self.default_max_iterations,
                     requested_ttl,
                 )
@@ -355,7 +355,10 @@ impl NannaMcpServer {
                 }
                 JsonRpcResponse::success(
                     id,
-                    resolve::list_repos(self.spawn_gate.context().catalog(), &self.repos_root),
+                    resolve::list_repos(
+                        self.spawn_gate.context().catalog(),
+                        &self.assign.repos_root,
+                    ),
                 )
             }
             "get_task_status" | "get_task_result" => {
@@ -1122,7 +1125,9 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("spawn refused"));
         assert!(body["fix"].as_str().unwrap().contains("Rephrase"));
         assert!(server.task_manager.list().await.is_empty());
-        assert!(server.spawn_gate.log().entries().unwrap().is_empty());
+        let entries = server.spawn_gate.log().entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record.model, resolve::PRECHECK_PROVENANCE);
     }
 
     #[tokio::test]
