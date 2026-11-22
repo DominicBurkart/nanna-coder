@@ -624,6 +624,7 @@ impl<'ast> Visit<'ast> for GateSites {
 const GATE_BUILDERS: &[&str] = &[
     "with_action_gate",
     "action_policy_gate",
+    "action_policy_gate_routed",
     "with_action_policy",
 ];
 
@@ -669,9 +670,11 @@ fn action_gates_are_built_only_at_the_pinned_production_sites() {
         found,
         expected(&[
             "main.rs: build_delegate_task_manager: with_action_policy",
-            "main.rs: build_mcp_task_manager_with_budget: action_policy_gate",
-            "task.rs: action_policy_gate: ActionGate::new",
+            "main.rs: build_mcp_task_manager_with_budget: action_policy_gate_routed",
             "task.rs: action_policy_gate: action_policy_gate",
+            "task.rs: action_policy_gate: action_policy_gate_routed",
+            "task.rs: action_policy_gate_routed: ActionGate::new",
+            "task.rs: action_policy_gate_routed: action_policy_gate_routed",
             "task.rs: default_action_gate: ActionGate::new",
             "task.rs: model_facing_registry: with_action_gate",
             "task.rs: with_action_gate: with_action_gate",

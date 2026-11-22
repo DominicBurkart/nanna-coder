@@ -197,6 +197,14 @@ const RUNTIME: Target = Target {
     owner: "HubRuntime",
     members: &["open", "open_with", "assemble"],
 };
+const ROUTER: Target = Target {
+    owner: "HubRouter",
+    members: &["new"],
+};
+const AUDITORS: Target = Target {
+    owner: "ProductionAuditors",
+    members: &["new"],
+};
 const RESTORE: Target = Target {
     owner: "TaskManager",
     members: &["restore_within_sessions"],
@@ -232,6 +240,18 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
             "main.rs: build_mcp_task_manager_with_budget: HubRuntime::open",
         ]),
         "delegate and backlog-sync must stay hub-less; pin any new opener deliberately"
+    );
+}
+
+#[test]
+fn the_router_and_the_production_auditors_are_built_only_by_the_hub_runtime() {
+    assert_eq!(
+        sorted(production(ROUTER)),
+        set(&["hub/runtime.rs: assemble: HubRouter::new"])
+    );
+    assert_eq!(
+        sorted(production(AUDITORS)),
+        set(&["hub/runtime.rs: open: ProductionAuditors::new"])
     );
 }
 

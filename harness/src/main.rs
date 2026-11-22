@@ -1871,16 +1871,17 @@ async fn build_mcp_task_manager_with_budget(
         spawn_escalation_hook(&plane),
         Some((provider.clone(), model.to_string())),
     )?;
-    let action_gate = TaskManager::action_policy_gate(
+    let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
+    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, provider.clone(), model);
+    let action_gate = TaskManager::action_policy_gate_routed(
         Arc::clone(&leases),
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
         Some((provider.clone(), model.to_string())),
         harness::action_auditor::ActionAuditLog::file(
             queue_path.with_file_name("action_audit.jsonl"),
         ),
+        hub.router_weak(),
     );
-    let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
-    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, provider.clone(), model);
     Ok(hub
         .restore(harness::task::RestoreParts {
             max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
