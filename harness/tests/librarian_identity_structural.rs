@@ -433,28 +433,23 @@ fn innocent_names_are_still_accepted_as_files_and_as_declared_names() {
     }
 }
 
+const EXACT_COMPARISONS: [&str; 3] = [
+    "== LIBRARIAN_IDENTITY",
+    "!= LIBRARIAN_IDENTITY",
+    "== \"session-librarian\"",
+];
+
+const FOLDING: &str = "eq_ignore_ascii_case(LIBRARIAN_IDENTITY)";
+
 #[test]
 fn the_reserved_name_comparison_exists_once_in_the_identity_sources() {
     let mut folding = 0;
     for (path, text) in identity_sources() {
-        assert!(
-            !text.contains("== LIBRARIAN_IDENTITY"),
-            "{}",
-            path.display()
-        );
-        assert!(
-            !text.contains("== \"session-librarian\""),
-            "{}",
-            path.display()
-        );
-        assert!(
-            !text.contains("!= LIBRARIAN_IDENTITY"),
-            "{}",
-            path.display()
-        );
-        folding += text
-            .matches("eq_ignore_ascii_case(LIBRARIAN_IDENTITY)")
-            .count();
+        for needle in EXACT_COMPARISONS {
+            let found = text.matches(needle).count();
+            assert_eq!(found, 0, "{} has {needle}", path.display());
+        }
+        folding += text.matches(FOLDING).count();
     }
     assert_eq!(folding, 1);
 }
