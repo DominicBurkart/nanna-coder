@@ -3,7 +3,7 @@
 use super::builtin::{librarian_identity, LIBRARIAN_IDENTITY};
 use super::{AgentIdentity, IdentityError};
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -282,17 +282,22 @@ fn load_dir(dir: &Path, untrusted: bool) -> Result<Vec<AgentIdentity>, IdentityE
     files.sort();
     let mut identities = Vec::with_capacity(files.len());
     for file in &files {
-        let stem = file.file_stem();
-        if stem.is_some_and(|stem| stem == LIBRARIAN_IDENTITY) {
+        let stem = file.file_stem().unwrap_or_default();
+        if is_reserved(stem) {
             return Err(reserved(file, untrusted));
         }
         let identity = AgentIdentity::load(file)?;
-        if identity.name() == LIBRARIAN_IDENTITY {
+        if is_reserved(OsStr::new(identity.name())) {
             return Err(reserved(file, untrusted));
         }
         identities.push(identity);
     }
     Ok(identities)
+}
+
+fn is_reserved(name: &OsStr) -> bool {
+    let folded = name.to_string_lossy().replace('_', "-");
+    folded.eq_ignore_ascii_case(LIBRARIAN_IDENTITY)
 }
 
 fn reserved(file: &Path, untrusted: bool) -> IdentityError {

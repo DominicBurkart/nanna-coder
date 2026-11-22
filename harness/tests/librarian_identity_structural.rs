@@ -44,6 +44,21 @@ const CARD_DIRS: [(&str, usize); 4] = [
     ("harness/tests/fixtures/identities/global", 5),
 ];
 
+const LOOKALIKES: [&str; 5] = [
+    "Session-Librarian",
+    "SESSION-LIBRARIAN",
+    "session_librarian",
+    "Session_Librarian",
+    "session-LIBRARIAN",
+];
+
+const INNOCENT: [&str; 4] = [
+    "session-librarian-helper",
+    "librarian",
+    "session-librarian2",
+    "my_session-librarian",
+];
+
 const TOOLS_LINE: &str = "tools = [\"index_search\", \"index_read\"]";
 const EFFECT_LINE: &str = "max_effect = \"none\"";
 
@@ -168,6 +183,7 @@ fn the_card_has_exactly_the_least_privilege_shape_in_raw_toml() {
     assert_eq!(scope["max_effect"].as_str(), Some("none"));
     assert_eq!(strings(&scope["tools"]), vec!["index_search", "index_read"]);
     assert!(strings(&scope["paths"]).is_empty());
+    assert_eq!(strings(&scope["repos"]), vec!["builtin"]);
     assert!(scope.get("read_paths").is_none());
     let reach = scope.get("message_reach");
     assert!(reach.is_none_or(|value| value.as_str() == Some("none")));
@@ -188,6 +204,7 @@ fn the_typed_card_agrees_with_the_raw_toml() {
     assert_eq!(names, strings(&raw["scope"]["tools"]));
     assert_eq!(typed.scope.paths, strings(&raw["scope"]["paths"]));
     assert_eq!(typed.scope.read_paths, None);
+    assert_eq!(typed.scope.repos, vec!["builtin"]);
     assert_eq!(typed.limits.max_iterations, 8);
     assert_eq!(typed.limits.max_wall_clock_secs, 60);
     assert_eq!(typed.limits.max_concurrent, 2);
@@ -359,4 +376,85 @@ fn with_builtins_twice_is_a_duplicate_error() {
     let once = IdentityCatalog::default().with_builtins().unwrap();
     let err = once.with_builtins().unwrap_err();
     assert_eq!(kind(&err), "DuplicateName", "{err:?}");
+}
+
+fn identity_sources() -> Vec<(PathBuf, String)> {
+    let dir = manifest().join("src/identity");
+    let mut sources = Vec::new();
+    for entry in fs::read_dir(dir).expect("directory reads") {
+        let path = entry.expect("entry reads").path();
+        let text = fs::read_to_string(&path).expect("source reads");
+        sources.push((path, text));
+    }
+    sources
+}
+
+#[test]
+fn every_lookalike_file_stem_is_rejected_in_both_dirs() {
+    for name in LOOKALIKES {
+        let file = format!("{name}.toml");
+        let (err, path) = global_error(&file, &card_named("other"));
+        rejected_as(&err, "ReservedIdentity", &path);
+        let base = base_catalog().with_builtins().unwrap();
+        let (err, path) = repo_error(base, &file, &card_named("other"));
+        rejected_as(&err, "ProtectedIdentity", &path);
+    }
+}
+
+#[test]
+fn every_lookalike_declared_name_is_rejected_in_both_dirs() {
+    for name in LOOKALIKES {
+        let text = card_named(name);
+        let (err, path) = global_error("innocent.toml", &text);
+        rejected_as(&err, "ReservedIdentity", &path);
+        assert!(!err.to_string().contains(name), "{err}");
+        let base = base_catalog().with_builtins().unwrap();
+        let (err, path) = repo_error(base, "innocent.toml", &text);
+        rejected_as(&err, "ProtectedIdentity", &path);
+        assert!(!err.to_string().contains(name), "{err}");
+    }
+}
+
+#[test]
+fn innocent_names_are_still_accepted_as_files_and_as_declared_names() {
+    for name in INNOCENT {
+        let dir = tempfile::tempdir().unwrap();
+        let file = format!("{name}.toml");
+        let declared = card_named(&format!("x-{name}"));
+        put(dir.path(), &file, &card_named(name));
+        put(dir.path(), "declared.toml", &declared);
+        let catalog = IdentityCatalog::load(dir.path()).unwrap();
+        assert!(catalog.get(name).is_some(), "{name}");
+        let repo = tempfile::tempdir().unwrap();
+        let agents = repo.path().join(REPO_AGENTS_DIR);
+        put(&agents, &file, &card_named(name));
+        let layered = catalog.with_repo_overrides(repo.path());
+        assert!(layered.is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn the_reserved_name_comparison_exists_once_in_the_identity_sources() {
+    let mut folding = 0;
+    for (path, text) in identity_sources() {
+        assert!(
+            !text.contains("== LIBRARIAN_IDENTITY"),
+            "{}",
+            path.display()
+        );
+        assert!(
+            !text.contains("== \"session-librarian\""),
+            "{}",
+            path.display()
+        );
+        assert!(
+            !text.contains("!= LIBRARIAN_IDENTITY"),
+            "{}",
+            path.display()
+        );
+        folding += text
+            .matches("eq_ignore_ascii_case(LIBRARIAN_IDENTITY)")
+            .count();
+    }
+    assert_eq!(folding, 1);
 }
