@@ -34,6 +34,7 @@ pub mod pr_binding;
 pub mod pr_tools;
 pub mod protected;
 pub mod qa;
+pub mod result_store;
 pub mod rollout;
 pub mod sandbox_tools;
 pub mod scheduler;
