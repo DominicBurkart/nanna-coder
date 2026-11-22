@@ -193,6 +193,7 @@ fn attach_to_a_missing_daemon_fails_with_a_message_and_empty_stdout() {
     assert!(!status.success());
     assert!(stdout.is_empty());
     assert!(stderr.contains("none.sock"), "{stderr}");
+    assert!(stderr.contains("cannot reach the nanna daemon"), "{stderr}");
 }
 
 #[test]

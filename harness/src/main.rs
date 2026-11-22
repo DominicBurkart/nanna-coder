@@ -2233,7 +2233,12 @@ async fn run_mcp_attach(
     socket: &std::path::Path,
     client: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    harness::mcp::attach::attach(socket, client, tokio::io::stdin(), tokio::io::stdout()).await?;
+    if let Err(error) =
+        harness::mcp::attach::attach(socket, client, tokio::io::stdin(), tokio::io::stdout()).await
+    {
+        eprintln!("nanna mcp-attach: {error}");
+        std::process::exit(1);
+    }
     Ok(())
 }
 

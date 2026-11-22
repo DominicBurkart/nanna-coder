@@ -1476,11 +1476,6 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         })
     }
 
-    /// Persist every Running or terminal task from now on and answer for the
-    /// tasks a previous process persisted. Ids the queue already holds are
-    /// left to the restore path; a task persisted as Running is a casualty of
-    /// the previous process and becomes `Failed` with `DaemonRestarted`.
-    /// Returns the number of tasks loaded.
     pub async fn attach_result_store(&self, store: Arc<crate::result_store::ResultStore>) -> usize {
         let pruner = Arc::clone(&store);
         let removed =
@@ -1822,17 +1817,14 @@ impl TaskRunner {
         else {
             return;
         };
-        let Some(task) = self.tasks.read().await.get(task_id).cloned() else {
-            return;
-        };
-        let durable =
-            matches!(task.status, TaskStatus::Running { .. }) || task.status.is_terminal();
-        if !durable || crate::result_store::is_parked_failure(&task.status) {
-            return;
-        }
-        let written = tokio::task::spawn_blocking(move || store.persist(&task)).await;
+        let tasks = Arc::clone(&self.tasks);
+        let id = task_id.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            store.persist_latest(|| tasks.blocking_read().get(&id).cloned())
+        })
+        .await;
         match written {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 tracing::error!(task_id = %task_id, %error, "Failed to persist the task result")
             }

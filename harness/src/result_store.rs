@@ -100,6 +100,7 @@ fn valid_id(id: &str) -> bool {
 pub struct ResultStore {
     dir: PathBuf,
     retention: Duration,
+    gate: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl ResultStore {
@@ -117,7 +118,11 @@ impl ResultStore {
                 reason: "not a real directory (symlinks are not followed)".to_string(),
             });
         }
-        Ok(Self { dir, retention })
+        Ok(Self {
+            dir,
+            retention,
+            gate: std::sync::Arc::default(),
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -172,6 +177,26 @@ impl ResultStore {
             let _ = dir.sync_all();
         }
         Ok(())
+    }
+
+    pub fn persist_latest(
+        &self,
+        read: impl FnOnce() -> Option<Task>,
+    ) -> Result<bool, ResultStoreError> {
+        let _turn = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(task) = read() else {
+            return Ok(false);
+        };
+        let durable =
+            matches!(task.status, TaskStatus::Running { .. }) || task.status.is_terminal();
+        if !durable || is_parked_failure(&task.status) {
+            return Ok(false);
+        }
+        self.persist(&task)?;
+        Ok(true)
     }
 
     fn read_regular(path: &Path) -> Result<Vec<u8>, ResultStoreError> {
@@ -564,6 +589,40 @@ mod tests {
             store.prune(SystemTime::now() + Duration::from_secs(2 * 86400)),
             1
         );
+    }
+
+    #[test]
+    fn persist_latest_writes_what_the_reader_returns_at_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut slot = Some(task("t", running()));
+        assert!(store.persist_latest(|| slot.take()).unwrap());
+        assert!(matches!(
+            store.load(&TaskId("t".into())).unwrap().status,
+            TaskStatus::Running { .. }
+        ));
+        let mut newer = Some(task("t", cancelled()));
+        assert!(store.persist_latest(|| newer.take()).unwrap());
+        assert!(matches!(
+            store.load(&TaskId("t".into())).unwrap().status,
+            TaskStatus::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn persist_latest_skips_missing_pending_and_parked_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        assert!(!store.persist_latest(|| None).unwrap());
+        assert!(!store
+            .persist_latest(|| Some(task("p", TaskStatus::Pending)))
+            .unwrap());
+        let mut parked = daemon_restarted_status(Utc::now(), 0);
+        if let TaskStatus::Failed { diagnostics, .. } = &mut parked {
+            diagnostics.error_type = "RestoreAuditFailed".into();
+        }
+        assert!(!store.persist_latest(|| Some(task("q", parked))).unwrap());
+        assert!(store.load_all().is_empty());
     }
 
     #[test]
