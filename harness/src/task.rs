@@ -8926,6 +8926,7 @@ mod pi_route_tests {
         Fail,
         CallGatedTool,
         Hang,
+        Panic,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -9035,6 +9036,7 @@ mod pi_route_tests {
                         action_audit: broker.action_audit(),
                     }
                 }
+                Mode::Panic => panic!("the pi executor panicked"),
                 Mode::Hang => {
                     let status = std::process::Command::new("podman")
                         .args(["run", "--name", launch.container_name(), IMAGE])
@@ -9295,7 +9297,7 @@ mod pi_route_tests {
 
     #[tokio::test]
     async fn test_a_pi_executor_failure_keeps_the_existing_failure_label() {
-        let _fake = FakePodman::install_async(None).await;
+        let fake = FakePodman::install_async(None).await;
         let stub = Stub::new(Mode::Fail);
         let manager = manager_with(&stub);
         let repo = repo_with_origin("https://github.com/example/repo.git");
@@ -9305,6 +9307,20 @@ mod pi_route_tests {
         assert_eq!(error_type, "StateError");
         assert!(error.contains("pi container exited"), "{error}");
         assert_eq!(worktrees(repo.path()), 1);
+        let removed = format!("rm -f nanna-pi-{}", id.0);
+        assert!(calls_until(&fake, &removed).await.contains(&removed));
+    }
+
+    #[tokio::test]
+    async fn test_a_panicking_pi_executor_still_force_removes_its_container() {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Panic);
+        let manager = manager_with(&stub);
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let id = spawn(&manager, repo.path(), provider()).await;
+        let removed = format!("rm -f nanna-pi-{}", id.0);
+        assert!(calls_until(&fake, &removed).await.contains(&removed));
+        assert_eq!(stub.launches().len(), 1);
     }
 
     #[tokio::test]
