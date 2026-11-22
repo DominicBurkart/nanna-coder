@@ -1879,19 +1879,22 @@ async fn build_mcp_task_manager_with_budget(
             queue_path.with_file_name("action_audit.jsonl"),
         ),
     );
-    Ok(TaskManager::restore_with_escalations(
-        DEFAULT_MAX_CONCURRENT_TASKS,
-        Box::new(HybridPolicy::default()),
-        Box::new(JsonlQueueStore::open(queue_path)?),
-        leases,
-        provider,
-        catalog,
-        plane,
-        action_gate,
-        &spawn_gate,
-    )
-    .await?
-    .with_durable_budget(budget_path))
+    let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
+    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, provider.clone(), model);
+    Ok(hub
+        .restore(harness::task::RestoreParts {
+            max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
+            policy: Box::new(HybridPolicy::default()),
+            store: Box::new(JsonlQueueStore::open(queue_path)?),
+            leases,
+            provider,
+            identities: catalog,
+            escalations: plane,
+            action_gate,
+            spawn_gate: &spawn_gate,
+        })
+        .await?
+        .with_durable_budget(budget_path))
 }
 
 fn build_delegate_task_manager(
@@ -3841,6 +3844,13 @@ mod tests {
             without.action_gate().auditor_name(),
             RULE_ACTION_AUDITOR_NAME
         );
+    }
+
+    #[test]
+    fn the_delegate_task_manager_has_no_message_hub() {
+        let manager =
+            build_delegate_task_manager(offline_provider(), Some("delegate-model"), quiet_plane());
+        assert!(manager.hub().is_none());
     }
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,

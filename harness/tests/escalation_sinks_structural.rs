@@ -332,15 +332,13 @@ fn every_production_task_manager_and_gate_in_the_cli_is_built_from_a_plane() {
         mentions("with_escalation_plane").get("main.rs").copied(),
         Some(1)
     );
-    assert_eq!(
-        mentions("restore_with_escalations").get("main.rs").copied(),
-        Some(1)
-    );
+    assert_eq!(mentions("RestoreParts").get("main.rs").copied(), Some(1));
+    assert_eq!(mentions("restore_with_escalations").get("main.rs"), None);
     assert_eq!(
         mentions("spawn_escalation_hook").get("main.rs").copied(),
         Some(3)
     );
-    assert_eq!(mentions("TaskManager").get("main.rs").copied(), Some(7));
+    assert_eq!(mentions("TaskManager").get("main.rs").copied(), Some(6));
     assert_eq!(mentions("EscalationLog").get("main.rs").copied(), Some(5));
     assert_eq!(mentions("EscalationPlane").get("task.rs").copied(), Some(6));
 }
