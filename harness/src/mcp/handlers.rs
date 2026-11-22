@@ -197,6 +197,17 @@ fn wire_status(status: &TaskStatus) -> (&'static str, Option<String>) {
     }
 }
 
+/// Wrap a JSON value as an ordinary, successful MCP tool result.
+pub fn text_tool_result(value: &Value) -> Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(value).unwrap_or_default()
+        }],
+        "isError": false
+    })
+}
+
 /// Build the MCP Tasks `Task` wire object for `tasks/get`, `tasks/list`,
 /// `tasks/cancel`, and the `CreateTaskResult` body.
 pub fn task_to_wire(task: &Task) -> Value {

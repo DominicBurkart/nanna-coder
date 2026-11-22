@@ -186,7 +186,7 @@ impl NannaMcpServer {
         serde_json::json!([
             {
                 "name": "assign_task",
-                "description": "Submit a coding task to be executed asynchronously in an isolated git worktree. This tool is task-augmented: clients MUST invoke it with a `task` field (MCP Tasks extension) and retrieve the result via tasks/result.",
+                "description": "Submit a coding task to be executed asynchronously in an isolated git worktree. Clients that support the MCP Tasks extension may include a `task` field and retrieve the outcome via tasks/result. Any other client can call it plainly: it returns JSON `{\"task_id\", \"status\", \"next\"}` immediately, and the outcome is read by calling get_task_status or get_task_result with that `task_id`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -225,7 +225,29 @@ impl NannaMcpServer {
                     },
                     "required": ["description", "repo_path", "identity"]
                 },
-                "execution": { "taskSupport": "required" }
+                "execution": { "taskSupport": "optional" }
+            },
+            {
+                "name": "get_task_status",
+                "description": "Return the status of a task created by assign_task (working, completed, failed or cancelled) without waiting. Takes the `task_id` returned by assign_task.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "The task_id returned by assign_task" }
+                    },
+                    "required": ["task_id"]
+                }
+            },
+            {
+                "name": "get_task_result",
+                "description": "Return the outcome of a task created by assign_task. Never blocks: while the task is still working it returns its status instead, so call it again later. Takes the `task_id` returned by assign_task.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "The task_id returned by assign_task" }
+                    },
+                    "required": ["task_id"]
+                }
             },
             {
                 "name": "onboard_repo",
@@ -264,18 +286,10 @@ impl NannaMcpServer {
             .and_then(|v| v.as_u64());
 
         match tool_name.as_str() {
-            // `assign_task` is `taskSupport: "required"`: it MUST be invoked as
-            // a task. A non-task-augmented call gets -32601 per the spec.
+            // `assign_task` is `taskSupport: "optional"`: a task-augmented call
+            // gets a CreateTaskResult, a plain call gets the same task as an
+            // ordinary tool result that get_task_status / get_task_result read.
             "assign_task" => {
-                if task_field.is_none() {
-                    return JsonRpcResponse::error(
-                        id,
-                        -32601,
-                        "Tool 'assign_task' requires task augmentation (include a `task` field). \
-                         Retrieve results via tasks/result."
-                            .to_string(),
-                    );
-                }
                 match handlers::handle_assign_task(
                     &tool_params,
                     &self.task_manager,
@@ -286,10 +300,50 @@ impl NannaMcpServer {
                 )
                 .await
                 {
-                    Ok(task_wire) => {
+                    Ok(task_wire) if task_field.is_some() => {
                         JsonRpcResponse::success(id, serde_json::json!({ "task": task_wire }))
                     }
+                    Ok(task_wire) => JsonRpcResponse::success(
+                        id,
+                        handlers::text_tool_result(&serde_json::json!({
+                            "task_id": task_wire["taskId"],
+                            "status": task_wire["status"],
+                            "next": "Call get_task_result (or get_task_status) with this task_id; poll again while status is working."
+                        })),
+                    ),
                     Err(msg) => JsonRpcResponse::error(id, -32602, msg),
+                }
+            }
+            "get_task_status" | "get_task_result" => {
+                if task_field.is_some() {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        format!("Tool '{tool_name}' does not support task augmentation"),
+                    );
+                }
+                let Some(raw) = tool_params.get("task_id").and_then(|v| v.as_str()) else {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing required argument: task_id".to_string(),
+                    );
+                };
+                let task_id = TaskId(raw.to_string());
+                match self.task_manager.poll(&task_id).await {
+                    Some(task) if tool_name == "get_task_result" && task.status.is_terminal() => {
+                        JsonRpcResponse::success(
+                            id,
+                            handlers::task_result_to_call_tool_result(&task_id.0, &task.status),
+                        )
+                    }
+                    Some(task) => JsonRpcResponse::success(
+                        id,
+                        handlers::text_tool_result(&handlers::task_to_wire(&task)),
+                    ),
+                    None => {
+                        JsonRpcResponse::error(id, -32602, format!("Task not found: {task_id}"))
+                    }
                 }
             }
             "plan_task" => {
@@ -525,7 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tools_list_returns_two_tools() {
+    async fn test_tools_list_returns_the_four_base_tools() {
         let server = make_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -537,16 +591,22 @@ mod tests {
         assert!(resp.error.is_none());
         let tools = &resp.result.unwrap()["tools"];
         let arr = tools.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 4);
         let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"assign_task"));
         assert!(names.contains(&"onboard_repo"));
-        // assign_task must declare task augmentation as required.
+        assert!(names.contains(&"get_task_status"));
+        assert!(names.contains(&"get_task_result"));
+        // assign_task accepts task augmentation but does not demand it, so
+        // clients without the Tasks extension can still submit work.
         let assign = arr
             .iter()
             .find(|t| t["name"] == "assign_task")
             .expect("assign_task present");
-        assert_eq!(assign["execution"]["taskSupport"], "required");
+        assert_eq!(assign["execution"]["taskSupport"], "optional");
+        let desc = assign["description"].as_str().unwrap();
+        assert!(desc.contains("get_task_result") && desc.contains("task_id"));
+        assert!(!desc.contains("MUST"));
         let required: Vec<&str> = assign["inputSchema"]["required"]
             .as_array()
             .unwrap()
@@ -621,7 +681,7 @@ mod tests {
             .unwrap();
         let v = parse_response(&bytes);
         assert_eq!(v["id"], 2);
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -719,16 +779,120 @@ mod tests {
         }
     }
 
+    fn queued_server() -> NannaMcpServer {
+        NannaMcpServer::new(
+            Arc::new(TaskManager::new(0)),
+            Arc::new(NoopProvider),
+            crate::auditor::test_support::fixture_gate(),
+            100,
+        )
+    }
+
+    fn plain_assign(id: i64) -> JsonRpcRequest {
+        tools_call(
+            id,
+            serde_json::json!({
+                "name": "assign_task",
+                "arguments": { "description": "d", "repo_path": crate::auditor::test_support::shared_repo().to_str().unwrap(), "identity": "rust-implementer" }
+            }),
+        )
+    }
+
+    fn text_json(result: &serde_json::Value) -> serde_json::Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
     #[tokio::test]
-    async fn test_assign_task_without_task_augmentation_is_method_not_found() {
+    async fn test_assign_task_without_task_augmentation_creates_a_task_with_a_plain_handle() {
+        let server = queued_server();
+        let resp = server.handle_request(plain_assign(10)).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let body = text_json(&result);
+        assert!(body["task_id"].is_string());
+        assert_eq!(body["status"], "working");
+        assert!(body["next"].as_str().unwrap().contains("get_task_result"));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_reports_a_task_created_without_augmentation() {
+        let server = queued_server();
+        let created = text_json(
+            &server
+                .handle_request(plain_assign(50))
+                .await
+                .result
+                .unwrap(),
+        );
+        let resp = server
+            .handle_request(tools_call(
+                51,
+                serde_json::json!({ "name": "get_task_status", "arguments": { "task_id": created["task_id"] } }),
+            ))
+            .await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let body = text_json(&result);
+        assert_eq!(body["taskId"], created["task_id"]);
+        assert_eq!(body["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn test_get_task_result_does_not_block_on_a_working_task() {
+        let server = queued_server();
+        let created = text_json(
+            &server
+                .handle_request(plain_assign(52))
+                .await
+                .result
+                .unwrap(),
+        );
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.handle_request(tools_call(
+                53,
+                serde_json::json!({ "name": "get_task_result", "arguments": { "task_id": created["task_id"] } }),
+            )),
+        )
+        .await
+        .expect("get_task_result must return immediately for a working task");
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(text_json(&result)["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn test_task_polling_tools_reject_unknown_ids_and_missing_arguments() {
+        let server = make_server();
+        for (n, tool) in ["get_task_status", "get_task_result"]
+            .into_iter()
+            .enumerate()
+        {
+            let unknown = server
+                .handle_request(tools_call(
+                    60 + n as i64,
+                    serde_json::json!({ "name": tool, "arguments": { "task_id": "nope" } }),
+                ))
+                .await;
+            assert_eq!(unknown.error.unwrap().code, -32602, "{tool}");
+            let missing = server
+                .handle_request(tools_call(
+                    70 + n as i64,
+                    serde_json::json!({ "name": tool, "arguments": {} }),
+                ))
+                .await;
+            assert_eq!(missing.error.unwrap().code, -32602, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_polling_tools_do_not_support_task_augmentation() {
         let server = make_server();
         let resp = server
             .handle_request(tools_call(
-                10,
-                serde_json::json!({
-                    "name": "assign_task",
-                    "arguments": { "description": "d", "repo_path": "/tmp" }
-                }),
+                80,
+                serde_json::json!({ "name": "get_task_status", "arguments": { "task_id": "x" }, "task": {} }),
             ))
             .await;
         assert_eq!(resp.error.unwrap().code, -32601);

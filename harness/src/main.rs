@@ -450,11 +450,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    let logging = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env());
+    if matches!(cli.command, Commands::McpServe { .. }) {
+        logging.with_writer(std::io::stderr).init();
+    } else {
+        logging.init();
+    }
 
     match cli.command {
         Commands::Chat {
