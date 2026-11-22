@@ -1,8 +1,9 @@
 //! A directory of identity files, with repo-local overrides.
 
+use super::builtin::{librarian_identity, LIBRARIAN_IDENTITY};
 use super::{AgentIdentity, IdentityError};
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,22 @@ impl IdentityCatalog {
         Ok(self)
     }
 
+    /// This catalog plus the built-in `session-librarian` card. No loader adds
+    /// it on its own: only the librarian's own gate calls this, so the card
+    /// is in no catalog an entry point can name.
+    ///
+    /// ```
+    /// use harness::identity::{IdentityCatalog, LIBRARIAN_IDENTITY};
+    ///
+    /// let catalog = IdentityCatalog::default().with_builtins().unwrap();
+    /// assert_eq!(catalog.names().collect::<Vec<_>>(), vec![LIBRARIAN_IDENTITY]);
+    /// assert!(catalog.with_builtins().is_err());
+    /// ```
+    pub fn with_builtins(mut self) -> Result<Self, IdentityError> {
+        self.insert_unique(librarian_identity()?)?;
+        Ok(self)
+    }
+
     pub(crate) fn from_identities(identities: impl IntoIterator<Item = AgentIdentity>) -> Self {
         Self {
             identities: identities
@@ -263,7 +280,32 @@ fn load_dir(dir: &Path, untrusted: bool) -> Result<Vec<AgentIdentity>, IdentityE
         }
     }
     files.sort();
-    files.iter().map(AgentIdentity::load).collect()
+    let mut identities = Vec::with_capacity(files.len());
+    for file in &files {
+        let stem = file.file_stem().unwrap_or_default();
+        if is_reserved(stem) {
+            return Err(reserved(file, untrusted));
+        }
+        let identity = AgentIdentity::load(file)?;
+        if is_reserved(OsStr::new(identity.name())) {
+            return Err(reserved(file, untrusted));
+        }
+        identities.push(identity);
+    }
+    Ok(identities)
+}
+
+fn is_reserved(name: &OsStr) -> bool {
+    let folded = name.to_string_lossy().replace('_', "-");
+    folded.eq_ignore_ascii_case(LIBRARIAN_IDENTITY)
+}
+
+fn reserved(file: &Path, untrusted: bool) -> IdentityError {
+    let (name, file) = (LIBRARIAN_IDENTITY.to_string(), file.to_path_buf());
+    if untrusted {
+        return IdentityError::ProtectedIdentity { name, file };
+    }
+    IdentityError::ReservedIdentity { name, file }
 }
 
 fn check_untrusted(path: &Path) -> Result<(), IdentityError> {

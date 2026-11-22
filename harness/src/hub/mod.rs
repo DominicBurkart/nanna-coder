@@ -7,6 +7,7 @@ pub mod query;
 pub mod reach;
 pub mod recv;
 pub mod registry;
+pub mod router;
 pub mod runtime;
 pub mod send;
 pub mod session;
