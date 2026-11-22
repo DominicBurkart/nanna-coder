@@ -129,6 +129,20 @@ macro_rules! session_store_impl {
                 Ok(found)
             }
 
+            fn update(
+                &self,
+                id: SessionId,
+                change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+            ) -> Result<(), StoreError> {
+                self.engine.commit(|table| {
+                    let current = table.by_id.get(&id).ok_or(StoreError::NotFound)?;
+                    let kept = change(current.clone()).map(|next| Record::Upsert {
+                        record: Box::new(next),
+                    });
+                    Ok(((), kept.into_iter().collect()))
+                })
+            }
+
             fn set_status(
                 &self,
                 id: SessionId,

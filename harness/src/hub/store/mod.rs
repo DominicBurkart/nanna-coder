@@ -117,6 +117,21 @@ pub trait SessionStore: Send + Sync {
     /// assert!(InMemorySessionStore::new().get(id).unwrap().is_none());
     /// ```
     fn get(&self, id: SessionId) -> Result<Option<SessionRecord>, StoreError>;
+    /// Replace the record with this id by what `change` returns for it, reading and writing under
+    /// one hold of the store's lock, so no other writer can run between the two. `change` returning
+    /// `None` leaves the record as it was. Unknown id: `NotFound`.
+    ///
+    /// ```
+    /// use harness::hub::store::{InMemorySessionStore, SessionStore, StoreError};
+    /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("x".into()));
+    /// let store = InMemorySessionStore::new();
+    /// assert!(matches!(store.update(id, Box::new(|_| None)), Err(StoreError::NotFound)));
+    /// ```
+    fn update(
+        &self,
+        id: SessionId,
+        change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+    ) -> Result<(), StoreError>;
     /// Every session in `root`, ordered by `created_at` then id.
     ///
     /// ```

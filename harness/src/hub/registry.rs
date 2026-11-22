@@ -1,4 +1,4 @@
-use super::lineage::{SessionBinding, SessionId};
+use super::lineage::{Lineage, SessionBinding, SessionId};
 use super::session::{SessionKind, SessionRecord, SessionStatus};
 use super::store::{SessionStore, StoreError};
 use super::summary::Summary;
@@ -196,8 +196,23 @@ impl SessionRegistry {
         id: &SessionId,
         change: impl FnOnce(SessionRecord) -> Result<SessionRecord, RegistryError>,
     ) -> Result<(), RegistryError> {
-        let record = self.store.get(id.clone())?.ok_or(RegistryError::Unknown)?;
-        Ok(self.store.upsert(change(record)?)?)
+        let mut refused = None;
+        let applied = self.store.update(
+            id.clone(),
+            Box::new(|record| match change(record) {
+                Ok(next) => Some(next),
+                Err(error) => {
+                    refused = Some(error);
+                    None
+                }
+            }),
+        );
+        match (applied, refused) {
+            (Err(StoreError::NotFound), _) => Err(RegistryError::Unknown),
+            (Err(other), _) => Err(other.into()),
+            (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        }
     }
 
     /// Move a `Pending` session to `Running`.
@@ -215,11 +230,15 @@ impl SessionRegistry {
             }
             SessionStatus::Pending | SessionStatus::Running => {}
         }
-        let record = self.store.get(id.clone())?.ok_or(RegistryError::Unknown)?;
-        if record.status != SessionStatus::Pending || to != SessionStatus::Running {
-            return Err(illegal(record.status, to));
-        }
-        Ok(self.store.set_status(id.clone(), to, at)?)
+        self.edit(id, |mut record| {
+            if record.status != SessionStatus::Pending || to != SessionStatus::Running {
+                return Err(illegal(record.status, to));
+            }
+            record.status = to;
+            record.last_activity = at;
+            record.ended_at = None;
+            Ok(record)
+        })
     }
 
     /// End the session in the terminal status `to`. `Pending` may only fail or be cancelled; the
@@ -298,27 +317,59 @@ impl SessionRegistry {
         })
     }
 
-    /// Replace the session's note with `text`, composed as a summary after review.
+    /// Replace the session's note with `text`, composed as a summary after review. A blank text
+    /// (empty or whitespace only) clears the note, so views fall back to the first subtask line.
+    /// Returns the stored note.
     pub fn set_note(
         &self,
         id: &SessionId,
         text: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Option<Summary>, RegistryError> {
+        self.put_note(id, None, text, at)
+    }
+
+    /// [`SessionRegistry::set_note`] for the session `caller` is bound to. A stored record whose
+    /// lineage is not the caller's is reported as [`RegistryError::Unknown`], like a missing one.
+    pub fn set_note_for(
+        &self,
+        caller: &SessionBinding,
+        text: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Summary>, RegistryError> {
+        self.put_note(caller.session(), Some(caller.lineage()), text, at)
+    }
+
+    fn put_note(
+        &self,
+        id: &SessionId,
+        owner: Option<&Lineage>,
+        text: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Summary>, RegistryError> {
         let _guard = self.lock();
+        let mut stored = None;
         self.edit(id, |mut record| {
+            if owner.is_some_and(|lineage| record.lineage != *lineage) {
+                return Err(RegistryError::Unknown);
+            }
             if !record.status.is_active() {
                 return Err(illegal(record.status, record.status));
             }
             let vetted = self.vet(text);
-            record.note = Some(Summary::compose(
-                &record.identity,
-                record.status.label(),
-                &vetted,
-            ));
+            record.note = match vetted.trim().is_empty() {
+                true => None,
+                false => Some(Summary::compose(
+                    &record.identity,
+                    record.status.label(),
+                    &vetted,
+                )),
+            };
+            stored = record.note.clone();
             record.last_activity = at;
             Ok(record)
-        })
+        })?;
+        Ok(stored)
     }
 }
 
@@ -365,6 +416,15 @@ pub(crate) mod test_support {
         fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
             self.inner.in_root(root)
         }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            Self::gate(&self.reads)?;
+            Self::gate(&self.writes)?;
+            self.inner.update(id, change)
+        }
         fn set_status(
             &self,
             id: SessionId,
@@ -389,7 +449,7 @@ mod tests {
     use super::test_support::Flaky;
     use super::*;
     use crate::hub::lineage::{Lineage, RootId};
-    use crate::hub::store::InMemorySessionStore;
+    use crate::hub::store::{InMemorySessionStore, Retention};
     use crate::task::TaskId;
     use chrono::TimeZone;
     use proptest::prelude::*;
@@ -1240,6 +1300,236 @@ mod tests {
                 .get(MessageId::from_uuid(Uuid::from_u128(MESSAGES as u128 + 50)))
                 .unwrap()
                 .is_some());
+        }
+    }
+
+    fn foreign_binding(name: &str) -> SessionBinding {
+        SessionBinding::from_audited(
+            &crate::identity::example(),
+            TaskId(name.to_string()),
+            Lineage::root_child(RootId::mcp(Uuid::from_u128(2))),
+        )
+    }
+
+    #[test]
+    fn a_blank_note_clears_the_note_and_the_next_note_is_stored_again() {
+        let (store, registry) = running("t");
+        let id = sid("t");
+        registry.set_note(&id, "reading", at(2)).unwrap();
+        assert!(stored(&store, "t").note.is_some());
+        for (n, blank) in ["", " ", "   ", "\n\t \r\n"].into_iter().enumerate() {
+            registry.set_note(&id, "reading", at(2)).unwrap();
+            let shown = registry.set_note(&id, blank, at(3 + n as i64)).unwrap();
+            assert_eq!(shown, None, "{blank:?}");
+            let record = stored(&store, "t");
+            assert_eq!(record.note, None, "{blank:?}");
+            assert_eq!(record.last_activity, at(3 + n as i64));
+            assert!(record.status.is_active());
+        }
+        let again = registry.set_note(&id, "back", at(9)).unwrap();
+        assert_eq!(
+            again,
+            Some(Summary::compose("rust-implementer", "running", "back"))
+        );
+        assert_eq!(stored(&store, "t").note, again);
+    }
+
+    #[test]
+    fn a_withheld_note_stays_a_marker_and_is_never_mistaken_for_a_blank_one() {
+        let (store, registry) = running("t");
+        for (text, marker) in [
+            ("\u{202e}", "[withheld: prompt_injection]"),
+            ("\u{200b}", "[withheld: prompt_injection]"),
+            ("a\0", "[withheld: other]"),
+            (&token(), "[withheld: secret_leak]"),
+        ] {
+            let shown = registry.set_note(&sid("t"), text, at(4)).unwrap();
+            let expected = Summary::compose("rust-implementer", "running", marker);
+            assert_eq!(shown, Some(expected.clone()), "{marker}");
+            assert_eq!(stored(&store, "t").note, Some(expected));
+        }
+    }
+
+    #[test]
+    fn set_note_for_writes_only_the_callers_own_record() {
+        let (store, registry) = running("t");
+        registry.register(&binding("u"), "other", at(0)).unwrap();
+        let shown = registry.set_note_for(&binding("t"), "mine", at(5)).unwrap();
+        assert_eq!(
+            shown,
+            Some(Summary::compose("rust-implementer", "running", "mine"))
+        );
+        assert_eq!(stored(&store, "t").note, shown);
+        assert_eq!(stored(&store, "u").note, None);
+    }
+
+    #[test]
+    fn a_record_under_another_lineage_is_unknown_to_the_caller_even_when_finished() {
+        let (store, registry) = running("t");
+        registry.set_note(&sid("t"), "mine", at(2)).unwrap();
+        let before = stored(&store, "t");
+        let intruder = foreign_binding("t");
+        let missing = registry
+            .set_note_for(&binding("ghost"), "x", at(3))
+            .unwrap_err();
+        let foreign = registry.set_note_for(&intruder, "x", at(3)).unwrap_err();
+        assert!(matches!(foreign, RegistryError::Unknown), "{foreign:?}");
+        assert_eq!(
+            format!("{foreign} {foreign:?}"),
+            format!("{missing} {missing:?}")
+        );
+        assert_eq!(stored(&store, "t"), before);
+        registry.cancel(&sid("t"), at(4)).unwrap();
+        let finished = stored(&store, "t");
+        let foreign = registry.set_note_for(&intruder, "x", at(5)).unwrap_err();
+        assert!(matches!(foreign, RegistryError::Unknown), "{foreign:?}");
+        let own = registry
+            .set_note_for(&binding("t"), "x", at(5))
+            .unwrap_err();
+        assert!(
+            matches!(own, RegistryError::IllegalTransition { .. }),
+            "{own:?}"
+        );
+        assert_eq!(stored(&store, "t"), finished);
+    }
+
+    #[test]
+    fn a_failing_store_leaves_the_previous_note_and_leaks_no_text() {
+        let planted = "NOTE-PLANT-91";
+        let flaky = Flaky::new();
+        let registry = SessionRegistry::new(flaky.clone());
+        registry.register(&binding("t"), "s", at(0)).unwrap();
+        registry.set_note(&sid("t"), "old", at(1)).unwrap();
+        let before = flaky.inner.get(sid("t")).unwrap().unwrap();
+        flaky.writes.store(true, Ordering::SeqCst);
+        let err = registry
+            .set_note_for(&binding("t"), planted, at(2))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Store(_)), "{err:?}");
+        assert!(!format!("{err} {err:?}").contains(planted));
+        flaky.writes.store(false, Ordering::SeqCst);
+        flaky.reads.store(true, Ordering::SeqCst);
+        let err = registry
+            .set_note_for(&binding("t"), planted, at(2))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Store(_)), "{err:?}");
+        flaky.reads.store(false, Ordering::SeqCst);
+        assert_eq!(flaky.inner.get(sid("t")).unwrap().unwrap(), before);
+    }
+
+    struct Racing {
+        inner: Arc<InMemorySessionStore>,
+        slipped_in: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl Racing {
+        fn fire(&self) {
+            let hook = self.slipped_in.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl SessionStore for Racing {
+        fn upsert(&self, rec: SessionRecord) -> Result<(), StoreError> {
+            self.inner.upsert(rec)
+        }
+        fn get(&self, id: SessionId) -> Result<Option<SessionRecord>, StoreError> {
+            let read = self.inner.get(id);
+            self.fire();
+            read
+        }
+        fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
+            self.inner.in_root(root)
+        }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            self.inner.update(id, change)
+        }
+        fn set_status(
+            &self,
+            id: SessionId,
+            s: SessionStatus,
+            at: DateTime<Utc>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_status(id, s, at)
+        }
+        fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError> {
+            self.inner.set_note(id, note)
+        }
+        fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
+            self.inner.prune(now, policy)
+        }
+    }
+
+    #[test]
+    fn the_racing_wrapper_delegates_everything_but_the_get_hook() {
+        let inner = Arc::new(InMemorySessionStore::new());
+        let racing = Racing {
+            inner: inner.clone(),
+            slipped_in: Mutex::new(None),
+        };
+        let registry = SessionRegistry::new(inner.clone());
+        registry.register(&binding("t"), "s", at(0)).unwrap();
+        let root = RootId::mcp(Uuid::from_u128(1));
+        assert_eq!(racing.in_root(&root).unwrap().len(), 1);
+        let kept = racing.get(sid("t")).unwrap().unwrap();
+        racing.upsert(kept.clone()).unwrap();
+        racing.update(sid("t"), Box::new(Some)).unwrap();
+        racing
+            .set_status(sid("t"), SessionStatus::Running, at(1))
+            .unwrap();
+        racing
+            .set_note(sid("t"), Summary::compose("a", "running", "n"))
+            .unwrap();
+        assert_eq!(racing.prune(at(2), &Default::default()).unwrap(), 0);
+        assert!(stored(&inner, "t").note.is_some());
+    }
+
+    #[test]
+    fn a_second_registry_finishing_the_session_mid_write_is_never_undone() {
+        type Op = fn(&SessionRegistry);
+        let ops: [(&str, Op); 3] = [
+            ("note", |r| {
+                let _ = r.set_note(&sid("t"), "late", at(5));
+            }),
+            ("touched", |r| {
+                let _ = r.record_touched(&sid("t"), &["a.rs".into()], at(5));
+            }),
+            ("status", |r| {
+                let _ = r.set_status(&sid("t"), SessionStatus::Running, at(5));
+            }),
+        ];
+        for (name, op) in ops {
+            let inner = Arc::new(InMemorySessionStore::new());
+            let other = Arc::new(SessionRegistry::new(inner.clone()));
+            other.register(&binding("t"), "do it", at(0)).unwrap();
+            if name != "status" {
+                other
+                    .set_status(&sid("t"), SessionStatus::Running, at(1))
+                    .unwrap();
+            }
+            let end = match name {
+                "status" => SessionStatus::Cancelled,
+                _ => SessionStatus::Completed,
+            };
+            let finisher = other.clone();
+            let slipped_in: Box<dyn FnOnce() + Send> = Box::new(move || {
+                finisher.finish(&sid("t"), end, None, at(3)).unwrap();
+            });
+            let racing = Arc::new(Racing {
+                inner: inner.clone(),
+                slipped_in: Mutex::new(Some(slipped_in)),
+            });
+            op(&SessionRegistry::new(racing.clone()));
+            racing.fire();
+            let record = stored(&inner, "t");
+            assert_eq!(record.status, end, "{name}");
+            assert_eq!(record.ended_at, Some(at(3)), "{name}");
         }
     }
 }
