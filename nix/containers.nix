@@ -13,6 +13,8 @@
 }:
 
 let
+  harnessToolchain = pkgs.rust-bin.stable."1.90.0".minimal;
+
   devContainerConfig = {
     Cmd = [ "${pkgs.coreutils}/bin/sleep" "infinity" ];
     Env = [
@@ -88,6 +90,8 @@ let
         pkgs.bash    # Shell for debugging
         pkgs.coreutils # Basic utilities
         pkgs.git
+        harnessToolchain
+        pkgs.stdenv.cc
       ];
       pathsToLink = [ "/bin" "/etc" "/share" ];
     };

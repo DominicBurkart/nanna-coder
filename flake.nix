@@ -124,6 +124,7 @@
             (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
             (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
             (pkgs.lib.hasSuffix "/nix/containers.nix" path) ||
+            (pkgs.lib.hasSuffix "/nix/packages.nix" path) ||
             (pkgs.lib.hasSuffix "/flake.nix" path) ||
             (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
             (pkgs.lib.hasInfix "/docs/" path) ||
@@ -300,6 +301,7 @@
           rustToolchain = pkgs.rust-bin.stable."1.87.0".default.override {
             extensions = [ "rust-src" "rustfmt" "clippy" "rust-analyzer" ];
           };
+          harnessToolchain = pkgs.rust-bin.stable."1.90.0".minimal;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
           
           # Add nix2container for container builds
@@ -321,6 +323,8 @@
               (pkgs.lib.hasSuffix "/.github/workflows/ci-gate-allowed-skips.txt" path) ||
               (pkgs.lib.hasSuffix "/.github/workflows/protected-paths-guard.yml" path) ||
               (pkgs.lib.hasSuffix "/nix/containers.nix" path) ||
+              (pkgs.lib.hasSuffix "/nix/packages.nix" path) ||
+            (pkgs.lib.hasSuffix "/nix/packages.nix" path) ||
               (pkgs.lib.hasSuffix "/flake.nix" path) ||
               (pkgs.lib.hasSuffix "/AGENTS.md" path) ||
               (pkgs.lib.hasInfix "/docs/" path) ||
@@ -350,12 +354,13 @@
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
             nativeCheckInputs = [ pkgs.jq ];
-            cargoBuildCommand = "cargo build --release --bin nanna";
+            cargoBuildCommand = "cargo build --release --bin nanna --bin nanna-sandbox";
             cargoCheckCommand = "cargo check --bin nanna";
             cargoTestCommand = "cargo test --package harness";
             installPhase = ''
               mkdir -p $out/bin
               cp target/release/nanna $out/bin/
+              cp target/release/nanna-sandbox $out/bin/
             '';
           };
 
@@ -372,13 +377,15 @@
                     buildInputs = commonBuildInputs;
                     nativeBuildInputs = commonNativeBuildInputs;
                     nativeCheckInputs = [ pkgs.jq ];
-                    cargoBuildCommand = "cargo build --release --bin nanna";
+                    cargoBuildCommand = "cargo build --release --bin nanna --bin nanna-sandbox";
                     installPhase = ''
                       mkdir -p $out/bin
                       cp target/release/nanna $out/bin/
+                      cp target/release/nanna-sandbox $out/bin/
                     '';
                   })
                   pkgs.cacert pkgs.tzdata pkgs.bash pkgs.coreutils pkgs.git
+                  harnessToolchain pkgs.stdenv.cc
                 ];
                 pathsToLink = [ "/bin" "/etc" "/share" ];
               };

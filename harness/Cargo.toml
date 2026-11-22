@@ -12,6 +12,10 @@ name = "nanna"
 path = "src/main.rs"
 
 [[bin]]
+name = "nanna-sandbox"
+path = "src/bin/sandbox.rs"
+
+[[bin]]
 name = "harness-eval"
 path = "src/bin/eval.rs"
 required-features = ["eval-runner"]

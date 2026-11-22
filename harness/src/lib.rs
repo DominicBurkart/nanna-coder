@@ -17,6 +17,8 @@ pub mod effects;
 pub mod entities;
 pub mod escalation;
 pub mod eval;
+pub mod exec_capabilities;
+pub mod exec_sandbox;
 pub mod harness_adapter;
 pub mod hub;
 pub mod identity;
