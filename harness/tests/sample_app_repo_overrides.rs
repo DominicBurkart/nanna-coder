@@ -149,9 +149,17 @@ async fn run(
         "repo_path": repo.to_str().unwrap(),
         "identity": identity,
     });
-    let wire = handle_assign_task(&params, &manager, &model, &gate(), 20, None)
-        .await
-        .unwrap();
+    let wire = handle_assign_task(
+        &params,
+        &manager,
+        &model,
+        &gate(),
+        &harness::mcp::resolve::AssignContext::new("/nonexistent/nanna/repos"),
+        20,
+        None,
+    )
+    .await
+    .unwrap();
     let id = TaskId(wire["taskId"].as_str().unwrap().to_string());
     let status = manager.wait_terminal(&id).await.unwrap();
     assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
@@ -248,9 +256,18 @@ async fn a_widened_sample_app_override_fails_the_assignment_closed() {
         "repo_path": repo.path().to_str().unwrap(),
         "identity": "sample-app-api",
     });
-    let err = handle_assign_task(&params, &manager, &model, &gate(), 20, None)
-        .await
-        .unwrap_err();
+    let err = handle_assign_task(
+        &params,
+        &manager,
+        &model,
+        &gate(),
+        &harness::mcp::resolve::AssignContext::new("/nonexistent/nanna/repos"),
+        20,
+        None,
+    )
+    .await
+    .unwrap_err();
+    let err = err.to_string();
     assert!(err.contains("widens"), "{err}");
     assert!(manager.list().await.is_empty());
 }
