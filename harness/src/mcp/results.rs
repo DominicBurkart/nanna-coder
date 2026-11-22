@@ -38,7 +38,7 @@ pub fn extend_tool_list(tools: &mut Vec<Value>) {
                 });
             }
             Some("get_task_result") => {
-                tool["description"] = json!("Return the outcome of a task created by assign_task. Never blocks: while the task is still working it returns its status instead, so call it again later. By default the answer is a compact summary (status, identity, repo, result_summary, files_modified, suggested_branch, suggested_pr_title, suggested_pr_body); call get_task_changes for the file contents. Pass detail=\"full\" for the complete payload (patches, tool calls, audits), which can be very large. Takes the `task_id` returned by assign_task.");
+                tool["description"] = json!("Return the outcome of a task created by assign_task. Never blocks: while the task is still working it returns its status instead, so call it again later. By default the answer is a compact summary (status, identity, repo, result_summary, files_modified, suggested_branch, suggested_pr_title, suggested_pr_body); call get_task_changes for the file contents. When it is completed, `next` tells you how to open the pull request with your own GitHub tools. Pass detail=\"full\" for the complete payload (patches, tool calls, audits), which can be very large. Takes the `task_id` returned by assign_task.");
                 tool["inputSchema"]["properties"]["detail"] = json!({
                     "type": "string",
                     "enum": ["compact", "full"],
@@ -324,7 +324,10 @@ pub fn compact_result(inputs: &ResultInputs<'_>) -> Value {
                     "max_effect_class": result.max_effect_class(),
                     "suggested_pr_title": suggested_pr_title(&task.description),
                     "suggested_pr_body": suggested_pr_body(&summary, closes),
-                    "next": "Call get_task_changes for the file contents; get_task_result with detail=full for patches and audits.",
+                    "next": format!(
+                        "To open the pull request, use your own GitHub tools: 1. call get_task_changes for the files; 2. create branch {} from the repository's default branch; 3. write each file on it (remove the deleted ones); 4. open a draft pull request using suggested_pr_title and suggested_pr_body; 5. give the user the PR link. Nanna cannot push or open pull requests. If you have no GitHub tool connected, show the user the files, the title and the body, and say a GitHub connection is needed.",
+                        format!("nanna/{}", task.id.0)
+                    ),
                 });
                 build_common(&mut value);
                 value
@@ -741,6 +744,52 @@ mod tests {
         assert_eq!(view["files_modified_total"], 3000);
         assert!(view["files_modified"].as_array().unwrap().len() < 3000);
         assert_eq!(view["result_summary_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn a_completed_result_tells_the_client_how_to_open_the_pull_request() {
+        let server = server();
+        let id = finished(&server, completed(big_result()), None).await;
+        let view = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
+        let next = view["next"].as_str().unwrap();
+        assert!(next.contains("get_task_changes"), "{next}");
+        assert!(next.contains(&format!("nanna/{}", id.0)), "{next}");
+        assert!(next.contains("draft pull request"), "{next}");
+        assert!(next.contains("suggested_pr_title"), "{next}");
+        assert!(
+            next.contains("Nanna cannot push or open pull requests"),
+            "{next}"
+        );
+        assert!(next.contains("no GitHub tool"), "{next}");
+        assert!(next.len() < 900, "{}", next.len());
+    }
+
+    #[tokio::test]
+    async fn a_failed_result_does_not_offer_pull_request_steps() {
+        let server = server();
+        let id = assign(&server, "d", json!({})).await;
+        let diagnostics = FailureDiagnostics {
+            changes: None,
+            tools_unavailable: vec![],
+            error_type: "SpawnRefused".to_string(),
+            iterations_completed: 0,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+            denials: vec![],
+            action_audit: vec![],
+        };
+        let refused = TaskStatus::Failed {
+            finished_at: chrono::Utc::now(),
+            error: "spawn refused: block: unknown".to_string(),
+            diagnostics,
+        };
+        server.task_manager.finish_for_test(&id, refused).await;
+        let view = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
+        let text = view.to_string();
+        assert!(!text.contains("draft pull request"), "{text}");
     }
 
     #[tokio::test]
