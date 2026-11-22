@@ -65,7 +65,9 @@ impl FailureKind {
             "ContainerSetupFailed" | "SidecarSetupFailed" => FailureKind::ContainerSetupFailed,
             "WorkspaceCreationFailed" => FailureKind::WorkspaceSetupFailed,
             "ImpactError" => FailureKind::ImpactError,
-            "QueuePersistFailed" => FailureKind::QueueError,
+            "QueuePersistFailed" | "SessionRegistryFailed" | "RestoreSessionRegistryFailed" => {
+                FailureKind::QueueError
+            }
             "RestoreNoIdentity"
             | "RestoreOverridesInvalid"
             | "RestoreRefused"
@@ -99,6 +101,8 @@ mod tests {
         ("WorkspaceCreationFailed", FailureKind::WorkspaceSetupFailed),
         ("ImpactError", FailureKind::ImpactError),
         ("QueuePersistFailed", FailureKind::QueueError),
+        ("SessionRegistryFailed", FailureKind::QueueError),
+        ("RestoreSessionRegistryFailed", FailureKind::QueueError),
         ("RestoreNoIdentity", FailureKind::RestoreRefused),
         ("RestoreOverridesInvalid", FailureKind::RestoreRefused),
         ("RestoreRefused", FailureKind::RestoreRefused),
