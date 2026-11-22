@@ -47,9 +47,15 @@ fn parse_client_ref(params: &Value) -> Result<Option<String>, String> {
 /// TTL, and return the `CreateTaskResult` task object without waiting for
 /// the audit.
 ///
-/// `identity` is required and names a card in the gate's catalog. The
-/// request is reviewed by [`SpawnGate::check`] inside the spawned run, not
-/// here: this function acknowledges with the task in the `Auditing` state
+/// `identity` names an assignable card in the gate's catalog; it may be
+/// omitted when exactly one identity is assignable. `repo_path` is resolved
+/// against `repos_root` (see [`resolve::resolve_repo`]). Before anything is
+/// registered, a rules-only pre-check refuses what needs no model to refuse:
+/// an unassignable identity, any non-`Allow` rule verdict and a repository
+/// outside `scope.repos`. It logs nothing and mints no proof.
+///
+/// The request is still reviewed by [`SpawnGate::check`] inside the spawned
+/// run: this function acknowledges with the task in the `Auditing` state
 /// and the run mints the [`Allowed`](crate::auditor::Allowed) proof before
 /// it creates a worktree, calls a tool or calls a model. A `Block`, an
 /// `Escalate` or an auditor failure ends the task as `Failed` with the
@@ -163,15 +169,23 @@ pub async fn handle_assign_task(
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut wire = if submission.created {
+    let (mut wire, identity, repo_path) = if submission.created {
         task_manager.set_ttl(&submission.task_id, ttl).await;
-        initial_task_wire(&submission.task_id.0, ttl)
+        (
+            initial_task_wire(&submission.task_id.0, ttl),
+            identity,
+            repo_path,
+        )
     } else {
-        task_manager
+        let task = task_manager
             .poll(&submission.task_id)
             .await
-            .map(|task| task_to_wire(&task))
-            .ok_or_else(|| format!("Task not found: {}", submission.task_id))?
+            .ok_or_else(|| format!("Task not found: {}", submission.task_id))?;
+        (
+            task_to_wire(&task),
+            task.identity_hint.clone().unwrap_or(identity),
+            task.repo_path.clone(),
+        )
     };
     wire["identity"] = Value::String(identity);
     wire["resolved_repo_path"] = Value::String(repo_path.display().to_string());
@@ -1627,28 +1641,25 @@ max_concurrent = 1
     }
 
     #[tokio::test]
-    async fn test_precheck_leaves_an_escalating_request_to_the_audit() {
+    async fn test_precheck_refuses_an_effect_no_card_reaches_before_the_ack() {
         let repo = repo_with_origin("https://github.com/example/repo.git");
         let manager = Arc::new(TaskManager::default());
         let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
         let gate = implementer_only_gate();
-        let mut request = params(repo.path(), "rust-implementer", "Add a test.");
-        request["requested_effect"] = serde_json::json!("sandbox");
-        let verdict = crate::auditor::RuleAuditor::new().evaluate(
-            &gate.request_with_caller(
-                TaskSummary::new("mcp-t", "d", "github.com/example/repo"),
-                "rust-implementer",
-                "Add a test.",
-                Some(EffectClass::Sandbox),
-                None,
-            ),
-            gate.context(),
-        );
-        assert_eq!(verdict.kind(), crate::auditor::VerdictKind::Escalate);
-        let id = assign(&manager, &provider, &gate, request).await.unwrap();
-        let status = manager.wait_terminal(&id).await.unwrap();
-        assert!(matches!(status, TaskStatus::Failed { .. }), "{status:?}");
-        assert_eq!(gate.log().entries().unwrap().len(), 1);
+        for effect in ["sandbox", "production"] {
+            let mut request = params(repo.path(), "rust-implementer", "Add a test.");
+            request["requested_effect"] = serde_json::json!(effect);
+            let json = precheck_refusal(&manager, &provider, &gate, request).await;
+            assert_eq!(json["reason_code"], "effect_above_ceiling", "{effect}");
+            assert!(json["reason_codes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("effect_above_ceiling")));
+            let message = json["message"].as_str().unwrap();
+            assert!(message.contains("capped at `repository`"), "{message}");
+            assert!(json["suggested_identity_change"].is_object(), "{effect}");
+            assert_eq!(json["derived_effect"], effect);
+        }
     }
 
     #[tokio::test]
@@ -1807,6 +1818,34 @@ max_concurrent = 1
         assert!(names.contains(&"rust-implementer"));
         assert!(names.contains(&"pr-shepherd"));
         assert!(!names.contains(&"auditor"));
+    }
+
+    #[tokio::test]
+    async fn test_a_repeated_client_ref_reports_the_existing_tasks_repo_and_identity() {
+        let first = repo_with_origin("https://github.com/example/repo.git");
+        let second = repo_with_origin("https://github.com/example/repo.git");
+        let manager = Arc::new(TaskManager::default());
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(plan_responses());
+        let gate = fixture_gate();
+        let a = assign_raw(
+            &manager,
+            &provider,
+            &gate,
+            with_ref(params(first.path(), "rust-implementer", "d"), "same"),
+        )
+        .await
+        .unwrap();
+        let b = assign_raw(
+            &manager,
+            &provider,
+            &gate,
+            with_ref(params(second.path(), "rust-implementer", "d"), "same"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a["taskId"], b["taskId"]);
+        assert_eq!(b["resolved_repo_path"], first.path().display().to_string());
+        assert_eq!(b["identity"], "rust-implementer");
     }
 
     fn with_ref(mut request: Value, client_ref: &str) -> Value {

@@ -1,4 +1,4 @@
-use crate::auditor::{AuditContext, ReasonCode, RuleAuditor, SpawnRequest, VerdictKind};
+use crate::auditor::{AuditContext, ReasonCode, RuleAuditor, SpawnRequest};
 use crate::identity::{IdentityCatalog, AUDITOR_IDENTITY};
 use crate::scope::{check_repo, origin_slug, repo_slug};
 use serde_json::{json, Map, Value};
@@ -459,7 +459,7 @@ pub fn precheck(
         return Err(not_assignable(&request.identity, catalog));
     }
     let verdict = RuleAuditor::new().evaluate(request, context);
-    if verdict.kind() == VerdictKind::Block {
+    if !verdict.is_allow() {
         let codes: Vec<ReasonCode> = verdict.reasons().iter().map(|r| r.code).collect();
         let primary = codes.first().copied().unwrap_or(ReasonCode::Other);
         let mut fixes: Vec<&str> = Vec::new();
@@ -469,7 +469,7 @@ pub fn precheck(
                 fixes.push(fix);
             }
         }
-        let refusal = Refusal::new(
+        let mut refusal = Refusal::new(
             "spawn_refused",
             format!("spawn refused: {verdict}"),
             fixes.join(" "),
@@ -478,7 +478,18 @@ pub fn precheck(
         .with(
             "reason_codes",
             json!(codes.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
-        );
+        )
+        .with(
+            "derived_effect",
+            json!(request.requested_effect.to_string()),
+        )
+        .with("derived_loop", json!(request.dev_loop.to_string()));
+        if let Some(suggestion) = verdict.suggestion() {
+            refusal = refusal.with(
+                "suggested_identity_change",
+                serde_json::to_value(suggestion).unwrap_or(Value::Null),
+            );
+        }
         return Err(identity_alternatives(refusal, catalog));
     }
     let Some(card) = catalog.get(&request.identity) else {
