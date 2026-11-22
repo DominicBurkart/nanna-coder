@@ -1746,6 +1746,7 @@ impl TaskRunner {
             action_gate: self.action_gate(),
             action_escalator: self.action_escalator(),
             subject: action_subject_for(task_id, queued, identity),
+            hub: self.hub_binding(task_id),
         }
     }
 
@@ -1802,6 +1803,14 @@ impl TaskRunner {
         if let Some((tx, _keepalive)) = senders.get(task_id) {
             let _ = tx.send(status);
         }
+    }
+
+    fn hub_binding(&self, task_id: &TaskId) -> Option<crate::hub::tools::HubBinding> {
+        let router = self.hub_router()?;
+        let session = router
+            .table()
+            .binding(&SessionId::from_task(task_id.clone()))?;
+        Some(crate::hub::tools::HubBinding::new(router, session))
     }
 
     fn hub_router(&self) -> Option<Arc<crate::hub::router::HubRouter>> {
@@ -2274,6 +2283,7 @@ pub(crate) struct ModelFacingLayers {
     pub(crate) action_gate: Arc<ActionGate>,
     pub(crate) action_escalator: Arc<crate::escalation::Escalator>,
     pub(crate) subject: crate::tools::ActionSubject,
+    pub(crate) hub: Option<crate::hub::tools::HubBinding>,
 }
 
 pub(crate) fn model_facing_registry(
@@ -2281,7 +2291,11 @@ pub(crate) fn model_facing_registry(
     identity: Option<&AgentIdentity>,
     layers: ModelFacingLayers,
 ) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
-    Ok(registry_for(workspace, identity)?
+    let mut registry = registry_for(workspace, identity)?;
+    if let (Some(hub), Some(identity)) = (&layers.hub, identity) {
+        crate::hub::tools::register(&mut registry, hub, identity);
+    }
+    Ok(registry
         .with_production_hold(layers.escalation_log, None)
         .with_action_gate(layers.action_gate, layers.subject)
         .with_action_escalator(layers.action_escalator))
@@ -2488,6 +2502,7 @@ max_concurrent = 1
     pub(super) struct MockProvider {
         responses: Mutex<Vec<ChatResponse>>,
         on_chat: Option<ChatHook>,
+        tools_seen: Mutex<Vec<String>>,
     }
 
     impl MockProvider {
@@ -2495,7 +2510,12 @@ max_concurrent = 1
             Arc::new(Self {
                 responses: Mutex::new(responses),
                 on_chat: None,
+                tools_seen: Mutex::new(Vec::new()),
             })
+        }
+
+        pub(super) fn tools_seen(&self) -> Vec<String> {
+            self.tools_seen.lock().unwrap().clone()
         }
 
         pub(super) fn remaining(&self) -> usize {
@@ -2506,16 +2526,20 @@ max_concurrent = 1
             Arc::new(Self {
                 responses: Mutex::new(responses),
                 on_chat: Some(on_chat),
+                tools_seen: Mutex::new(Vec::new()),
             })
         }
     }
 
     #[async_trait]
     impl ModelProvider for MockProvider {
-        async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+        async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
             if let Some(hook) = &self.on_chat {
                 hook();
             }
+            let offered = request.tools.unwrap_or_default();
+            let names = offered.iter().map(|tool| tool.function.name.clone());
+            self.tools_seen.lock().unwrap().extend(names);
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Err(ModelError::Unknown {
@@ -4448,6 +4472,78 @@ mod identity_tests {
         fn effect_class(&self) -> EffectClass {
             EffectClass::Production
         }
+    }
+
+    fn hub_card(reach: crate::hub::message::MessageReach) -> AgentIdentity {
+        let mut identity = scoped_identity();
+        identity.scope.message_reach = reach;
+        for name in crate::hub::tools::HUB_TOOLS {
+            identity.scope.tools.push(name.parse().unwrap());
+        }
+        identity
+    }
+
+    fn hub_names(registry: &crate::tools::ToolRegistry) -> Vec<String> {
+        let all = registry.list_tools();
+        let mut found: Vec<String> = all.iter().map(|n| n.to_string()).collect();
+        found.retain(|name| crate::hub::tools::HUB_TOOLS.contains(&name.as_str()));
+        found.sort();
+        found
+    }
+
+    fn hub_runtime() -> crate::hub::runtime::HubRuntime {
+        let auditor = crate::action_auditor::FailClosedMessageAuditor::new(
+            crate::action_auditor::ModelMessageAuditor::new(MockProvider::new(vec![]), "m"),
+        );
+        let shared: Arc<dyn crate::action_auditor::MessageAuditor> = Arc::new(auditor);
+        crate::hub::runtime::HubRuntime::assemble(
+            Arc::new(crate::hub::store::InMemorySessionStore::new()),
+            Arc::new(crate::hub::store::InMemoryMessageStore::new()),
+            crate::hub::runtime::tests::constant_auditors(shared),
+            Arc::new(crate::leases::SystemClock),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_the_shared_constructor_registers_hub_tools_only_for_a_live_bound_reaching_card() {
+        use crate::hub::message::MessageReach;
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let task_id = TaskId::new();
+        let workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
+        let queued = queued(repo.path());
+        let root = MessageReach::Root;
+        let card = hub_card(root);
+        let mut sorted_all: Vec<String> = crate::hub::tools::HUB_TOOLS
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        sorted_all.sort();
+        let build = |manager: &TaskManager, card: Option<&AgentIdentity>| {
+            let layers = manager.runner.model_facing_layers(&task_id, &queued, card);
+            model_facing_registry(&workspace, card, layers).unwrap()
+        };
+        let runtime = hub_runtime();
+        let manager = runtime.attach(TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS));
+        let table = runtime.router_weak().upgrade().unwrap().table();
+        assert!(hub_names(&build(&manager, Some(&card))).is_empty());
+        let proof = SessionBinding::from_audited(
+            &card,
+            task_id.clone(),
+            Lineage::root_child(RootId::legacy(task_id.clone())),
+        );
+        let guard = table.enter(proof);
+        assert_eq!(hub_names(&build(&manager, Some(&card))), sorted_all);
+        let none = hub_card(MessageReach::None);
+        assert!(hub_names(&build(&manager, Some(&none))).is_empty());
+        assert!(hub_names(&build(&manager, None)).is_empty());
+        let bare = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        assert!(hub_names(&build(&bare, Some(&card))).is_empty());
+        let mut without_names = scoped_identity();
+        without_names.scope.message_reach = root;
+        assert!(hub_names(&build(&manager, Some(&without_names))).is_empty());
+        drop(guard);
+        assert!(hub_names(&build(&manager, Some(&card))).is_empty());
     }
 
     #[tokio::test]
@@ -9546,6 +9642,135 @@ mod session_registry_tests {
                 reasons[0].detail,
                 "message router does not handle this message tool"
             );
+        }
+
+        fn reaching_card() -> AgentIdentity {
+            let catalog = fixture_catalog();
+            let mut card = catalog.get("rust-implementer").unwrap().clone();
+            card.scope.message_reach = crate::hub::message::MessageReach::Root;
+            for name in crate::hub::tools::HUB_TOOLS {
+                card.scope.tools.push(name.parse().unwrap());
+            }
+            card
+        }
+
+        async fn allowed_as(card: &AgentIdentity) -> Allowed {
+            let base = fixture_catalog();
+            let auditor = base.get("auditor").unwrap().clone();
+            let mut all: Vec<AgentIdentity> = vec![auditor.clone(), card.clone()];
+            all.retain(|identity| !identity.name().is_empty());
+            let catalog = crate::identity::IdentityCatalog::from_identities(all);
+            let request = SpawnRequest {
+                parent_task: TaskSummary::new(MCP_PARENT, "Fix bug X", "github.com/example/repo"),
+                identity: card.name().to_string(),
+                subtask: SUBTASK.to_string(),
+                dev_loop: DevLoop::Inner,
+                requested_effect: EffectClass::Workspace,
+            };
+            let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+            let context = AuditContext::new(catalog, auditor).unwrap();
+            gate.check(request, &context).await.unwrap()
+        }
+
+        async fn offered(
+            manager: &TaskManager,
+            card: &AgentIdentity,
+            audited: bool,
+        ) -> Vec<String> {
+            let repo = repo();
+            let provider = MockProvider::new(done());
+            let id = match audited {
+                true => {
+                    let proof = allowed_as(card).await;
+                    let path = repo.path().to_path_buf();
+                    let model = "gemma4:e4b".to_string();
+                    let shared: Arc<dyn ModelProvider> = provider.clone();
+                    manager
+                        .submit_spawn(proof, path, "HEAD".to_string(), model, 20, shared)
+                        .await
+                        .unwrap()
+                }
+                false => {
+                    let shared: Arc<dyn ModelProvider> = provider.clone();
+                    let path = repo.path().to_path_buf();
+                    let model = "gemma4:e4b".to_string();
+                    let mine = Some(card.clone());
+                    manager
+                        .submit_with_identity(
+                            "t".to_string(),
+                            path,
+                            "HEAD".to_string(),
+                            model,
+                            20,
+                            shared,
+                            mine,
+                        )
+                        .await
+                }
+            };
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            let mut seen = provider.tools_seen();
+            seen.retain(|name| crate::hub::tools::HUB_TOOLS.contains(&name.as_str()));
+            seen.sort();
+            seen.dedup();
+            seen
+        }
+
+        fn every_hub_tool() -> Vec<String> {
+            let mut all: Vec<String> = crate::hub::tools::HUB_TOOLS
+                .iter()
+                .map(|n| n.to_string())
+                .collect();
+            all.sort();
+            all
+        }
+
+        #[tokio::test]
+        async fn an_audited_task_with_a_reaching_card_is_offered_the_six_tools_on_a_live_hub_only()
+        {
+            let card = reaching_card();
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            assert_eq!(offered(&manager, &card, true).await, every_hub_tool());
+            let (_, locked) = (0, HubRuntime::unavailable());
+            let hubless = locked.attach(TaskManager::new(2));
+            assert!(offered(&hubless, &card, true).await.is_empty());
+            let bare = TaskManager::new(2);
+            assert!(offered(&bare, &card, true).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_card_without_reach_and_an_unaudited_task_are_offered_none() {
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let mut quiet = reaching_card();
+            quiet.scope.message_reach = crate::hub::message::MessageReach::None;
+            assert!(offered(&manager, &quiet, true).await.is_empty());
+            assert!(offered(&manager, &reaching_card(), false).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn locked_stores_register_no_tool_and_the_gate_blocks_message_tools() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = HubPaths {
+                sessions: dir.path().join("sessions.jsonl"),
+                messages: dir.path().join("messages.jsonl"),
+            };
+            let first = HubRuntime::open(&paths, provider(), "m");
+            let second = HubRuntime::open(&paths, provider(), "m");
+            assert!(first.is_available() && !second.is_available());
+            let manager = second.attach(TaskManager::new(2));
+            assert!(offered(&manager, &reaching_card(), true).await.is_empty());
+            let gate = TaskManager::action_policy_gate_routed(
+                Arc::new(InMemoryLeaseStore::default()),
+                crate::windows::WindowSet::default(),
+                None,
+                crate::action_auditor::ActionAuditLog::in_memory(),
+                second.router_weak(),
+            );
+            let verdict = gate.run_gate(&review("msg_send"), &context_at()).await;
+            assert!(is_block(&verdict), "{verdict:?}");
         }
 
         async fn restore_via(runtime: &HubRuntime, entries: &[&QueuedTask]) -> TaskManager {

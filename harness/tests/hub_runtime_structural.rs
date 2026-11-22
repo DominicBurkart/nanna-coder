@@ -205,6 +205,10 @@ const AUDITORS: Target = Target {
     owner: "ProductionAuditors",
     members: &["new"],
 };
+const TOOLS: Target = Target {
+    owner: "tools",
+    members: &["register"],
+};
 const RESTORE: Target = Target {
     owner: "TaskManager",
     members: &["restore_within_sessions"],
@@ -253,6 +257,13 @@ fn the_router_and_the_production_auditors_are_built_only_by_the_hub_runtime() {
         sorted(production(AUDITORS)),
         set(&["hub/runtime.rs: open: ProductionAuditors::new"])
     );
+}
+
+#[test]
+fn the_hub_tools_are_registered_only_by_the_shared_constructor() {
+    let found = sorted(production(TOOLS));
+    let expected = set(&["task.rs: model_facing_registry: tools::register"]);
+    assert_eq!(found, expected);
 }
 
 #[test]
