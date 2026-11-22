@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{watch, Mutex, RwLock};
 use uuid::Uuid;
 
@@ -371,7 +371,7 @@ struct TaskRunner {
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
     sessions: std::sync::RwLock<Option<Arc<SessionRegistry>>>,
-    hub: std::sync::RwLock<Option<Arc<crate::hub::send::MessageHub>>>,
+    hub: std::sync::RwLock<Option<Arc<crate::hub::router::HubRouter>>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -426,9 +426,19 @@ fn default_action_gate(leases: Arc<dyn LeaseStore>) -> Arc<ActionGate> {
         leases,
         DEFAULT_ACTION_LEASE_TTL,
     );
+    let default = Arc::new(crate::action_auditor::FailClosedActionAuditor::new(auditor));
     Arc::new(ActionGate::new(
-        Arc::new(crate::action_auditor::FailClosedActionAuditor::new(auditor)),
+        routed(Weak::new(), default),
         crate::action_auditor::ActionAuditLog::in_memory(),
+    ))
+}
+
+fn routed(
+    router: Weak<crate::hub::router::HubRouter>,
+    default: Arc<dyn crate::action_auditor::ActionAuditor>,
+) -> Arc<dyn crate::action_auditor::ActionAuditor> {
+    Arc::new(crate::action_auditor::RoutingActionAuditor::new(
+        router, default,
     ))
 }
 
@@ -511,6 +521,21 @@ impl AuditedIdentity {
     }
 }
 
+fn split_bound(
+    bound: Option<BoundIdentity>,
+    task: &TaskId,
+    lineage: Lineage,
+) -> (Option<AgentIdentity>, Option<SessionBinding>) {
+    match bound {
+        Some(BoundIdentity::Audited(audited)) => {
+            let binding = audited.binding(task.clone(), lineage);
+            (Some(audited.identity), Some(binding))
+        }
+        Some(BoundIdentity::Unaudited(identity)) => (Some(identity), None),
+        None => (None, None),
+    }
+}
+
 fn final_lineage(queued: &QueuedTask) -> Lineage {
     queued
         .lineage
@@ -545,6 +570,7 @@ impl BoundIdentity {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_identity(self) -> AgentIdentity {
         match self {
             BoundIdentity::Audited(audited) => audited.identity,
@@ -999,14 +1025,14 @@ impl TaskManager {
     }
 
     /// Keep `hub` alive for the life of this manager.
-    pub fn with_hub(self, hub: Arc<crate::hub::send::MessageHub>) -> Self {
-        *self.runner.hub.write().unwrap() = Some(hub);
+    pub fn with_hub(self, router: Arc<crate::hub::router::HubRouter>) -> Self {
+        *self.runner.hub.write().unwrap() = Some(router);
         self
     }
 
     /// The hub this manager was attached to, if any.
     pub fn hub(&self) -> Option<Arc<crate::hub::send::MessageHub>> {
-        self.runner.hub.read().unwrap().clone()
+        self.runner.hub_router().map(|router| router.hub())
     }
 
     /// Deliver protected-path violations from every task's workspace to `hook`.
@@ -1061,8 +1087,20 @@ impl TaskManager {
         model: Option<(Arc<dyn ModelProvider>, String)>,
         log: crate::action_auditor::ActionAuditLog,
     ) -> Arc<ActionGate> {
+        Self::action_policy_gate_routed(leases, windows, model, log, Weak::new())
+    }
+
+    /// [`TaskManager::action_policy_gate`] with the message hub's router: message tools are
+    /// reviewed by `router`, and blocked when it is gone or does not handle them.
+    pub fn action_policy_gate_routed(
+        leases: Arc<dyn LeaseStore>,
+        windows: crate::windows::WindowSet,
+        model: Option<(Arc<dyn ModelProvider>, String)>,
+        log: crate::action_auditor::ActionAuditLog,
+        router: Weak<crate::hub::router::HubRouter>,
+    ) -> Arc<ActionGate> {
         let windows = Arc::new(windows);
-        let auditor: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
+        let default: Arc<dyn crate::action_auditor::ActionAuditor> = match model {
             Some((provider, name)) => {
                 Arc::new(crate::action_auditor::FailClosedActionAuditor::new(
                     crate::action_auditor::ModelActionAuditor::new(
@@ -1082,7 +1120,7 @@ impl TaskManager {
                 ),
             )),
         };
-        Arc::new(ActionGate::new(auditor, log))
+        Arc::new(ActionGate::new(routed(router, default), log))
     }
 
     pub fn with_durable_budget(self, location: Option<PathBuf>) -> Self {
@@ -1766,6 +1804,10 @@ impl TaskRunner {
         }
     }
 
+    fn hub_router(&self) -> Option<Arc<crate::hub::router::HubRouter>> {
+        self.hub.read().unwrap().clone()
+    }
+
     fn session_registry(&self) -> Option<Arc<SessionRegistry>> {
         self.sessions.read().unwrap().clone()
     }
@@ -1931,11 +1973,16 @@ impl TaskRunner {
             .resolve_identity(&task_id, queued.identity_hint.as_deref(), &queued.repo_path)
             .await
         {
-            Ok(bound) => bound.map(BoundIdentity::into_identity),
+            Ok(bound) => split_bound(bound, &task_id, final_lineage(&queued)),
             Err(e) => {
                 self.fail(&task_id, e, "IdentityUnavailable").await;
                 return;
             }
+        };
+        let (identity, binding) = identity;
+        let bound_session = match (binding, self.hub_router()) {
+            (Some(binding), Some(router)) => Some(router.table().enter(binding)),
+            _ => None,
         };
         if let Some(identity) = &identity {
             if let Err(e) = crate::scope::check_repo(identity, &queued.repo_path) {
@@ -2038,6 +2085,9 @@ impl TaskRunner {
             workspace.set_ci_client(client);
         }
 
+        if let Some(guard) = &bound_session {
+            guard.set_workspace(workspace.workspace_path.clone());
+        }
         let layers = self.model_facing_layers(&task_id, &queued, identity.as_ref());
         workspace.bind_sandbox_pr(&layers.subject);
         let tool_registry = match model_facing_registry(&workspace, identity.as_ref(), layers) {
@@ -9226,7 +9276,7 @@ mod session_registry_tests {
             let runtime = HubRuntime::assemble(
                 store.clone(),
                 Arc::new(InMemoryMessageStore::new()),
-                Arc::new(auditors),
+                crate::hub::runtime::tests::constant_auditors(auditors),
                 Arc::new(crate::leases::SystemClock),
             );
             (store, runtime)
@@ -9351,6 +9401,248 @@ mod session_registry_tests {
             assert!(std::fs::read_to_string(&paths.sessions)
                 .unwrap()
                 .contains(&id.0));
+        }
+
+        type Seen = Arc<std::sync::Mutex<Vec<(usize, bool)>>>;
+
+        fn watching(
+            runtime: &HubRuntime,
+            responses: Vec<model::types::ChatResponse>,
+        ) -> (
+            Arc<dyn ModelProvider>,
+            Seen,
+            Arc<crate::hub::router::BindingTable>,
+        ) {
+            let table = runtime.router_weak().upgrade().unwrap().table();
+            let seen: Seen = Arc::default();
+            let (watched, log) = (table.clone(), seen.clone());
+            let hook = Box::new(move || {
+                let has_workspace = watched.workspace_of_only_entry().is_some();
+                log.lock().unwrap().push((watched.len(), has_workspace));
+            });
+            (MockProvider::with_hook(responses, hook), seen, table)
+        }
+
+        async fn drained(table: &crate::hub::router::BindingTable) -> bool {
+            for _ in 0..500 {
+                if table.is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            table.is_empty()
+        }
+
+        fn done() -> Vec<model::types::ChatResponse> {
+            wrap_with_state_machine_responses(vec![stop_response("all done")])
+        }
+
+        #[tokio::test]
+        async fn an_audited_task_is_bound_with_its_workspace_while_it_runs_and_unbound_when_it_completes(
+        ) {
+            let repo = repo();
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let (provider, seen, table) = watching(&runtime, done());
+            let request = SpawnRequest {
+                parent_task: TaskSummary::new(MCP_PARENT, "Fix bug X", "github.com/example/repo"),
+                identity: "rust-implementer".to_string(),
+                subtask: SUBTASK.to_string(),
+                dev_loop: DevLoop::Inner,
+                requested_effect: EffectClass::Workspace,
+            };
+            let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+            let allowed = gate.check(request, &context()).await.unwrap();
+            let id = manager
+                .submit_spawn(
+                    allowed,
+                    repo.path().to_path_buf(),
+                    "HEAD".to_string(),
+                    "gemma4:e4b".to_string(),
+                    20,
+                    provider,
+                )
+                .await
+                .unwrap();
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            assert!(seen.lock().unwrap().iter().all(|entry| *entry == (1, true)));
+            assert!(!seen.lock().unwrap().is_empty());
+            assert!(drained(&table).await);
+        }
+
+        #[tokio::test]
+        async fn a_task_that_fails_is_unbound() {
+            let repo = repo();
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let (provider, seen, table) = watching(&runtime, vec![]);
+            let id = submit_audited_with(&manager, repo.path(), provider).await;
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Failed { .. }), "{status:?}");
+            assert!(!seen.lock().unwrap().is_empty());
+            assert!(drained(&table).await);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_task_cancelled_while_running_is_unbound() {
+            let repo = repo();
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let table = runtime.router_weak().upgrade().unwrap().table();
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = entered.clone();
+            let hook = Box::new(move || {
+                flag.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            });
+            let provider = MockProvider::with_hook(done(), hook);
+            let id = submit_audited_with(&manager, repo.path(), provider).await;
+            for _ in 0..500 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(entered.load(Ordering::SeqCst));
+            assert_eq!(table.len(), 1);
+            manager.cancel(&id).await.unwrap();
+            assert!(drained(&table).await);
+        }
+
+        #[tokio::test]
+        async fn an_unaudited_task_is_never_bound() {
+            let repo = repo();
+            let (_, runtime) = runtime();
+            let manager = runtime.attach(TaskManager::new(2));
+            let (provider, seen, table) = watching(&runtime, done());
+            let identity = fixture_catalog().get("pr-shepherd").unwrap().clone();
+            let id = manager
+                .submit_with_identity(
+                    SUBTASK.to_string(),
+                    repo.path().to_path_buf(),
+                    "HEAD".to_string(),
+                    "gemma4:e4b".to_string(),
+                    20,
+                    provider,
+                    Some(identity),
+                )
+                .await;
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+            assert!(!seen.lock().unwrap().is_empty());
+            assert!(seen.lock().unwrap().iter().all(|entry| entry.0 == 0));
+            assert!(table.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_task_on_a_manager_with_no_hub_binds_nothing_and_still_completes() {
+            let repo = repo();
+            let manager = TaskManager::new(2);
+            let id = spawn(&manager, repo.path(), MCP_PARENT).await.unwrap();
+            let status = manager.wait_terminal(&id).await.unwrap();
+            assert!(matches!(status, TaskStatus::Completed { .. }), "{status:?}");
+        }
+
+        async fn submit_audited_with(
+            manager: &TaskManager,
+            repo: &std::path::Path,
+            provider: Arc<dyn ModelProvider>,
+        ) -> TaskId {
+            manager
+                .submit_spawn(
+                    allowed(MCP_PARENT).await,
+                    repo.to_path_buf(),
+                    "HEAD".to_string(),
+                    "gemma4:e4b".to_string(),
+                    20,
+                    provider,
+                )
+                .await
+                .unwrap()
+        }
+
+        fn review(tool: &str) -> crate::action_auditor::ActionReview {
+            crate::action_auditor::ActionReview {
+                identity: "x".to_string(),
+                task_id: TaskId("t".to_string()),
+                tool: tool.to_string(),
+                args: serde_json::json!({}),
+                effect_class: EffectClass::None,
+                prior_actions: vec![],
+            }
+        }
+
+        fn context_at() -> crate::action_auditor::ActionContext<'static> {
+            crate::action_auditor::ActionContext {
+                max_effect: EffectClass::None,
+                window: None,
+                lease: crate::leases::LeaseContext::default(),
+                now: Utc::now(),
+                task: "",
+            }
+        }
+
+        fn is_block(verdict: &crate::action_auditor::ActionVerdict) -> bool {
+            matches!(verdict, crate::action_auditor::ActionVerdict::Block { .. })
+        }
+
+        #[tokio::test]
+        async fn every_production_gate_constructor_blocks_message_tools_without_a_live_router() {
+            let leases = || Arc::new(InMemoryLeaseStore::default());
+            let gates = [
+                default_action_gate(leases()),
+                TaskManager::action_policy_gate(
+                    leases(),
+                    crate::windows::WindowSet::default(),
+                    None,
+                    crate::action_auditor::ActionAuditLog::in_memory(),
+                ),
+                TaskManager::action_policy_gate(
+                    leases(),
+                    crate::windows::WindowSet::default(),
+                    Some((provider(), "m".to_string())),
+                    crate::action_auditor::ActionAuditLog::in_memory(),
+                ),
+                TaskManager::action_policy_gate_routed(
+                    leases(),
+                    crate::windows::WindowSet::default(),
+                    None,
+                    crate::action_auditor::ActionAuditLog::in_memory(),
+                    HubRuntime::unavailable().router_weak(),
+                ),
+            ];
+            for gate in gates {
+                for tool in ["msg_send", "session_set_note", "sessions_query"] {
+                    let verdict = gate.run_gate(&review(tool), &context_at()).await;
+                    assert!(is_block(&verdict), "{tool}: {verdict:?}");
+                }
+                let other = gate.run_gate(&review("read_file"), &context_at()).await;
+                assert!(!is_block(&other), "{other:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_routed_constructor_reaches_a_live_router_for_message_tools_only() {
+            use crate::action_auditor::ActionVerdict::Block as B;
+            let (_, runtime) = runtime();
+            let gate = TaskManager::action_policy_gate_routed(
+                Arc::new(InMemoryLeaseStore::default()),
+                crate::windows::WindowSet::default(),
+                None,
+                crate::action_auditor::ActionAuditLog::in_memory(),
+                runtime.router_weak(),
+            );
+            let v = gate.run_gate(&review("msg_send"), &context_at()).await;
+            let B { reasons } = v else { unreachable!() };
+            assert_eq!(reasons[0].detail, "no session is bound to this call");
+            let (rq, cx) = (review("sessions_query"), context_at());
+            let q = gate.run_gate(&rq, &cx).await;
+            let B { reasons } = q else { unreachable!() };
+            assert_eq!(
+                reasons[0].detail,
+                "message router does not handle this message tool"
+            );
         }
 
         async fn restore_via(runtime: &HubRuntime, entries: &[&QueuedTask]) -> TaskManager {
