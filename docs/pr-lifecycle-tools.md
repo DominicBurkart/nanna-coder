@@ -18,6 +18,19 @@ Every git subprocess runs with a cleared environment plus an allow-list: PATH, H
 
 The credentials must not carry merge scope; no tool merges.
 
+## The credential defines the capability (deferred decision)
+
+Nanna keeps no per-repository, per-branch or per-operation policy for these tools. The identity card limits which tools exist and the effect ceiling, and the credential limits what those tools can actually do on the forge. To limit a deployment, issue a narrowly scoped key: only the repositories involved, no merge scope.
+
+Consequences operators should know:
+
+- Nanna cannot see what a key allows. A push or PR the key forbids fails when the forge refuses it, after the work is done, and the refusal comes from the forge, not from nanna.
+- `repository` is one effect class for branch push, PR open, comments and issue writes alike.
+- Separating two identities (for example one that drafts and one that publishes) requires giving them different keys.
+- Nanna does not protect branches itself; use the forge's branch protection.
+
+This is a deliberate deferral. Granular capabilities (operations, repositories, branch patterns, an intersection with what the key permits) are tracked in issue 1112; the opt-in PR capability for MCP-driven identities is tracked in issue 1107.
+
 ## Solo repositories
 
 `.nanna/policy.toml` in the base checkout sets `human_gate = "github"` (the default when the file is missing) or `"solo"`. In `github` mode the tools behave as described above. In `solo` mode `github_pr_promote` always refuses, and `git_push_branch` refuses to push a branch that has an open pull request that is not a draft, and refuses when the pull request state cannot be read, so only a human can mark a Nanna pull request ready for review and the agent cannot add commits afterwards. The harness process needs a `GITHUB_TOKEN` with pull request read access for pushes in a solo repository; without one every push refuses. A checkout without the file has no gate and nothing warns about it. A human click between the draft check and the push is not detected, an `origin` that is a fork (the upstream pull request is not seen) is not covered, and only open pull requests count, so an agent can close a readied pull request, push and open a new draft. The lookup follows at most 5 pages of pull requests and refuses beyond that. A raw GitHub token, a pull request created outside the harness, a workflow the repository allow-lists for `ci_trigger` and a merge bot that acts on comments are out of scope. A malformed, oversized (over 65536 bytes), unreadable, non-UTF-8, directory or symlink policy file, an unknown key or an unknown `human_gate` value makes the task refuse to start.
