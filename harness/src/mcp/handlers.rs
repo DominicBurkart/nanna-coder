@@ -491,6 +491,7 @@ mod tests {
     fn sample_result() -> TaskResult {
         TaskResult {
             changes: None,
+            tools_unavailable: vec![],
             result_summary: "did the thing".to_string(),
             changes_patch: Some("diff".to_string()),
             format_patch: None,
@@ -509,6 +510,7 @@ mod tests {
     fn sample_diagnostics() -> FailureDiagnostics {
         FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "MaxIterationsExceeded".to_string(),
             iterations_completed: 5,
             last_tool_call: None,

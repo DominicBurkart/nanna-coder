@@ -758,6 +758,7 @@ mod tests {
     fn result(files: &[&str], effect: Option<EffectClass>) -> TaskResult {
         TaskResult {
             changes: None,
+            tools_unavailable: vec![],
             result_summary: "done".to_string(),
             changes_patch: None,
             format_patch: None,
@@ -795,6 +796,7 @@ mod tests {
             error: "boom".to_string(),
             diagnostics: FailureDiagnostics {
                 changes: None,
+                tools_unavailable: vec![],
                 error_type: "E".to_string(),
                 iterations_completed: 0,
                 last_tool_call: None,

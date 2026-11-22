@@ -25,6 +25,16 @@ impl ChangeStatus {
             ChangeStatus::Renamed => "renamed",
         }
     }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "added" => Some(ChangeStatus::Added),
+            "modified" => Some(ChangeStatus::Modified),
+            "deleted" => Some(ChangeStatus::Deleted),
+            "renamed" => Some(ChangeStatus::Renamed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +202,35 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |byte: u8| B64.iter().position(|c| *c == byte).map(|i| i as u32);
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let last = bytes.len() / 4;
+    for (index, quad) in bytes.chunks(4).enumerate() {
+        let pad = quad.iter().rev().take_while(|b| **b == b'=').count();
+        if pad > 2 || (pad > 0 && index + 1 != last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (slot, byte) in quad.iter().enumerate() {
+            let digit = if slot >= 4 - pad { 0 } else { value(*byte)? };
+            n = (n << 6) | digit;
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 fn entry(file: &CapturedFile, offset: usize, budget: usize) -> (Value, usize, usize) {
     let mut value = json!({
         "path": file.path,
@@ -283,6 +322,36 @@ pub fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_decode_inverts_encode_for_every_padding_length() {
+        for len in 0..=40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            assert_eq!(base64_decode(&base64_encode(&bytes)), Some(bytes), "{len}");
+        }
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(base64_decode(&base64_encode(&all)), Some(all));
+    }
+
+    #[test]
+    fn base64_decode_rejects_malformed_input() {
+        for bad in ["abc", "ab=c", "a===", "====", "AA==AAAA", "!!!!", "AAA*"] {
+            assert_eq!(base64_decode(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn change_status_parses_what_it_prints() {
+        for status in [
+            ChangeStatus::Added,
+            ChangeStatus::Modified,
+            ChangeStatus::Deleted,
+            ChangeStatus::Renamed,
+        ] {
+            assert_eq!(ChangeStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(ChangeStatus::parse("copied"), None);
+    }
 
     fn text(path: &str, body: &str) -> CapturedFile {
         CapturedFile {

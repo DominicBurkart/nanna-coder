@@ -151,6 +151,8 @@ pub struct TaskResult {
     pub budget: BudgetReport,
     #[serde(skip)]
     pub changes: Option<crate::changes::ChangeCapture>,
+    #[serde(default)]
+    pub tools_unavailable: Vec<crate::exec_capabilities::ToolsUnavailable>,
 }
 
 impl TaskResult {
@@ -206,6 +208,8 @@ pub struct FailureDiagnostics {
     pub action_audit: Vec<ActionAuditLogEntry>,
     #[serde(skip)]
     pub changes: Option<crate::changes::ChangeCapture>,
+    #[serde(default)]
+    pub tools_unavailable: Vec<crate::exec_capabilities::ToolsUnavailable>,
 }
 
 impl FailureDiagnostics {
@@ -245,6 +249,7 @@ fn protected_failure(
     denials.push(denial);
     let diagnostics = FailureDiagnostics {
         changes: None,
+        tools_unavailable: vec![],
         error_type: "ProtectedPathViolation".to_string(),
         iterations_completed,
         last_tool_call: tool_call_history.last().cloned(),
@@ -616,6 +621,7 @@ pub struct TaskManager {
     runner: Arc<TaskRunner>,
     dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
     closes: std::sync::RwLock<HashMap<TaskId, String>>,
+    changes_lost: std::sync::RwLock<std::collections::HashSet<TaskId>>,
 }
 
 impl TaskManager {
@@ -919,6 +925,7 @@ impl TaskManager {
             runner,
             dispatcher,
             closes: std::sync::RwLock::new(HashMap::new()),
+            changes_lost: std::sync::RwLock::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1504,9 +1511,25 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
     }
 
     pub fn set_closes(&self, task_id: &TaskId, closes: String) {
+        if let Some(store) = self
+            .runner
+            .results
+            .read()
+            .expect("result store lock poisoned")
+            .clone()
+        {
+            store.set_closes(task_id, closes.clone());
+        }
         if let Ok(mut map) = self.closes.write() {
             map.insert(task_id.clone(), closes);
         }
+    }
+
+    pub fn changes_not_retained(&self, task_id: &TaskId) -> bool {
+        self.changes_lost
+            .read()
+            .map(|lost| lost.contains(task_id))
+            .unwrap_or(false)
     }
 
     pub fn closes(&self, task_id: &TaskId) -> Option<String> {
@@ -1546,7 +1569,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             tracing::info!(removed, "Pruned expired task results");
         }
         let reader = Arc::clone(&store);
-        let persisted = tokio::task::spawn_blocking(move || reader.load_all())
+        let persisted = tokio::task::spawn_blocking(move || reader.load_all_records())
             .await
             .unwrap_or_default();
         *self
@@ -1555,9 +1578,24 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             .write()
             .expect("result store lock poisoned") = Some(store);
         let mut loaded = 0;
-        for mut task in persisted {
+        for record in persisted {
+            let crate::result_store::LoadedRecord {
+                mut task,
+                closes,
+                changes_lost,
+            } = record;
             if self.runner.tasks.read().await.contains_key(&task.id) {
                 continue;
+            }
+            if let Some(closes) = closes {
+                if let Ok(mut map) = self.closes.write() {
+                    map.insert(task.id.clone(), closes);
+                }
+            }
+            if changes_lost {
+                if let Ok(mut lost) = self.changes_lost.write() {
+                    lost.insert(task.id.clone());
+                }
             }
             let interrupted = matches!(task.status, TaskStatus::Running { .. });
             if interrupted {
@@ -1981,6 +2019,7 @@ impl TaskRunner {
                 error,
                 diagnostics: FailureDiagnostics {
                     changes: None,
+                    tools_unavailable: vec![],
                     error_type: error_type.to_string(),
                     iterations_completed: 0,
                     last_tool_call: None,
@@ -2188,6 +2227,7 @@ impl TaskRunner {
             app_state_id: task_id.0.clone(),
         };
 
+        let tools_unavailable = tool_registry.tools_unavailable().to_vec();
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
         let mut run_result = match wall_clock_limit(identity.as_ref()) {
@@ -2258,8 +2298,9 @@ impl TaskRunner {
 
         if let Err(WorkspaceError::ProtectedPath(violation)) = extracted {
             let name = identity.as_ref().map(|i| i.name());
-            let (error, diagnostics) =
+            let (error, mut diagnostics) =
                 protected_failure(violation, name, &run_result, action_audit);
+            diagnostics.tools_unavailable = tools_unavailable;
             let finished_at = Utc::now();
             let status = TaskStatus::Failed {
                 finished_at,
@@ -2287,6 +2328,7 @@ impl TaskRunner {
                     qa_summary,
                     budget,
                     changes: capture,
+                    tools_unavailable,
                 };
                 self.set_status(
                     &task_id,
@@ -2316,6 +2358,7 @@ impl TaskRunner {
                     denials: vec![],
                     action_audit,
                     changes: capture,
+                    tools_unavailable,
                 };
                 self.set_status(
                     &task_id,
@@ -2676,6 +2719,7 @@ max_concurrent = 1
     fn test_task_result_to_json() {
         let result = TaskResult {
             changes: None,
+            tools_unavailable: vec![],
             result_summary: "Done".to_string(),
             changes_patch: Some("diff --git a/foo".to_string()),
             format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
@@ -2743,6 +2787,7 @@ max_concurrent = 1
     fn test_failure_diagnostics_to_json() {
         let diag = FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "MaxIterationsExceeded".to_string(),
             iterations_completed: 100,
             last_tool_call: None,
@@ -2771,6 +2816,7 @@ max_concurrent = 1
         };
         let diag = FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "StateError".to_string(),
             iterations_completed: 5,
             last_tool_call: Some(tool_call.clone()),
@@ -2804,6 +2850,7 @@ max_concurrent = 1
     fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
         TaskResult {
             changes: None,
+            tools_unavailable: vec![],
             result_summary: "done".to_string(),
             changes_patch: None,
             format_patch: None,
@@ -4723,6 +4770,140 @@ mod identity_tests {
             .await;
         let task = wait_for(&manager, &id, terminal).await;
         assert_eq!(failed_with(&task.status).0, "ScopeError");
+    }
+
+    fn cargo_repo() -> tempfile::TempDir {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-m", "add manifest"]] {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        repo
+    }
+
+    fn identity_with_tools(tools: &[&str]) -> AgentIdentity {
+        let mut identity = scoped_identity();
+        identity.scope.tools = tools.iter().map(|t| t.parse().unwrap()).collect();
+        identity
+    }
+
+    async fn run_with_identity(
+        manager: &TaskManager,
+        repo: &std::path::Path,
+        identity: AgentIdentity,
+    ) -> TaskId {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("done")]),
+        );
+        let id = manager
+            .submit_with_identity(
+                "Test".to_string(),
+                repo.to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider,
+                Some(identity),
+            )
+            .await;
+        wait_for(manager, &id, terminal).await;
+        id
+    }
+
+    #[tokio::test]
+    async fn a_card_listing_cargo_check_without_a_toolchain_reports_it_in_the_result() {
+        let repo = cargo_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let id = run_with_identity(
+            &manager,
+            repo.path(),
+            identity_with_tools(&["read_file", "cargo_check"]),
+        )
+        .await;
+        let result = manager.get_result(&id).await.unwrap();
+        assert_eq!(
+            result.tools_unavailable.len(),
+            1,
+            "{:?}",
+            result.tools_unavailable
+        );
+        let entry = &result.tools_unavailable[0];
+        assert_eq!(entry.tools, vec!["cargo_check".to_string()]);
+        assert!(!entry.capability.is_empty());
+        assert!(!entry.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_card_listing_only_read_tools_reports_no_unavailable_tools() {
+        let repo = cargo_repo();
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let id = run_with_identity(
+            &manager,
+            repo.path(),
+            identity_with_tools(&["read_file", "list_dir"]),
+        )
+        .await;
+        let result = manager.get_result(&id).await.unwrap();
+        assert!(result.tools_unavailable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tools_unavailable_survives_a_restart_through_the_result_store() {
+        let repo = cargo_repo();
+        let dir = tempfile::tempdir().unwrap();
+        let first = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        first
+            .attach_result_store(Arc::new(
+                crate::result_store::ResultStore::open(
+                    dir.path(),
+                    std::time::Duration::from_secs(86400),
+                )
+                .unwrap(),
+            ))
+            .await;
+        let id = run_with_identity(
+            &first,
+            repo.path(),
+            identity_with_tools(&["read_file", "cargo_check"]),
+        )
+        .await;
+        let before = first.get_result(&id).await.unwrap().tools_unavailable;
+        assert_eq!(before.len(), 1);
+        let probe = crate::result_store::ResultStore::open(
+            dir.path(),
+            std::time::Duration::from_secs(86400),
+        )
+        .unwrap();
+        for _ in 0..400 {
+            if probe.load(&id).is_ok_and(|task| task.status.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        drop(first);
+        let second = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        second
+            .attach_result_store(Arc::new(
+                crate::result_store::ResultStore::open(
+                    dir.path(),
+                    std::time::Duration::from_secs(86400),
+                )
+                .unwrap(),
+            ))
+            .await;
+        assert_eq!(
+            second.get_result(&id).await.unwrap().tools_unavailable,
+            before
+        );
     }
 
     #[tokio::test]
@@ -7300,6 +7481,7 @@ mod identity_tests {
         };
         let diagnostics = FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "ProtectedPathViolation".to_string(),
             iterations_completed: 1,
             last_tool_call: None,
@@ -9243,6 +9425,7 @@ mod result_persistence {
         TaskResult {
             result_summary: "all done".to_string(),
             changes: None,
+            tools_unavailable: vec![],
             changes_patch: Some("diff".to_string()),
             format_patch: None,
             files_modified: vec!["a.rs".to_string()],

@@ -215,9 +215,25 @@ fn merge(base: &mut Value, extra: Value) {
     }
 }
 
+fn tools_unavailable_of(task: &Task) -> &[crate::exec_capabilities::ToolsUnavailable] {
+    match &task.status {
+        TaskStatus::Completed { result, .. } => &result.tools_unavailable,
+        TaskStatus::Failed { diagnostics, .. } => &diagnostics.tools_unavailable,
+        _ => &[],
+    }
+}
+
+fn merge_tools_unavailable(value: &mut Value, task: &Task) {
+    let entries = tools_unavailable_of(task);
+    if !entries.is_empty() {
+        value["tools_unavailable"] = json!(entries);
+    }
+}
+
 pub fn status_view(gate: &SpawnGate, task: &Task) -> Value {
     let mut view = handlers::task_to_wire(task);
     merge(&mut view, identity_fields(gate, task));
+    merge_tools_unavailable(&mut view, task);
     if let TaskStatus::Failed {
         error, diagnostics, ..
     } = &task.status
@@ -281,6 +297,7 @@ pub fn compact_result(inputs: &ResultInputs<'_>) -> Value {
     let changes_available = inputs.capture.as_ref().is_some_and(|c| !c.files.is_empty());
     let build_common = |value: &mut Value| {
         merge(value, identity_fields(inputs.gate, task));
+        merge_tools_unavailable(value, task);
         merge(
             value,
             json!({
@@ -444,6 +461,15 @@ pub async fn handle_get_task_changes(
         ));
     }
     let Some(capture) = manager.captured_changes(&task.id).await else {
+        if manager.changes_not_retained(&task.id) {
+            return Ok(text_result(
+                &json!({
+                    "status": "changes_not_retained",
+                    "message": "This task changed files, but the contents were not retained (the stored copy was missing, unreadable, oversize or corrupt). The result itself is intact; get_task_result with detail=full still carries the patch when one was recorded.",
+                }),
+                true,
+            ));
+        }
         return Ok(text_result(
             &json!({
                 "status": "no_changes",
@@ -615,6 +641,7 @@ mod tests {
         };
         TaskResult {
             changes: None,
+            tools_unavailable: vec![],
             result_summary: format!("{}\u{0001}", "summary \u{0001}\"".repeat(20_000)),
             changes_patch: Some("diff --git a/a b/a\n".repeat(5000)),
             format_patch: Some("From abc\n".repeat(5000)),
@@ -814,12 +841,73 @@ mod tests {
         assert!(result["_meta"]["io.modelcontextprotocol/related-task"].is_object());
     }
 
+    fn unavailable() -> Vec<crate::exec_capabilities::ToolsUnavailable> {
+        vec![crate::exec_capabilities::ToolsUnavailable {
+            capability: "cargo".to_string(),
+            tools: vec!["cargo_check".to_string()],
+            reason: "CARGO_NET_OFFLINE=true is not set for the harness".to_string(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn the_compact_result_and_status_show_tools_unavailable_only_when_present() {
+        let server = server();
+        let mut with = big_result();
+        with.tools_unavailable = unavailable();
+        let flagged = finished(&server, completed(with), None).await;
+        let plain = finished(&server, completed(big_result()), None).await;
+        let expected = json!([{
+            "capability": "cargo",
+            "tools": ["cargo_check"],
+            "reason": "CARGO_NET_OFFLINE=true is not set for the harness",
+        }]);
+        for tool in ["get_task_result", "get_task_status"] {
+            let view = body(&fetch(&server, tool, json!({"task_id": flagged.0})).await);
+            assert_eq!(view["tools_unavailable"], expected, "{tool}");
+            let view = body(&fetch(&server, tool, json!({"task_id": plain.0})).await);
+            assert!(view.get("tools_unavailable").is_none(), "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_shows_tools_unavailable_in_result_and_status() {
+        let server = server();
+        let id = assign(&server, "d", json!({})).await;
+        let diagnostics = FailureDiagnostics {
+            changes: None,
+            tools_unavailable: unavailable(),
+            error_type: "MaxIterationsExceeded".to_string(),
+            iterations_completed: 3,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+            denials: vec![],
+            action_audit: vec![],
+        };
+        let status = TaskStatus::Failed {
+            finished_at: chrono::Utc::now(),
+            error: "ran out of iterations".to_string(),
+            diagnostics,
+        };
+        server.task_manager.finish_for_test(&id, status).await;
+        for tool in ["get_task_result", "get_task_status"] {
+            let view = body(&fetch(&server, tool, json!({"task_id": id.0})).await);
+            assert_eq!(
+                view["tools_unavailable"][0]["tools"][0], "cargo_check",
+                "{tool}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_refused_task_reports_reason_code_retryable_and_fix() {
         let server = server();
         let id = assign(&server, "d", json!({})).await;
         let diagnostics = FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "SpawnRefused".to_string(),
             iterations_completed: 0,
             last_tool_call: None,
@@ -863,6 +951,7 @@ mod tests {
         let id = assign(&server, "d", json!({})).await;
         let diagnostics = FailureDiagnostics {
             changes: None,
+            tools_unavailable: vec![],
             error_type: "SpawnAuditFailed".to_string(),
             iterations_completed: 0,
             last_tool_call: None,
@@ -982,6 +1071,99 @@ mod tests {
             ))
             .await;
         assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    async fn server_over(dir: &std::path::Path) -> NannaMcpServer {
+        let manager = Arc::new(TaskManager::new(0));
+        let store = Arc::new(
+            crate::result_store::ResultStore::open(dir, std::time::Duration::from_secs(86400))
+                .unwrap(),
+        );
+        manager.attach_result_store(store).await;
+        NannaMcpServer::new(
+            manager,
+            Arc::new(NoopProvider),
+            crate::auditor::test_support::fixture_gate(),
+            100,
+        )
+    }
+
+    fn mixed_capture() -> ChangeCapture {
+        let mut binary = file("img.bin", "");
+        binary.binary = true;
+        binary.content = Some(vec![0, 1, 2, 255]);
+        binary.size = 4;
+        let mut deleted = file("gone.rs", "");
+        deleted.status = ChangeStatus::Deleted;
+        deleted.content = None;
+        deleted.size = 0;
+        let mut renamed = file("to.rs", "fn a() {}\n");
+        renamed.status = ChangeStatus::Renamed;
+        renamed.old_path = Some("from.rs".to_string());
+        let mut truncated = file("big.txt", "caf\u{e9} caf\u{e9} ");
+        truncated.size = 9_000_000;
+        truncated.capture_truncated = true;
+        ChangeCapture {
+            base_ref: Some("abc".to_string()),
+            files: vec![file("a.rs", "hello"), binary, deleted, renamed, truncated],
+            patch_original_bytes: Some(70_000),
+        }
+    }
+
+    async fn every_page(server: &NannaMcpServer, id: &TaskId) -> Vec<Value> {
+        let mut pages = Vec::new();
+        for args in [
+            json!({"task_id": id.0, "limit": 2}),
+            json!({"task_id": id.0, "offset": 2, "limit": 2}),
+            json!({"task_id": id.0, "offset": 4}),
+            json!({"task_id": id.0, "path": "big.txt", "offset": 3, "limit": 5}),
+            json!({"task_id": id.0, "path": "img.bin"}),
+        ] {
+            pages.push(body(&fetch(server, "get_task_changes", args).await));
+        }
+        pages
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_task_changes_and_closes_survive_a_restart_with_identical_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = server_over(dir.path()).await;
+        let id = finished(&first, completed(big_result()), Some(mixed_capture())).await;
+        let before = every_page(&first, &id).await;
+        let result_before = body(&fetch(&first, "get_task_result", json!({"task_id": id.0})).await);
+        drop(first);
+
+        let second = server_over(dir.path()).await;
+        assert_eq!(every_page(&second, &id).await, before);
+        assert_eq!(before[0]["files"][1]["content_base64"], "AAEC/w==");
+        assert_eq!(before[1]["files"][1]["status"], "renamed");
+        assert_eq!(before[3]["files"][0]["truncated"], true);
+        let result_after = body(&fetch(&second, "get_task_result", json!({"task_id": id.0})).await);
+        assert_eq!(result_after["closes"], "#462");
+        assert_eq!(result_after, result_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_damaged_sidecar_after_restart_answers_not_retained_and_keeps_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = server_over(dir.path()).await;
+        let id = finished(&first, completed(big_result()), Some(mixed_capture())).await;
+        drop(first);
+        let sidecar = dir
+            .path()
+            .join(crate::result_store::RESULTS_DIR)
+            .join(format!("{}.changes.json", id.0));
+        std::fs::write(&sidecar, b"{broken").unwrap();
+
+        let second = server_over(dir.path()).await;
+        let changes = fetch(&second, "get_task_changes", json!({"task_id": id.0})).await;
+        assert_eq!(changes["isError"], true);
+        let view = body(&changes);
+        assert_eq!(view["status"], "changes_not_retained");
+        assert!(view["message"].as_str().unwrap().contains("not retained"));
+        let result = fetch(&second, "get_task_result", json!({"task_id": id.0})).await;
+        assert_eq!(result["isError"], false);
+        assert_eq!(body(&result)["status"], "completed");
     }
 
     #[test]
