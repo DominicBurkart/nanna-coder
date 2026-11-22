@@ -223,6 +223,9 @@ fn nothing_a_task_controls_gains_a_pull_request_or_window_field() {
             "identity_hint",
             "origin",
             "lineage",
+            "client_ref",
+            "requested_effect",
+            "dev_loop",
         ])
     );
     let tools = source("src/tools.rs");

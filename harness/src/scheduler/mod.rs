@@ -103,6 +103,17 @@ pub struct QueuedTask {
     /// before lineage existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<crate::hub::lineage::Lineage>,
+    /// Caller-chosen idempotency key, unique per identity. Absent for entries
+    /// written before the key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
+    /// Effect class the caller's request was audited at, so a restore audits
+    /// the same request. Absent for entries written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effect: Option<crate::effects::EffectClass>,
+    /// Development loop the caller's request was audited at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_loop: Option<crate::identity::DevLoop>,
 }
 
 impl QueuedTask {
@@ -128,7 +139,27 @@ impl QueuedTask {
             identity_hint: None,
             origin: None,
             lineage: None,
+            client_ref: None,
+            requested_effect: None,
+            dev_loop: None,
         }
+    }
+
+    /// Record the effect class and loop the request was audited at.
+    pub fn with_audited_request(
+        mut self,
+        requested_effect: Option<crate::effects::EffectClass>,
+        dev_loop: Option<crate::identity::DevLoop>,
+    ) -> Self {
+        self.requested_effect = requested_effect;
+        self.dev_loop = dev_loop;
+        self
+    }
+
+    /// Record the caller's idempotency key.
+    pub fn with_client_ref(mut self, client_ref: Option<String>) -> Self {
+        self.client_ref = client_ref;
+        self
     }
 
     /// Record where the entry sits in its session tree.
@@ -198,6 +229,24 @@ mod tests {
     }
 
     #[test]
+    fn client_ref_round_trips_through_the_store_encoding() {
+        let task = QueuedTask::new("d", PathBuf::from("/r"), "HEAD", "m", 1)
+            .with_client_ref(Some("lumo-42".to_string()))
+            .with_audited_request(
+                Some(crate::effects::EffectClass::Production),
+                Some(crate::identity::DevLoop::Outer),
+            );
+        let back: QueuedTask =
+            serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(back.client_ref.as_deref(), Some("lumo-42"));
+        assert_eq!(
+            back.requested_effect,
+            Some(crate::effects::EffectClass::Production)
+        );
+        assert_eq!(back.dev_loop, Some(crate::identity::DevLoop::Outer));
+    }
+
+    #[test]
     fn readiness_follows_not_before() {
         let now = Utc::now();
         let ready = QueuedTask::new("d", PathBuf::from("/r"), "HEAD", "m", 1);
@@ -217,6 +266,9 @@ mod tests {
         assert!(task.not_before.is_none());
         assert!(task.identity_hint.is_none());
         assert!(task.origin.is_none());
+        assert!(task.client_ref.is_none());
+        assert!(task.requested_effect.is_none());
+        assert!(task.dev_loop.is_none());
         let back: QueuedTask =
             serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
         assert_eq!(back, task);
