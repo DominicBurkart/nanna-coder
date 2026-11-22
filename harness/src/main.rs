@@ -118,6 +118,28 @@ enum Commands {
         /// (falls back to NANNA_PLANNER_MODEL; without either the tool is off)
         #[arg(long)]
         planner_model: Option<String>,
+        /// Serve MCP over a unix socket at this path instead of stdio. Many
+        /// clients may connect at once and share one task manager; a client
+        /// disconnecting never stops a running task. The socket is mode 0600
+        /// in a 0700 directory and there is no network listener.
+        #[arg(long, value_name = "SOCKET")]
+        listen: Option<std::path::PathBuf>,
+    },
+    /// Bridge stdin/stdout to a running `mcp-serve --listen` daemon.
+    ///
+    /// Copies newline-delimited JSON-RPC from stdin to the daemon's unix
+    /// socket and the daemon's replies to stdout; stdout carries protocol
+    /// bytes only. Exits 0 when stdin closes (after draining replies) and
+    /// non-zero when the daemon is unreachable or goes away.
+    McpAttach {
+        /// Unix socket of the daemon
+        #[arg(long, value_name = "SOCKET", default_value = "/run/nanna/mcp.sock")]
+        socket: std::path::PathBuf,
+        /// A label for this client in the daemon's log. It is a tag only and
+        /// is not authenticated: anyone who can open the socket can claim any
+        /// name, and it grants no permissions.
+        #[arg(long, default_value = "unnamed")]
+        client: String,
     },
     /// Delegate a coding task through the MCP Tasks protocol.
     ///
@@ -454,7 +476,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let logging = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env());
-    if matches!(cli.command, Commands::McpServe { .. }) {
+    if matches!(
+        cli.command,
+        Commands::McpServe { .. } | Commands::McpAttach { .. }
+    ) {
         logging.with_writer(std::io::stderr).init();
     } else {
         logging.init();
@@ -559,12 +584,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             audit_model,
             max_iterations,
             planner_model,
+            listen,
         } => {
             let from_env = std::env::var("NANNA_PLANNER_MODEL").ok();
             let planner = planner_model
                 .or(from_env)
                 .filter(|name| !name.trim().is_empty());
-            run_mcp_server(model, audit_model, max_iterations, planner).await?;
+            run_mcp_server(model, audit_model, max_iterations, planner, listen).await?;
+        }
+        Commands::McpAttach { socket, client } => {
+            run_mcp_attach(&socket, &client).await?;
         }
         Commands::Delegate {
             description,
@@ -1902,7 +1931,24 @@ async fn build_mcp_task_manager_with_budget(
             queue_path.with_file_name("action_audit.jsonl"),
         ),
     );
-    Ok(TaskManager::restore_with_escalations(
+    let results = std::sync::Arc::new(harness::result_store::ResultStore::open(
+        &harness::result_store::state_dir_from(
+            std::env::var_os(harness::result_store::STATE_DIR_ENV),
+            queue_path,
+        ),
+        harness::result_store::retention_from(std::env::var_os(
+            harness::result_store::RETENTION_DAYS_ENV,
+        )),
+    )?);
+    let interrupted =
+        harness::result_store::drop_interrupted(&JsonlQueueStore::open(queue_path)?, &results)?;
+    if !interrupted.is_empty() {
+        warn!(
+            count = interrupted.len(),
+            "Tasks that were running when the previous process ended will be marked failed (DaemonRestarted)"
+        );
+    }
+    let manager = TaskManager::restore_with_escalations(
         DEFAULT_MAX_CONCURRENT_TASKS,
         Box::new(HybridPolicy::default()),
         Box::new(JsonlQueueStore::open(queue_path)?),
@@ -1914,7 +1960,10 @@ async fn build_mcp_task_manager_with_budget(
         &spawn_gate,
     )
     .await?
-    .with_durable_budget(budget_path))
+    .with_durable_budget(budget_path);
+    let loaded = manager.attach_result_store(results).await;
+    info!(loaded, "Loaded persisted task results");
+    Ok(manager)
 }
 
 fn build_delegate_task_manager(
@@ -2097,6 +2146,7 @@ async fn run_mcp_server(
     audit_model: Option<String>,
     max_iterations: usize,
     planner_model: Option<String>,
+    listen: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
@@ -2133,6 +2183,7 @@ async fn run_mcp_server(
     );
     export_budget(&task_manager.cost_accountant(), &telemetry);
     let flush = spawn_telemetry_flush(Arc::clone(&telemetry), TELEMETRY_FLUSH_EVERY);
+    let _pruning = harness::result_store::spawn_pruning(Arc::clone(&task_manager));
 
     info!(
         "Starting Nanna MCP server (auditor model: {}, max_iterations: {}, queue: {}, leases: {}, escalations: {})",
@@ -2157,16 +2208,65 @@ async fn run_mcp_server(
     }
     let server = Arc::new(server);
 
-    let reader = tokio::io::BufReader::new(tokio::io::stdin());
-    let writer = tokio::io::stdout();
     let serving = async {
-        tokio::select! {
-            served = server.serve(reader, writer) => served,
-            _ = shutdown_signal() => Ok(()),
+        match listen {
+            Some(socket) => {
+                tokio::select! {
+                    served = serve_on_socket(Arc::clone(&server), socket) => served,
+                    _ = shutdown_signal() => Ok(()),
+                }
+            }
+            None => {
+                let reader = tokio::io::BufReader::new(tokio::io::stdin());
+                let writer = tokio::io::stdout();
+                tokio::select! {
+                    served = server.serve(reader, writer) => served,
+                    _ = shutdown_signal() => Ok(()),
+                }
+            }
         }
     };
     finish_with_flush(&telemetry, Some(flush), serving).await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn serve_on_socket(
+    server: std::sync::Arc<harness::mcp::NannaMcpServer>,
+    socket: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    harness::mcp::listen::serve_unix(server, &socket).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn serve_on_socket(
+    _server: std::sync::Arc<harness::mcp::NannaMcpServer>,
+    _socket: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("--listen needs unix sockets, which this platform lacks".into())
+}
+
+#[cfg(unix)]
+async fn run_mcp_attach(
+    socket: &std::path::Path,
+    client: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(error) =
+        harness::mcp::attach::attach(socket, client, tokio::io::stdin(), tokio::io::stdout()).await
+    {
+        eprintln!("nanna mcp-attach: {error}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_mcp_attach(
+    _socket: &std::path::Path,
+    _client: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("mcp-attach needs unix sockets, which this platform lacks".into())
 }
 
 /// Delegate a coding task through the MCP Tasks protocol by driving an

@@ -379,6 +379,7 @@ struct TaskRunner {
     sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
     ci_client: std::sync::RwLock<Option<Arc<dyn crate::backlog::GithubActionsClient>>>,
+    results: std::sync::RwLock<Option<Arc<crate::result_store::ResultStore>>>,
 }
 
 /// What [`TaskManager::submit_for_audit`] did with a request.
@@ -910,6 +911,7 @@ impl TaskManager {
             sink,
             cost_accountant: std::sync::RwLock::new(cost_accountant),
             ci_client: std::sync::RwLock::new(None),
+            results: std::sync::RwLock::new(None),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -1534,6 +1536,94 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         })
     }
 
+    pub async fn attach_result_store(&self, store: Arc<crate::result_store::ResultStore>) -> usize {
+        let pruner = Arc::clone(&store);
+        let removed =
+            tokio::task::spawn_blocking(move || pruner.prune(std::time::SystemTime::now()))
+                .await
+                .unwrap_or(0);
+        if removed > 0 {
+            tracing::info!(removed, "Pruned expired task results");
+        }
+        let reader = Arc::clone(&store);
+        let persisted = tokio::task::spawn_blocking(move || reader.load_all())
+            .await
+            .unwrap_or_default();
+        *self
+            .runner
+            .results
+            .write()
+            .expect("result store lock poisoned") = Some(store);
+        let mut loaded = 0;
+        for mut task in persisted {
+            if self.runner.tasks.read().await.contains_key(&task.id) {
+                continue;
+            }
+            let interrupted = matches!(task.status, TaskStatus::Running { .. });
+            if interrupted {
+                let iterations = match task.status {
+                    TaskStatus::Running { iterations, .. } => iterations,
+                    _ => 0,
+                };
+                let now = Utc::now();
+                task.status = crate::result_store::daemon_restarted_status(now, iterations);
+                task.last_updated_at = now;
+            }
+            if !task.status.is_terminal() {
+                continue;
+            }
+            let (tx, rx) = watch::channel(task.status.clone());
+            self.runner
+                .status_senders
+                .write()
+                .await
+                .insert(task.id.clone(), (tx, rx));
+            let id = task.id.clone();
+            self.runner.tasks.write().await.insert(id.clone(), task);
+            if interrupted {
+                self.runner.persist_snapshot(&id).await;
+            }
+            loaded += 1;
+        }
+        loaded
+    }
+
+    pub async fn prune_results(&self) -> usize {
+        self.prune_results_at(std::time::SystemTime::now()).await
+    }
+
+    pub(crate) async fn prune_results_at(&self, now: std::time::SystemTime) -> usize {
+        let Some(store) = self
+            .runner
+            .results
+            .read()
+            .expect("result store lock poisoned")
+            .clone()
+        else {
+            return 0;
+        };
+        let retention = store.retention();
+        let on_disk = tokio::task::spawn_blocking(move || store.prune(now))
+            .await
+            .unwrap_or(0);
+        let now: DateTime<Utc> = now.into();
+        let keep = chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+        let expired: Vec<TaskId> = self
+            .runner
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|task| task.status.is_terminal() && now - task.last_updated_at > keep)
+            .map(|task| task.id.clone())
+            .collect();
+        for id in &expired {
+            self.runner.tasks.write().await.remove(id);
+            self.runner.status_senders.write().await.remove(id);
+        }
+        on_disk.max(expired.len())
+    }
+
     pub async fn list(&self) -> Vec<Task> {
         let tasks = self.runner.tasks.read().await;
         tasks.values().cloned().collect()
@@ -1601,6 +1691,7 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
             self.runner.bound.write().await.remove(task_id);
         }
         self.runner.pending_audits.write().await.remove(task_id);
+        self.runner.persist_snapshot(task_id).await;
 
         // Broadcast the terminal transition to any `wait_terminal` subscribers.
         {
@@ -1770,9 +1861,36 @@ impl TaskRunner {
             self.bound.write().await.remove(task_id);
             self.pending_audits.write().await.remove(task_id);
         }
+        self.persist_snapshot(task_id).await;
         let senders = self.status_senders.read().await;
         if let Some((tx, _keepalive)) = senders.get(task_id) {
             let _ = tx.send(status);
+        }
+    }
+
+    async fn persist_snapshot(&self, task_id: &TaskId) {
+        let Some(store) = self
+            .results
+            .read()
+            .expect("result store lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let tasks = Arc::clone(&self.tasks);
+        let id = task_id.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            store.persist_latest(|| tasks.blocking_read().get(&id).cloned())
+        })
+        .await;
+        match written {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::error!(task_id = %task_id, %error, "Failed to persist the task result")
+            }
+            Err(error) => {
+                tracing::error!(task_id = %task_id, %error, "Result persistence task failed")
+            }
         }
     }
 
@@ -9072,5 +9190,278 @@ mod identity_limit_tests {
             "{:?}",
             task.status
         );
+    }
+}
+
+#[cfg(test)]
+mod result_persistence {
+    use super::scheduler_tests::{queued, wait_for};
+    use super::tests::MockProvider;
+    use super::*;
+    use crate::leases::InMemoryLeaseStore;
+    use crate::result_store::{ResultStore, RESULTS_DIR};
+    use crate::scheduler::{HybridPolicy, JsonlQueueStore, QueueStore};
+    use std::time::Duration;
+
+    fn open_store(dir: &std::path::Path) -> Arc<ResultStore> {
+        Arc::new(ResultStore::open(dir, Duration::from_secs(14 * 86400)).unwrap())
+    }
+
+    async fn restored(max: usize, queue: &std::path::Path) -> TaskManager {
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        TaskManager::restore(
+            max,
+            Box::new(HybridPolicy::default()),
+            Box::new(JsonlQueueStore::open(queue).unwrap()),
+            Arc::new(InMemoryLeaseStore::default()),
+            provider,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn record(id: &TaskId, status: TaskStatus) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.clone(),
+            description: "d".to_string(),
+            repo_path: PathBuf::from("/nonexistent"),
+            branch: "HEAD".to_string(),
+            model: "mock".to_string(),
+            status,
+            created_at: now,
+            last_updated_at: now,
+            ttl_ms: None,
+            not_before: None,
+            identity_hint: None,
+            origin: None,
+            lineage: None,
+        }
+    }
+
+    fn result() -> TaskResult {
+        TaskResult {
+            result_summary: "all done".to_string(),
+            changes: None,
+            changes_patch: Some("diff".to_string()),
+            format_patch: None,
+            files_modified: vec!["a.rs".to_string()],
+            tool_calls_made: vec![],
+            denials: vec![],
+            action_audit: vec![],
+            iterations: 4,
+            model_used: "mock".to_string(),
+            blast_radius: None,
+            qa_summary: Default::default(),
+            budget: Default::default(),
+        }
+    }
+
+    fn cancelled() -> TaskStatus {
+        TaskStatus::Cancelled {
+            finished_at: Utc::now(),
+            iterations_completed: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_task_is_written_and_answers_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let first = restored(2, &queue).await;
+        first.attach_result_store(open_store(dir.path())).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = first
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        let done = wait_for(&first, &id, TaskStatus::is_terminal).await;
+        let file = dir.path().join(RESULTS_DIR).join(format!("{id}.json"));
+        for _ in 0..200 {
+            if file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(file.is_file());
+        drop(first);
+
+        let second = restored(2, &queue).await;
+        assert_eq!(second.attach_result_store(open_store(dir.path())).await, 1);
+        let back = second.poll(&id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&back.status).unwrap(),
+            serde_json::to_value(&done.status).unwrap()
+        );
+        assert_eq!(second.list().await.len(), 1);
+        assert!(matches!(
+            second.wait_terminal(&id).await,
+            Some(TaskStatus::Failed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_completed_result_survives_with_its_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let id = TaskId::new();
+        let store = open_store(dir.path());
+        store
+            .persist(&record(
+                &id,
+                TaskStatus::Completed {
+                    finished_at: Utc::now(),
+                    result: result(),
+                },
+            ))
+            .unwrap();
+
+        let manager = restored(0, &queue).await;
+        manager.attach_result_store(store).await;
+        let got = manager.get_result(&id).await.unwrap();
+        assert_eq!(got.result_summary, "all done");
+        assert_eq!(got.files_modified, vec!["a.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let manager = restored(0, &queue).await;
+        let store = open_store(dir.path());
+        manager.attach_result_store(Arc::clone(&store)).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        manager.cancel(&id).await.unwrap();
+        let persisted = store.load(&id).unwrap();
+        assert!(matches!(persisted.status, TaskStatus::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_task_found_running_becomes_failed_daemon_restarted_and_is_not_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let first = restored(0, &queue).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = first
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        drop(first);
+        let store = open_store(dir.path());
+        store
+            .persist(&record(
+                &id,
+                TaskStatus::Running {
+                    started_at: Utc::now(),
+                    iterations: 7,
+                },
+            ))
+            .unwrap();
+
+        let queue_store = JsonlQueueStore::open(&queue).unwrap();
+        let dropped = crate::result_store::drop_interrupted(&queue_store, &store).unwrap();
+        assert_eq!(dropped, vec![id.clone()]);
+        assert!(queue_store.load().unwrap().is_empty());
+
+        let second = restored(2, &queue).await;
+        second.attach_result_store(Arc::clone(&store)).await;
+        let task = second.poll(&id).await.unwrap();
+        match task.status {
+            TaskStatus::Failed {
+                diagnostics, error, ..
+            } => {
+                assert_eq!(diagnostics.error_type, "DaemonRestarted");
+                assert_eq!(diagnostics.iterations_completed, 7);
+                assert!(error.contains("retryable"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let persisted = store.load(&id).unwrap();
+        assert!(matches!(persisted.status, TaskStatus::Failed { .. }));
+        assert!(store.interrupted_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_task_the_queue_still_holds_is_left_to_the_restore_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let first = restored(0, &queue).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = first
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        drop(first);
+        let store = open_store(dir.path());
+        store.persist(&record(&id, cancelled())).unwrap();
+
+        let second = restored(0, &queue).await;
+        assert_eq!(second.attach_result_store(store).await, 0);
+        let task = second.poll(&id).await.unwrap();
+        assert!(matches!(task.status, TaskStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn parked_restore_failures_are_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let manager = restored(0, &queue).await;
+        let store = open_store(dir.path());
+        manager.attach_result_store(Arc::clone(&store)).await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
+        let id = manager
+            .submit_task(queued(Path::new("/nonexistent")), provider)
+            .await;
+        manager
+            .runner
+            .fail(&id, "parked".to_string(), "RestoreAuditDeferred")
+            .await;
+        assert!(store.load(&id).is_err());
+        manager
+            .runner
+            .fail(&id, "really failed".to_string(), "ScopeError")
+            .await;
+        assert!(store.load(&id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn attach_prunes_expired_results_and_ignores_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let store = Arc::new(ResultStore::open(dir.path(), Duration::from_secs(86400)).unwrap());
+        let old = TaskId::new();
+        let fresh = TaskId::new();
+        for id in [&old, &fresh] {
+            store.persist(&record(id, cancelled())).unwrap();
+        }
+        std::fs::write(store.dir().join("junk.json"), b"{").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(store.dir().join(format!("{old}.json")))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3 * 86400))
+            .unwrap();
+
+        let manager = restored(0, &queue).await;
+        assert_eq!(manager.attach_result_store(store).await, 1);
+        assert!(manager.poll(&old).await.is_none());
+        assert!(manager.poll(&fresh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn periodic_pruning_drops_expired_tasks_from_memory_and_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue.jsonl");
+        let store = Arc::new(ResultStore::open(dir.path(), Duration::from_secs(86400)).unwrap());
+        let id = TaskId::new();
+        store.persist(&record(&id, cancelled())).unwrap();
+        let manager = restored(0, &queue).await;
+        manager.attach_result_store(Arc::clone(&store)).await;
+        assert_eq!(manager.prune_results().await, 0);
+        assert!(manager.poll(&id).await.is_some());
+        let later = std::time::SystemTime::now() + Duration::from_secs(2 * 86400);
+        assert_eq!(manager.prune_results_at(later).await, 1);
+        assert!(manager.poll(&id).await.is_none());
+        assert!(store.load(&id).is_err());
     }
 }

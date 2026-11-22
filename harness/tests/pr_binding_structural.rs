@@ -167,6 +167,7 @@ fn only_the_pull_request_open_tool_binds_a_pull_request() {
             "pr_tools.rs: GithubPrOpenTool::execute",
             "apprun/ports.rs: port_is_free",
             "sandbox_tools.rs: FakeSandboxTarget::deploy",
+            "mcp/listen.rs: bind_private",
         ])
     );
     assert_eq!(
