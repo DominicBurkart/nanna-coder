@@ -49,8 +49,7 @@ impl Scan {
             match token {
                 TokenTree::Group(group) => self.tokens(group.stream()),
                 TokenTree::Ident(owner) if owner == target.owner => {
-                    let joined = matches!(flat.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
-                        && matches!(flat.get(index + 2), Some(TokenTree::Punct(p)) if p.as_char() == ':');
+                    let joined = is_colon(flat.get(index + 1)) && is_colon(flat.get(index + 2));
                     if let (true, Some(TokenTree::Ident(member))) = (joined, flat.get(index + 3)) {
                         if self.hits(Some(owner), member) {
                             self.note(&format!("{}::{}", target.owner, member));
@@ -81,21 +80,19 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.enter(node.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, node);
+            self.stack.pop();
         }
-        self.enter(node.sig.ident.to_string());
-        syn::visit::visit_item_fn(self, node);
-        self.stack.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.enter(node.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, node);
+            self.stack.pop();
         }
-        self.enter(node.sig.ident.to_string());
-        syn::visit::visit_impl_item_fn(self, node);
-        self.stack.pop();
     }
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
@@ -117,14 +114,8 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         if let syn::Type::Path(ty) = &*node.ty {
-            let target = self.target;
-            if ty
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == target.owner)
-            {
-                self.note(&format!("alias of {}", target.owner));
+            if names_owner(ty, self.target.owner) {
+                self.note(&format!("alias of {}", self.target.owner));
             }
         }
     }
@@ -160,6 +151,19 @@ fn scan(text: &str, target: Target) -> Vec<String> {
     scan.found
 }
 
+fn is_colon(token: Option<&TokenTree>) -> bool {
+    matches!(token, Some(TokenTree::Punct(p)) if p.as_char() == ':')
+}
+
+fn relative(path: &Path, base: &Path) -> String {
+    let tail = path.strip_prefix(base).unwrap();
+    tail.to_string_lossy().replace('\\', "/")
+}
+
+fn names_owner(ty: &syn::TypePath, owner: &str) -> bool {
+    ty.path.segments.last().is_some_and(|s| s.ident == owner)
+}
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -177,11 +181,7 @@ fn production(target: Target) -> Vec<String> {
     rust_files(&src, &mut files);
     let mut found = Vec::new();
     for path in files {
-        let rel = path
-            .strip_prefix(&src)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative(&path, &src);
         for item in scan(&fs::read_to_string(&path).unwrap(), target) {
             found.push(format!("{rel}: {item}"));
         }
