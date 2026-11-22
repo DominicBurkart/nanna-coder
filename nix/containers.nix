@@ -87,6 +87,7 @@ let
         pkgs.tzdata  # Timezone data
         pkgs.bash    # Shell for debugging
         pkgs.coreutils # Basic utilities
+        pkgs.git
       ];
       pathsToLink = [ "/bin" "/etc" "/share" ];
     };
