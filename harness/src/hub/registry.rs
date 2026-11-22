@@ -1627,11 +1627,11 @@ mod tests {
                     if result.is_err() {
                         assert_eq!(after, before, "{from:?} -> {to:?}");
                         assert_eq!(registry.tracks(&sid("t")), tracked);
-                        continue;
+                    } else {
+                        assert_eq!(after.status, to);
+                        assert_eq!(after.ended_at.is_some(), !to.is_active());
+                        assert_eq!(registry.tracks(&sid("t")), to.is_active());
                     }
-                    assert_eq!(after.status, to);
-                    assert_eq!(after.ended_at.is_some(), !to.is_active());
-                    assert_eq!(registry.tracks(&sid("t")), to.is_active());
                 }
             }
         }
@@ -1657,9 +1657,9 @@ mod tests {
         #[test]
         fn a_waiting_session_still_takes_notes_and_touched_paths() {
             let (store, registry) = waiting();
-            registry
-                .record_touched(&sid("t"), &["a.rs".into()], at(3))
-                .unwrap();
+            let paths = ["a.rs".to_string()];
+            let touched = registry.record_touched(&sid("t"), &paths, at(3));
+            touched.unwrap();
             let note = registry.set_note(&sid("t"), "parked", at(4)).unwrap();
             let record = stored(&store, "t");
             assert_eq!(record.status, SessionStatus::WaitingOnMessages);
@@ -1768,9 +1768,9 @@ mod tests {
         #[test]
         fn a_leave_that_wins_the_race_lets_the_later_cancel_close_the_record() {
             let (store, registry) = waiting();
-            registry
-                .set_status(&sid("t"), SessionStatus::Running, at(4))
-                .unwrap();
+            let back = SessionStatus::Running;
+            let left = registry.set_status(&sid("t"), back, at(4));
+            left.unwrap();
             registry.cancel(&sid("t"), at(5)).unwrap();
             let record = stored(&store, "t");
             assert_eq!(record.status, SessionStatus::Cancelled);
@@ -1898,17 +1898,15 @@ mod tests {
                     for (n, expected) in model.iter().enumerate() {
                         let name = format!("s{n}");
                         let found = store.get(sid(&name)).unwrap();
-                        let Some(status) = expected else {
-                            prop_assert!(found.is_none());
-                            continue;
-                        };
-                        let record = found.unwrap();
-                        prop_assert_eq!(record.status, *status);
-                        prop_assert_eq!(record.ended_at.is_some(), !status.is_active());
-                        prop_assert_eq!(registry.tracks(&sid(&name)), status.is_active());
-                        prop_assert_eq!(record.created_at, created[n]);
-                        closed[n] = closed[n] || !status.is_active();
-                        prop_assert!(!(closed[n] && record.status.is_active()));
+                        prop_assert_eq!(found.is_some(), expected.is_some());
+                        if let (Some(status), Some(record)) = (expected, found) {
+                            prop_assert_eq!(record.status, *status);
+                            prop_assert_eq!(record.ended_at.is_some(), !status.is_active());
+                            prop_assert_eq!(registry.tracks(&sid(&name)), status.is_active());
+                            prop_assert_eq!(record.created_at, created[n]);
+                            closed[n] = closed[n] || !status.is_active();
+                            prop_assert!(!(closed[n] && record.status.is_active()));
+                        }
                     }
                 }
             }

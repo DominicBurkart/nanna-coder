@@ -8795,13 +8795,11 @@ mod session_registry_tests {
         let registry = manager.runner.session_registry().unwrap();
         let session_id = SessionId::from_task(id.clone());
         let running = SessionStatus::Running;
-        registry
-            .set_status(&session_id, running, Utc::now())
-            .unwrap();
+        let started = registry.set_status(&session_id, running, Utc::now());
+        started.unwrap();
         let waiting = SessionStatus::WaitingOnMessages;
-        registry
-            .set_status(&session_id, waiting, Utc::now())
-            .unwrap();
+        let parked = registry.set_status(&session_id, waiting, Utc::now());
+        parked.unwrap();
         assert_eq!(session(&store, &id).status, waiting);
         (store, manager, id, repo)
     }
@@ -8868,9 +8866,8 @@ mod session_registry_tests {
         let lineage = Lineage::root_child(RootId::legacy(hostile.id.clone()));
         let store = Arc::new(InMemorySessionStore::new());
         let waiting = SessionStatus::WaitingOnMessages;
-        store
-            .upsert(session_record_for(&hostile, &lineage, waiting))
-            .unwrap();
+        let stale = session_record_for(&hostile, &lineage, waiting);
+        store.upsert(stale).unwrap();
         let registry = Arc::new(SessionRegistry::new(store.clone()));
         let gate = crate::auditor::test_support::fixture_gate();
         let _manager = restore_with(&[&hostile], registry, &gate).await;
