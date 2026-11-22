@@ -186,6 +186,7 @@ pub struct SessionRecord {
     pub note: Option<Summary>,        // latest session_set_note (audited)
     pub result_summary: Option<String>, // TaskResult.result_summary (untrusted)
     pub touched_paths: Vec<String>,   // from broker CallRecords: paths only, ≤256, protected/secret paths dropped
+    pub read_paths: ReadScope,        // Unknown | Unrestricted | Paths(..); serde default Unknown
     pub status: SessionStatus,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -210,6 +211,8 @@ impl Summary {
 
 impl TryFrom<String> for Summary { type Error = SummaryError; /* TooLong | Unprintable | Unredacted | NotCollapsed */ }
 ```
+
+**Read paths (`ReadScope`).** `SessionRecord` stored write paths only, and an `Option<Vec<_>>` for read paths is ambiguous for a record written before the field existed: a missing field would load as "no restriction" and the privilege comparison in §8.2 would never fire. `ReadScope` is therefore `Unknown | Unrestricted | Paths(Vec<String>)`, with serde default `Unknown`. A legacy record with no read-path field loads as `Unknown` and is least privileged for a sender (no authority) and unrestricted for a recipient. Both directions over-trigger the inbound model pass and never under-trigger. Read paths are recorded at registration.
 
 `Summary` invariants:
 - **Kani + proptest:** `chars().count() < 180` for all inputs. Status: the Kani harness (`cut_plan_output_is_within_the_limit_and_never_over_slices`) has never been executed (`cargo-kani` is not installed on the build hosts) and is not verified in CI; the proptests are the only evidence.
@@ -292,7 +295,7 @@ pub trait ActivityStore: Send + Sync {
   - `ToolCall` entries come from the broker's `CallRecord`s, or from `ToolRegistry::execute`'s result on the `AgentLoop` path.
   - `AssistantTurn` entries come from the executor or `AgentLoop`.
   - `MessageMeta` and `StatusChange` entries come from the hub.
-  - Nothing is wired yet: #1069 and #1071 call the store.
+  - No production code writes the activity log yet. The `ToolCall` writer, together with declared parameter names for `ArgsSummary::from_args`, lands in #1073, its first consumer (the librarian index). The `AssistantTurn`, `MessageMeta` and `StatusChange` writers are also unwritten.
 - **Every string field is processed inside `append`, so no caller can skip it.** In order: take at most 64 KiB of the raw text, `strip_unprintable`, `redact_resilient` on the whole text, cut to the field limit (on a char boundary, backing off to whitespace within 64 bytes), then `RuleMessageAuditor::review_field_with` on exactly the text that will be stored. A rule hit stores `"[withheld: <reason code>]"` in place of the text; the append succeeds and the original is never stored, logged or echoed. The cut comes after redaction (a secret cannot be split into an unrecognised fragment) and before the review (the review rejects text over 8 KiB, which would withhold every long turn). Limits: 2048 bytes for a turn, 300 chars for an argument summary, 200 chars for a subject, 64 chars for a tool name.
 - **Oracle per call (deviation).** `append_with` takes an `IdentifierOracle` like `review_field_with`, because a real oracle belongs to the logging session's workspace. `append` uses `NullOracle`.
 - **Arguments are summarized from the call, never stored raw (deviation).** `args_summary` is an `ArgsSummary`, which can only be built by `ArgsSummary::from_args(&args, known)`; it records argument names and the kind and length of each value (`path=str:12 content=str:4096`), never a value. A name is written only if the caller lists it in `known`, the tool's declared parameter names (the tool registry's schema, or `known_arguments(tool)` for the message tools, supplied by #1071/#1072); every other name is `?`. There is no character-class rule: a name is agent-controlled and a short random secret used as a key passes any identifier-shape test and the 24-char entropy rule. Non-object arguments are `value=<kind>`. The doc earlier said "keeps keys and paths, truncates values"; paths are values and are not kept. The summary then goes through the pipeline above like any other field. `ActivityEntry::tool_call(session, at, tool, &args, known, ok)` is the convenience constructor.
@@ -384,7 +387,8 @@ The hub checks reach deterministically, after the outbound audit passes.
   - `lineage` means the parent, children, siblings and the root mailbox.
   - `root` means any session in the root.
   - A narrowing card may only lower it (`narrows()` rule).
-  - The shipped catalog cards get `root`, and `session-librarian` gets `none`.
+  - The shipped catalog cards get `root`, except the built-in `auditor` and `session-librarian` cards, which stay `none` (amends D2; G2).
+- **Hub tools at `none`.** At `message_reach = none` all six agent tools (`msg_send`, `msg_recv`, `session_set_note`, `sessions_list`, `session_describe`, `sessions_tree`) are hidden, not just `msg_send`: the read views put peer-authored text into a session that is meant to be isolated. A card lists the six tool names explicitly, never a pattern, because `narrows()` compares tool names as exact strings. Setting `message_reach` alone grants no tools.
 - A recipient must be active, with status `Pending`, `Running` or `WaitingOnMessages`. Sending to a completed session returns `RecipientInactive`.
 - An unknown session and one in another root return the **same** error (`NotVisible`), so cross-root ids cannot be probed.
 - **Limits:** 30 messages per sender per 10 minutes; 256 unread per recipient (beyond that, `InboxFull`); 2,000 messages per root per hour; thread depth ≤ 32.
@@ -448,6 +452,8 @@ sequenceDiagram
 ```
 
 The receive side as built is described under "Recv path as built" in section 9.1.
+
+The diagram shows the gate's review. `MessageHub::send` reviews again (§8.2, two reviews of record).
 
 **Before the executor exists**, there is no doorbell. `NoopDoorbell` is used, and agents poll with `msg_recv` (with `wait_secs` up to 60 for long-polling).
 
@@ -691,9 +697,10 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
   2. Rules run, and their `Block` cannot be overridden by the model.
   3. `ModelMessageAuditor` runs.
   4. `FailClosedMessageAuditor` applies a 30 s timeout.
+- **Two reviews of record.** The gate runs the full `review_outbound` for the sender bound to `ActionReview.task_id`, and `MessageHub::send` runs it again. `hub.send` is the reviewer of record, so any caller of `send` (the operator path, tests) is reviewed. A `Block` from either review wins and nothing is stored. A `Quarantine` from either review halts the sender (`ActionDenied::Escalate` or an equivalent halting error): if the gate delivers and `hub.send` then quarantines, the call surfaces as a halting error, not a plain tool error. When the gate quarantines, `on_quarantine` stores through the existing `quarantined_text` pipeline and `QuarantineSink`; no third place persists suspect text. Reviewing once, with a router-only one-shot token that binds the content hash and the resolved recipient set, is a measured optimisation for later and is not part of #1072. `session_set_note` gets the full outbound review at the gate as well, because a note reaches every peer through summaries. The registry's field review stays, and the per-session rate limit bounds the model cost.
 - **Inbound** (at `msg_recv`, inside the hub; recv args carry no content, so the action gate has nothing to review):
   1. Rules are re-run against the *recipient's* context. This is cheap, and catches rule-set updates between send and receive.
-  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks, or the recipient's write paths (or read paths; an absent read scope means unrestricted) are not an exact-string subset of the sender's, the same rule as `narrows()`. The comparison can over-trigger and never under-triggers. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
+  2. The model pass runs **only when** the recipient's `max_effect` is above the sender's, or the recipient holds tools the sender lacks, or the recipient's write paths or read paths are not an exact-string subset of the sender's (read paths compared as a `ReadScope`: for a recipient `Unknown` counts as unrestricted, for a sender `Unknown` counts as no authority), the same rule as `narrows()`. The comparison can over-trigger and never under-triggers. That is the confused-deputy case. Otherwise the verdict is bound to the outbound one by content hash.
 - **Verdict mapping:**
 
 | `MessageVerdict` | Outbound result | Inbound result |
@@ -702,6 +709,7 @@ impl IndexView { pub(crate) fn freeze(store: &dyn SessionStore, caller: &Session
 | `Block` | `ActionDenied::Block`; the agent sees reason codes only, never the matched text; the 3rd denial escalates via `RepeatedDenials` | Withheld; the sender is notified with the reason code |
 | `Quarantine` | `ActionDenied::Escalate`; the sender halts; the message is stored `Quarantined`; the Escalator is notified (`Severity::Blocked`, `EscalationSource::Auditor`) | Quarantined and escalated |
 
+- **Sender notice for an inbound `Block`.** "The sender is notified with the reason code" needs a channel. The hub keeps at most 16 `SenderNotice { message_id, codes, at }` per session in memory, dropping the oldest. `codes` come from the fixed `ReasonCode` enum. The next `msg_recv` or `msg_send` result of that session carries the notices, rendered by the host as `[nanna] message <id> was not delivered: <code>`. A notice has no text field, is not a `StoredMessage`, is not fenced as an agent message and does not survive a restart.
 - **No plaintext message content in audit output.** The args of `msg_send`, `session_set_note` and `sessions_query` are the message, note or query itself. Before any append, `ActionAuditLog` (and the registry's in-memory `action_reviews`, which end up in task results) replaces them with `{redacted, keys (only the argument names the tool itself defines, from `known_arguments`; any other key is `?`, because key names are agent-controlled and can be a secret), bytes, hash}` (`redact_for_log`). The hash is the non-cryptographic 64-bit `content_hash`: it lets a reader confirm a guess of the exact content, it neither recovers it nor attests integrity. Telemetry events and escalation evidence carry no args by construction. Every other tool's entries are byte-identical to before. A test plants a token-shaped string and asserts it appears in none of the audit file, telemetry output, escalation evidence or error returned to the agent.
 - **Never silently redacting message bodies** (decision D3). Redaction changes meaning, and the sender learns nothing from it. Summaries *are* redacted, because they have no sender to inform.
 
@@ -794,7 +802,7 @@ pub enum MessageVerdict { Deliver, Block { reasons: Vec<Reason> }, Quarantine { 
 
 pub struct OutboundReview<'a> { pub sender: &'a SessionBinding, pub tool: &'a str, pub recipients: &'a [RecipientScope], pub subject: &'a str, pub body: &'a str, pub window: &'a [StoredMessage], pub thread: &'a [StoredMessage] }
 pub struct InboundReview<'a>  { pub recipient: &'a SessionBinding, pub sender: RecipientScope, pub message: &'a StoredMessage, pub thread: &'a [StoredMessage] }
-pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String>, pub read_paths: Option<Vec<String>> }
+pub struct RecipientScope { pub session: SessionId, pub identity: String, pub max_effect: EffectClass, pub tools: Vec<String>, pub write_paths: Vec<String>, pub read_paths: ReadScope }
 
 #[async_trait]
 pub trait MessageAuditor: Send + Sync {
@@ -894,7 +902,7 @@ impl MessageHub {
     pub fn set_note(&self, caller: &SessionBinding, note: &str) -> Result<Option<Summary>, HubError>;
     // gate-side (RoutingActionAuditor only)
     pub(crate) fn record_outbound_quarantine(&self, from: &SessionBinding, args: &SendRequest, reasons: &[Reason]) -> Result<MessageId, HubError>;
-    // lifecycle (TaskManager only)
+    // lifecycle (TaskManager only). As built these live on `SessionRegistry` (`harness/src/hub/registry.rs`), called by the TaskManager, not on `MessageHub`.
     pub(crate) fn register(&self, b: &SessionBinding, meta: SessionMeta) -> Result<(), HubError>;
     pub(crate) fn set_status(&self, id: SessionId, s: SessionStatus) -> Result<(), HubError>;
     pub(crate) fn record_touched(&self, id: SessionId, path: &str);
@@ -997,6 +1005,13 @@ pub(crate) fn register_librarian(registry: &mut ToolRegistry, view: Arc<IndexVie
 
 - `ModelFacingLayers` (`task.rs`, `pub` after #962) gains `hub: Option<HubBinding>`.
 - `model_facing_registry` calls `hub::tools::register` **before** `scoped_for`, so `scope.tools` decides which hub tools survive.
+- **Audit proof.** `HubBinding` exists only for a task whose identity went through the spawn gate (`BoundIdentity::Audited`). A catalog-by-hint identity (`Unaudited`) and an unscoped task get no hub tools and no binding-table entry.
+- **Router ownership.** The `TaskManager`, through `HubRuntime`, owns the `Arc<HubRouter>`; gates hold `Weak`. A gate built without a hub holds a dangling `Weak`, so message tools are Blocked.
+- **Binding table.** The hub holds a host-owned table `SessionId -> Arc<SessionBinding>`, written when the `HubBinding` is created in `TaskManager::run` and removed on every exit path (cancel, failure, finish). The router resolves the sender from `SessionId::from_task(review.task_id)`. A missing entry is a Block, never a default binding.
+- **Workspace map.** The hub holds a host-owned map `SessionId -> workspace path`, set in `TaskManager::run` after the workspace exists and removed on every exit path. The path never comes from tool arguments. The git-object oracle runs only against a path from this map; a session with no entry gets `NullOracle`, never the host repository.
+- **Locked stores.** When the stores cannot be opened (`Locked` by a second `mcp-serve`), the process starts without a hub: the six tools are not registered at all and the gate Blocks message tools. This is logged loudly.
+- **Paths without a hub in #1072.** `nanna delegate` and backlog-sync get no hub: those paths register no hub tools and create no binding-table entry, so `RootId::Cli` sessions (§3.1) are not hub-enabled yet.
+- **Production construction.** `main.rs` is a separate crate from the `harness` lib, so construction lives in one lib function, `HubRuntime::open` (taking a parameter struct), and `restore_within_sessions` is narrowed behind it. A structural scan pins exactly one `SessionRegistry::new` per store in production, and the same `SessionRegistry` instance goes to the `TaskManager` and the hub.
 - A structural test (`harness/tests/hub_single_door_structural.rs`, using `syn` as in `guarded_constructors_structural.rs`) asserts:
   - `hub::tools::register` is called only from `model_facing_registry`;
   - `register_librarian` is called only from `SpawnedLibrarian`;
@@ -1149,7 +1164,7 @@ Issues 1–14 and 16 work on the current runtime. Issue 15 is the only pi-couple
 | ID | Decision | Default taken |
 | --- | --- | --- |
 | D1 | Can messages and lookups cross roots? | **No.** Same root only; one error for foreign and unknown ids. |
-| D2 | Who may message whom? | New card field `scope.message_reach = none \| lineage \| root`. Absent means `none`. Shipped catalog cards are set to `root`. |
+| D2 | Who may message whom? | New card field `scope.message_reach = none \| lineage \| root`. Absent means `none`. Shipped catalog cards are set to `root`, except the built-in `auditor` and `session-librarian`, which stay `none`. |
 | D3 | What happens on a secret hit? | **Block** with the reason code only (no silent redaction). The 3rd denial escalates. Quarantine is for injection, steering and collusion. |
 | D4 | Delivery model | **Pull-first** (`msg_recv`, long-poll ≤60 s) ships on the current runtime. The `steer` doorbell comes with the pi executor. |
 | D5 | What does the librarian index contain? | **Decided:** a redacted per-session activity log (§4.1) plus metadata. No message bodies and no file contents. |
