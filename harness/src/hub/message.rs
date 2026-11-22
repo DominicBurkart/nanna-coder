@@ -348,6 +348,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_of_a_send_request_prints_lengths_and_no_text() {
+        let request = SendRequest {
+            to: Recipient::Parent,
+            kind: MessageKind::Info,
+            subject: "subject-SECRET".into(),
+            body: "body-SECRET".into(),
+            in_reply_to: None,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(
+            debug.contains("subject_len: 14") && debug.contains("body_len: 11"),
+            "{debug}"
+        );
+    }
+
+    #[test]
     fn message_reach_defaults_to_none_and_orders_by_permission() {
         assert_eq!(MessageReach::default(), MessageReach::None);
         assert!(MessageReach::None < MessageReach::Lineage);

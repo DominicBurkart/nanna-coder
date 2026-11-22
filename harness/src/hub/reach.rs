@@ -32,11 +32,7 @@ pub fn relation_of(me: &SessionBinding, other: &SessionRecord) -> Relation {
 }
 
 fn allowed(reach: MessageReach, relation: Relation) -> bool {
-    match reach {
-        MessageReach::None => false,
-        MessageReach::Lineage => relation != Relation::Other,
-        MessageReach::Root => true,
-    }
+    reach == MessageReach::Root || relation != Relation::Other
 }
 
 /// The active recipients `to` names, from `in_root`, the sessions of the sender's own root.
