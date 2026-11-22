@@ -101,7 +101,7 @@ only run tests, in an image that also has a deploy tool). The opposite
 mismatch, an image that lacks a capability the card lists, was already an
 error.
 
-Reading applied here (flagged for confirmation): the card names the
+Reading applied here (accepted, decision b below): the card names the
 environment and lists the capability set, and the two must be identical for
 the container-executed class. A mismatch in either direction is a load-time
 hard error: `CapabilityNotProvided` (card needs more than the image gives) and
@@ -119,7 +119,7 @@ no capability list declared by `.nanna/verify.toml`. The checks the verifier
 may run are the capabilities its environment declares; if #1028 keeps a
 `verify.toml`, it may only select among the verifier environment's
 capabilities and cannot add one. This needs agreement with the owner of #1028
-(see the confirmation list).
+(decision d below: direction accepted, not decided here).
 
 ### D4. Child environments and `extends` are removed
 
@@ -347,10 +347,10 @@ tools, limits).
   not trigger `cargo vendor`, because #1031 refuses the task on a stale or
   missing `Cargo.lock`, which would block a docs task for an unrelated
   reason. This is a small `workspace.rs` change after #1031 lands.
-- Network stays derived from the ceiling: `verifier` and `docs-writer`
-  (ceiling `workspace`) are `--network=none`; `rust-implementer`,
-  `pr-shepherd` and `reviewer` (ceiling `repository` or above) keep the
-  default network.
+- Network stays derived from the ceiling: `reviewer` (ceiling `none`),
+  `verifier` and `docs-writer` (ceiling `workspace`) are `--network=none`;
+  `rust-implementer` and `pr-shepherd` (ceiling `repository` or above) keep
+  the default network.
 - The verifier needs nothing special: its environment declares the check
   capabilities it uses, and a check whose binary is missing from the image
   fails with the existing `VerifierExecFailed`.
@@ -370,11 +370,11 @@ which will now be built from the resolved environment.
 Cards live in the host config directory (`$NANNA_CONFIG_DIR/agents/`).
 `rust-implementer` and `pr-shepherd` follow the existing fixtures with an
 `[environment]` table added; `reviewer`, `docs-writer` and `verifier` do not
-exist as fixtures yet, so their scope values below are proposals for the user
-to adjust. Repo names, models, prompt paths, capability ids and commands are
-illustrative. Each card is followed by the environment declaration it must
-line up with, described by its capability list (the `[build]` table is as in
-D7).
+exist as fixtures yet, so their scope values below are the default ceilings of
+decision e, amended only with a stated reason per card. Repo names, models,
+prompt paths, capability ids and commands are illustrative. Each card is
+followed by the environment declaration it must line up with, described by its
+capability list (the `[build]` table is as in D7).
 
 ```toml
 [identity]
@@ -446,7 +446,7 @@ failures locally; this is a deliberate edit of that card.
 ```toml
 [identity]
 name = "reviewer"
-description = "Reads a pull request diff and comments on it; never edits the repository."
+description = "Reads a pull request diff and reports findings; read-only, never edits the repository or posts."
 loop = "middle"
 model = "gemma4:e4b"
 system_prompt = "prompts/reviewer.md"
@@ -455,11 +455,10 @@ system_prompt = "prompts/reviewer.md"
 repos = ["github.com/example/repo"]
 paths = []
 read_paths = ["**"]
-max_effect = "repository"
+max_effect = "none"
 tools = [
   "read_file", "search", "list_directory", "git_diff", "git_status",
   "github_pr_status", "github_pr_comments", "github_issue_read",
-  "github_issue_comment",
 ]
 
 [environment]
@@ -471,6 +470,8 @@ max_wall_clock_secs = 1200
 max_concurrent = 4
 ```
 
+The reviewer's ceiling is `none` (decision e), so it holds no write tool such
+as `github_issue_comment`, and its container runs with `--network=none`.
 `review` declares no capabilities: a minimal image with git and coreutils. All
 of the reviewer's tools are host-side, so the container exists to satisfy the
 invariant and to guarantee the reviewer has no compiler or package manager. If
@@ -576,6 +577,14 @@ own subagent and environment.
 
 ## Worked example: the cargo dependency reviewer
 
+Status: PROPOSAL, NOT DECIDED. This section is a proposal built from the
+user's ruling on offline cargo dependencies, quoted below. Its new schema keys
+(`[limits]`, `[sandbox]`, `[network]`, `[[input]]`) and its lifecycle change
+for #1027 and #1031 (dependencies installed at image build time against main,
+new dependencies gated by the reviewer subagent's verdict) are undecided. They
+depend on a user ruling about #1031 and on the owner of #1027. See "Open
+(proposal only)" at the end of this section.
+
 Ruling, in the user's words: "offline cargo's install can happen when the
 container is built against main. iff new deps are added, a dedicated subagent
 can do a dep review to make sure that it's compliant with the repo's licenses
@@ -592,7 +601,7 @@ whose capability set is deliberately tiny. Hosts, limits, capability ids and
 commands are proposals. Three things here go beyond the schema above and are
 marked as such: the `[limits]`, `[sandbox]` and `[network]` tables in
 `environment.toml`, the verdict artifact, and the build gate. They are listed
-under "Needs confirmation".
+under "Open (proposal only)".
 
 ### Lifecycle: dependencies are installed at image build time
 
@@ -630,7 +639,7 @@ offline, so someone must produce the proposed `Cargo.lock` delta before the
 reviewer sees it. Options are a harness pre-step that runs `cargo update -p`
 with the same allowlisted egress, or the implementer submitting only a
 `(name, version requirement)` request. Either way the reviewer's input is a
-lockfile, never code the implementer wrote. See "Needs confirmation".
+lockfile, never code the implementer wrote. See "Open (proposal only)".
 
 ### The card
 
@@ -1067,6 +1076,43 @@ Pure tests (no podman) run everywhere; the container tests use the existing
   (TOCTOU); a verdict for a different `lockfile_sha256` is not accepted;
   `needs-human` blocks until a ledger entry exists.
 
+### Open (proposal only)
+
+Not decided. These items belong to the proposal above and stay open until the
+user rules on #1031 and the owner of #1027 answers.
+
+6. Schema keys for the dependency reviewer example. The `[limits]` (`cpus`,
+   `memory_mb`, `pids`, `wall_clock_secs`, `tmpfs_mb`), `[sandbox]`
+   (`read_only_root`, `cap_drop`, `no_new_privileges`, `user`, `env`),
+   `[network]` (`mode`, `allow`) and `[[input]]` tables in `environment.toml`
+   are new, and the default values (1 cpu, 1024 MB, 128 pids, 600 s, 256 MB
+   scratch, 50/150 MB crate caps) are proposals. Is a declared network
+   allowlist acceptable at all? D8 says network is derived from the card's
+   ceiling and never an environment property, and the card here has ceiling
+   `workspace`, which means `--network=none`. The example needs a narrow
+   exception (an environment may only move from none to a named allowlist
+   through the proxy, never to open network) or a new ceiling level. Which? And
+   should the sandbox keys be a baseline every environment gets, with
+   environments only able to tighten them?
+7. Lifecycle change for #1027 and #1031. If approved dependencies are installed
+   in the image at build time, task-time vendoring is unnecessary for them. Do
+   the owners of #1027 and #1031 retire it, or keep it for dependencies without
+   a verdict (which would be a second install path)? This document does not
+   decide.
+8. Who consumes the verdict. The design has the image build step consume it
+   against a human-merged approved ledger under protected `.nanna/`, and a
+   human (or a declarative repo policy) decide `needs-human`. Confirm the
+   consumer, the ledger location, and whether any policy auto-approval is
+   allowed at all.
+9. How a branch that adds a dependency gets it. Either the implementer waits
+   for the review and a derived image layer built from the approved delta, or
+   the dependency change merges first and the next image build picks it up.
+   Also who produces the proposed `Cargo.lock` delta offline.
+10. Deterministic-first reviewer. The verdict is computed from deterministic
+    checks and the model may only escalate. Confirm that the model must not be
+    able to turn a `deny` into `approve`, and whether a model should be in the
+    loop at all for the build-script review.
+
 ## Test plan
 
 Test names are proposals. Contract tests are written first in each step.
@@ -1174,7 +1220,9 @@ not add or change any workflow or CI file.
    module docs; the configuration reference promoted out of this document.
    Hot: none.
 
-8. Cargo dependency reviewer example (see the worked example above). Lands
+8. Cargo dependency reviewer example (see the worked example above). This
+   step is conditional on the open items listed under "Open (proposal only)";
+   it is not scheduled until they are decided. If adopted, it lands
    after the environment schema steps: it needs step 1 (card), step 2
    (declaration and checker, extended with the `[limits]`, `[sandbox]`,
    `[network]` and `[[input]]` keys), step 3 (Containerfile builder, onboarding
@@ -1207,55 +1255,26 @@ steps 4, 5 and 6 must wait for them. Step 8 waits for steps 1 to 4.
   The Nix backend narrows the gap by generating image and declaration from one
   list.
 
-## Needs confirmation
+## Decisions (nanna-coder M1 reviewer, 2026-11-22)
 
-1. Definition format (D7). Default to a Containerfile built locally with
-   podman, with the existing nix2container flake output available behind the
-   same `environment.toml`. Is Containerfile-first, Nix-optional what you meant
-   by "dockerfile-like"?
-2. Mismatch reading (D2). My reading of your answer on "wider" images: the
-   card declares its environment and its capability set together, and any
-   mismatch in either direction is a load-time hard error. Is that right, and
-   in particular should an image that provides more than the card allows be an
-   error rather than tolerated?
-3. Consequence of D1 and D9. Every task bound to an identity now requires a
-   declared, locally buildable environment, including repos that today run
-   without a container, and a repo-local card cannot narrow a container-class
-   capability set without becoming a separately named subagent. Acceptable?
-4. Verifier (D3). `run_checks` and `.nanna/verify.toml` in #1028 must be
-   reconciled so that checks are capabilities declared by the verifier's
-   environment. Should #1028's owner be asked to adopt that, or should
-   `verify.toml` remain a selector over the environment's capabilities?
-5. The `reviewer`, `docs-writer` and `verifier` card values above are
-   proposals; confirm ceilings and tool lists.
-6. Schema keys for the dependency reviewer example. The `[limits]` (`cpus`,
-   `memory_mb`, `pids`, `wall_clock_secs`, `tmpfs_mb`), `[sandbox]`
-   (`read_only_root`, `cap_drop`, `no_new_privileges`, `user`, `env`),
-   `[network]` (`mode`, `allow`) and `[[input]]` tables in `environment.toml`
-   are new, and the default values (1 cpu, 1024 MB, 128 pids, 600 s, 256 MB
-   scratch, 50/150 MB crate caps) are proposals. Is a declared network
-   allowlist acceptable at all? D8 says network is derived from the card's
-   ceiling and never an environment property, and the card here has ceiling
-   `workspace`, which means `--network=none`. The example needs a narrow
-   exception (an environment may only move from none to a named allowlist
-   through the proxy, never to open network) or a new ceiling level. Which? And
-   should the sandbox keys be a baseline every environment gets, with
-   environments only able to tighten them?
-7. Lifecycle change for #1027 and #1031. If approved dependencies are installed
-   in the image at build time, task-time vendoring is unnecessary for them. Do
-   the owners of #1027 and #1031 retire it, or keep it for dependencies without
-   a verdict (which would be a second install path)? This document does not
-   decide.
-8. Who consumes the verdict. The design has the image build step consume it
-   against a human-merged approved ledger under protected `.nanna/`, and a
-   human (or a declarative repo policy) decide `needs-human`. Confirm the
-   consumer, the ledger location, and whether any policy auto-approval is
-   allowed at all.
-9. How a branch that adds a dependency gets it. Either the implementer waits
-   for the review and a derived image layer built from the approved delta, or
-   the dependency change merges first and the next image build picks it up.
-   Also who produces the proposed `Cargo.lock` delta offline.
-10. Deterministic-first reviewer. The verdict is computed from deterministic
-    checks and the model may only escalate. Confirm that the model must not be
-    able to turn a `deny` into `approve`, and whether a model should be in the
-    loop at all for the build-script review.
+These record the reviewer's decisions on the points this design previously
+left open. D1 to D5 above are the user's rulings and are unchanged.
+
+- a. Definition format (D7): ACCEPTED. A Containerfile built locally with
+  podman is the default; the nix2container flake output is an optional backend
+  behind the same `environment.toml`. Reason: installing nanna must not require
+  Nix.
+- b. Card and environment capability sets (D2, D8): ACCEPTED. The two must be
+  equal, and a mismatch in either direction is a load-time hard error.
+  Reason: the capability set and the environment are one unit.
+- c. Consequence of D1 and D9: ACCEPTED. Every identity-bound task needs a
+  declared, locally buildable environment, and a repo-local card may not narrow
+  a container capability set without becoming a separately named subagent.
+- d. Verifier checks (D3): ACCEPTED AS THE DIRECTION, NOT DECIDED HERE. The
+  verifier's checks are capabilities of the verifier's own environment, with
+  `verify.toml` at most a selector over them. This requires the owner of
+  nanna-coder #1028 to adopt it; this document does not decide it for them.
+- e. Default ceilings: ACCEPTED as defaults, to be amended only with a stated
+  reason per card. `reviewer` is read-only (`max_effect` none), `docs-writer`
+  is `workspace`, and `verifier` is `workspace` without merge and without
+  network.
