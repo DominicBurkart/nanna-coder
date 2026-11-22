@@ -2,7 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CARD="${NANNA_LUMO_CARD:-$SCRIPT_DIR/lumo-config/agents/lumo.toml}"
 VOLUME_PREFIX="${NANNA_REPO_VOLUME_PREFIX:-nanna-repo-}"
 GIT_IMAGE="${NANNA_REPOS_IMAGE:-docker.io/library/rust:1-bookworm}"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
@@ -14,18 +13,35 @@ require_podman() {
   fi
 }
 
+catalog_source() {
+  if [[ -n "${NANNA_CATALOG_SRC:-}" ]]; then
+    printf '%s\n' "$NANNA_CATALOG_SRC"
+  elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    printf '%s\n' "$XDG_CONFIG_HOME/nanna/agents"
+  else
+    printf '%s\n' "${HOME:-/nonexistent}/.config/nanna/agents"
+  fi
+}
+
 card_slugs() {
-  if [[ ! -r "$CARD" ]]; then
-    printf 'lumo card not found at %s\n' "$CARD" >&2
+  local source card line all="" slugs
+  source="$(catalog_source)"
+  if [[ ! -d "$source" ]]; then
+    printf 'identity catalog not found at %s; set NANNA_CATALOG_SRC\n' "$source" >&2
     exit 2
   fi
-  local line
-  line="$(grep -m1 '^repos = \[' "$CARD" || true)"
-  if [[ -z "$line" ]]; then
-    printf 'no scope.repos entry in %s\n' "$CARD" >&2
+  for card in "$source"/*.toml; do
+    [[ -f "$card" ]] || continue
+    line="$(grep -m1 '^repos = \[' "$card" || true)"
+    [[ -n "$line" ]] || continue
+    all+="$(grep -o '"[^"]*"' <<< "$line" | tr -d '"')"$'\n'
+  done
+  slugs="$(awk 'NF && !seen[$0]++' <<< "$all")"
+  if [[ -z "$slugs" ]]; then
+    printf 'no scope.repos entry in any card under %s\n' "$source" >&2
     exit 2
   fi
-  grep -o '"[^"]*"' <<< "$line" | tr -d '"'
+  printf '%s\n' "$slugs"
 }
 
 declare -a NAMES=() VOLUMES=() SLUGS=()
@@ -35,7 +51,7 @@ load_repos() {
   slugs="$(card_slugs)" || exit 2
   while IFS= read -r slug; do
     if [[ ! "$slug" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
-      printf 'refusing malformed repository slug in the card: %s\n' "$slug" >&2
+      printf 'refusing malformed repository slug in the catalog: %s\n' "$slug" >&2
       exit 2
     fi
     name="${slug##*/}"
@@ -121,7 +137,7 @@ for i in "${!NAMES[@]}"; do
   fi
 done
 if [[ ${#selected[@]} -eq 0 ]]; then
-  printf 'no repository named %s in the lumo card; run: %s --list\n' "$ONLY" "$SELF" >&2
+  printf 'no repository named %s in the identity catalog; run: %s --list\n' "$ONLY" "$SELF" >&2
   exit 2
 fi
 
