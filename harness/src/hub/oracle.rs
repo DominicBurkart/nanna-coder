@@ -6,7 +6,9 @@ use crate::task::TaskId;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn git_env_names(vars: impl Iterator<Item = OsString>) -> Vec<OsString> {
     vars.filter(|name| name.to_string_lossy().starts_with("GIT_"))
@@ -20,6 +22,40 @@ fn process_git_env_names() -> Vec<OsString> {
 fn scrub_git_env(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
     for name in names {
         command.env_remove(name);
+    }
+}
+
+/// How long one `git cat-file` may run before it is killed and the token is not vouched.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many `git` processes one oracle may start; later tokens are not vouched.
+pub const MAX_GIT_LOOKUPS: usize = 8;
+
+fn git_command(dir: &Path, hex: &str, names: Vec<OsString>) -> Command {
+    let mut git = Command::new("git");
+    scrub_git_env(&mut git, names);
+    git.arg("-C").arg(dir).args(["cat-file", "-e", hex]);
+    git.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    git
+}
+
+fn run_bounded(mut command: Command, limit: Duration) -> bool {
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -40,13 +76,7 @@ pub struct SystemGit;
 
 impl GitRunner for SystemGit {
     fn object_exists(&self, dir: &Path, hex: &str) -> bool {
-        let mut git = Command::new("git");
-        scrub_git_env(&mut git, process_git_env_names());
-        git.arg("-C").arg(dir).args(["cat-file", "-e", hex]);
-        git.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        git.status().is_ok_and(|status| status.success())
+        run_bounded(git_command(dir, hex, process_git_env_names()), GIT_TIMEOUT)
     }
 }
 
@@ -54,7 +84,7 @@ fn is_object_name(hex: &str) -> bool {
     (4..=64).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Vouches for a hex token only when the object exists in the sender's own workspace. The
+/// Vouches for a hex token only when the object exists in the sender's own workspace. Build one oracle per review: it starts at most [`MAX_GIT_LOOKUPS`] git processes, each bounded by [`GIT_TIMEOUT`]. The
 /// directory is fixed by the host when the oracle is built; nothing the sender writes selects it.
 ///
 /// ```
@@ -69,17 +99,24 @@ fn is_object_name(hex: &str) -> bool {
 pub struct GitObjectOracle {
     dir: PathBuf,
     runner: Arc<dyn GitRunner>,
+    lookups: AtomicUsize,
 }
 
 impl GitObjectOracle {
     pub fn new(dir: PathBuf, runner: Arc<dyn GitRunner>) -> Self {
-        Self { dir, runner }
+        Self {
+            dir,
+            runner,
+            lookups: AtomicUsize::new(0),
+        }
     }
 }
 
 impl IdentifierOracle for GitObjectOracle {
     fn is_known_git_object(&self, hex: &str) -> bool {
-        is_object_name(hex) && self.runner.object_exists(&self.dir, hex)
+        is_object_name(hex)
+            && self.lookups.fetch_add(1, Ordering::SeqCst) < MAX_GIT_LOOKUPS
+            && self.runner.object_exists(&self.dir, hex)
     }
 
     fn is_known_hub_id(&self, _id: &str) -> bool {
@@ -266,6 +303,72 @@ mod tests {
         assert!(process_git_env_names()
             .iter()
             .all(|name| name.to_string_lossy().starts_with("GIT_")));
+    }
+
+    #[test]
+    fn the_real_command_is_git_with_the_fixed_arguments_and_the_given_names_removed() {
+        let hex = "0123456789abcdef";
+        let command = git_command(
+            Path::new("/ws/own"),
+            hex,
+            names(&["GIT_DIR", "GIT_WORK_TREE"]),
+        );
+        assert_eq!(command.get_program(), "git");
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(args, ["-C", "/ws/own", "cat-file", "-e", hex]);
+        let envs: Vec<(OsString, Option<OsString>)> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect();
+        assert_eq!(envs.len(), 2);
+        assert!(envs.contains(&(OsString::from("GIT_DIR"), None)));
+        assert!(envs.contains(&(OsString::from("GIT_WORK_TREE"), None)));
+        assert_eq!(command.get_current_dir(), None);
+    }
+
+    #[test]
+    fn a_bounded_run_reports_success_failure_and_a_missing_program() {
+        let mut version = Command::new("git");
+        version.arg("--version").stdout(Stdio::null());
+        assert!(run_bounded(version, GIT_TIMEOUT));
+        let mut unknown = Command::new("git");
+        unknown
+            .args(["no-such-subcommand-xyz"])
+            .stderr(Stdio::null());
+        assert!(!run_bounded(unknown, GIT_TIMEOUT));
+        assert!(!run_bounded(
+            Command::new("no-such-program-xyz"),
+            GIT_TIMEOUT
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_outlasts_the_limit_is_killed_and_not_vouched() {
+        let mut slow = Command::new("sleep");
+        slow.arg("30");
+        let started = Instant::now();
+        assert!(!run_bounded(slow, Duration::from_millis(100)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_the_first_eight_valid_lookups_start_git_and_invalid_names_cost_nothing() {
+        let runner = Arc::new(Recording {
+            calls: Mutex::new(Vec::new()),
+            answer: true,
+        });
+        let oracle = GitObjectOracle::new(PathBuf::from("/ws"), runner.clone());
+        for bad in ["zz", "", "not hex", "--x"] {
+            assert!(!oracle.is_known_git_object(bad));
+        }
+        let vouched: Vec<bool> = (0..12)
+            .map(|n| oracle.is_known_git_object(&format!("{:040x}", n + 1)))
+            .collect();
+        assert_eq!(vouched.iter().filter(|v| **v).count(), MAX_GIT_LOOKUPS);
+        assert!(vouched[..MAX_GIT_LOOKUPS].iter().all(|v| *v));
+        assert!(vouched[MAX_GIT_LOOKUPS..].iter().all(|v| !*v));
+        assert_eq!(runner.calls.lock().unwrap().len(), MAX_GIT_LOOKUPS);
     }
 
     #[test]
