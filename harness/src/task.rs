@@ -149,6 +149,8 @@ pub struct TaskResult {
     pub qa_summary: QaSummary,
     #[serde(default)]
     pub budget: BudgetReport,
+    #[serde(skip)]
+    pub changes: Option<crate::changes::ChangeCapture>,
 }
 
 impl TaskResult {
@@ -202,6 +204,8 @@ pub struct FailureDiagnostics {
     /// failed, allowed or not, in order.
     #[serde(default)]
     pub action_audit: Vec<ActionAuditLogEntry>,
+    #[serde(skip)]
+    pub changes: Option<crate::changes::ChangeCapture>,
 }
 
 impl FailureDiagnostics {
@@ -240,6 +244,7 @@ fn protected_failure(
     }
     denials.push(denial);
     let diagnostics = FailureDiagnostics {
+        changes: None,
         error_type: "ProtectedPathViolation".to_string(),
         iterations_completed,
         last_tool_call: tool_call_history.last().cloned(),
@@ -609,6 +614,7 @@ enum RestoreAudit<'a> {
 pub struct TaskManager {
     runner: Arc<TaskRunner>,
     dispatcher: Arc<Dispatcher<Arc<TaskRunner>>>,
+    closes: std::sync::RwLock<HashMap<TaskId, String>>,
 }
 
 impl TaskManager {
@@ -907,7 +913,11 @@ impl TaskManager {
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
-        Ok(Self { runner, dispatcher })
+        Ok(Self {
+            runner,
+            dispatcher,
+            closes: std::sync::RwLock::new(HashMap::new()),
+        })
     }
 
     /// Deliver protected-path violations from every task's workspace to `hook`.
@@ -1486,6 +1496,33 @@ assert_eq!(manager.cost_accountant().task_summary("id", "t1").ci.count, 0);
         Some(task)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn finish_for_test(&self, task_id: &TaskId, status: TaskStatus) {
+        self.runner.set_status(task_id, status).await;
+    }
+
+    pub fn set_closes(&self, task_id: &TaskId, closes: String) {
+        if let Ok(mut map) = self.closes.write() {
+            map.insert(task_id.clone(), closes);
+        }
+    }
+
+    pub fn closes(&self, task_id: &TaskId) -> Option<String> {
+        self.closes.read().ok()?.get(task_id).cloned()
+    }
+
+    pub async fn captured_changes(
+        &self,
+        task_id: &TaskId,
+    ) -> Option<crate::changes::ChangeCapture> {
+        let tasks = self.runner.tasks.read().await;
+        match &tasks.get(task_id)?.status {
+            TaskStatus::Completed { result, .. } => result.changes.clone(),
+            TaskStatus::Failed { diagnostics, .. } => diagnostics.changes.clone(),
+            _ => None,
+        }
+    }
+
     pub async fn get_result(&self, task_id: &TaskId) -> Option<TaskResult> {
         let tasks = self.runner.tasks.read().await;
         tasks.get(task_id).and_then(|t| {
@@ -1825,6 +1862,7 @@ impl TaskRunner {
                 finished_at: Utc::now(),
                 error,
                 diagnostics: FailureDiagnostics {
+                    changes: None,
                     error_type: error_type.to_string(),
                     iterations_completed: 0,
                     last_tool_call: None,
@@ -2074,7 +2112,17 @@ impl TaskRunner {
             _ => None,
         };
 
-        let changes_patch = raw_patch.and_then(bound_patch);
+        let (changes_patch, patch_original_bytes) = match raw_patch {
+            Some(patch) => bound_patch_to(patch, MAX_DIFF_BYTES),
+            None => (None, None),
+        };
+        let capture = match &extracted {
+            Ok(_) => crate::changes::capture_staged(&workspace.workspace_path).map(|mut c| {
+                c.patch_original_bytes = patch_original_bytes;
+                c
+            }),
+            Err(_) => None,
+        };
 
         let format_patch = match &extracted {
             Err(WorkspaceError::ProtectedPath(_)) => None,
@@ -2120,6 +2168,7 @@ impl TaskRunner {
                     blast_radius,
                     qa_summary,
                     budget,
+                    changes: capture,
                 };
                 self.set_status(
                     &task_id,
@@ -2148,6 +2197,7 @@ impl TaskRunner {
                     conversation_snapshot: Some(conversation_snapshot),
                     denials: vec![],
                     action_audit,
+                    changes: capture,
                 };
                 self.set_status(
                     &task_id,
@@ -2244,14 +2294,20 @@ fn impact_required(
     has_impact && run_succeeded && !matches!(extracted, Err(WorkspaceError::ProtectedPath(_)))
 }
 
-fn bound_patch(patch: String) -> Option<String> {
+fn bound_patch_to(patch: String, limit: usize) -> (Option<String>, Option<usize>) {
     if patch.is_empty() {
-        None
-    } else if patch.len() > MAX_DIFF_BYTES {
-        Some(patch[..MAX_DIFF_BYTES].to_string())
-    } else {
-        Some(patch)
+        return (None, None);
     }
+    if patch.len() <= limit {
+        return (Some(patch), None);
+    }
+    let original = patch.len();
+    let mut cut = limit;
+    while !patch.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let bounded = patch[..cut].to_string();
+    ((!bounded.is_empty()).then_some(bounded), Some(original))
 }
 
 pub(crate) const UNSCOPED_ACTION_CEILING: EffectClass = EffectClass::None;
@@ -2501,6 +2557,7 @@ max_concurrent = 1
     #[test]
     fn test_task_result_to_json() {
         let result = TaskResult {
+            changes: None,
             result_summary: "Done".to_string(),
             changes_patch: Some("diff --git a/foo".to_string()),
             format_patch: Some("From abc Mon Sep 17 00:00:00 2001\n".to_string()),
@@ -2567,6 +2624,7 @@ max_concurrent = 1
     #[test]
     fn test_failure_diagnostics_to_json() {
         let diag = FailureDiagnostics {
+            changes: None,
             error_type: "MaxIterationsExceeded".to_string(),
             iterations_completed: 100,
             last_tool_call: None,
@@ -2594,6 +2652,7 @@ max_concurrent = 1
             effect: Some(crate::effects::EffectRecord::new(EffectClass::None)),
         };
         let diag = FailureDiagnostics {
+            changes: None,
             error_type: "StateError".to_string(),
             iterations_completed: 5,
             last_tool_call: Some(tool_call.clone()),
@@ -2626,6 +2685,7 @@ max_concurrent = 1
 
     fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
         TaskResult {
+            changes: None,
             result_summary: "done".to_string(),
             changes_patch: None,
             format_patch: None,
@@ -2738,11 +2798,31 @@ max_concurrent = 1
     }
 
     #[test]
+    fn test_bound_patch_cuts_on_a_character_boundary_and_reports_the_original_size() {
+        let patch = format!("{}\u{00e9}tail", "a".repeat(9));
+        assert_eq!(patch.len(), 15);
+        let (bounded, original) = bound_patch_to(patch.clone(), 10);
+        assert_eq!(bounded.as_deref(), Some("aaaaaaaaa"));
+        assert_eq!(original, Some(15));
+        let (whole, none) = bound_patch_to(patch.clone(), 15);
+        assert_eq!(whole.as_deref(), Some(patch.as_str()));
+        assert_eq!(none, None);
+        let (empty, none) = bound_patch_to(String::new(), 10);
+        assert_eq!((empty, none), (None, None));
+        let emoji = "\u{1F600}".repeat(4);
+        for limit in 0..=16 {
+            let (cut, _) = bound_patch_to(emoji.clone(), limit);
+            assert!(cut.as_deref().unwrap_or("").len() <= limit);
+        }
+    }
+
+    #[test]
     fn test_bound_patch_drops_empty_and_truncates_large() {
-        assert_eq!(bound_patch(String::new()), None);
-        assert_eq!(bound_patch("+x".to_string()).as_deref(), Some("+x"));
+        let bound = |patch: String| bound_patch_to(patch, MAX_DIFF_BYTES).0;
+        assert_eq!(bound(String::new()), None);
+        assert_eq!(bound("+x".to_string()).as_deref(), Some("+x"));
         let huge = "a".repeat(MAX_DIFF_BYTES + 10);
-        assert_eq!(bound_patch(huge).unwrap().len(), MAX_DIFF_BYTES);
+        assert_eq!(bound(huge).unwrap().len(), MAX_DIFF_BYTES);
     }
 
     #[test]
@@ -4569,6 +4649,11 @@ mod identity_tests {
             "README.md"
         );
         assert_eq!(result.files_modified, vec!["api/new.rs".to_string()]);
+        let capture = manager.captured_changes(&id).await.unwrap();
+        assert_eq!(capture.files.len(), 1);
+        assert_eq!(capture.files[0].path, "api/new.rs");
+        assert_eq!(capture.files[0].content.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(capture.base_ref.as_deref().map(str::len), Some(40));
     }
 
     fn repository_scoped_identity() -> AgentIdentity {
@@ -7096,6 +7181,7 @@ mod identity_tests {
             rule: "codecov.yml".to_string(),
         };
         let diagnostics = FailureDiagnostics {
+            changes: None,
             error_type: "ProtectedPathViolation".to_string(),
             iterations_completed: 1,
             last_tool_call: None,

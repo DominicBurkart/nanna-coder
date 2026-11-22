@@ -757,6 +757,7 @@ mod tests {
 
     fn result(files: &[&str], effect: Option<EffectClass>) -> TaskResult {
         TaskResult {
+            changes: None,
             result_summary: "done".to_string(),
             changes_patch: None,
             format_patch: None,
@@ -793,6 +794,7 @@ mod tests {
             finished_at: Utc::now(),
             error: "boom".to_string(),
             diagnostics: FailureDiagnostics {
+                changes: None,
                 error_type: "E".to_string(),
                 iterations_completed: 0,
                 last_tool_call: None,

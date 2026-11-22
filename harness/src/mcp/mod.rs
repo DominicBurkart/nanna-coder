@@ -3,6 +3,7 @@ pub mod handlers;
 pub mod introspect;
 pub mod jsonrpc;
 pub mod plan;
+pub mod results;
 
 use crate::auditor::SpawnGate;
 use crate::task::{TaskId, TaskManager};
@@ -184,7 +185,7 @@ impl NannaMcpServer {
     }
 
     fn base_tool_list(&self) -> Value {
-        serde_json::json!([
+        let mut tools = serde_json::json!([
             {
                 "name": "assign_task",
                 "description": "Submit a coding task to be executed asynchronously in an isolated git worktree. Clients that support the MCP Tasks extension may include a `task` field and retrieve the outcome via tasks/result. Any other client can call it plainly: it returns JSON `{\"task_id\", \"status\", \"next\"}` immediately, and the outcome is read by calling get_task_status or get_task_result with that `task_id`. The call only registers the task: the spawn audit runs afterwards, so a fresh task reports status working (\"Auditing the request.\") and a refused request later reads as failed with the refusal reason; nothing executes before the audit allows it. Pass `client_ref` to make retries safe: a repeated call with the same identity and client_ref returns the existing task instead of creating another.",
@@ -276,8 +277,9 @@ impl NannaMcpServer {
         .into_iter()
         .flatten()
         .chain(introspect::tool_definitions().as_array().cloned().into_iter().flatten())
-        .collect::<Vec<Value>>()
-        .into()
+        .collect::<Vec<Value>>();
+        results::extend_tool_list(&mut tools);
+        tools.into()
     }
 
     async fn handle_tools_call(&self, id: Option<Value>, params: &Value) -> JsonRpcResponse {
@@ -343,21 +345,38 @@ impl NannaMcpServer {
                         "Missing required argument: task_id".to_string(),
                     );
                 };
-                let task_id = TaskId(raw.to_string());
-                match self.task_manager.poll(&task_id).await {
-                    Some(task) if tool_name == "get_task_result" && task.status.is_terminal() => {
-                        JsonRpcResponse::success(
-                            id,
-                            handlers::task_result_to_call_tool_result(&task_id.0, &task.status),
-                        )
-                    }
-                    Some(task) => JsonRpcResponse::success(
+                let _ = raw;
+                let outcome = if tool_name == "get_task_result" {
+                    results::handle_get_task_result(
+                        &self.task_manager,
+                        &self.spawn_gate,
+                        &tool_params,
+                    )
+                    .await
+                } else {
+                    results::handle_get_task_status(
+                        &self.task_manager,
+                        &self.spawn_gate,
+                        &tool_params,
+                    )
+                    .await
+                };
+                match outcome {
+                    Ok(result) => JsonRpcResponse::success(id, result),
+                    Err(msg) => JsonRpcResponse::error(id, -32602, msg),
+                }
+            }
+            "get_task_changes" => {
+                if task_field.is_some() {
+                    return JsonRpcResponse::error(
                         id,
-                        handlers::text_tool_result(&handlers::task_to_wire(&task)),
-                    ),
-                    None => {
-                        JsonRpcResponse::error(id, -32602, format!("Task not found: {task_id}"))
-                    }
+                        -32601,
+                        format!("Tool '{tool_name}' does not support task augmentation"),
+                    );
+                }
+                match results::handle_get_task_changes(&self.task_manager, &tool_params).await {
+                    Ok(result) => JsonRpcResponse::success(id, result),
+                    Err(msg) => JsonRpcResponse::error(id, -32602, msg),
                 }
             }
             name if introspect::is_introspection_tool(name) => {
@@ -625,7 +644,7 @@ mod tests {
         assert!(resp.error.is_none());
         let tools = &resp.result.unwrap()["tools"];
         let arr = tools.as_array().unwrap();
-        assert_eq!(arr.len(), 7);
+        assert_eq!(arr.len(), 8);
         let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_identities"));
         assert!(names.contains(&"describe_identity"));
@@ -634,6 +653,7 @@ mod tests {
         assert!(names.contains(&"onboard_repo"));
         assert!(names.contains(&"get_task_status"));
         assert!(names.contains(&"get_task_result"));
+        assert!(names.contains(&"get_task_changes"));
         // assign_task accepts task augmentation but does not demand it, so
         // clients without the Tasks extension can still submit work.
         let assign = arr
@@ -718,7 +738,7 @@ mod tests {
             .unwrap();
         let v = parse_response(&bytes);
         assert_eq!(v["id"], 2);
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[tokio::test]

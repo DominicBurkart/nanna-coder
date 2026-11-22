@@ -108,6 +108,7 @@ pub async fn handle_assign_task(
     ensure_known_repo(&repo_path)?;
 
     let client_ref = parse_client_ref(params)?;
+    let closes = super::results::parse_closes(params)?;
     let ttl = ttl_ms.map(|t| t.min(MAX_TTL_MS));
     let repo_gate = spawn_gate
         .for_repo(&repo_path)
@@ -171,6 +172,9 @@ pub async fn handle_assign_task(
             .await
             .map(|task| task_to_wire(&task))
             .ok_or_else(|| format!("Task not found: {}", submission.task_id));
+    }
+    if let Some(closes) = closes {
+        task_manager.set_closes(&submission.task_id, closes);
     }
     task_manager.set_ttl(&submission.task_id, ttl).await;
     Ok(initial_task_wire(&submission.task_id.0, ttl))
@@ -294,6 +298,16 @@ pub fn task_to_wire(task: &Task) -> Value {
 /// metadata. For non-terminal input the caller is expected to have awaited a
 /// terminal state first; a defensive `isError` result is returned regardless.
 pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Value {
+    task_result_with_extra(task_id, status, &Value::Null)
+}
+
+pub(crate) fn task_result_with_extra(task_id: &str, status: &TaskStatus, extra: &Value) -> Value {
+    let merged = |mut body: Value| {
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        body
+    };
     let related = serde_json::json!({
         "io.modelcontextprotocol/related-task": { "taskId": task_id }
     });
@@ -301,7 +315,7 @@ pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Va
         TaskStatus::Completed { result, .. } => serde_json::json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result.to_json()).unwrap_or_default()
+                "text": serde_json::to_string_pretty(&merged(result.to_json())).unwrap_or_default()
             }],
             "isError": false,
             "_meta": related,
@@ -314,7 +328,7 @@ pub fn task_result_to_call_tool_result(task_id: &str, status: &TaskStatus) -> Va
                 "text": format!(
                     "{}\n\n{}",
                     error,
-                    serde_json::to_string_pretty(&diagnostics.to_json()).unwrap_or_default()
+                    serde_json::to_string_pretty(&merged(diagnostics.to_json())).unwrap_or_default()
                 )
             }],
             "isError": true,
@@ -439,6 +453,7 @@ mod tests {
 
     fn sample_result() -> TaskResult {
         TaskResult {
+            changes: None,
             result_summary: "did the thing".to_string(),
             changes_patch: Some("diff".to_string()),
             format_patch: None,
@@ -456,6 +471,7 @@ mod tests {
 
     fn sample_diagnostics() -> FailureDiagnostics {
         FailureDiagnostics {
+            changes: None,
             error_type: "MaxIterationsExceeded".to_string(),
             iterations_completed: 5,
             last_tool_call: None,
