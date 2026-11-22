@@ -2015,7 +2015,7 @@ impl TaskRunner {
         };
         let entity_store = InMemoryEntityStore::new();
         let agent_config = AgentConfig {
-            max_iterations: queued.max_iterations,
+            max_iterations: effective_max_iterations(queued.max_iterations, identity.as_ref()),
             verbose: false,
             system_prompt: build_task_system_prompt(
                 &workspace.workspace_path,
@@ -2034,7 +2034,13 @@ impl TaskRunner {
 
         let mut agent = AgentLoop::with_tools(agent_config, entity_store, provider, tool_registry);
         agent.set_progress_counter(Arc::clone(&progress_counter));
-        let mut run_result = agent.run(context).await;
+        let mut run_result = match wall_clock_limit(identity.as_ref()) {
+            Some(limit) => match tokio::time::timeout(limit, agent.run(context)).await {
+                Ok(result) => result,
+                Err(_) => Err(agent.wall_clock_exceeded(limit.as_secs())),
+            },
+            None => agent.run(context).await,
+        };
         let action_audit = agent
             .tool_registry()
             .map(crate::tools::ToolRegistry::action_reviews)
@@ -2157,6 +2163,16 @@ impl TaskRunner {
     }
 }
 
+fn effective_max_iterations(requested: usize, identity: Option<&AgentIdentity>) -> usize {
+    identity.map_or(requested, |identity| {
+        requested.min(identity.limits.max_iterations)
+    })
+}
+
+fn wall_clock_limit(identity: Option<&AgentIdentity>) -> Option<std::time::Duration> {
+    identity.map(|identity| std::time::Duration::from_secs(identity.limits.max_wall_clock_secs))
+}
+
 /// The network policy a task's dev container gets: the identity's ceiling
 /// when running under one, otherwise the ceiling of an unscoped task.
 fn network_policy_for(identity: Option<&AgentIdentity>) -> NetworkPolicy {
@@ -2204,6 +2220,7 @@ fn agent_error_type(error: &AgentError) -> &'static str {
         AgentError::MaxIterationsExceeded { .. } => "MaxIterationsExceeded",
         AgentError::StateError { .. } => "StateError",
         AgentError::TaskCheckFailed { .. } => "TaskCheckFailed",
+        AgentError::WallClockExceeded { .. } => "WallClockExceeded",
     }
 }
 
@@ -8752,5 +8769,222 @@ mod impact_tests {
             },
         ));
         assert!(!impact_required(true, true, &protected));
+    }
+}
+
+#[cfg(test)]
+mod identity_limit_tests {
+    use super::identity_tests::tool_call_response;
+    use super::scheduler_tests::{git_repo, queued, GatedProvider};
+    use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
+    use super::*;
+    use crate::identity::IdentityCatalog;
+    use async_trait::async_trait;
+    use model::types::{ChatRequest, ChatResponse, ModelInfo};
+    use model::ModelResult;
+
+    const GLOBAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/identities/global"
+    );
+    const NARROWING: &str =
+        include_str!("../tests/fixtures/identities/repo/.nanna/agents/rust-implementer.toml");
+
+    fn card(max_iterations: usize, max_wall_clock_secs: u64) -> AgentIdentity {
+        let catalog = IdentityCatalog::load(GLOBAL).unwrap();
+        let mut identity = catalog.get("rust-implementer").unwrap().clone();
+        identity.limits.max_iterations = max_iterations;
+        identity.limits.max_wall_clock_secs = max_wall_clock_secs;
+        identity
+    }
+
+    fn repo_with_limits(max_iterations: usize, max_wall_clock_secs: u64) -> tempfile::TempDir {
+        let repo = git_repo();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let body = NARROWING
+            .replace(
+                "max_iterations = 100",
+                &format!("max_iterations = {max_iterations}"),
+            )
+            .replace(
+                "max_wall_clock_secs = 1800",
+                &format!("max_wall_clock_secs = {max_wall_clock_secs}"),
+            );
+        let dir = repo.path().join(".nanna/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rust-implementer.toml"), body).unwrap();
+        repo
+    }
+
+    async fn manager() -> TaskManager {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        manager
+            .register_catalog(&IdentityCatalog::load(GLOBAL).unwrap())
+            .await;
+        manager
+    }
+
+    async fn finished(manager: &TaskManager, id: &TaskId) -> Task {
+        for _ in 0..20_000 {
+            let task = manager.poll(id).await.unwrap();
+            if task.status.is_terminal() {
+                return task;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("task {id} never finished");
+    }
+
+    fn failed(task: &Task) -> (&str, &FailureDiagnostics) {
+        match &task.status {
+            TaskStatus::Failed { diagnostics, .. } => (&diagnostics.error_type, diagnostics),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    async fn run_with_gate(repo: &Path, requested: usize, hinted: bool) -> Task {
+        let manager = manager().await;
+        let (open, gate) = tokio::sync::watch::channel(true);
+        let provider: Arc<dyn ModelProvider> = Arc::new(GatedProvider { gate });
+        let mut entry = queued(repo);
+        entry.max_iterations = requested;
+        let entry = entry.with_identity_hint(hinted.then(|| "rust-implementer".to_string()));
+        let id = manager.submit_task(entry, provider).await;
+        let task = finished(&manager, &id).await;
+        drop(open);
+        task
+    }
+
+    #[test]
+    fn test_the_effective_iterations_are_the_lower_of_the_request_and_the_card() {
+        let identity = card(8, 60);
+        assert_eq!(effective_max_iterations(100, Some(&identity)), 8);
+        assert_eq!(effective_max_iterations(3, Some(&identity)), 3);
+        assert_eq!(effective_max_iterations(8, Some(&identity)), 8);
+        assert_eq!(effective_max_iterations(100, None), 100);
+    }
+
+    #[test]
+    fn test_the_wall_clock_limit_comes_from_the_card_only() {
+        assert_eq!(
+            wall_clock_limit(Some(&card(8, 90))),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(wall_clock_limit(None), None);
+    }
+
+    #[tokio::test]
+    async fn test_a_caller_asking_for_more_iterations_than_the_card_allows_is_capped() {
+        let repo = repo_with_limits(1, 1800);
+        let task = run_with_gate(repo.path(), 50, true).await;
+        assert_eq!(failed(&task).0, "MaxIterationsExceeded");
+    }
+
+    #[tokio::test]
+    async fn test_a_caller_value_below_the_card_maximum_is_used() {
+        let repo = repo_with_limits(100, 1800);
+        let task = run_with_gate(repo.path(), 1, true).await;
+        assert_eq!(failed(&task).0, "MaxIterationsExceeded");
+    }
+
+    #[tokio::test]
+    async fn test_a_task_within_both_limits_completes_under_its_card() {
+        let repo = repo_with_limits(100, 1800);
+        let task = run_with_gate(repo.path(), 10, true).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unscoped_task_keeps_the_requested_iterations() {
+        let repo = git_repo();
+        let task = run_with_gate(repo.path(), 10, false).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+    }
+
+    struct HangsWhenScriptEnds(Arc<MockProvider>);
+
+    #[async_trait]
+    impl ModelProvider for HangsWhenScriptEnds {
+        async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+            if self.0.remaining() == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.0.chat(request).await
+        }
+
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "hangs"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_run_past_the_card_wall_clock_fails_keeping_partial_changes_and_cleaning_up() {
+        let repo = repo_with_limits(100, 30);
+        let manager = manager().await;
+        let mut script = wrap_with_state_machine_responses(vec![tool_call_response(
+            "write_file",
+            serde_json::json!({"path": "api/a.rs", "content": "partial work"}),
+        )]);
+        script.truncate(2);
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(HangsWhenScriptEnds(MockProvider::new(script)));
+        let entry = queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string()));
+        let id = manager.submit_task(entry, provider).await;
+        let task = finished(&manager, &id).await;
+        let (error_type, diagnostics) = failed(&task);
+        assert_eq!(error_type, "WallClockExceeded");
+        match &task.status {
+            TaskStatus::Failed { error, .. } => assert!(error.contains("30"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        let partial = diagnostics.partial_changes.as_deref().unwrap_or_default();
+        assert!(partial.contains("api/a.rs"), "{partial:?}");
+        assert!(manager.get_result(&id).await.is_none());
+        assert!(!std::env::temp_dir()
+            .join(format!("nanna-task-{}", id.0))
+            .exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_run_that_stops_before_the_wall_clock_is_not_failed() {
+        let repo = repo_with_limits(100, 30);
+        let manager = manager().await;
+        let provider: Arc<dyn ModelProvider> = MockProvider::new(
+            wrap_with_state_machine_responses(vec![stop_response("nothing to change")]),
+        );
+        let entry = queued(repo.path()).with_identity_hint(Some("rust-implementer".to_string()));
+        let id = manager.submit_task(entry, provider).await;
+        let task = finished(&manager, &id).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
     }
 }

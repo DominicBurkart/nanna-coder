@@ -75,6 +75,14 @@ pub enum AgentError {
         conversation_snapshot: Vec<ChatMessage>,
         last_agent_state: AgentState,
     },
+    #[error("Wall-clock limit of {limit_secs}s exceeded after {iterations_completed} iterations")]
+    WallClockExceeded {
+        limit_secs: u64,
+        iterations_completed: usize,
+        tool_calls_made: Vec<ToolCallRecord>,
+        conversation_snapshot: Vec<ChatMessage>,
+        last_agent_state: AgentState,
+    },
 }
 
 impl AgentError {
@@ -109,6 +117,13 @@ impl AgentError {
                 conversation_snapshot,
                 iterations_completed,
                 last_agent_state,
+            }
+            | AgentError::WallClockExceeded {
+                tool_calls_made,
+                conversation_snapshot,
+                iterations_completed,
+                last_agent_state,
+                ..
             } => (
                 tool_calls_made,
                 conversation_snapshot,
@@ -432,6 +447,16 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         }
     }
 
+    pub fn wall_clock_exceeded(&self, limit_secs: u64) -> AgentError {
+        AgentError::WallClockExceeded {
+            limit_secs,
+            iterations_completed: self.iterations,
+            tool_calls_made: self.tool_call_records(&self.conversation_history),
+            conversation_snapshot: self.conversation_history.clone(),
+            last_agent_state: self.state.clone(),
+        }
+    }
+
     fn enrich_error(&self, error: AgentError) -> AgentError {
         let tool_calls = self.tool_call_records(&self.conversation_history);
         let conversation = self.conversation_history.clone();
@@ -456,6 +481,17 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 iterations_completed,
                 ..
             } => AgentError::MaxIterationsExceeded {
+                iterations_completed,
+                tool_calls_made: tool_calls,
+                conversation_snapshot: conversation,
+                last_agent_state: state,
+            },
+            AgentError::WallClockExceeded {
+                limit_secs,
+                iterations_completed,
+                ..
+            } => AgentError::WallClockExceeded {
+                limit_secs,
                 iterations_completed,
                 tool_calls_made: tool_calls,
                 conversation_snapshot: conversation,
