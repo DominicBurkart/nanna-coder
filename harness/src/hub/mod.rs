@@ -4,6 +4,7 @@ pub mod lineage;
 pub mod message;
 pub mod oracle;
 pub mod reach;
+pub mod recv;
 pub mod registry;
 pub mod send;
 pub mod session;

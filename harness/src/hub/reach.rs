@@ -4,7 +4,8 @@ use super::message::{MessageReach, Recipient};
 use super::session::SessionRecord;
 
 /// How a session stands to the sender, by lineage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Relation {
     Parent,
     Child,
