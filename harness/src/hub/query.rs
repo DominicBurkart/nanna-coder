@@ -188,12 +188,9 @@ impl LibrarianMatch {
 
 impl fmt::Debug for LibrarianMatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let relevance = self.relevance;
-        let why_chars = self.why.chars().count();
-        write!(
-            f,
-            "LibrarianMatch {{ relevance: {relevance}, why_chars: {why_chars} }}"
-        )
+        let rel = self.relevance;
+        let n = self.why.chars().count();
+        write!(f, "LibrarianMatch {{ relevance: {rel}, why_chars: {n} }}")
     }
 }
 
@@ -224,10 +221,8 @@ fn decode(text: &str) -> Result<WireAnswer, ParseError> {
 }
 
 fn known_id(text: &str, known: &BTreeSet<SessionId>) -> Result<SessionId, ParseError> {
-    ensure(
-        text.chars().count() <= MAX_ID_CHARS,
-        ParseError::UnknownSession,
-    )?;
+    let chars = text.chars().count();
+    ensure(chars <= MAX_ID_CHARS, ParseError::UnknownSession)?;
     let id = SessionId::from_task(TaskId(text.to_string()));
     ensure(known.contains(&id), ParseError::UnknownSession)?;
     Ok(id)
@@ -240,10 +235,8 @@ fn checked_relevance(value: f64) -> Result<f32, ParseError> {
 
 fn checked_why(text: String) -> Result<String, ParseError> {
     ensure(!text.trim().is_empty(), ParseError::BadWhy)?;
-    ensure(
-        text.chars().count() <= Summary::MAX_CHARS,
-        ParseError::BadWhy,
-    )?;
+    let chars = text.chars().count();
+    ensure(chars <= Summary::MAX_CHARS, ParseError::BadWhy)?;
     ensure(!text.chars().any(char::is_control), ParseError::BadWhy)?;
     ensure(strip_unprintable(&text) == text, ParseError::BadWhy)?;
     ensure(redact_resilient(&text) == text, ParseError::BadWhy)?;
@@ -251,9 +244,8 @@ fn checked_why(text: String) -> Result<String, ParseError> {
 }
 
 fn rank(a: &LibrarianMatch, b: &LibrarianMatch) -> std::cmp::Ordering {
-    b.relevance
-        .total_cmp(&a.relevance)
-        .then_with(|| a.id.cmp(&b.id))
+    let by_relevance = b.relevance.total_cmp(&a.relevance);
+    by_relevance.then_with(|| a.id.cmp(&b.id))
 }
 
 /// Parses a librarian reply strictly: the whole text (JSON whitespace allowed at the ends, nothing else) is one JSON object
@@ -285,10 +277,8 @@ pub fn parse_strict(
 ) -> Result<Vec<LibrarianMatch>, ParseError> {
     ensure((1..=MAX_RESULTS).contains(&max), ParseError::BadLimit)?;
     let wire = decode(&raw.0)?;
-    ensure(
-        wire.matches.len() <= usize::from(max),
-        ParseError::TooManyMatches,
-    )?;
+    let wanted = usize::from(max);
+    ensure(wire.matches.len() <= wanted, ParseError::TooManyMatches)?;
     let mut seen = BTreeSet::new();
     let mut found = Vec::new();
     for entry in wire.matches {
@@ -310,13 +300,18 @@ mod tests {
 
     const TOKEN: &str = "PLANTEDxq7Zk";
     const SECRET: &str = "ghp_aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5";
+    const UNKNOWN: ParseError = ParseError::UnknownSession;
+    const BAD_WHY: ParseError = ParseError::BadWhy;
+    const BAD_REL: ParseError = ParseError::BadRelevance;
+    const MALFORMED: ParseError = ParseError::Malformed;
 
     fn sid(text: &str) -> SessionId {
         SessionId::from_task(TaskId(text.to_string()))
     }
 
-    fn known(ids: &[&str]) -> BTreeSet<SessionId> {
-        ids.iter().map(|id| sid(id)).collect()
+    fn arb_known() -> BTreeSet<SessionId> {
+        let names = ["a", "b", "c", "id-1", "id-2"];
+        names.iter().map(|id| sid(id)).collect()
     }
 
     fn raw(text: &str) -> RawLibrarianAnswer {
@@ -325,6 +320,15 @@ mod tests {
 
     fn parse(text: &str, max: u8) -> Result<Vec<LibrarianMatch>, ParseError> {
         parse_strict(&raw(text), &arb_known(), max)
+    }
+
+    fn entry(id: &str, relevance: f64, why: &str) -> Value {
+        json!({"id": id, "relevance": relevance, "why": why})
+    }
+
+    fn answer(items: &[(&str, f64, &str)]) -> String {
+        let entries: Vec<Value> = items.iter().map(|i| entry(i.0, i.1, i.2)).collect();
+        json!({"matches": entries}).to_string()
     }
 
     fn reply(id: &str, relevance: Value, why: &str) -> String {
@@ -343,8 +347,20 @@ mod tests {
         parse(text, 5).unwrap_err()
     }
 
+    fn expect_refused(text: &str, expected: ParseError, label: &str) {
+        assert_eq!(refused(text), expected, "{label}");
+    }
+
     fn texts(error: ParseError) -> String {
         format!("{error} {error:?}")
+    }
+
+    fn why_list(found: &[LibrarianMatch]) -> Vec<String> {
+        found.iter().map(|m| m.why().to_string()).collect()
+    }
+
+    fn ids(found: &[LibrarianMatch]) -> Vec<String> {
+        found.iter().map(|m| m.id().to_string()).collect()
     }
 
     #[test]
@@ -355,10 +371,9 @@ mod tests {
         assert_eq!(found[0].relevance(), 0.5);
         assert_eq!(found[0].why(), "edits the parser");
         let (id, relevance, why) = found[0].clone().into_fields();
-        assert_eq!(
-            (id, relevance, why.as_str()),
-            (sid("a"), 0.5, "edits the parser")
-        );
+        assert_eq!(id, sid("a"));
+        assert_eq!(relevance, 0.5);
+        assert_eq!(why, "edits the parser");
     }
 
     #[test]
@@ -373,8 +388,8 @@ mod tests {
 
     #[test]
     fn unicode_whitespace_around_the_object_is_refused() {
-        assert_eq!(refused("\u{a0}{\"matches\":[]}"), ParseError::Malformed);
-        assert_eq!(refused("{\"matches\":[]}\u{2003}"), ParseError::Malformed);
+        expect_refused("\u{a0}{\"matches\":[]}", MALFORMED, "leading");
+        expect_refused("{\"matches\":[]}\u{2003}", MALFORMED, "trailing");
     }
 
     #[test]
@@ -385,24 +400,19 @@ mod tests {
         assert!(parse(&at_cap, 5).is_ok());
         let over = format!("{{\"matches\":[] {pad}}}");
         assert_eq!(over.len(), MAX_RAW_BYTES + 1);
-        assert_eq!(
-            RawLibrarianAnswer::new(over).unwrap_err(),
-            ParseError::TooLarge
-        );
+        let error = RawLibrarianAnswer::new(over).unwrap_err();
+        assert_eq!(error, ParseError::TooLarge);
     }
 
     #[test]
     fn why_cap_counts_characters_not_bytes() {
-        let ascii = "a".repeat(179);
-        assert!(parse(&with_why(&ascii), 5).is_ok());
-        assert_eq!(refused(&with_why(&"a".repeat(180))), ParseError::BadWhy);
-        let wide = "é".repeat(179);
-        assert_eq!(wide.len(), 358);
-        assert!(parse(&with_why(&wide), 5).is_ok());
-        assert_eq!(refused(&with_why(&"é".repeat(180))), ParseError::BadWhy);
-        let cjk = "日".repeat(179);
-        assert!(parse(&with_why(&cjk), 5).is_ok());
-        assert_eq!(refused(&with_why(&"日".repeat(180))), ParseError::BadWhy);
+        for ch in ["a", "é", "日"] {
+            let at_cap = ch.repeat(179);
+            assert!(parse(&with_why(&at_cap), 5).is_ok(), "{ch}");
+            let over = ch.repeat(180);
+            expect_refused(&with_why(&over), BAD_WHY, ch);
+        }
+        assert_eq!("é".repeat(179).len(), 358);
     }
 
     #[test]
@@ -413,82 +423,94 @@ mod tests {
     #[test]
     fn why_of_one_character_is_accepted_and_empty_is_not() {
         assert!(parse(&with_why("x"), 5).is_ok());
-        assert_eq!(refused(&with_why("")), ParseError::BadWhy);
-        assert_eq!(refused(&with_why("   ")), ParseError::BadWhy);
+        expect_refused(&with_why(""), BAD_WHY, "empty");
+        expect_refused(&with_why("   "), BAD_WHY, "blank");
     }
 
     #[test]
     fn why_with_control_characters_is_refused() {
         for bad in ["a\nb", "a\tb", "a\u{0}b", "a\u{7}b", "a\u{85}b", "a\rb"] {
-            assert_eq!(refused(&with_why(bad)), ParseError::BadWhy, "{bad:?}");
+            expect_refused(&with_why(bad), BAD_WHY, bad);
         }
     }
 
+    const HIDDEN: [&str; 7] = [
+        "\u{202e}",
+        "\u{200d}",
+        "\u{200b}",
+        "\u{feff}",
+        "\u{ad}",
+        "\u{e0041}",
+        "\u{2066}",
+    ];
+
     #[test]
     fn why_with_hidden_or_bidi_characters_is_refused() {
-        let bad = [
-            "\u{202e}",
-            "\u{200d}",
-            "\u{200b}",
-            "\u{feff}",
-            "\u{ad}",
-            "\u{e0041}",
-            "\u{2066}",
-        ];
-        for part in bad {
+        for part in HIDDEN {
             let why = format!("fine{part}text");
-            assert_eq!(refused(&with_why(&why)), ParseError::BadWhy, "{part:?}");
+            expect_refused(&with_why(&why), BAD_WHY, part);
         }
     }
 
     #[test]
     fn why_with_unicode_escapes_for_bidi_is_refused() {
         let text = "{\"matches\":[{\"id\":\"a\",\"relevance\":0.5,\"why\":\"x\\u202ey\"}]}";
-        assert_eq!(refused(text), ParseError::BadWhy);
+        expect_refused(text, BAD_WHY, "escaped");
     }
 
     #[test]
     fn why_that_redaction_would_change_is_refused() {
-        assert_eq!(refused(&with_why(SECRET)), ParseError::BadWhy);
+        expect_refused(&with_why(SECRET), BAD_WHY, "bare");
         let spaced = format!("see {SECRET} now");
-        assert_eq!(refused(&with_why(&spaced)), ParseError::BadWhy);
+        expect_refused(&with_why(&spaced), BAD_WHY, "spaced");
         let joined = SECRET.replace('_', "_\u{200d}");
-        assert_eq!(refused(&with_why(&joined)), ParseError::BadWhy);
+        expect_refused(&with_why(&joined), BAD_WHY, "joined");
     }
 
     #[test]
     fn multibyte_and_combining_text_is_accepted_when_printable() {
-        let found = parse(&with_why("naïve café 日本語 résumé"), 5).unwrap();
-        assert_eq!(found[0].why(), "naïve café 日本語 résumé");
+        let plain = "naïve café 日本語 résumé";
+        assert_eq!(parse(&with_why(plain), 5).unwrap()[0].why(), plain);
         let combining = "e\u{301} cafe\u{301}";
         assert_eq!(parse(&with_why(combining), 5).unwrap()[0].why(), combining);
     }
 
     #[test]
     fn why_may_quote_json_as_plain_text() {
-        let found = parse(&with_why(r#"{"matches":[]} and "quotes""#), 5).unwrap();
-        assert_eq!(found[0].why(), r#"{"matches":[]} and "quotes""#);
+        let quoted = r#"{"matches":[]} and "quotes""#;
+        assert_eq!(parse(&with_why(quoted), 5).unwrap()[0].why(), quoted);
     }
+
+    const GOOD_RELEVANCE: [&str; 9] = ["0", "0.0", "1", "1.0", "0.5", "1e0", "0e5", "-0.0", "5e-1"];
+    const BAD_RELEVANCE: [&str; 7] = [
+        "1.0000001",
+        "-0.0000001",
+        "2",
+        "-1",
+        "1e300",
+        "-1e300",
+        "1.000000000001",
+    ];
+    const NOT_A_NUMBER: [&str; 10] = [
+        "1e999",
+        "-1e999",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "\"0.5\"",
+        "null",
+        "true",
+        "[0.5]",
+        "{}",
+    ];
 
     #[test]
     fn relevance_bounds_are_exact() {
-        for good in ["0", "0.0", "1", "1.0", "0.5", "1e0", "0e5", "-0.0", "5e-1"] {
+        for good in GOOD_RELEVANCE {
             assert!(parse(&with_relevance(good), 5).is_ok(), "{good}");
         }
-        for bad in [
-            "1.0000001",
-            "-0.0000001",
-            "2",
-            "-1",
-            "1e300",
-            "-1e300",
-            "1.000000000001",
-        ] {
-            assert_eq!(
-                refused(&with_relevance(bad)),
-                ParseError::BadRelevance,
-                "{bad}"
-            );
+        for bad in BAD_RELEVANCE {
+            expect_refused(&with_relevance(bad), BAD_REL, bad);
         }
     }
 
@@ -501,38 +523,17 @@ mod tests {
 
     #[test]
     fn non_finite_and_non_numeric_relevance_is_malformed() {
-        for bad in [
-            "1e999",
-            "-1e999",
-            "NaN",
-            "Infinity",
-            "-Infinity",
-            "\"0.5\"",
-            "null",
-            "true",
-        ] {
-            assert_eq!(
-                refused(&with_relevance(bad)),
-                ParseError::Malformed,
-                "{bad}"
-            );
+        for bad in NOT_A_NUMBER {
+            expect_refused(&with_relevance(bad), MALFORMED, bad);
         }
-        assert_eq!(refused(&with_relevance("[0.5]")), ParseError::Malformed);
-        assert_eq!(refused(&with_relevance("{\"v\":1}")), ParseError::Malformed);
     }
 
     #[test]
     fn match_count_cap_is_exact() {
-        let ids = ["a", "b", "c"];
-        let entries: Vec<Value> = ids.iter().map(|id| entry(id, 0.5, "ok")).collect();
-        let text = json!({"matches": entries}).to_string();
+        let text = answer(&[("a", 0.5, "ok"), ("b", 0.5, "ok"), ("c", 0.5, "ok")]);
         assert_eq!(parse(&text, 3).unwrap().len(), 3);
         assert_eq!(parse(&text, 2).unwrap_err(), ParseError::TooManyMatches);
         assert_eq!(parse(&text, 1).unwrap_err(), ParseError::TooManyMatches);
-    }
-
-    fn entry(id: &str, relevance: f64, why: &str) -> Value {
-        json!({"id": id, "relevance": relevance, "why": why})
     }
 
     #[test]
@@ -541,10 +542,8 @@ mod tests {
         assert_eq!(parse(text, 0).unwrap_err(), ParseError::BadLimit);
         assert!(parse(text, 1).is_ok());
         assert!(parse(text, MAX_RESULTS).is_ok());
-        assert_eq!(
-            parse(text, MAX_RESULTS + 1).unwrap_err(),
-            ParseError::BadLimit
-        );
+        let eleven = parse(text, MAX_RESULTS + 1).unwrap_err();
+        assert_eq!(eleven, ParseError::BadLimit);
         assert_eq!(parse(text, u8::MAX).unwrap_err(), ParseError::BadLimit);
     }
 
@@ -555,10 +554,8 @@ mod tests {
         let entries: Vec<Value> = names.iter().map(|n| entry(n, 0.5, "ok")).collect();
         let text = json!({"matches": entries}).to_string();
         assert_eq!(parse_strict(&raw(&text), &set, 10).unwrap().len(), 10);
-        assert_eq!(
-            parse_strict(&raw(&text), &set, 9).unwrap_err(),
-            ParseError::TooManyMatches
-        );
+        let nine = parse_strict(&raw(&text), &set, 9).unwrap_err();
+        assert_eq!(nine, ParseError::TooManyMatches);
     }
 
     #[test]
@@ -570,222 +567,118 @@ mod tests {
         assert_eq!(parse_strict(&raw(&accepted), &set, 5).unwrap().len(), 1);
         let rejected = reply(&over, json!(0.5), "ok");
         let error = parse_strict(&raw(&rejected), &set, 5).unwrap_err();
-        assert_eq!(error, ParseError::UnknownSession);
+        assert_eq!(error, UNKNOWN);
     }
+
+    const LOOK_ALIKES: [&str; 9] = ["zz", "", "A", " a", "a ", "a\u{0}", "\u{430}", "aa", "../a"];
 
     #[test]
     fn unknown_ids_are_refused_including_look_alikes() {
-        for id in ["zz", "", "A", " a", "a ", "a\u{0}", "\u{430}", "aa", "../a"] {
-            assert_eq!(
-                refused(&reply(id, json!(0.5), "ok")),
-                ParseError::UnknownSession,
-                "{id:?}"
-            );
+        for id in LOOK_ALIKES {
+            expect_refused(&reply(id, json!(0.5), "ok"), UNKNOWN, id);
         }
     }
 
     #[test]
     fn duplicate_ids_are_refused() {
-        let two = vec![entry("a", 0.9, "one"), entry("a", 0.1, "two")];
-        let text = json!({"matches": two}).to_string();
-        assert_eq!(refused(&text), ParseError::Duplicate);
+        let text = answer(&[("a", 0.9, "one"), ("a", 0.1, "two")]);
+        expect_refused(&text, ParseError::Duplicate, "dup");
     }
 
     #[test]
     fn one_bad_entry_refuses_the_whole_answer() {
-        let mixed = vec![
-            entry("a", 0.9, "fine"),
-            entry("b", 2.0, "bad"),
-            entry("c", 0.1, "fine"),
-        ];
-        let text = json!({"matches": mixed}).to_string();
-        assert_eq!(refused(&text), ParseError::BadRelevance);
-        let unknown = vec![entry("a", 0.9, "fine"), entry("zz", 0.5, "fine")];
-        let text = json!({"matches": unknown}).to_string();
-        assert_eq!(refused(&text), ParseError::UnknownSession);
-        let bad_why = vec![entry("a", 0.9, "fine"), entry("b", 0.5, "\u{202e}")];
-        let text = json!({"matches": bad_why}).to_string();
-        assert_eq!(refused(&text), ParseError::BadWhy);
+        let mixed = answer(&[("a", 0.9, "fine"), ("b", 2.0, "bad"), ("c", 0.1, "fine")]);
+        expect_refused(&mixed, BAD_REL, "relevance");
+        let unknown = answer(&[("a", 0.9, "fine"), ("zz", 0.5, "fine")]);
+        expect_refused(&unknown, UNKNOWN, "unknown");
+        let bad_why = answer(&[("a", 0.9, "fine"), ("b", 0.5, "\u{202e}")]);
+        expect_refused(&bad_why, BAD_WHY, "why");
     }
 
     #[test]
     fn matches_are_ordered_by_relevance_then_id() {
-        let shuffled = vec![
-            entry("c", 0.9, "third"),
-            entry("b", 0.2, "fourth"),
-            entry("a", 0.9, "first"),
+        let shuffled = [
+            ("c", 0.9, "third"),
+            ("b", 0.2, "fourth"),
+            ("a", 0.9, "first"),
         ];
-        let text = json!({"matches": shuffled}).to_string();
+        let text = answer(&shuffled);
         let found = parse(&text, 5).unwrap();
-        let order: Vec<&str> = found.iter().map(|m| m.why()).collect();
-        assert_eq!(order, ["first", "third", "fourth"]);
+        assert_eq!(why_list(&found), ["first", "third", "fourth"]);
     }
 
     #[test]
     fn lower_relevance_never_precedes_higher() {
-        let rising = vec![
-            entry("a", 0.1, "x"),
-            entry("b", 0.2, "x"),
-            entry("c", 0.3, "x"),
-        ];
-        let text = json!({"matches": rising}).to_string();
-        let found = parse(&text, 5).unwrap();
-        let ids: Vec<String> = found.iter().map(|m| m.id().to_string()).collect();
-        assert_eq!(ids, ["c", "b", "a"]);
+        let text = answer(&[("a", 0.1, "x"), ("b", 0.2, "x"), ("c", 0.3, "x")]);
+        assert_eq!(ids(&parse(&text, 5).unwrap()), ["c", "b", "a"]);
     }
+
+    const HOSTILE: [(&str, &str); 31] = [
+        ("empty", ""),
+        ("null", "null"),
+        ("array", "[]"),
+        ("string", "\"{}\""),
+        ("number", "7"),
+        ("trailing prose", "{\"matches\":[]} trailing"),
+        ("two objects", "{\"matches\":[]}{\"matches\":[]}"),
+        ("leading prose", "Here: {\"matches\":[]}"),
+        ("code fence", "```json\n{\"matches\":[]}\n```"),
+        ("bare fence", "```\n{\"matches\":[]}\n```"),
+        ("bom", "\u{feff}{\"matches\":[]}"),
+        ("dup top key", "{\"matches\":[],\"matches\":[]}"),
+        (
+            "dup match key",
+            r#"{"matches":[{"id":"a","id":"b","relevance":1,"why":"w"}]}"#,
+        ),
+        ("extra top key", "{\"matches\":[],\"x\":1}"),
+        (
+            "extra match key",
+            r#"{"matches":[{"id":"a","relevance":1,"why":"w","n":1}]}"#,
+        ),
+        ("missing matches", "{}"),
+        ("missing id", r#"{"matches":[{"relevance":1,"why":"w"}]}"#),
+        ("missing why", r#"{"matches":[{"id":"a","relevance":1}]}"#),
+        ("missing relevance", r#"{"matches":[{"id":"a","why":"w"}]}"#),
+        ("matches object", r#"{"matches":{}}"#),
+        ("matches string", r#"{"matches":"a"}"#),
+        ("null entry", r#"{"matches":[null]}"#),
+        ("array entry", r#"{"matches":[[]]}"#),
+        (
+            "numeric id",
+            r#"{"matches":[{"id":1,"relevance":1,"why":"w"}]}"#,
+        ),
+        (
+            "object why",
+            r#"{"matches":[{"id":"a","relevance":1,"why":{"a":1}}]}"#,
+        ),
+        (
+            "array why",
+            r#"{"matches":[{"id":"a","relevance":1,"why":["x"]}]}"#,
+        ),
+        ("single quotes", "{'matches':[]}"),
+        ("trailing comma", "{\"matches\":[],}"),
+        ("comment", "{\"matches\":[]} // done"),
+        ("nul byte", "{\"matches\":[]}\u{0}"),
+        ("lone brace", "{"),
+    ];
 
     #[test]
     fn hostile_reply_table_is_refused_whole() {
-        let cases: Vec<(&str, String, ParseError)> = vec![
-            ("empty", String::new(), ParseError::Malformed),
-            ("null", "null".into(), ParseError::Malformed),
-            ("array", "[]".into(), ParseError::Malformed),
-            ("string", "\"{}\"".into(), ParseError::Malformed),
-            ("number", "7".into(), ParseError::Malformed),
-            (
-                "trailing prose",
-                "{\"matches\":[]} trailing".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "two objects",
-                "{\"matches\":[]}{\"matches\":[]}".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "leading prose",
-                "Here: {\"matches\":[]}".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "code fence",
-                "```json\n{\"matches\":[]}\n```".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "bare fence",
-                "```\n{\"matches\":[]}\n```".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "bom",
-                "\u{feff}{\"matches\":[]}".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "dup top key",
-                "{\"matches\":[],\"matches\":[]}".into(),
-                ParseError::Malformed,
-            ),
-            ("dup match key", dup_match_key(), ParseError::Malformed),
-            (
-                "extra top key",
-                "{\"matches\":[],\"x\":1}".into(),
-                ParseError::Malformed,
-            ),
-            ("extra match key", extra_match_key(), ParseError::Malformed),
-            ("missing matches", "{}".into(), ParseError::Malformed),
-            (
-                "missing id",
-                r#"{"matches":[{"relevance":1,"why":"w"}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "missing why",
-                r#"{"matches":[{"id":"a","relevance":1}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "missing relevance",
-                r#"{"matches":[{"id":"a","why":"w"}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "matches object",
-                r#"{"matches":{}}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "matches string",
-                r#"{"matches":"a"}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "null entry",
-                r#"{"matches":[null]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "array entry",
-                r#"{"matches":[[]]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "numeric id",
-                r#"{"matches":[{"id":1,"relevance":1,"why":"w"}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "object why",
-                r#"{"matches":[{"id":"a","relevance":1,"why":{"a":1}}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "array why",
-                r#"{"matches":[{"id":"a","relevance":1,"why":["x"]}]}"#.into(),
-                ParseError::Malformed,
-            ),
-            (
-                "single quotes",
-                "{'matches':[]}".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "trailing comma",
-                "{\"matches\":[],}".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "comment",
-                "{\"matches\":[]} // done".into(),
-                ParseError::Malformed,
-            ),
-            (
-                "nul byte",
-                "{\"matches\":[]}\u{0}".into(),
-                ParseError::Malformed,
-            ),
-            ("deep array", "[".repeat(10_000), ParseError::Malformed),
-            (
-                "deep nesting in extra key",
-                deep_extra_key(),
-                ParseError::Malformed,
-            ),
-            ("escaped bidi", with_why("x\u{202e}y"), ParseError::BadWhy),
-            (
-                "huge number",
-                with_relevance("1e999"),
-                ParseError::Malformed,
-            ),
-        ];
-        assert!(cases.len() >= 20);
-        for (name, text, expected) in cases {
-            assert_eq!(parse(&text, 5).unwrap_err(), expected, "{name}");
+        assert!(HOSTILE.len() >= 20);
+        for (name, text) in HOSTILE {
+            expect_refused(text, MALFORMED, name);
         }
     }
 
-    fn dup_match_key() -> String {
-        r#"{"matches":[{"id":"a","id":"b","relevance":1,"why":"w"}]}"#.to_string()
-    }
-
-    fn extra_match_key() -> String {
-        r#"{"matches":[{"id":"a","relevance":1,"why":"w","note":"n"}]}"#.to_string()
-    }
-
-    fn deep_extra_key() -> String {
+    #[test]
+    fn deeply_nested_replies_are_refused_without_overflow() {
+        expect_refused(&"[".repeat(10_000), MALFORMED, "deep array");
         let open = "[".repeat(200);
         let close = "]".repeat(200);
-        format!("{{\"matches\":[],\"x\":{open}{close}}}")
+        let nested = format!("{{\"matches\":[],\"x\":{open}{close}}}");
+        expect_refused(&nested, MALFORMED, "nested extra key");
+        let object = format!("{{\"matches\":{}{}}}", "[".repeat(5_000), "]".repeat(5_000));
+        expect_refused(&object, MALFORMED, "nested matches");
     }
 
     #[test]
@@ -802,21 +695,21 @@ mod tests {
     #[test]
     fn planted_token_never_reaches_an_error() {
         let long = format!("{TOKEN}{}", "z".repeat(200));
-        let attempts = vec![
-            reply(TOKEN, json!(0.5), "ok"),
-            reply("a", json!(0.5), &long),
-            reply("a", json!(0.5), &format!("{TOKEN}\u{202e}")),
-            reply("a", json!(0.5), &format!("{TOKEN} {SECRET}")),
-            reply("a", json!(TOKEN), "ok"),
-            format!("{{\"{TOKEN}\":1,\"matches\":[]}}"),
-            format!("{{\"matches\":[{{\"{TOKEN}\":1}}]}}"),
-            format!("prose {TOKEN} {{\"matches\":[]}}"),
-            format!("{{\"matches\":[]}} {TOKEN}"),
-            format!("```{TOKEN}```"),
-        ];
+        let bidi = format!("{TOKEN}\u{202e}");
+        let secret = format!("{TOKEN} {SECRET}");
+        let key = format!("{{\"{TOKEN}\":1,\"matches\":[]}}");
+        let inner = format!("{{\"matches\":[{{\"{TOKEN}\":1}}]}}");
+        let prose = format!("prose {TOKEN} {{\"matches\":[]}}");
+        let tail = format!("{{\"matches\":[]}} {TOKEN}");
+        let fence = format!("```{TOKEN}```");
+        let mut attempts = vec![key, inner, prose, tail, fence];
+        attempts.push(reply(TOKEN, json!(0.5), "ok"));
+        attempts.push(reply("a", json!(0.5), &long));
+        attempts.push(reply("a", json!(0.5), &bidi));
+        attempts.push(reply("a", json!(0.5), &secret));
+        attempts.push(reply("a", json!(TOKEN), "ok"));
         for text in attempts {
-            let error = refused(&text);
-            let shown = texts(error);
+            let shown = texts(refused(&text));
             assert!(!shown.contains(TOKEN), "{shown}");
             assert!(!shown.contains("ghp_"), "{shown}");
         }
@@ -825,34 +718,31 @@ mod tests {
         assert!(!texts(error).contains(TOKEN));
     }
 
+    const ALL_ERRORS: [ParseError; 8] = [
+        ParseError::TooLarge,
+        ParseError::Malformed,
+        ParseError::UnknownSession,
+        ParseError::Duplicate,
+        ParseError::TooManyMatches,
+        ParseError::BadRelevance,
+        ParseError::BadWhy,
+        ParseError::BadLimit,
+    ];
+
     #[test]
     fn every_error_text_is_fixed_and_distinct() {
-        let all = [
-            ParseError::TooLarge,
-            ParseError::Malformed,
-            ParseError::UnknownSession,
-            ParseError::Duplicate,
-            ParseError::TooManyMatches,
-            ParseError::BadRelevance,
-            ParseError::BadWhy,
-            ParseError::BadLimit,
-        ];
-        let shown: BTreeSet<String> = all.iter().map(|e| e.to_string()).collect();
-        assert_eq!(shown.len(), all.len());
+        let shown: BTreeSet<String> = ALL_ERRORS.iter().map(|e| e.to_string()).collect();
+        assert_eq!(shown.len(), ALL_ERRORS.len());
         for text in &shown {
             assert!(text.starts_with("librarian reply refused: "), "{text}");
         }
     }
 
-    fn arb_known() -> BTreeSet<SessionId> {
-        known(&["a", "b", "c", "id-1", "id-2"])
-    }
-
     fn check_invariants(found: &[LibrarianMatch], max: u8) {
         let set = arb_known();
         assert!(found.len() <= usize::from(max));
-        let ids: BTreeSet<&SessionId> = found.iter().map(|m| m.id()).collect();
-        assert_eq!(ids.len(), found.len());
+        let unique: BTreeSet<&SessionId> = found.iter().map(|m| m.id()).collect();
+        assert_eq!(unique.len(), found.len());
         for item in found {
             assert!(set.contains(item.id()));
             assert!((0.0..=1.0).contains(&item.relevance()));
@@ -950,38 +840,34 @@ mod tests {
     ];
 
     const POOL: [&str; 5] = ["a", "b", "c", "id-1", "id-2"];
+    const ALPHABET: &str = "aeé日ß -_./x1";
 
     fn why_strategy() -> impl Strategy<Value = String> {
-        let alphabet: Vec<char> = "aeé日ß -_./x1".chars().collect();
-        let letters = proptest::sample::select(alphabet);
+        let letters = proptest::sample::select(ALPHABET.chars().collect::<Vec<char>>());
         let lengths = prop_oneof![1usize..=20, 178usize..=179];
-        lengths
-            .prop_flat_map(move |n| proptest::collection::vec(letters.clone(), n))
-            .prop_map(|chars| chars.into_iter().collect::<String>())
-            .prop_filter("not blank", |text| !text.trim().is_empty())
+        let text = lengths.prop_flat_map(move |n| proptest::collection::vec(letters.clone(), n));
+        let joined = text.prop_map(|chars| chars.into_iter().collect::<String>());
+        joined.prop_filter("not blank", |text| !text.trim().is_empty())
+    }
+
+    fn set_field(entries: &mut [Value], at: usize, key: &str, value: Value) {
+        entries[at][key] = value;
     }
 
     fn apply(defect: Defect, entries: &mut [Value], top: &mut serde_json::Map<String, Value>) {
-        let first = 0;
         match defect {
-            Defect::ExtraTopKey => {
-                top.insert("extra".into(), json!(1));
-            }
-            Defect::ExtraMatchKey => {
-                entries[first]["extra"] = json!(1);
-            }
-            Defect::UnknownId => entries[first]["id"] = json!("not-in-view"),
-            Defect::Duplicate => entries[1]["id"] = entries[first]["id"].clone(),
-            Defect::WhyTooLong => entries[first]["why"] = json!("é".repeat(180)),
-            Defect::WhyBadChar => entries[first]["why"] = json!("fine\u{202e}text"),
-            Defect::WhyEmpty => entries[first]["why"] = json!(""),
-            Defect::WhySecret => entries[first]["why"] = json!(SECRET),
-            Defect::RelevanceHigh => entries[first]["relevance"] = json!(1.0000001),
-            Defect::RelevanceLow => entries[first]["relevance"] = json!(-0.0000001),
-            Defect::RelevanceString => entries[first]["relevance"] = json!("0.5"),
-            Defect::MissingKey => {
-                entries[first].as_object_mut().unwrap().remove("why");
-            }
+            Defect::ExtraTopKey => drop(top.insert("extra".into(), json!(1))),
+            Defect::ExtraMatchKey => set_field(entries, 0, "extra", json!(1)),
+            Defect::UnknownId => set_field(entries, 0, "id", json!("not-in-view")),
+            Defect::Duplicate => set_field(entries, 1, "id", entries[0]["id"].clone()),
+            Defect::WhyTooLong => set_field(entries, 0, "why", json!("é".repeat(180))),
+            Defect::WhyBadChar => set_field(entries, 0, "why", json!("fine\u{202e}text")),
+            Defect::WhyEmpty => set_field(entries, 0, "why", json!("")),
+            Defect::WhySecret => set_field(entries, 0, "why", json!(SECRET)),
+            Defect::RelevanceHigh => set_field(entries, 0, "relevance", json!(1.0000001)),
+            Defect::RelevanceLow => set_field(entries, 0, "relevance", json!(-0.0000001)),
+            Defect::RelevanceString => set_field(entries, 0, "relevance", json!("0.5")),
+            Defect::MissingKey => drop(entries[0].as_object_mut().map(|o| o.remove("why"))),
             _ => {}
         }
     }
@@ -995,22 +881,61 @@ mod tests {
         }
     }
 
-    fn expected_order(items: &[(String, f64, String)]) -> Vec<String> {
-        let mut left: Vec<&(String, f64, String)> = items.iter().collect();
+    type Item = (String, f64, String);
+
+    fn beats(a: &Item, b: &Item) -> bool {
+        let (rel_a, rel_b) = (a.1 as f32, b.1 as f32);
+        rel_a > rel_b || (rel_a == rel_b && a.0 < b.0)
+    }
+
+    fn expected_order(items: &[Item]) -> Vec<String> {
+        let mut left: Vec<&Item> = items.iter().collect();
         let mut order = Vec::new();
         while !left.is_empty() {
             let mut best = 0;
             for (at, item) in left.iter().enumerate() {
-                let current = left[best];
-                let rel_now = item.1 as f32;
-                let rel_best = current.1 as f32;
-                if rel_now > rel_best || (rel_now == rel_best && item.0 < current.0) {
+                if beats(item, left[best]) {
                     best = at;
                 }
             }
             order.push(left.remove(best).2.clone());
         }
         order
+    }
+
+    fn build_items(picks: &[&str], relevances: &[f64], whys: &[String]) -> Vec<Item> {
+        let mut items = Vec::new();
+        for (at, id) in picks.iter().enumerate() {
+            items.push((id.to_string(), relevances[at], whys[at].clone()));
+        }
+        items
+    }
+
+    fn echo(found: &[LibrarianMatch]) -> String {
+        let mut entries = Vec::new();
+        for item in found {
+            let id = item.id().to_string();
+            let rel = f64::from(item.relevance());
+            entries.push(entry(&id, rel, item.why()));
+        }
+        json!({"matches": entries}).to_string()
+    }
+
+    fn render(items: &[Item], defect: Defect) -> String {
+        let mut entries: Vec<Value> = items.iter().map(|i| entry(&i.0, i.1, &i.2)).collect();
+        let mut top = serde_json::Map::new();
+        apply(defect, &mut entries, &mut top);
+        top.insert("matches".into(), Value::Array(entries));
+        decorate(defect, Value::Object(top).to_string())
+    }
+
+    fn limit_for(defect: Defect, count: usize, slack: u8) -> u8 {
+        let count = count as u8;
+        if defect == Defect::TooMany {
+            count - 1
+        } else {
+            (count + slack).min(10)
+        }
     }
 
     proptest! {
@@ -1024,35 +949,24 @@ mod tests {
             slack in 0u8..=5,
             defect in proptest::sample::select(DEFECTS.to_vec()),
         ) {
-            let items: Vec<(String, f64, String)> = picks
-                .iter()
-                .zip(relevances.iter().zip(whys.iter()))
-                .map(|(id, (rel, why))| (id.to_string(), *rel, why.clone()))
-                .collect();
-            let n = items.len();
-            let mut entries: Vec<Value> = items.iter().map(|i| entry(&i.0, i.1, &i.2)).collect();
-            let mut top = serde_json::Map::new();
-            apply(defect, &mut entries, &mut top);
-            top.insert("matches".into(), Value::Array(entries));
-            let text = decorate(defect, Value::Object(top).to_string());
-            let max = if defect == Defect::TooMany { n as u8 - 1 } else { (n as u8 + slack).min(10) };
+            let items = build_items(&picks, &relevances, &whys);
+            let text = render(&items, defect);
+            let max = limit_for(defect, items.len(), slack);
             let outcome = parse(&text, max);
             prop_assert_eq!(outcome.is_ok(), defect == Defect::Clean, "{:?}", defect);
             if let Ok(found) = outcome {
-                let got: Vec<String> = found.iter().map(|m| m.why().to_string()).collect();
-                prop_assert_eq!(got, expected_order(&items));
+                prop_assert_eq!(why_list(&found), expected_order(&items));
                 check_invariants(&found, max);
-                let echoed: Vec<Value> = found
-                    .iter()
-                    .map(|m| entry(&m.id().to_string(), f64::from(m.relevance()), m.why()))
-                    .collect();
-                let again = parse(&json!({"matches": echoed}).to_string(), max).unwrap();
+                let again = parse(&echo(&found), max).unwrap();
                 prop_assert_eq!(again, found);
             }
         }
 
         #[test]
-        fn why_length_boundary_with_multibyte_text(len in 170usize..190, ch in prop_oneof![Just('a'), Just('é'), Just('日')]) {
+        fn why_length_boundary_with_multibyte_text(
+            len in 170usize..190,
+            ch in prop_oneof![Just('a'), Just('é'), Just('日')],
+        ) {
             let why = ch.to_string().repeat(len);
             let accepted = parse(&with_why(&why), 5).is_ok();
             prop_assert_eq!(accepted, len < 180);
