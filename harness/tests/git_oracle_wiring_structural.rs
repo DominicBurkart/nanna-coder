@@ -72,6 +72,8 @@ fn the_scan_rejects_a_call_without_the_process_names_or_a_second_command() {
     assert!(!wiring_of(renamed).calls_git_command_with_process_names);
     let bypass = "impl GitRunner for SystemGit { fn object_exists(&self) -> bool { run(Command::new(\"git\")) } }";
     assert!(wiring_of(bypass).other_command_new);
+    let parenthesised = "impl GitRunner for SystemGit { fn object_exists(&self) -> bool { run((git_command)(d, h, process_git_env_names())) } }";
+    assert!(!wiring_of(parenthesised).calls_git_command_with_process_names);
     let good = "impl GitRunner for SystemGit { fn object_exists(&self) -> bool { run(git_command(d, h, process_git_env_names())) } }";
     let wiring = wiring_of(good);
     assert!(wiring.calls_git_command_with_process_names && !wiring.other_command_new);
