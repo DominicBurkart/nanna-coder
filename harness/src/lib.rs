@@ -7,6 +7,7 @@ pub mod backlog;
 pub mod budget;
 pub mod budget_export;
 pub mod capabilities;
+pub mod changes;
 mod ci_integrity;
 pub mod ci_policy;
 pub mod ci_tools;
