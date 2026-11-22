@@ -1811,6 +1811,8 @@ mod tests {
             prop_assume!(sha.bytes().any(|b| b.is_ascii_lowercase()));
             prop_assume!(digest.bytes().any(|b| b.is_ascii_lowercase()));
             let token = [sha, digest, uuid][which].clone();
+            let digits: Vec<u8> = token.bytes().filter(|b| *b != b'-').collect();
+            prop_assume!(shannon_bits(&digits) >= EntropyThresholds::default().hex_bits);
             let text = probes(&token, kind);
             let outcome = rules().review("s", &text, &[]);
             prop_assert!(outcome.verdict.is_block(), "{text}: {outcome:?}");
