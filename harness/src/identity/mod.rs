@@ -34,10 +34,12 @@
 //! [`IdentityCatalog`] loads a directory of them and applies repo-local
 //! overrides, which may only narrow the global identity they shadow.
 
+mod builtin;
 mod catalog;
 mod dev_loop;
 mod pattern;
 
+pub use builtin::{librarian_identity, LIBRARIAN_CARD, LIBRARIAN_IDENTITY};
 pub use catalog::{
     config_dir_from, IdentityCatalog, AGENTS_SUBDIR, AUDITOR_IDENTITY, CONFIG_DIR_ENV,
     REPO_AGENTS_DIR,
@@ -122,6 +124,14 @@ pub enum IdentityError {
         /// The protected name.
         name: String,
         /// Repo-local file that declared it.
+        file: PathBuf,
+    },
+    /// A file declares a name that is built into nanna and may not come from a file.
+    #[error("{file}: identity `{name}` is built in and cannot be declared by a file")]
+    ReservedIdentity {
+        /// The reserved name.
+        name: String,
+        /// File that declared it.
         file: PathBuf,
     },
     /// Two files in the same catalog directory declare the same name.
