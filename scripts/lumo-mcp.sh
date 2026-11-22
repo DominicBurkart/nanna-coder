@@ -8,6 +8,11 @@ POD="${NANNA_POD:-nanna-coder-pod}"
 IMAGE="${NANNA_HARNESS_IMAGE:-$REGISTRY/harness:$TAG}"
 CONFIG_VOLUME="${NANNA_CONFIG_VOLUME:-nanna-lumo-config}"
 STATE_VOLUME="${NANNA_STATE_VOLUME:-nanna-state}"
+CARGO_VOLUME="${NANNA_CARGO_VOLUME:-nanna-cargo-home}"
+STATE_PATH=/state
+CONFIG_PATH=/etc/nanna
+CARGO_PATH=/cargo
+SANDBOX_HIDE="/repos:$CONFIG_PATH:$STATE_PATH"
 DAEMON="${NANNA_DAEMON_NAME:-nanna-daemon}"
 SOCKET="${NANNA_DAEMON_SOCKET:-/run/nanna/mcp.sock}"
 WAIT_SECS="${NANNA_DAEMON_WAIT_SECS:-30}"
@@ -106,16 +111,21 @@ daemon_running() {
 socket_ready() { podman exec "$DAEMON" test -S "$SOCKET" > /dev/null 2>&1; }
 
 create_daemon() {
-  local -a retention=()
+  local -a retention=() cargo=()
+  if podman volume exists "$CARGO_VOLUME" > /dev/null 2>&1; then
+    cargo=(-v "$CARGO_VOLUME:$CARGO_PATH:ro" -e "CARGO_HOME=$CARGO_PATH" -e CARGO_NET_OFFLINE=true -e "NANNA_SANDBOX_HIDE=$SANDBOX_HIDE")
+  else
+    say "the cargo-home volume $CARGO_VOLUME does not exist; starting without it, so the cargo tools stay unavailable. Run $SCRIPT_DIR/lumo-cargo-vendor.sh, then $SELF --restart"
+  fi
   if [[ -n "${NANNA_RESULT_RETENTION_DAYS:-}" ]]; then
     retention=(-e "NANNA_RESULT_RETENTION_DAYS=$NANNA_RESULT_RETENTION_DAYS")
   fi
   podman run -d --name "$DAEMON" --pod "$POD" --restart=no \
-    -v "$STATE_VOLUME:/state" \
-    -v "$CONFIG_VOLUME:/etc/nanna:ro" "${repo_mounts[@]}" \
-    -e NANNA_CONFIG_DIR=/etc/nanna \
-    -e NANNA_QUEUE_PATH=/state/queue.jsonl \
-    -e NANNA_STATE_DIR=/state \
+    -v "$STATE_VOLUME:$STATE_PATH" \
+    -v "$CONFIG_VOLUME:$CONFIG_PATH:ro" "${repo_mounts[@]}" "${cargo[@]}" \
+    -e NANNA_CONFIG_DIR="$CONFIG_PATH" \
+    -e NANNA_QUEUE_PATH="$STATE_PATH/queue.jsonl" \
+    -e NANNA_STATE_DIR="$STATE_PATH" \
     -e "NANNA_AUDIT_TIMEOUT_SECS=$AUDIT_TIMEOUT" "${retention[@]}" \
     "$IMAGE" /bin/nanna mcp-serve --listen "$SOCKET" --model "$MODEL" > /dev/null
 }
@@ -194,7 +204,27 @@ task_counts() {
   printf '%s\n' "${counts:-none}"
 }
 
+cargo_status() {
+  local present=absent started=""
+  if podman volume exists "$CARGO_VOLUME" > /dev/null 2>&1; then present=present; fi
+  if daemon_running; then
+    if podman inspect --format '{{range .Mounts}}{{.Name}}:{{.Destination}} {{end}}' "$DAEMON" 2> /dev/null | grep -qF " $CARGO_VOLUME:$CARGO_PATH " ; then
+      started="; daemon started with it"
+    else
+      started="; daemon started WITHOUT it"
+    fi
+  fi
+  if [[ "$present" == absent ]]; then
+    printf 'cargo-home: absent (%s); cargo tools are unavailable; run %s/lumo-cargo-vendor.sh, then --restart%s\n' "$CARGO_VOLUME" "$SCRIPT_DIR" "$started"
+  elif [[ "$started" == "; daemon started WITHOUT it" ]]; then
+    printf 'cargo-home: present (%s)%s; run %s --restart to mount it\n' "$CARGO_VOLUME" "$started" "$SELF"
+  else
+    printf 'cargo-home: present (%s)%s\n' "$CARGO_VOLUME" "$started"
+  fi
+}
+
 status_daemon() {
+  cargo_status
   if ! daemon_exists; then
     printf 'daemon: absent (%s)\n' "$DAEMON"
     exit 1
@@ -232,11 +262,17 @@ stdin/stdout to it ('nanna mcp-attach'). This is the command Lumo Desktop runs.
   --start            ensure the daemon is running and its socket is open
   --stop             stop and remove the daemon; the $STATE_VOLUME volume is kept
   --restart          stop, remove and start the daemon (replaces a stale image)
-  --status           running state, image freshness, socket and task counts
+  --status           running state, image freshness, socket, task counts and
+                     whether the cargo-home volume exists and is mounted
   --install-catalog  copy your identity catalog into the $CONFIG_VOLUME volume
                      (from \$NANNA_CATALOG_SRC, else \$XDG_CONFIG_HOME/nanna/agents,
                      else ~/.config/nanna/agents; it must hold auditor.toml)
   --print            show the name and command to enter in Lumo
+
+Cargo tools need the volume $CARGO_VOLUME (override with \$NANNA_CARGO_VOLUME),
+filled by scripts/lumo-cargo-vendor.sh. The launcher mounts it read-only at
+$CARGO_PATH when it exists, never creates it, and starts the daemon without it
+otherwise. After vendoring, run --restart so the daemon mounts it.
 EOF
 }
 

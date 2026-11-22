@@ -28,6 +28,7 @@ case "${1:-}" in
     case "$*" in
       *State.Running*) cat "$S/running" ;;
       *'{{.Image}}'*) cat "$S/image" ;;
+      *.Mounts*) cat "$S/mounts" 2> /dev/null || true ;;
     esac
     exit 0
     ;;
@@ -36,6 +37,7 @@ case "${1:-}" in
     printf '%s\n' "$@" > "$FAKE_RUN_ARGV"
     if [[ -n "${FAKE_RUN_FAILS:-}" ]]; then exit 126; fi
     touch "$S/container"; echo true > "$S/running"; echo "$FAKE_IMAGE_ID_RUNNING" > "$S/image"
+    awk 'prev=="-v"{split($0,m,":"); printf "%s:%s ", m[1], m[2]} {prev=$0}' "$FAKE_RUN_ARGV" > "$S/mounts"
     if [[ -n "${FAKE_RACE:-}" ]]; then echo "Error: the container name is already in use" >&2; exit 125; fi
     echo fakecontainerid
     exit 0
@@ -123,6 +125,73 @@ grep -qx 'nanna-lumo-config:/etc/nanna:ro' "$FAKE_RUN_ARGV" || fail "the config 
 grep -qx 'nanna-state:/state' "$FAKE_RUN_ARGV" || fail "the state volume must be mounted read-write at /state"
 ! grep -q "$WORK/home\|$CATALOG" "$FAKE_RUN_ARGV" || fail "must not mount any host path into the container"
 [[ "$(awk '$1=="run"' "$FAKE_PODMAN_LOG" | wc -l)" -eq 1 ]] || fail "exactly one container must be created"
+
+reset_world
+touch "$FAKE_STATE/volumes/nanna-cargo-home"
+run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > "$WORK/out" 2> "$WORK/err" || fail "launch with a cargo-home volume must succeed: $(cat "$WORK/err")"
+grep -qx 'nanna-cargo-home:/cargo:ro' "$FAKE_RUN_ARGV" || fail "an existing cargo-home volume must be mounted read-only at /cargo"
+grep -qx 'CARGO_HOME=/cargo' "$FAKE_RUN_ARGV" || fail "CARGO_HOME must point at the read-only mount"
+grep -qx 'CARGO_NET_OFFLINE=true' "$FAKE_RUN_ARGV" || fail "cargo must be offline"
+grep -qx 'NANNA_SANDBOX_HIDE=/repos:/etc/nanna:/state' "$FAKE_RUN_ARGV" || fail "the sandbox hide list must cover the repos, config and state mounts: $(grep SANDBOX_HIDE "$FAKE_RUN_ARGV")"
+mapfile -t cmounts < <(awk 'prev=="-v"{print} {prev=$0}' "$FAKE_RUN_ARGV")
+[[ ${#cmounts[@]} -eq 7 ]] || fail "expected state, config, cargo and four repo volumes, got ${#cmounts[@]}"
+for v in "${cmounts[@]}"; do
+  src="${v%%:*}"; rest="${v#*:}"; dest="${rest%%:*}"
+  case "$dest" in /state|/etc/nanna|/cargo|/repos/*) ;; *) fail "unexpected mount destination: $v" ;; esac
+  [[ "$src" != /* && "$src" != .* && "$src" != *'~'* ]] || fail "mount source must be a named volume: $v"
+done
+! grep -E ':(z|Z)$|,z|,Z|label|privileged|security-opt|--device|--publish|^-p$' "$FAKE_RUN_ARGV" || fail "the cargo-home wiring must not weaken isolation"
+! grep -q '^nanna-cargo-home:/cargo$' "$FAKE_RUN_ARGV" || fail "cargo-home must never be mounted writable"
+! grep -q 'lumo-cargo-vendor' "$WORK/err" || fail "no vendoring notice when the volume exists"
+! grep -q '^volume create' "$FAKE_PODMAN_LOG" || fail "the launcher must never create the cargo-home volume"
+
+reset_world
+run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > "$WORK/out" 2> "$WORK/err" || fail "a missing cargo-home volume must not fail startup: $(cat "$WORK/err")"
+[[ "$(cat "$WORK/out")" == "$ping" ]] || fail "startup without cargo-home must still bridge"
+! grep -q 'cargo\|CARGO\|SANDBOX_HIDE' "$FAKE_RUN_ARGV" || fail "without the volume the daemon must get no cargo mount or env: $(cat "$FAKE_RUN_ARGV")"
+grep -q 'scripts/lumo-cargo-vendor.sh' "$WORK/err" || fail "a missing cargo-home volume must be noticed on stderr naming scripts/lumo-cargo-vendor.sh"
+[[ "$(grep -c 'lumo-cargo-vendor.sh' "$WORK/err")" -eq 1 ]] || fail "the notice must be a single line"
+! grep -q '^volume create' "$FAKE_PODMAN_LOG" || fail "the launcher must never create the cargo-home volume"
+[[ ! -e "$FAKE_STATE/volumes/nanna-cargo-home" ]] || fail "the cargo-home volume must stay absent"
+
+reset_world
+touch "$FAKE_STATE/volumes/othercargo"
+run_launcher NANNA_CARGO_VOLUME=othercargo "$BASH" "$LAUNCHER" --start > /dev/null 2>&1 || fail "NANNA_CARGO_VOLUME start must succeed"
+grep -qx 'othercargo:/cargo:ro' "$FAKE_RUN_ARGV" || fail "NANNA_CARGO_VOLUME override ignored"
+
+reset_world
+touch "$FAKE_STATE/volumes/nanna-cargo-home"
+run_launcher "$BASH" "$LAUNCHER" --start > /dev/null 2>&1
+run_launcher "$BASH" "$LAUNCHER" --status > "$WORK/out" 2> /dev/null || fail "--status must succeed"
+grep -q '^cargo-home: present (nanna-cargo-home); daemon started with it' "$WORK/out" || fail "--status must report a daemon started with the cargo-home volume: $(cat "$WORK/out")"
+
+reset_world
+run_launcher "$BASH" "$LAUNCHER" --start > /dev/null 2>&1
+touch "$FAKE_STATE/volumes/nanna-cargo-home"
+run_launcher "$BASH" "$LAUNCHER" --status > "$WORK/out" 2> /dev/null || fail "--status must succeed"
+grep -q '^cargo-home: present (nanna-cargo-home); daemon started WITHOUT it; run .* --restart' "$WORK/out" || fail "--status must tell the user to --restart after vendoring: $(cat "$WORK/out")"
+
+reset_world
+run_launcher "$BASH" "$LAUNCHER" --start > /dev/null 2>&1
+run_launcher "$BASH" "$LAUNCHER" --status > "$WORK/out" 2> /dev/null || fail "--status must succeed"
+grep -q '^cargo-home: absent (nanna-cargo-home).*lumo-cargo-vendor.sh' "$WORK/out" || fail "--status must report an absent cargo-home volume and name the vendor script: $(cat "$WORK/out")"
+! grep -q '^volume create' "$FAKE_PODMAN_LOG" || fail "--status must not create volumes"
+
+reset_world
+touch "$FAKE_STATE/volumes/nanna-cargo-home"
+if run_launcher "$BASH" "$LAUNCHER" --status > "$WORK/out" 2> /dev/null; then fail "--status with no daemon must exit non-zero"; fi
+grep -q '^daemon: absent' "$WORK/out" || fail "--status must still report an absent daemon"
+grep -q '^cargo-home: present (nanna-cargo-home)$' "$WORK/out" || fail "--status must report the cargo-home volume even without a daemon: $(cat "$WORK/out")"
+
+VENDOR="$HERE/../../scripts/lumo-cargo-vendor.sh"
+"$BASH" "$VENDOR" --help > "$WORK/vhelp" 2>&1 || fail "vendor --help must succeed"
+grep -q 'nanna-cargo-home' "$WORK/vhelp" || fail "vendor --help must name the default volume the launcher mounts"
+grep -q 'NANNA_CARGO_VOLUME' "$WORK/vhelp" || fail "vendor --help must name the same NANNA_CARGO_VOLUME variable as the launcher"
+grep -q -- '--restart' "$WORK/vhelp" || fail "vendor --help must tell the user to restart the daemon"
+! grep -qi 'lumo card' "$WORK/vhelp" || fail "vendor --help must not mention a lumo card"
+run_launcher "$BASH" "$LAUNCHER" --help > "$WORK/out"
+grep -q 'NANNA_CARGO_VOLUME' "$WORK/out" || fail "launcher --help must document the cargo-home volume"
+grep -q 'lumo-cargo-vendor.sh' "$WORK/out" || fail "launcher --help must name the vendor script"
 
 reset_world
 touch "$FAKE_STATE/container"; echo true > "$FAKE_STATE/running"; echo sha256:old > "$FAKE_STATE/image"

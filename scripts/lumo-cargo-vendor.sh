@@ -4,7 +4,7 @@ set -euo pipefail
 REGISTRY="${NANNA_REGISTRY:-ghcr.io/dominicburkart/nanna-coder}"
 TAG="${NANNA_TAG:-latest}"
 IMAGE="${NANNA_HARNESS_IMAGE:-$REGISTRY/harness:$TAG}"
-CARGO_VOLUME="${NANNA_CARGO_HOME_VOLUME:-nanna-cargo-home}"
+CARGO_VOLUME="${NANNA_CARGO_VOLUME:-nanna-cargo-home}"
 VOLUME_PREFIX="${NANNA_REPO_VOLUME_PREFIX:-nanna-repo-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,8 +20,13 @@ from the harness image, repository volumes mounted read-only, no host paths.
 Repositories are copied inside the throwaway container so a missing Cargo.lock
 can be resolved without writing to the repository volume.
 Run it again after a dependency changes; the daemon mounts VOLUME read-only at
-/cargo with CARGO_HOME=/cargo and CARGO_NET_OFFLINE=true. With no REPO_NAME the
-repositories of the lumo card are used.
+/cargo with CARGO_HOME=/cargo and CARGO_NET_OFFLINE=true. With no REPO_NAME every
+repository in your identity catalog is vendored (see lumo-repos.sh --list).
+
+VOLUME defaults to nanna-cargo-home, the volume lumo-mcp.sh mounts; set
+NANNA_CARGO_VOLUME (read by both scripts) to use another name. The image defaults
+to the harness image (NANNA_HARNESS_IMAGE). The daemon only mounts the volume
+when it is created, so run lumo-mcp.sh --restart after vendoring.
 EOF
 }
 
@@ -94,4 +99,4 @@ podman run --rm --entrypoint /bin/sh \
   -v "$CARGO_VOLUME:/cargo" "${mounts[@]}" \
   "$IMAGE" -c "$inner" vendor "${names[@]}"
 
-printf 'vendored dependencies of %s into podman volume %s\n' "${names[*]}" "$CARGO_VOLUME"
+printf 'vendored dependencies of %s into podman volume %s\nrun %s/lumo-mcp.sh --restart so the daemon mounts it\n' "${names[*]}" "$CARGO_VOLUME" "$SCRIPT_DIR"
