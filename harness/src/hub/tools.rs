@@ -162,8 +162,10 @@ fn flag(args: &Value, key: &str) -> ToolResult<bool> {
     let Some(raw) = args.get(key) else {
         return Ok(false);
     };
-    raw.as_bool()
-        .ok_or_else(|| invalid(&format!("{key} must be true or false")))
+    let Some(value) = raw.as_bool() else {
+        return Err(invalid(&format!("{key} must be true or false")));
+    };
+    Ok(value)
 }
 
 fn text<'a>(args: &'a Value, key: &str) -> ToolResult<Option<&'a str>> {
@@ -310,16 +312,14 @@ impl HubTool {
         let now = self.hub.clock.now();
         let (hub, sender) = (&self.hub, &self.sender);
         match self.name {
-            "msg_send" => to_json(
-                &hub.send(sender, send_request(&args)?)
-                    .await
-                    .map_err(hub_failure)?,
-            ),
-            "msg_recv" => to_json(
-                &hub.recv(sender, recv_request(&args)?)
-                    .await
-                    .map_err(hub_failure)?,
-            ),
+            "msg_send" => {
+                let sent = hub.send(sender, send_request(&args)?).await;
+                to_json(&sent.map_err(hub_failure)?)
+            }
+            "msg_recv" => {
+                let page = hub.recv(sender, recv_request(&args)?).await;
+                to_json(&page.map_err(hub_failure)?)
+            }
             "session_set_note" => {
                 let note = text(&args, "note")?.ok_or_else(|| invalid("note is required"))?;
                 let stored = hub.set_note(sender, note).map_err(hub_failure)?;
@@ -413,6 +413,22 @@ mod tests {
         let binding = HubBinding::new(rig.router.clone(), rig.sender.clone());
         register(&mut registry, &binding, card);
         registry
+    }
+
+    async fn run(registry: &ToolRegistry, tool: &str, args: Value) -> ToolResult<Value> {
+        registry.execute(tool, args).await
+    }
+
+    async fn good(registry: &ToolRegistry, tool: &str, args: Value) -> Value {
+        registry.execute(tool, args).await.unwrap()
+    }
+
+    async fn works(registry: &ToolRegistry, tool: &str, args: Value) -> bool {
+        registry.execute(tool, args).await.is_ok()
+    }
+
+    async fn bad(registry: &ToolRegistry, tool: &str, args: Value) -> ToolError {
+        registry.execute(tool, args).await.unwrap_err()
     }
 
     fn names(registry: &ToolRegistry) -> Vec<String> {
@@ -546,33 +562,21 @@ mod tests {
         ] {
             assert!(registry.execute("msg_recv", call).await.is_ok());
         }
-        assert!(registry
-            .execute("sessions_tree", json!({"depth": 3}))
-            .await
-            .is_ok());
+        assert!(works(&registry, "sessions_tree", json!({"depth": 3})).await);
     }
 
     #[tokio::test]
     async fn a_message_sent_through_the_tool_is_received_fenced_through_the_tool() {
         let rig = rig(vec![], true);
         let sender = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
-        let receipt = sender
-            .execute("msg_send", args(&rig, "hello there"))
-            .await
-            .unwrap();
+        let receipt = good(&sender, "msg_send", args(&rig, "hello there")).await;
         assert_eq!(receipt["recipients"], 1);
-        let page = peer_registry(&rig)
-            .execute("msg_recv", json!({}))
-            .await
-            .unwrap();
+        let page = good(&peer_registry(&rig), "msg_recv", json!({})).await;
         let shown = page.to_string();
         assert!(shown.contains("hello there"));
         assert!(shown.contains("UNTRUSTED_AGENT_MESSAGE"));
         assert_eq!(page["withheld"], 0);
-        let again = peer_registry(&rig)
-            .execute("msg_recv", json!({"ack_through": 1}))
-            .await
-            .unwrap();
+        let again = good(&peer_registry(&rig), "msg_recv", json!({"ack_through": 1})).await;
         assert_eq!(again["messages"].as_array().unwrap().len(), 0);
     }
 
@@ -584,9 +588,7 @@ mod tests {
         ];
         let rig = rig(verdicts, true);
         let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
-        let result = registry
-            .execute("msg_send", args(&rig, "do the thing"))
-            .await;
+        let result = run(&registry, "msg_send", args(&rig, "do the thing")).await;
         assert!(denied(result).is_escalation());
         assert_eq!(rig.auditor.calls(), 2);
         assert_eq!(rig.escalations.escalations().len(), 1);
@@ -634,16 +636,11 @@ mod tests {
     async fn a_note_is_reviewed_at_the_gate_stored_and_a_blank_one_clears_it() {
         let rig = rig(vec![], true);
         let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
-        let set = registry
-            .execute("session_set_note", json!({"note": "reading the parser"}))
-            .await
-            .unwrap();
+        let note = json!({"note": "reading the parser"});
+        let set = good(&registry, "session_set_note", note).await;
         assert!(set["summary"].is_string());
         assert_eq!(rig.auditor.calls(), 1);
-        let cleared = registry
-            .execute("session_set_note", json!({"note": "  "}))
-            .await
-            .unwrap();
+        let cleared = good(&registry, "session_set_note", json!({"note": " "})).await;
         assert!(cleared["summary"].is_null());
         let missing = registry.execute("session_set_note", json!({})).await;
         assert!(missing.is_err());
@@ -657,14 +654,9 @@ mod tests {
         };
         let rig = rig_with(vec![], true, limits);
         let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
-        assert!(registry
-            .execute("session_set_note", json!({"note": "one"}))
-            .await
-            .is_ok());
+        assert!(works(&registry, "session_set_note", json!({"note": "one"})).await);
         let before = rig.auditor.calls();
-        let second = registry
-            .execute("session_set_note", json!({"note": "two"}))
-            .await;
+        let second = run(&registry, "session_set_note", json!({"note": "two"})).await;
         assert!(second.is_err());
         let send = registry.execute("msg_send", args(&rig, "hello")).await;
         assert!(send.is_err());
@@ -677,36 +669,20 @@ mod tests {
         let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
         let list = registry.execute("sessions_list", json!({"filter": {"status": ["pending"], "relation": ["peer", "sibling"], "identity": ["x"], "include_librarians": true, "include_completed": true}, "order": "recent"})).await.unwrap();
         assert!(list["counts"]["total"].as_u64().unwrap() >= 2);
-        assert!(registry
-            .execute("sessions_list", json!({"order": "identity"}))
-            .await
-            .is_ok());
-        let tree = registry
-            .execute(
-                "sessions_tree",
-                json!({"include_children": true, "depth": 2}),
-            )
-            .await
-            .unwrap();
+        assert!(works(&registry, "sessions_list", json!({"order": "identity"})).await);
+        let every = json!({"filter": {"relation": ["self_node", "parent", "ancestor", "child"], "status": ["running", "waiting_on_messages", "completed", "failed", "cancelled"]}});
+        assert!(works(&registry, "sessions_list", every).await);
+        let deep = json!({"include_children": true, "depth": 2});
+        let tree = good(&registry, "sessions_tree", deep).await;
         assert!(tree["notice"].is_string());
-        let peer = registry
-            .execute("session_describe", json!({"id": "peer"}))
-            .await
-            .unwrap();
+        let peer = good(&registry, "session_describe", json!({"id": "peer"})).await;
         assert_eq!(peer["id"], "peer");
-        let unknown = registry
-            .execute("session_describe", json!({"id": "ghost"}))
-            .await
-            .unwrap_err();
-        let too_long = registry
-            .execute("session_describe", json!({"id": "x".repeat(129)}))
-            .await
-            .unwrap_err();
+        let unknown = bad(&registry, "session_describe", json!({"id": "ghost"})).await;
+        let long_id = json!({"id": "x".repeat(129)});
+        let too_long = bad(&registry, "session_describe", long_id).await;
         assert!(unknown.to_string().contains("session not visible"));
         assert!(matches!(too_long, ToolError::InvalidArguments { .. }));
-        let own_tree = registry
-            .execute("sessions_tree", json!({"of": "peer"}))
-            .await;
+        let own_tree = run(&registry, "sessions_tree", json!({"of": "peer"})).await;
         assert!(own_tree.is_ok());
     }
 

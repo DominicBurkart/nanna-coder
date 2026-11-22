@@ -1807,9 +1807,8 @@ impl TaskRunner {
 
     fn hub_binding(&self, task_id: &TaskId) -> Option<crate::hub::tools::HubBinding> {
         let router = self.hub_router()?;
-        let session = router
-            .table()
-            .binding(&SessionId::from_task(task_id.clone()))?;
+        let table = router.table();
+        let session = table.binding(&SessionId::from_task(task_id.clone()))?;
         Some(crate::hub::tools::HubBinding::new(router, session))
     }
 
