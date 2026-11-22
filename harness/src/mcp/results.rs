@@ -148,6 +148,11 @@ pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, Strin
             false,
             "Raise max_iterations or split the task into smaller ones.".to_string(),
         ),
+        "NoProgress" => (
+            "no_progress".to_string(),
+            true,
+            "The agent did not edit any files after being prompted. Assign a more specific task: name the file, the function and the exact change.".to_string(),
+        ),
         "ProtectedPathViolation" => (
             error_type.to_string(),
             false,
@@ -568,6 +573,9 @@ mod tests {
         assert!(!code("SpawnAuditFailed", "audit log write failed: disk").1);
         assert!(code("RestoreAuditFailed", "x").1);
         assert!(!code("MaxIterationsExceeded", "x").1);
+        let (c, retryable, fix) = code("NoProgress", "Agent made no progress");
+        assert_eq!((c.as_str(), retryable), ("no_progress", true));
+        assert!(fix.contains("name the file"), "{fix}");
         assert_eq!(code("SomethingNew", "x").0, "SomethingNew");
     }
 
@@ -1025,6 +1033,38 @@ mod tests {
         assert_eq!(view["reason_code"], status["reason_code"]);
         assert_eq!(view["retryable"], false);
         assert!(view["fix"].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_task_that_made_no_progress_reports_no_progress_retryable_with_a_fix() {
+        let server = server();
+        let id = assign(&server, "d", json!({})).await;
+        let diagnostics = FailureDiagnostics {
+            changes: None,
+            tools_unavailable: vec![],
+            error_type: "NoProgress".to_string(),
+            iterations_completed: 4,
+            last_tool_call: None,
+            partial_changes: None,
+            tool_call_history: vec![],
+            last_agent_state: None,
+            conversation_snapshot: None,
+            denials: vec![],
+            action_audit: vec![],
+        };
+        let status = TaskStatus::Failed {
+            finished_at: chrono::Utc::now(),
+            error: "Agent made no progress: it stopped 2 time(s) after being prompted without changing any files. Last message: I will add a test".to_string(),
+            diagnostics,
+        };
+        server.task_manager.finish_for_test(&id, status).await;
+        let view = body(&fetch(&server, "get_task_status", json!({"task_id": id.0})).await);
+        assert_eq!(view["reason_code"], "no_progress");
+        assert_eq!(view["retryable"], true);
+        assert!(view["fix"].as_str().unwrap().contains("name the file"));
+        let result = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
+        assert_eq!(result["reason_code"], "no_progress");
+        assert_eq!(result["retryable"], true);
     }
 
     #[tokio::test]
