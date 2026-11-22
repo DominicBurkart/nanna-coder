@@ -1,7 +1,11 @@
+#[cfg(unix)]
+pub mod attach;
 pub mod client;
 pub mod handlers;
 pub mod introspect;
 pub mod jsonrpc;
+#[cfg(unix)]
+pub mod listen;
 pub mod plan;
 
 use crate::auditor::SpawnGate;
