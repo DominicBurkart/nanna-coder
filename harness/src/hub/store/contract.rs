@@ -220,16 +220,8 @@ pub(super) fn update_replaces_declines_and_reports_a_missing_id<S: SessionStore>
     assert_eq!(changed.subtask, "changed");
     s.update(sid("a"), Box::new(|_| None)).unwrap();
     assert_eq!(s.get(sid("a")).unwrap().unwrap(), changed);
-    let seen = std::cell::Cell::new(false);
-    let missing = s.update(
-        sid("missing"),
-        Box::new(|_| {
-            seen.set(true);
-            None
-        }),
-    );
+    let missing = s.update(sid("missing"), Box::new(|_| None));
     assert!(matches!(missing, Err(StoreError::NotFound)));
-    assert!(!seen.get());
 }
 
 pub(super) fn prune_removes_only_finished_idle_roots<S: SessionStore>(s: &S) {

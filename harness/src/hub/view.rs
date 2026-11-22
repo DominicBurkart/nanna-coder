@@ -3051,4 +3051,14 @@ mod tests {
         registry.set_note(&sid("t"), "  \n ", at(2)).unwrap();
         assert_eq!(shown(&store), "rust-implementer [pending] fix the parser");
     }
+
+    #[test]
+    fn the_flaky_session_store_passes_updates_until_its_gate_closes() {
+        let r = root(1);
+        let record = flat("a", &r, "coder", SessionStatus::Running, 0);
+        let flaky = FlakySessions(store_of(vec![record]), Gate::from(1));
+        flaky.update(sid("a"), Box::new(Some)).unwrap();
+        let closed = flaky.update(sid("a"), Box::new(Some));
+        assert!(matches!(closed, Err(StoreError::Locked)));
+    }
 }

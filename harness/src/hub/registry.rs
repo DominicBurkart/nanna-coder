@@ -1467,6 +1467,30 @@ mod tests {
     }
 
     #[test]
+    fn the_racing_wrapper_delegates_everything_but_the_get_hook() {
+        let inner = Arc::new(InMemorySessionStore::new());
+        let racing = Racing {
+            inner: inner.clone(),
+            slipped_in: Mutex::new(None),
+        };
+        let registry = SessionRegistry::new(inner.clone());
+        registry.register(&binding("t"), "s", at(0)).unwrap();
+        let root = RootId::mcp(Uuid::from_u128(1));
+        assert_eq!(racing.in_root(&root).unwrap().len(), 1);
+        let kept = racing.get(sid("t")).unwrap().unwrap();
+        racing.upsert(kept.clone()).unwrap();
+        racing.update(sid("t"), Box::new(Some)).unwrap();
+        racing
+            .set_status(sid("t"), SessionStatus::Running, at(1))
+            .unwrap();
+        racing
+            .set_note(sid("t"), Summary::compose("a", "running", "n"))
+            .unwrap();
+        assert_eq!(racing.prune(at(2), &Default::default()).unwrap(), 0);
+        assert!(stored(&inner, "t").note.is_some());
+    }
+
+    #[test]
     fn a_second_registry_finishing_the_session_mid_write_is_never_undone() {
         type Op = fn(&SessionRegistry);
         let ops: [(&str, Op); 3] = [
