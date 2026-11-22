@@ -1,4 +1,4 @@
-use super::lineage::{SessionBinding, SessionId};
+use super::lineage::{Lineage, SessionBinding, SessionId};
 use super::session::{SessionKind, SessionRecord, SessionStatus};
 use super::store::{SessionStore, StoreError};
 use super::summary::Summary;
@@ -298,27 +298,59 @@ impl SessionRegistry {
         })
     }
 
-    /// Replace the session's note with `text`, composed as a summary after review.
+    /// Replace the session's note with `text`, composed as a summary after review. A blank text
+    /// (empty or whitespace only) clears the note, so views fall back to the first subtask line.
+    /// Returns the stored note.
     pub fn set_note(
         &self,
         id: &SessionId,
         text: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Option<Summary>, RegistryError> {
+        self.put_note(id, None, text, at)
+    }
+
+    /// [`SessionRegistry::set_note`] for the session `caller` is bound to. A stored record whose
+    /// lineage is not the caller's is reported as [`RegistryError::Unknown`], like a missing one.
+    pub fn set_note_for(
+        &self,
+        caller: &SessionBinding,
+        text: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Summary>, RegistryError> {
+        self.put_note(caller.session(), Some(caller.lineage()), text, at)
+    }
+
+    fn put_note(
+        &self,
+        id: &SessionId,
+        owner: Option<&Lineage>,
+        text: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<Summary>, RegistryError> {
         let _guard = self.lock();
+        let mut stored = None;
         self.edit(id, |mut record| {
+            if owner.is_some_and(|lineage| record.lineage != *lineage) {
+                return Err(RegistryError::Unknown);
+            }
             if !record.status.is_active() {
                 return Err(illegal(record.status, record.status));
             }
             let vetted = self.vet(text);
-            record.note = Some(Summary::compose(
-                &record.identity,
-                record.status.label(),
-                &vetted,
-            ));
+            record.note = match vetted.trim().is_empty() {
+                true => None,
+                false => Some(Summary::compose(
+                    &record.identity,
+                    record.status.label(),
+                    &vetted,
+                )),
+            };
+            stored = record.note.clone();
             record.last_activity = at;
             Ok(record)
-        })
+        })?;
+        Ok(stored)
     }
 }
 
@@ -1241,5 +1273,119 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    fn foreign_binding(name: &str) -> SessionBinding {
+        SessionBinding::from_audited(
+            &crate::identity::example(),
+            TaskId(name.to_string()),
+            Lineage::root_child(RootId::mcp(Uuid::from_u128(2))),
+        )
+    }
+
+    #[test]
+    fn a_blank_note_clears_the_note_and_the_next_note_is_stored_again() {
+        let (store, registry) = running("t");
+        let id = sid("t");
+        registry.set_note(&id, "reading", at(2)).unwrap();
+        assert!(stored(&store, "t").note.is_some());
+        for (n, blank) in ["", " ", "   ", "\n\t \r\n"].into_iter().enumerate() {
+            registry.set_note(&id, "reading", at(2)).unwrap();
+            let shown = registry.set_note(&id, blank, at(3 + n as i64)).unwrap();
+            assert_eq!(shown, None, "{blank:?}");
+            let record = stored(&store, "t");
+            assert_eq!(record.note, None, "{blank:?}");
+            assert_eq!(record.last_activity, at(3 + n as i64));
+            assert!(record.status.is_active());
+        }
+        let again = registry.set_note(&id, "back", at(9)).unwrap();
+        assert_eq!(
+            again,
+            Some(Summary::compose("rust-implementer", "running", "back"))
+        );
+        assert_eq!(stored(&store, "t").note, again);
+    }
+
+    #[test]
+    fn a_withheld_note_stays_a_marker_and_is_never_mistaken_for_a_blank_one() {
+        let (store, registry) = running("t");
+        for (text, marker) in [
+            ("\u{202e}", "[withheld: prompt_injection]"),
+            ("\u{200b}", "[withheld: prompt_injection]"),
+            ("a\0", "[withheld: other]"),
+            (&token(), "[withheld: secret_leak]"),
+        ] {
+            let shown = registry.set_note(&sid("t"), text, at(4)).unwrap();
+            let expected = Summary::compose("rust-implementer", "running", marker);
+            assert_eq!(shown, Some(expected.clone()), "{marker}");
+            assert_eq!(stored(&store, "t").note, Some(expected));
+        }
+    }
+
+    #[test]
+    fn set_note_for_writes_only_the_callers_own_record() {
+        let (store, registry) = running("t");
+        registry.register(&binding("u"), "other", at(0)).unwrap();
+        let shown = registry.set_note_for(&binding("t"), "mine", at(5)).unwrap();
+        assert_eq!(
+            shown,
+            Some(Summary::compose("rust-implementer", "running", "mine"))
+        );
+        assert_eq!(stored(&store, "t").note, shown);
+        assert_eq!(stored(&store, "u").note, None);
+    }
+
+    #[test]
+    fn a_record_under_another_lineage_is_unknown_to_the_caller_even_when_finished() {
+        let (store, registry) = running("t");
+        registry.set_note(&sid("t"), "mine", at(2)).unwrap();
+        let before = stored(&store, "t");
+        let intruder = foreign_binding("t");
+        let missing = registry
+            .set_note_for(&binding("ghost"), "x", at(3))
+            .unwrap_err();
+        let foreign = registry.set_note_for(&intruder, "x", at(3)).unwrap_err();
+        assert!(matches!(foreign, RegistryError::Unknown), "{foreign:?}");
+        assert_eq!(
+            format!("{foreign} {foreign:?}"),
+            format!("{missing} {missing:?}")
+        );
+        assert_eq!(stored(&store, "t"), before);
+        registry.cancel(&sid("t"), at(4)).unwrap();
+        let finished = stored(&store, "t");
+        let foreign = registry.set_note_for(&intruder, "x", at(5)).unwrap_err();
+        assert!(matches!(foreign, RegistryError::Unknown), "{foreign:?}");
+        let own = registry
+            .set_note_for(&binding("t"), "x", at(5))
+            .unwrap_err();
+        assert!(
+            matches!(own, RegistryError::IllegalTransition { .. }),
+            "{own:?}"
+        );
+        assert_eq!(stored(&store, "t"), finished);
+    }
+
+    #[test]
+    fn a_failing_store_leaves_the_previous_note_and_leaks_no_text() {
+        let planted = "NOTE-PLANT-91";
+        let flaky = Flaky::new();
+        let registry = SessionRegistry::new(flaky.clone());
+        registry.register(&binding("t"), "s", at(0)).unwrap();
+        registry.set_note(&sid("t"), "old", at(1)).unwrap();
+        let before = flaky.inner.get(sid("t")).unwrap().unwrap();
+        flaky.writes.store(true, Ordering::SeqCst);
+        let err = registry
+            .set_note_for(&binding("t"), planted, at(2))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Store(_)), "{err:?}");
+        assert!(!format!("{err} {err:?}").contains(planted));
+        flaky.writes.store(false, Ordering::SeqCst);
+        flaky.reads.store(true, Ordering::SeqCst);
+        let err = registry
+            .set_note_for(&binding("t"), planted, at(2))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Store(_)), "{err:?}");
+        flaky.reads.store(false, Ordering::SeqCst);
+        assert_eq!(flaky.inner.get(sid("t")).unwrap().unwrap(), before);
     }
 }
