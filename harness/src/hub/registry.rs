@@ -43,8 +43,6 @@ pub enum RegistryError {
     UseFinish,
     #[error("finish needs a terminal status")]
     NotTerminal,
-    #[error("waiting_on_messages is not supported yet")]
-    Unsupported,
 }
 
 fn illegal(from: SessionStatus, to: SessionStatus) -> RegistryError {
@@ -215,7 +213,26 @@ impl SessionRegistry {
         }
     }
 
-    /// Move a `Pending` session to `Running`.
+    /// Move a session between the non-terminal statuses. The legal moves are `Pending -> Running`,
+    /// `Running -> WaitingOnMessages` and `WaitingOnMessages -> Running`; every other pair is an
+    /// [`RegistryError::IllegalTransition`] and terminal statuses go through [`Self::finish`].
+    /// The legality check runs inside the store's atomic `update`, so leaving
+    /// `WaitingOnMessages` is a compare-and-set: a record that is no longer waiting (for example
+    /// one a concurrent `finish` just closed) is never changed. Entering `WaitingOnMessages`
+    /// leaves `last_activity` alone, so an idle waiter does not look recently active.
+    ///
+    /// ```
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::session::SessionStatus;
+    /// use harness::hub::store::InMemorySessionStore;
+    /// use std::sync::Arc;
+    ///
+    /// let registry = SessionRegistry::new(Arc::new(InMemorySessionStore::new()));
+    /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("t".into()));
+    /// let at = chrono::Utc::now();
+    /// assert!(registry.set_status(&id, SessionStatus::Running, at).is_err());
+    /// assert!(registry.set_status(&id, SessionStatus::Completed, at).is_err());
+    /// ```
     pub fn set_status(
         &self,
         id: &SessionId,
@@ -223,26 +240,33 @@ impl SessionRegistry {
         at: DateTime<Utc>,
     ) -> Result<(), RegistryError> {
         let _guard = self.lock();
-        match to {
-            SessionStatus::WaitingOnMessages => return Err(RegistryError::Unsupported),
-            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled => {
-                return Err(RegistryError::UseFinish)
-            }
-            SessionStatus::Pending | SessionStatus::Running => {}
+        if matches!(
+            to,
+            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
+        ) {
+            return Err(RegistryError::UseFinish);
         }
         self.edit(id, |mut record| {
-            if record.status != SessionStatus::Pending || to != SessionStatus::Running {
+            let legal = matches!(
+                (record.status, to),
+                (SessionStatus::Pending, SessionStatus::Running)
+                    | (SessionStatus::Running, SessionStatus::WaitingOnMessages)
+                    | (SessionStatus::WaitingOnMessages, SessionStatus::Running)
+            );
+            if !legal {
                 return Err(illegal(record.status, to));
             }
             record.status = to;
-            record.last_activity = at;
+            if to != SessionStatus::WaitingOnMessages {
+                record.last_activity = at;
+            }
             record.ended_at = None;
             Ok(record)
         })
     }
 
-    /// End the session in the terminal status `to`. `Pending` may only fail or be cancelled; the
-    /// first terminal status wins. `summary` is stored as untrusted text.
+    /// End the session in the terminal status `to`. `Pending` may only fail or be cancelled, a
+    /// running or waiting session may complete, fail or be cancelled; the first terminal status wins. `summary` is stored as untrusted text.
     pub fn finish(
         &self,
         id: &SessionId,
@@ -257,8 +281,10 @@ impl SessionRegistry {
         self.edit(id, |mut record| {
             let legal = match record.status {
                 SessionStatus::Pending => to != SessionStatus::Completed,
-                SessionStatus::Running => true,
-                _ => false,
+                SessionStatus::Running | SessionStatus::WaitingOnMessages => true,
+                SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled => {
+                    false
+                }
             };
             if !legal {
                 return Err(illegal(record.status, to));
@@ -655,7 +681,7 @@ mod tests {
         ));
         assert!(matches!(
             registry.set_status(&sid("t"), SessionStatus::WaitingOnMessages, at(1)),
-            Err(RegistryError::Unsupported)
+            Err(RegistryError::IllegalTransition { .. })
         ));
         for terminal in [
             SessionStatus::Completed,
@@ -1448,6 +1474,7 @@ mod tests {
             id: SessionId,
             change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
         ) -> Result<(), StoreError> {
+            self.fire();
             self.inner.update(id, change)
         }
         fn set_status(
@@ -1530,6 +1557,361 @@ mod tests {
             let record = stored(&inner, "t");
             assert_eq!(record.status, end, "{name}");
             assert_eq!(record.ended_at, Some(at(3)), "{name}");
+        }
+    }
+
+    mod waiting {
+        use super::*;
+
+        const EDGES: [(SessionStatus, SessionStatus); 11] = [
+            (SessionStatus::Pending, SessionStatus::Running),
+            (SessionStatus::Pending, SessionStatus::Failed),
+            (SessionStatus::Pending, SessionStatus::Cancelled),
+            (SessionStatus::Running, SessionStatus::WaitingOnMessages),
+            (SessionStatus::Running, SessionStatus::Completed),
+            (SessionStatus::Running, SessionStatus::Failed),
+            (SessionStatus::Running, SessionStatus::Cancelled),
+            (SessionStatus::WaitingOnMessages, SessionStatus::Running),
+            (SessionStatus::WaitingOnMessages, SessionStatus::Completed),
+            (SessionStatus::WaitingOnMessages, SessionStatus::Failed),
+            (SessionStatus::WaitingOnMessages, SessionStatus::Cancelled),
+        ];
+
+        fn legal(from: SessionStatus, to: SessionStatus) -> bool {
+            EDGES.contains(&(from, to))
+        }
+
+        fn mv(
+            registry: &SessionRegistry,
+            name: &str,
+            to: SessionStatus,
+            secs: i64,
+        ) -> Result<(), RegistryError> {
+            match to.is_active() {
+                true => registry.set_status(&sid(name), to, at(secs)),
+                false => registry.finish(&sid(name), to, Some("done"), at(secs)),
+            }
+        }
+
+        fn seeded(from: SessionStatus) -> (Arc<InMemorySessionStore>, SessionRegistry) {
+            let (store, registry) = registry();
+            registry.register(&binding("t"), "s", at(0)).unwrap();
+            let ended = (!from.is_active()).then(|| at(2));
+            let change = move |mut record: SessionRecord| {
+                record.status = from;
+                record.ended_at = ended;
+                Some(record)
+            };
+            store.update(sid("t"), Box::new(change)).unwrap();
+            (store, registry)
+        }
+
+        fn waiting() -> (Arc<InMemorySessionStore>, SessionRegistry) {
+            let (store, registry) = running("t");
+            let to = SessionStatus::WaitingOnMessages;
+            registry.set_status(&sid("t"), to, at(2)).unwrap();
+            (store, registry)
+        }
+
+        #[test]
+        fn the_transition_table_is_exactly_the_literal_edge_list() {
+            assert_eq!(EDGES.len(), 11);
+            for from in STATUSES {
+                for to in STATUSES {
+                    let (store, registry) = seeded(from);
+                    let before = stored(&store, "t");
+                    let tracked = registry.tracks(&sid("t"));
+                    let result = mv(&registry, "t", to, 50);
+                    let after = stored(&store, "t");
+                    assert_eq!(result.is_ok(), legal(from, to), "{from:?} -> {to:?}");
+                    if result.is_err() {
+                        assert_eq!(after, before, "{from:?} -> {to:?}");
+                        assert_eq!(registry.tracks(&sid("t")), tracked);
+                        continue;
+                    }
+                    assert_eq!(after.status, to);
+                    assert_eq!(after.ended_at.is_some(), !to.is_active());
+                    assert_eq!(registry.tracks(&sid("t")), to.is_active());
+                }
+            }
+        }
+
+        #[test]
+        fn entering_waiting_keeps_last_activity_and_leaving_bumps_it() {
+            let (store, registry) = running("t");
+            let to = SessionStatus::WaitingOnMessages;
+            registry.set_status(&sid("t"), to, at(9)).unwrap();
+            let entered = stored(&store, "t");
+            assert_eq!(entered.status, to);
+            assert_eq!(entered.last_activity, at(1));
+            assert_eq!(entered.ended_at, None);
+            let back = SessionStatus::Running;
+            registry.set_status(&sid("t"), back, at(12)).unwrap();
+            let left = stored(&store, "t");
+            assert_eq!(left.status, back);
+            assert_eq!(left.last_activity, at(12));
+            assert_eq!(left.created_at, at(0));
+            assert!(registry.tracks(&sid("t")));
+        }
+
+        #[test]
+        fn a_waiting_session_still_takes_notes_and_touched_paths() {
+            let (store, registry) = waiting();
+            registry
+                .record_touched(&sid("t"), &["a.rs".into()], at(3))
+                .unwrap();
+            let note = registry.set_note(&sid("t"), "parked", at(4)).unwrap();
+            let record = stored(&store, "t");
+            assert_eq!(record.status, SessionStatus::WaitingOnMessages);
+            assert_eq!(record.touched_paths, ["a.rs"]);
+            assert_eq!(record.note, note);
+            assert!(note.unwrap().as_str().contains("waiting_on_messages"));
+        }
+
+        #[test]
+        fn every_exit_from_waiting_closes_the_session() {
+            for to in [
+                SessionStatus::Completed,
+                SessionStatus::Failed,
+                SessionStatus::Cancelled,
+            ] {
+                let (store, registry) = waiting();
+                registry.finish(&sid("t"), to, Some("done"), at(7)).unwrap();
+                let record = stored(&store, "t");
+                assert_eq!(record.status, to);
+                assert_eq!(record.ended_at, Some(at(7)));
+                assert_eq!(record.result_summary.as_deref(), Some("done"));
+                assert!(!registry.tracks(&sid("t")));
+            }
+            let (store, registry) = waiting();
+            registry.cancel(&sid("t"), at(8)).unwrap();
+            assert_eq!(stored(&store, "t").status, SessionStatus::Cancelled);
+            let (store, registry) = waiting();
+            assert!(registry.abandon(&sid("t"), at(9)).unwrap());
+            let record = stored(&store, "t");
+            assert_eq!(record.status, SessionStatus::Failed);
+            assert_eq!(record.ended_at, Some(at(9)));
+            assert!(!registry.abandon(&sid("t"), at(10)).unwrap());
+        }
+
+        #[test]
+        fn reregistering_a_waiting_record_resets_it_to_pending_keeping_created_at() {
+            let (store, registry) = waiting();
+            registry.reregister(&binding("t"), "again", at(20)).unwrap();
+            let record = stored(&store, "t");
+            assert_eq!(record.status, SessionStatus::Pending);
+            assert_eq!(record.created_at, at(0));
+            assert_eq!(record.last_activity, at(20));
+            assert_eq!(record.ended_at, None);
+        }
+
+        fn raced(
+            to: SessionStatus,
+            seed: SessionStatus,
+            end: SessionStatus,
+        ) -> (Arc<InMemorySessionStore>, Result<(), RegistryError>) {
+            let inner = Arc::new(InMemorySessionStore::new());
+            let other = Arc::new(SessionRegistry::new(inner.clone()));
+            other.register(&binding("t"), "s", at(0)).unwrap();
+            let running = SessionStatus::Running;
+            other.set_status(&sid("t"), running, at(1)).unwrap();
+            if seed == SessionStatus::WaitingOnMessages {
+                other.set_status(&sid("t"), seed, at(2)).unwrap();
+            }
+            let finisher = other.clone();
+            let slipped_in: Box<dyn FnOnce() + Send> = Box::new(move || {
+                finisher.finish(&sid("t"), end, None, at(3)).unwrap();
+            });
+            let hook = Mutex::new(Some(slipped_in));
+            let racing = Arc::new(Racing {
+                inner: inner.clone(),
+                slipped_in: hook,
+            });
+            let result = SessionRegistry::new(racing).set_status(&sid("t"), to, at(5));
+            (inner, result)
+        }
+
+        #[test]
+        fn a_leave_racing_a_close_never_resurrects_the_session() {
+            let waiting = SessionStatus::WaitingOnMessages;
+            for end in [
+                SessionStatus::Cancelled,
+                SessionStatus::Completed,
+                SessionStatus::Failed,
+            ] {
+                let (inner, result) = raced(SessionStatus::Running, waiting, end);
+                assert!(
+                    matches!(result, Err(RegistryError::IllegalTransition { .. })),
+                    "{end:?}"
+                );
+                let record = stored(&inner, "t");
+                assert_eq!(record.status, end);
+                assert_eq!(record.ended_at, Some(at(3)));
+                assert_eq!(record.last_activity, at(3));
+            }
+        }
+
+        #[test]
+        fn an_enter_racing_a_close_never_resurrects_the_session() {
+            let running = SessionStatus::Running;
+            let end = SessionStatus::Cancelled;
+            let (inner, result) = raced(SessionStatus::WaitingOnMessages, running, end);
+            assert!(matches!(
+                result,
+                Err(RegistryError::IllegalTransition { .. })
+            ));
+            let record = stored(&inner, "t");
+            assert_eq!(record.status, end);
+            assert_eq!(record.ended_at, Some(at(3)));
+        }
+
+        #[test]
+        fn a_leave_that_wins_the_race_lets_the_later_cancel_close_the_record() {
+            let (store, registry) = waiting();
+            registry
+                .set_status(&sid("t"), SessionStatus::Running, at(4))
+                .unwrap();
+            registry.cancel(&sid("t"), at(5)).unwrap();
+            let record = stored(&store, "t");
+            assert_eq!(record.status, SessionStatus::Cancelled);
+            assert_eq!(record.ended_at, Some(at(5)));
+        }
+
+        #[test]
+        fn store_failures_leave_a_waiting_record_waiting_and_tracked() {
+            let store = Flaky::new();
+            let registry = SessionRegistry::new(store.clone());
+            registry.register(&binding("t"), "s", at(0)).unwrap();
+            let running = SessionStatus::Running;
+            registry.set_status(&sid("t"), running, at(1)).unwrap();
+            store.writes.store(true, Ordering::SeqCst);
+            let to = SessionStatus::WaitingOnMessages;
+            let enter = registry.set_status(&sid("t"), to, at(2));
+            assert!(matches!(enter, Err(RegistryError::Store(_))));
+            assert_eq!(store.inner.get(sid("t")).unwrap().unwrap().status, running);
+            store.writes.store(false, Ordering::SeqCst);
+            registry.set_status(&sid("t"), to, at(2)).unwrap();
+            let before = store.inner.get(sid("t")).unwrap().unwrap();
+            for flag in [&store.writes, &store.reads] {
+                flag.store(true, Ordering::SeqCst);
+                let leave = registry.set_status(&sid("t"), running, at(3));
+                assert!(matches!(leave, Err(RegistryError::Store(_))));
+                let end = registry.finish(&sid("t"), SessionStatus::Failed, None, at(3));
+                assert!(matches!(end, Err(RegistryError::Store(_))));
+                assert!(registry.abandon(&sid("t"), at(3)).is_err());
+                flag.store(false, Ordering::SeqCst);
+                assert_eq!(store.inner.get(sid("t")).unwrap().unwrap(), before);
+                assert!(registry.tracks(&sid("t")));
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        enum Step {
+            Register(u8),
+            Reregister(u8),
+            Move(u8, u8),
+            Abandon(u8),
+            Touch(u8),
+            Note(u8),
+        }
+
+        fn steps() -> impl Strategy<Value = Vec<Step>> {
+            let one = prop_oneof![
+                (0u8..3).prop_map(Step::Register),
+                (0u8..3).prop_map(Step::Reregister),
+                (0u8..3, 0u8..6).prop_map(|(n, to)| Step::Move(n, to)),
+                (0u8..3, 0u8..6).prop_map(|(n, to)| Step::Move(n, to)),
+                (0u8..3).prop_map(Step::Abandon),
+                (0u8..3).prop_map(Step::Touch),
+                (0u8..3).prop_map(Step::Note),
+            ];
+            proptest::collection::vec(one, 1..60)
+        }
+
+        proptest! {
+            #[test]
+            fn random_sequences_obey_the_edge_table_and_never_revive_a_closed_session(
+                steps in steps()
+            ) {
+                let (store, registry) = registry();
+                let mut model: [Option<SessionStatus>; 3] = [None, None, None];
+                let mut closed = [false; 3];
+                let mut created = [at(0); 3];
+                let mut clock = 0i64;
+                for step in steps {
+                    clock += 1;
+                    match step {
+                        Step::Register(n) => {
+                            let name = format!("s{n}");
+                            let result = registry.register(&binding(&name), "go", at(clock));
+                            prop_assert_eq!(result.is_ok(), model[n as usize].is_none());
+                            if result.is_ok() {
+                                model[n as usize] = Some(SessionStatus::Pending);
+                                created[n as usize] = at(clock);
+                            }
+                        }
+                        Step::Reregister(n) => {
+                            let name = format!("s{n}");
+                            let result = registry.reregister(&binding(&name), "go", at(clock));
+                            let open = model[n as usize].is_none_or(|s| s.is_active());
+                            prop_assert_eq!(result.is_ok(), open);
+                            if open {
+                                if model[n as usize].is_none() {
+                                    created[n as usize] = at(clock);
+                                }
+                                model[n as usize] = Some(SessionStatus::Pending);
+                            }
+                        }
+                        Step::Move(n, code) => {
+                            let name = format!("s{n}");
+                            let to = STATUSES[code as usize];
+                            let result = mv(&registry, &name, to, clock);
+                            let allowed = model[n as usize].is_some_and(|from| legal(from, to));
+                            prop_assert_eq!(result.is_ok(), allowed);
+                            if allowed {
+                                model[n as usize] = Some(to);
+                            }
+                        }
+                        Step::Abandon(n) => {
+                            let name = format!("s{n}");
+                            let result = registry.abandon(&sid(&name), at(clock));
+                            let open = model[n as usize].is_some_and(|s| s.is_active());
+                            prop_assert_eq!(result.unwrap(), open);
+                            if open {
+                                model[n as usize] = Some(SessionStatus::Failed);
+                            }
+                        }
+                        Step::Touch(n) => {
+                            let name = format!("s{n}");
+                            let paths = ["a.rs".to_string()];
+                            let result = registry.record_touched(&sid(&name), &paths, at(clock));
+                            let open = model[n as usize].is_some_and(|s| s.is_active());
+                            prop_assert_eq!(result.is_ok(), open);
+                        }
+                        Step::Note(n) => {
+                            let name = format!("s{n}");
+                            let result = registry.set_note(&sid(&name), "hmm", at(clock));
+                            let open = model[n as usize].is_some_and(|s| s.is_active());
+                            prop_assert_eq!(result.is_ok(), open);
+                        }
+                    }
+                    for (n, expected) in model.iter().enumerate() {
+                        let name = format!("s{n}");
+                        let found = store.get(sid(&name)).unwrap();
+                        let Some(status) = expected else {
+                            prop_assert!(found.is_none());
+                            continue;
+                        };
+                        let record = found.unwrap();
+                        prop_assert_eq!(record.status, *status);
+                        prop_assert_eq!(record.ended_at.is_some(), !status.is_active());
+                        prop_assert_eq!(registry.tracks(&sid(&name)), status.is_active());
+                        prop_assert_eq!(record.created_at, created[n]);
+                        closed[n] = closed[n] || !status.is_active();
+                        prop_assert!(!(closed[n] && record.status.is_active()));
+                    }
+                }
+            }
         }
     }
 }
