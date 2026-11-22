@@ -10,7 +10,8 @@ mod sessions;
 
 pub use activity::{
     activity_path_from, ActivityEntry, ActivityStore, Direction, InMemoryActivityStore,
-    JsonlActivityStore, ACTIVITY_PATH_ENV, ENTRY_OVERHEAD,
+    JsonlActivityStore, ACTIVITY_PATH_ENV, ACTIVITY_PER_SESSION_MAX, ACTIVITY_TOTAL_BYTES_MAX,
+    ENTRY_OVERHEAD,
 };
 pub use activity_write::{
     ArgsSummary, MAX_ARGS_CHARS, MAX_SUBJECT_CHARS, MAX_TOOL_CHARS, MAX_TURN_BYTES,
