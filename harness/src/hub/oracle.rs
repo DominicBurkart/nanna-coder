@@ -3,9 +3,25 @@ use super::message::MessageId;
 use super::store::{MessageStore, SessionStore};
 use crate::action_auditor::IdentifierOracle;
 use crate::task::TaskId;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+fn git_env_names(vars: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    vars.filter(|name| name.to_string_lossy().starts_with("GIT_"))
+        .collect()
+}
+
+fn process_git_env_names() -> Vec<OsString> {
+    git_env_names(std::env::vars_os().map(|(name, _)| name))
+}
+
+fn scrub_git_env(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        command.env_remove(name);
+    }
+}
 
 /// Asks whether a git object exists in a repository directory.
 pub trait GitRunner: Send + Sync {
@@ -25,11 +41,7 @@ pub struct SystemGit;
 impl GitRunner for SystemGit {
     fn object_exists(&self, dir: &Path, hex: &str) -> bool {
         let mut git = Command::new("git");
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("GIT_") {
-                git.env_remove(&name);
-            }
-        }
+        scrub_git_env(&mut git, process_git_env_names());
         git.arg("-C").arg(dir).args(["cat-file", "-e", hex]);
         git.stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -210,6 +222,52 @@ mod tests {
         assert_eq!(&*calls, &[(PathBuf::from("/ws/own"), sha.to_string())]);
     }
 
+    fn names(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_names_with_the_git_prefix_are_selected_for_scrubbing() {
+        let all = names(&[
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_",
+            "GITHUB_TOKEN",
+            "PATH",
+            "",
+            "xGIT_DIR",
+            "git_dir",
+        ]);
+        let picked = git_env_names(all.into_iter());
+        assert_eq!(picked, names(&["GIT_DIR", "GIT_INDEX_FILE", "GIT_"]));
+        assert!(git_env_names(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn scrubbing_marks_exactly_the_given_names_removed() {
+        let mut command = Command::new("git");
+        command.env("KEEP", "1");
+        scrub_git_env(&mut command, names(&["GIT_DIR", "GIT_INDEX_FILE"]));
+        let envs: Vec<(OsString, Option<OsString>)> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect();
+        assert!(envs.contains(&(OsString::from("GIT_DIR"), None)));
+        assert!(envs.contains(&(OsString::from("GIT_INDEX_FILE"), None)));
+        assert!(envs.contains(&(OsString::from("KEEP"), Some(OsString::from("1")))));
+        assert_eq!(envs.len(), 3);
+        let mut untouched = Command::new("git");
+        scrub_git_env(&mut untouched, Vec::new());
+        assert_eq!(untouched.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn the_process_names_helper_selects_only_git_prefixed_names() {
+        assert!(process_git_env_names()
+            .iter()
+            .all(|name| name.to_string_lossy().starts_with("GIT_")));
+    }
+
     #[test]
     fn a_negative_answer_from_git_is_not_a_vouch() {
         let runner = Arc::new(Recording {
@@ -222,11 +280,7 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) -> bool {
         let mut command = Command::new("git");
-        for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("GIT_") {
-                command.env_remove(name);
-            }
-        }
+        scrub_git_env(&mut command, process_git_env_names());
         command
             .arg("-C")
             .arg(dir)
