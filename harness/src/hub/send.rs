@@ -60,12 +60,12 @@ impl QuarantineSink for NoopQuarantineSink {
 
 /// The hub's agent-facing send path.
 pub struct MessageHub {
-    sessions: Arc<dyn SessionStore>,
-    messages: Arc<dyn MessageStore>,
-    auditors: Arc<dyn AuditorProvider>,
-    sink: Arc<dyn QuarantineSink>,
-    clock: Arc<dyn Clock>,
-    limits: HubLimits,
+    pub(super) sessions: Arc<dyn SessionStore>,
+    pub(super) messages: Arc<dyn MessageStore>,
+    pub(super) auditors: Arc<dyn AuditorProvider>,
+    pub(super) sink: Arc<dyn QuarantineSink>,
+    pub(super) clock: Arc<dyn Clock>,
+    pub(super) limits: HubLimits,
     windows: Mutex<Windows>,
 }
 
@@ -100,7 +100,7 @@ struct Draft {
     body: String,
 }
 
-fn quarantined_text(text: &str, codes: &[ReasonCode]) -> String {
+pub(super) fn quarantined_text(text: &str, codes: &[ReasonCode]) -> String {
     if codes.contains(&ReasonCode::SecretLeak) {
         return format!(
             "[withheld: {}; {} bytes]",
@@ -120,7 +120,7 @@ fn quarantined_text(text: &str, codes: &[ReasonCode]) -> String {
     }
 }
 
-fn to_thread(message: &StoredMessage) -> ThreadMessage {
+pub(super) fn to_thread(message: &StoredMessage) -> ThreadMessage {
     let (from, from_identity) = (message.from.clone(), message.from_identity.clone());
     let (subject, body) = (message.subject.clone(), message.body.clone());
     ThreadMessage {
@@ -131,7 +131,7 @@ fn to_thread(message: &StoredMessage) -> ThreadMessage {
     }
 }
 
-fn scope_of(rec: &SessionRecord) -> RecipientScope {
+pub(super) fn scope_of(rec: &SessionRecord) -> RecipientScope {
     RecipientScope {
         session: rec.id.clone(),
         identity: rec.identity.clone(),
@@ -142,11 +142,11 @@ fn scope_of(rec: &SessionRecord) -> RecipientScope {
     }
 }
 
-fn hash_u64(subject: &str, body: &str) -> u64 {
+pub(super) fn hash_u64(subject: &str, body: &str) -> u64 {
     u64::from_str_radix(&message_content_hash(subject, body), 16).unwrap_or_default()
 }
 
-fn codes_of(verdict: &MessageVerdict) -> Vec<ReasonCode> {
+pub(super) fn codes_of(verdict: &MessageVerdict) -> Vec<ReasonCode> {
     verdict.reasons().iter().map(|reason| reason.code).collect()
 }
 
@@ -198,7 +198,11 @@ impl MessageHub {
         Ok(())
     }
 
-    fn parent_of(&self, sender: &SessionBinding, id: MessageId) -> Result<StoredMessage, HubError> {
+    pub(super) fn parent_of(
+        &self,
+        sender: &SessionBinding,
+        id: MessageId,
+    ) -> Result<StoredMessage, HubError> {
         let found = self.messages.get(id)?.ok_or(HubError::NotVisible)?;
         let mine = found.to == *sender.session() || found.from == *sender.session();
         if found.root != *sender.lineage().root() || !mine {
@@ -207,7 +211,10 @@ impl MessageHub {
         Ok(found)
     }
 
-    fn thread_of(&self, parent: &Option<StoredMessage>) -> Result<Vec<ThreadMessage>, HubError> {
+    pub(super) fn thread_of(
+        &self,
+        parent: &Option<StoredMessage>,
+    ) -> Result<Vec<ThreadMessage>, HubError> {
         let mut thread = Vec::new();
         let mut next = parent.clone();
         while let Some(message) = next.take() {
