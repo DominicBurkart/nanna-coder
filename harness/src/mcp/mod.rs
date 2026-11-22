@@ -201,7 +201,7 @@ impl NannaMcpServer {
         let mut tools = serde_json::json!([
             {
                 "name": "assign_task",
-                "description": "Submit a coding task to be executed asynchronously in an isolated git worktree. Clients that support the MCP Tasks extension may include a `task` field and retrieve the outcome via tasks/result. Any other client can call it plainly: it returns JSON `{\"task_id\", \"status\", \"next\"}` immediately, and the outcome is read by calling get_task_status or get_task_result with that `task_id`. The call only registers the task: the spawn audit runs afterwards, so a fresh task reports status working (\"Auditing the request.\") and a refused request later reads as failed with the refusal reason; nothing executes before the audit allows it. Pass `client_ref` to make retries safe: a repeated call with the same identity and client_ref returns the existing task instead of creating another.",
+                "description": "Delegate ONE coding change to a nanna agent. It works in an isolated copy of the repository and hands back the changed files and a patch; nanna does not push or open pull requests. Good: one issue or bug, a few files, the expected tests named in the description. Bad: a multi-step project, vague 'improve everything', or anything that needs pushing or deploying. Agents are slow: expect minutes to an hour. Flow: (1) if unsure, call list_repos and list_identities; (2) call assign_task, which only registers the task and returns {task_id, status} immediately; tell the user the task_id; (3) do not poll in a loop: call get_task_status when the user asks or after several minutes; (4) when it is completed call get_task_result, then get_task_changes to get file contents for a branch or pull request. Requests nanna can refuse on the rules (unknown identity, repository outside the identity's scope, effect above its ceiling) come back immediately as an error result with a `fix`; the model audit runs after the reply, so a task can still end failed later with its reason in get_task_status. Leave requested_effect unset. If a call times out, repeat it with the same client_ref: the same identity and client_ref return the existing task instead of creating another. Clients that support the MCP Tasks extension may pass a `task` field and read tasks/result.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -250,7 +250,7 @@ impl NannaMcpServer {
             },
             {
                 "name": "get_task_status",
-                "description": "Return the status of a task created by assign_task (working, completed, failed or cancelled) without waiting. Takes the `task_id` returned by assign_task.",
+                "description": "Check on a task from assign_task without waiting. Returns status (working, completed, failed or cancelled), a progress message, identity and repo; for failed tasks also reason_code, message, retryable and fix; tools_unavailable names tools the identity's card asked for that this server could not provide. Takes the `task_id` returned by assign_task.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -261,7 +261,7 @@ impl NannaMcpServer {
             },
             {
                 "name": "get_task_result",
-                "description": "Return the outcome of a task created by assign_task. Never blocks: while the task is still working it returns its status instead, so call it again later. Takes the `task_id` returned by assign_task.",
+                "description": "Get the outcome of a task from assign_task: summary, files_modified, suggested_branch, suggested_pr_title and suggested_pr_body, plus the status fields of get_task_status. It never waits: while the task is still working it returns the status instead, so call it again later. Pass detail \"full\" for the whole payload (patches, tool calls, audit entries); use get_task_changes for file contents. Takes the `task_id` returned by assign_task.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
