@@ -204,6 +204,34 @@ pub(super) fn set_note_replaces<S: SessionStore>(s: &S) {
     ));
 }
 
+pub(super) fn update_replaces_declines_and_reports_a_missing_id<S: SessionStore>(s: &S) {
+    let r = root(1);
+    s.upsert(session("a", &r, SessionStatus::Running, 0, 0))
+        .unwrap();
+    s.update(
+        sid("a"),
+        Box::new(|mut record| {
+            record.subtask = "changed".into();
+            Some(record)
+        }),
+    )
+    .unwrap();
+    let changed = s.get(sid("a")).unwrap().unwrap();
+    assert_eq!(changed.subtask, "changed");
+    s.update(sid("a"), Box::new(|_| None)).unwrap();
+    assert_eq!(s.get(sid("a")).unwrap().unwrap(), changed);
+    let seen = std::cell::Cell::new(false);
+    let missing = s.update(
+        sid("missing"),
+        Box::new(|_| {
+            seen.set(true);
+            None
+        }),
+    );
+    assert!(matches!(missing, Err(StoreError::NotFound)));
+    assert!(!seen.get());
+}
+
 pub(super) fn prune_removes_only_finished_idle_roots<S: SessionStore>(s: &S) {
     let (old, busy, fresh) = (root(1), root(2), root(3));
     s.upsert(session("old1", &old, SessionStatus::Completed, 0, 10))
@@ -488,6 +516,7 @@ macro_rules! session_contract_tests {
             in_root_filters_and_orders,
             set_status_tracks_activity_and_end,
             set_note_replaces,
+            update_replaces_declines_and_reports_a_missing_id,
             prune_removes_only_finished_idle_roots,
             prune_keeps_a_root_exactly_at_the_ttl
         );

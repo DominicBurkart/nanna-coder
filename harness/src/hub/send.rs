@@ -173,9 +173,9 @@ impl MessageHub {
         auditors: Arc<dyn AuditorProvider>,
         clock: Arc<dyn Clock>,
         limits: HubLimits,
+        registry: Arc<SessionRegistry>,
     ) -> Self {
         let sink: Arc<dyn QuarantineSink> = Arc::new(NoopQuarantineSink);
-        let registry = Arc::new(SessionRegistry::new(sessions.clone()));
         Self {
             sessions,
             messages,
@@ -188,16 +188,10 @@ impl MessageHub {
         }
     }
 
-    /// Write notes through `registry`. Production passes the instance the `TaskManager` holds, so
-    /// a note and a status change never race on two read-modify-write locks.
-    pub fn with_registry(mut self, registry: Arc<SessionRegistry>) -> Self {
-        self.registry = registry;
-        self
-    }
-
     /// Set the caller's own note. The session comes from `caller` only. A blank note clears the
     /// note (`Ok(None)`); anything else is reviewed and stored as a bounded summary, which is
     /// returned. A missing or foreign session is `NotVisible`, a finished one `RecipientInactive`.
+    /// Every accepted-size call counts against the same per-sender and per-root windows as a send.
     pub fn set_note(
         &self,
         caller: &SessionBinding,
@@ -210,9 +204,10 @@ impl MessageHub {
             });
         }
         let at = self.clock.now();
-        self.registry
-            .set_note_for(caller, note, at)
-            .map_err(note_error)
+        let (session, root) = (caller.session(), caller.lineage().root());
+        self.windows().admit(at, session, root, &self.limits)?;
+        let stored = self.registry.set_note_for(caller, note, at);
+        stored.map_err(note_error)
     }
 
     /// Send quarantine events to `sink`.
@@ -544,7 +539,7 @@ mod tests {
     struct World {
         sessions: Arc<InMemorySessionStore>,
         messages: Arc<dyn MessageStore>,
-        registry: SessionRegistry,
+        registry: Arc<SessionRegistry>,
         clock: SimulatedClock,
         root: RootId,
     }
@@ -552,7 +547,7 @@ mod tests {
     impl World {
         fn new(messages: Arc<dyn MessageStore>) -> Self {
             let sessions = Arc::new(InMemorySessionStore::new());
-            let registry = SessionRegistry::new(sessions.clone());
+            let registry = Arc::new(SessionRegistry::new(sessions.clone()));
             let root = RootId::mcp(Uuid::from_u128(1));
             Self {
                 sessions,
@@ -603,6 +598,7 @@ mod tests {
                 auditors,
                 Arc::new(self.clock.clone()),
                 limits,
+                self.registry.clone(),
             )
         }
 
@@ -1774,8 +1770,8 @@ mod tests {
             Arc::new(Arc::new(RuleMessageAuditor::new()) as Arc<dyn MessageAuditor>),
             Arc::new(SimulatedClock::new(start())),
             HubLimits::default(),
-        )
-        .with_registry(registry);
+            registry,
+        );
         for (text, marker, needle) in cases {
             let shown = hub.set_note(&binding, &text).unwrap().unwrap();
             assert_eq!(shown.as_str(), format!("{WHO}{marker}"), "{marker}");
@@ -1804,8 +1800,8 @@ mod tests {
             Arc::new(Arc::new(RuleMessageAuditor::new()) as Arc<dyn MessageAuditor>),
             Arc::new(SimulatedClock::new(start())),
             HubLimits::default(),
-        )
-        .with_registry(registry);
+            registry,
+        );
         hub.set_note(&binding, "old").unwrap();
         let before = flaky.inner.get(binding.session().clone()).unwrap().unwrap();
         for writes in [true, false] {
@@ -1830,7 +1826,15 @@ mod tests {
         let other = Arc::new(InMemorySessionStore::new());
         let registry = Arc::new(SessionRegistry::new(other.clone()));
         registry.register(&a, "elsewhere", start()).unwrap();
-        let hub = world.hub(Scripted::deliver()).with_registry(registry);
+        let shared: Arc<dyn MessageAuditor> = Scripted::deliver();
+        let hub = MessageHub::new(
+            world.sessions.clone(),
+            world.messages.clone(),
+            Arc::new(shared),
+            Arc::new(world.clock.clone()),
+            HubLimits::default(),
+            registry,
+        );
         hub.set_note(&a, "routed").unwrap();
         assert_eq!(
             other
@@ -1877,5 +1881,56 @@ mod tests {
             }
             prop_assert!(note_of(&world, &a).is_none_or(|n| !n.contains(&planted)));
         }
+    }
+
+    #[tokio::test]
+    async fn notes_count_against_the_sender_window_and_share_it_with_sends() {
+        let world = World::memory();
+        let (a, b) = (
+            world.bind("a", None, MessageReach::Root),
+            world.bind("b", None, MessageReach::Root),
+        );
+        let hub = world.hub(Scripted::deliver());
+        for n in 0..29 {
+            hub.set_note(&a, &format!("step {n}")).unwrap();
+        }
+        hub.send(&a, req(&b, "hi")).await.unwrap();
+        let before = note_of(&world, &a);
+        let err = hub.set_note(&a, "one too many").unwrap_err();
+        assert!(
+            matches!(err, HubError::RateLimited(wait) if wait == std::time::Duration::from_secs(600)),
+            "{err:?}"
+        );
+        assert_eq!(note_of(&world, &a), before);
+        let sent = hub.send(&a, req(&b, "hi")).await.unwrap_err();
+        assert_eq!(format!("{err}"), format!("{sent}"));
+        world.clock.advance(Span::seconds(600));
+        hub.set_note(&a, "later").unwrap();
+        assert_eq!(note_of(&world, &a), Some(format!("{WHO}later")));
+        assert!(hub.set_note(&b, "other sender").is_ok());
+    }
+
+    #[test]
+    fn notes_count_against_the_per_root_cap_and_an_oversized_note_costs_nothing() {
+        let world = World::memory();
+        let limits = HubLimits {
+            per_root_per_hour: 3,
+            ..HubLimits::default()
+        };
+        let shared: Arc<dyn MessageAuditor> = Scripted::deliver();
+        let hub = world.hub_with(Arc::new(shared), limits);
+        let spawned: Vec<SessionBinding> = (0..4)
+            .map(|n| world.bind(&format!("s{n}"), None, MessageReach::None))
+            .collect();
+        assert!(hub.set_note(&spawned[0], &"x".repeat(180)).is_err());
+        for who in &spawned[..3] {
+            hub.set_note(who, "ok").unwrap();
+        }
+        let err = hub.set_note(&spawned[3], "ok").unwrap_err();
+        assert!(matches!(err, HubError::RateLimited(_)), "{err:?}");
+        assert_eq!(note_of(&world, &spawned[3]), None);
+        let other_root = RootId::mcp(Uuid::from_u128(9));
+        let elsewhere = world.bind_in(&other_root, "z", None, MessageReach::None);
+        assert!(hub.set_note(&elsewhere, "ok").is_ok());
     }
 }

@@ -2647,6 +2647,14 @@ mod tests {
             self.1.pass()?;
             self.0.in_root(root)
         }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            self.1.pass()?;
+            self.0.update(id, change)
+        }
         fn set_status(
             &self,
             id: SessionId,

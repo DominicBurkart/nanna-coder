@@ -196,8 +196,23 @@ impl SessionRegistry {
         id: &SessionId,
         change: impl FnOnce(SessionRecord) -> Result<SessionRecord, RegistryError>,
     ) -> Result<(), RegistryError> {
-        let record = self.store.get(id.clone())?.ok_or(RegistryError::Unknown)?;
-        Ok(self.store.upsert(change(record)?)?)
+        let mut refused = None;
+        let applied = self.store.update(
+            id.clone(),
+            Box::new(|record| match change(record) {
+                Ok(next) => Some(next),
+                Err(error) => {
+                    refused = Some(error);
+                    None
+                }
+            }),
+        );
+        match (applied, refused) {
+            (Err(StoreError::NotFound), _) => Err(RegistryError::Unknown),
+            (Err(other), _) => Err(other.into()),
+            (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        }
     }
 
     /// Move a `Pending` session to `Running`.
@@ -215,11 +230,15 @@ impl SessionRegistry {
             }
             SessionStatus::Pending | SessionStatus::Running => {}
         }
-        let record = self.store.get(id.clone())?.ok_or(RegistryError::Unknown)?;
-        if record.status != SessionStatus::Pending || to != SessionStatus::Running {
-            return Err(illegal(record.status, to));
-        }
-        Ok(self.store.set_status(id.clone(), to, at)?)
+        self.edit(id, |mut record| {
+            if record.status != SessionStatus::Pending || to != SessionStatus::Running {
+                return Err(illegal(record.status, to));
+            }
+            record.status = to;
+            record.last_activity = at;
+            record.ended_at = None;
+            Ok(record)
+        })
     }
 
     /// End the session in the terminal status `to`. `Pending` may only fail or be cancelled; the
@@ -397,6 +416,15 @@ pub(crate) mod test_support {
         fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
             self.inner.in_root(root)
         }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            Self::gate(&self.reads)?;
+            Self::gate(&self.writes)?;
+            self.inner.update(id, change)
+        }
         fn set_status(
             &self,
             id: SessionId,
@@ -421,7 +449,7 @@ mod tests {
     use super::test_support::Flaky;
     use super::*;
     use crate::hub::lineage::{Lineage, RootId};
-    use crate::hub::store::InMemorySessionStore;
+    use crate::hub::store::{InMemorySessionStore, Retention};
     use crate::task::TaskId;
     use chrono::TimeZone;
     use proptest::prelude::*;
@@ -1387,5 +1415,97 @@ mod tests {
         assert!(matches!(err, RegistryError::Store(_)), "{err:?}");
         flaky.reads.store(false, Ordering::SeqCst);
         assert_eq!(flaky.inner.get(sid("t")).unwrap().unwrap(), before);
+    }
+
+    struct Racing {
+        inner: Arc<InMemorySessionStore>,
+        slipped_in: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl Racing {
+        fn fire(&self) {
+            let hook = self.slipped_in.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl SessionStore for Racing {
+        fn upsert(&self, rec: SessionRecord) -> Result<(), StoreError> {
+            self.inner.upsert(rec)
+        }
+        fn get(&self, id: SessionId) -> Result<Option<SessionRecord>, StoreError> {
+            let read = self.inner.get(id);
+            self.fire();
+            read
+        }
+        fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
+            self.inner.in_root(root)
+        }
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            self.inner.update(id, change)
+        }
+        fn set_status(
+            &self,
+            id: SessionId,
+            s: SessionStatus,
+            at: DateTime<Utc>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_status(id, s, at)
+        }
+        fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError> {
+            self.inner.set_note(id, note)
+        }
+        fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
+            self.inner.prune(now, policy)
+        }
+    }
+
+    #[test]
+    fn a_second_registry_finishing_the_session_mid_write_is_never_undone() {
+        type Op = fn(&SessionRegistry);
+        let ops: [(&str, Op); 3] = [
+            ("note", |r| {
+                let _ = r.set_note(&sid("t"), "late", at(5));
+            }),
+            ("touched", |r| {
+                let _ = r.record_touched(&sid("t"), &["a.rs".into()], at(5));
+            }),
+            ("status", |r| {
+                let _ = r.set_status(&sid("t"), SessionStatus::Running, at(5));
+            }),
+        ];
+        for (name, op) in ops {
+            let inner = Arc::new(InMemorySessionStore::new());
+            let other = Arc::new(SessionRegistry::new(inner.clone()));
+            other.register(&binding("t"), "do it", at(0)).unwrap();
+            if name != "status" {
+                other
+                    .set_status(&sid("t"), SessionStatus::Running, at(1))
+                    .unwrap();
+            }
+            let end = match name {
+                "status" => SessionStatus::Cancelled,
+                _ => SessionStatus::Completed,
+            };
+            let finisher = other.clone();
+            let slipped_in: Box<dyn FnOnce() + Send> = Box::new(move || {
+                finisher.finish(&sid("t"), end, None, at(3)).unwrap();
+            });
+            let racing = Arc::new(Racing {
+                inner: inner.clone(),
+                slipped_in: Mutex::new(Some(slipped_in)),
+            });
+            op(&SessionRegistry::new(racing.clone()));
+            racing.fire();
+            let record = stored(&inner, "t");
+            assert_eq!(record.status, end, "{name}");
+            assert_eq!(record.ended_at, Some(at(3)), "{name}");
+        }
     }
 }
