@@ -312,6 +312,7 @@ pub fn compact_result(inputs: &ResultInputs<'_>) -> Value {
     match &task.status {
         TaskStatus::Completed { result, .. } => {
             let (files, total) = compact_files(&result.files_modified);
+            let no_changes = result.files_modified.is_empty();
             let text = bounded(|limit| {
                 let (summary, summary_truncated) = truncate_chars(&result.result_summary, limit);
                 let mut value = json!({
@@ -324,10 +325,15 @@ pub fn compact_result(inputs: &ResultInputs<'_>) -> Value {
                     "max_effect_class": result.max_effect_class(),
                     "suggested_pr_title": suggested_pr_title(&task.description),
                     "suggested_pr_body": suggested_pr_body(&summary, closes),
-                    "next": format!(
-                        "To open the pull request, use your own GitHub tools: 1. call get_task_changes for the files; 2. create branch {} from the repository's default branch; 3. write each file on it (remove the deleted ones); 4. open a draft pull request using suggested_pr_title and suggested_pr_body; 5. give the user the PR link. Nanna cannot push or open pull requests. If you have no GitHub tool connected, show the user the files, the title and the body, and say a GitHub connection is needed.",
-                        format!("nanna/{}", task.id.0)
-                    ),
+                    "no_changes": no_changes,
+                    "next": if no_changes {
+                        "The task finished without changing any files, so it did not implement anything and there is no pull request to open. Read result_summary to see what it did, then either assign a more specific task (name the file, the function and the exact change) or make the change yourself.".to_string()
+                    } else {
+                        format!(
+                            "To open the pull request, use your own GitHub tools: 1. call get_task_changes for the files; 2. create branch nanna/{} from the repository's default branch; 3. write each file on it (remove the deleted ones); 4. open a draft pull request using suggested_pr_title and suggested_pr_body; 5. give the user the PR link. Nanna cannot push or open pull requests. If you have no GitHub tool connected, show the user the files, the title and the body, and say a GitHub connection is needed.",
+                            task.id.0
+                        )
+                    },
                 });
                 build_common(&mut value);
                 value
@@ -762,6 +768,33 @@ mod tests {
         );
         assert!(next.contains("no GitHub tool"), "{next}");
         assert!(next.len() < 900, "{}", next.len());
+    }
+
+    #[tokio::test]
+    async fn a_completed_result_without_file_changes_is_not_presented_as_an_implementation() {
+        let server = server();
+        let mut result = big_result();
+        result.files_modified = vec![];
+        result.changes_patch = None;
+        result.format_patch = None;
+        let id = finished(&server, completed(result), None).await;
+        let view = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["no_changes"], true);
+        let next = view["next"].as_str().unwrap();
+        assert!(next.contains("without changing any files"), "{next}");
+        assert!(next.contains("no pull request to open"), "{next}");
+        assert!(!next.contains("create branch"), "{next}");
+        let with_changes = finished(&server, completed(big_result()), None).await;
+        let view = body(
+            &fetch(
+                &server,
+                "get_task_result",
+                json!({"task_id": with_changes.0}),
+            )
+            .await,
+        );
+        assert_eq!(view["no_changes"], false);
     }
 
     #[tokio::test]
