@@ -93,10 +93,9 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
         if let Some(last) = node.path.segments.last() {
-            *self
-                .struct_literals
-                .entry(last.ident.to_string())
-                .or_default() += 1;
+            let name = last.ident.to_string();
+            let count = self.struct_literals.entry(name).or_default();
+            *count += 1;
         }
         syn::visit::visit_expr_struct(self, node);
     }

@@ -895,6 +895,7 @@ mod tests {
         assert!(total <= 16 * 1024);
         assert_eq!(SESSION_BUDGET_BYTES, 16 * 1024);
         assert_eq!(VIEW_BUDGET_BYTES, 64 * 1024);
+        assert_eq!(MAX_TERMS_CHARS, 200);
     }
 
     #[test]
@@ -1493,9 +1494,9 @@ mod tests {
     #[test]
     fn terms_are_required_text_of_at_most_two_hundred_characters() {
         let view = frozen(vec![running("a")]);
-        let longest = "\u{e9}".repeat(MAX_TERMS_CHARS);
+        let longest = "\u{e9}".repeat(200);
         assert!(index_search(&view, &json!({"terms": longest})).is_ok());
-        let too_long = "x".repeat(MAX_TERMS_CHARS + 1);
+        let too_long = "x".repeat(201);
         for bad in [
             json!({"terms": too_long}),
             json!({}),
