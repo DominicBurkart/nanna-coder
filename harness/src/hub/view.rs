@@ -1194,6 +1194,7 @@ mod tests {
             max_effect: EffectClass::Workspace,
             tools: vec!["read_file".into()],
             write_paths: vec!["src".into()],
+            read_paths: crate::hub::session::ReadScope::Unrestricted,
             subtask: format!("subtask of {id}\nsecond line"),
             note: None,
             result_summary: None,

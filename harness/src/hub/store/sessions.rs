@@ -244,7 +244,7 @@ session_store_impl!(InMemorySessionStore);
 /// use chrono::Utc;
 /// use harness::effects::EffectClass;
 /// use harness::hub::lineage::{Lineage, RootId, SessionId};
-/// use harness::hub::session::{SessionKind, SessionRecord, SessionStatus};
+/// use harness::hub::session::{ReadScope, SessionKind, SessionRecord, SessionStatus};
 /// use harness::hub::store::{HubLock, JsonlSessionStore, SessionStore};
 /// use harness::identity::DevLoop;
 /// use harness::task::TaskId;
@@ -264,6 +264,7 @@ session_store_impl!(InMemorySessionStore);
 ///     max_effect: EffectClass::Workspace,
 ///     tools: vec![],
 ///     write_paths: vec![],
+///     read_paths: ReadScope::Unrestricted,
 ///     subtask: "fix".into(),
 ///     note: None,
 ///     result_summary: None,
@@ -480,6 +481,29 @@ mod tests {
         assert!(!std::fs::read_to_string(fixture.path("sessions.jsonl"))
             .unwrap()
             .contains(TOKEN));
+    }
+
+    #[test]
+    fn a_journal_written_before_read_paths_replays_as_unknown_and_compaction_names_it() {
+        let fixture = Fixture::new();
+        let r = root(1);
+        let store = open(&fixture).unwrap();
+        let mut record = session("a", &r, SessionStatus::Running, 0, 0);
+        record.read_paths = crate::hub::session::ReadScope::Unrestricted;
+        store.upsert(record).unwrap();
+        drop(store);
+        let legacy: Vec<String> = lines(&fixture)
+            .iter()
+            .map(|line| line.replace("\"read_paths\":\"unrestricted\",", ""))
+            .collect();
+        assert!(legacy.iter().all(|line| !line.contains("read_paths")));
+        std::fs::write(fixture.path("sessions.jsonl"), legacy.join("\n") + "\n").unwrap();
+        let reopened = open(&fixture).unwrap();
+        let loaded = reopened.get(sid("a")).unwrap().unwrap();
+        assert_eq!(loaded.read_paths, crate::hub::session::ReadScope::Unknown);
+        assert!(lines(&fixture)
+            .iter()
+            .all(|line| line.contains("\"read_paths\":\"unknown\"")));
     }
 
     #[test]
