@@ -455,6 +455,7 @@ mod tests {
     use crate::task::TaskId;
     use async_trait::async_trait;
     use chrono::TimeZone;
+    use futures::FutureExt;
     use model::types::{ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole};
     use model::{ModelProvider, ModelResult};
     use proptest::prelude::*;
@@ -897,6 +898,10 @@ mod tests {
     fn step(call: &mut Call<'_>) -> std::task::Poll<Result<RecvPage, HubError>> {
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
         call.as_mut().poll(&mut cx)
+    }
+
+    fn finished(call: Call<'_>) -> Result<RecvPage, HubError> {
+        call.now_or_never().expect("the call did not finish")
     }
 
     fn parked(call: &mut Call<'_>) -> bool {
@@ -2199,10 +2204,7 @@ mod tests {
         assert_eq!(world.sessions.written(), [SessionStatus::WaitingOnMessages]);
         world.put(&a, &b, "m1");
         gate.release(1);
-        let page = match step(&mut waiting) {
-            std::task::Poll::Ready(page) => page.unwrap(),
-            std::task::Poll::Pending => panic!("the arrival did not end the wait"),
-        };
+        let page = finished(waiting).unwrap();
         assert_eq!(bodies(&page), ["m1"]);
         let record = world.record(&b);
         assert_eq!(record.status, SessionStatus::Running);
@@ -2246,10 +2248,7 @@ mod tests {
         world.put(&a, &b, "m1");
         flaky.fail_inbox.store(true, Ordering::SeqCst);
         gate.release(1);
-        let outcome = match step(&mut waiting) {
-            std::task::Poll::Ready(outcome) => outcome,
-            std::task::Poll::Pending => panic!("the error did not end the wait"),
-        };
+        let outcome = finished(waiting);
         assert!(matches!(outcome, Err(HubError::Store(_))));
         assert_eq!(world.record(&b).status, SessionStatus::Running);
     }
@@ -2399,10 +2398,7 @@ mod tests {
         assert_eq!(world.record(&b).status, SessionStatus::Running);
         world.put(&a, &b, "m1");
         gate.release(1);
-        let page = match step(&mut waiting) {
-            std::task::Poll::Ready(page) => page.unwrap(),
-            std::task::Poll::Pending => panic!("the wait did not end"),
-        };
+        let page = finished(waiting).unwrap();
         assert_eq!(bodies(&page), ["m1"]);
         world.sessions.fail_updates.store(false, Ordering::SeqCst);
         assert_eq!(world.sessions.written(), []);
@@ -2413,10 +2409,7 @@ mod tests {
         world.sessions.fail_updates.store(true, Ordering::SeqCst);
         world.put(&a, &b, "m2");
         gate.release(1);
-        let page = match step(&mut again) {
-            std::task::Poll::Ready(page) => page.unwrap(),
-            std::task::Poll::Pending => panic!("the wait did not end"),
-        };
+        let page = finished(again).unwrap();
         assert_eq!(bodies(&page), ["m2"]);
         assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
     }
@@ -2444,13 +2437,7 @@ mod tests {
         world.run(&c);
         let hub = world.gated(&gate);
         let mine = world.hub(Recorder::deliver());
-        let flag = || {
-            let mut asking = call(&mine, &a, 0);
-            match step(&mut asking) {
-                std::task::Poll::Ready(page) => page.unwrap().all_peers_waiting,
-                std::task::Poll::Pending => panic!("a zero wait blocked"),
-            }
-        };
+        let flag = || finished(call(&mine, &a, 0)).unwrap().all_peers_waiting;
         assert!(!flag());
         let mut b_waits = call(&hub, &b, 30);
         assert!(parked(&mut b_waits));
@@ -2477,18 +2464,12 @@ mod tests {
         let mine = world.hub(Recorder::deliver());
         let mut b_waits = call(&hub, &b, 30);
         assert!(parked(&mut b_waits));
-        let page = match step(&mut call(&mine, &a, 0)) {
-            std::task::Poll::Ready(page) => page.unwrap(),
-            std::task::Poll::Pending => panic!("a zero wait blocked"),
-        };
+        let page = finished(call(&mine, &a, 0)).unwrap();
         assert!(page.all_peers_waiting);
         world.put(&a, &b, "wake");
         gate.release(1);
         assert!(!parked(&mut b_waits));
-        let page = match step(&mut call(&mine, &a, 0)) {
-            std::task::Poll::Ready(page) => page.unwrap(),
-            std::task::Poll::Pending => panic!("a zero wait blocked"),
-        };
+        let page = finished(call(&mine, &a, 0)).unwrap();
         assert!(!page.all_peers_waiting);
         assert_eq!(world.record(&b).status, SessionStatus::Running);
     }
@@ -2850,6 +2831,14 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         assert_eq!(sessions.prune(start(), &policy).unwrap(), 0);
+        let spy = Spy::new();
+        let note = crate::hub::summary::Summary::compose("a", "running", "n");
+        let unknown = SessionId::from_task(TaskId("y".into()));
+        assert!(matches!(
+            spy.set_note(unknown, note),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(spy.prune(start(), &policy).unwrap(), 0);
         let provider = Counting {
             reply: String::new(),
             calls: AtomicUsize::new(0),
