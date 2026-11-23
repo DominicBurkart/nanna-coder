@@ -1,4 +1,5 @@
 pub mod error;
+pub mod index;
 pub mod limits;
 pub mod lineage;
 pub mod message;

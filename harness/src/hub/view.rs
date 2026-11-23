@@ -567,6 +567,31 @@ fn note_of(record: &SessionRecord) -> Option<&Summary> {
     record.note.as_ref()
 }
 
+pub(super) fn summary_of(record: &SessionRecord) -> Summary {
+    match note_of(record) {
+        Some(stored) => stored.clone(),
+        None => Summary::compose(
+            &record.identity,
+            record.status.label(),
+            record.subtask.lines().next().unwrap_or_default(),
+        ),
+    }
+}
+
+pub(super) fn index_order<'a>(
+    records: &'a [SessionRecord],
+    binding: &SessionBinding,
+) -> Vec<&'a SessionRecord> {
+    let viewer = Viewer::from(binding);
+    let world = World::new(&viewer, records);
+    let mut ranked: Vec<Ranked<'a>> = Vec::new();
+    for record in records.iter().filter(|r| visible(r, false)) {
+        ranked.push(world.rank(record));
+    }
+    order_entries(&mut ranked, ListOrder::Proximity);
+    ranked.into_iter().map(|entry| entry.record).collect()
+}
+
 fn visible(record: &SessionRecord, include_librarians: bool) -> bool {
     include_librarians || record.kind == SessionKind::Agent
 }
@@ -672,19 +697,11 @@ impl<'a> World<'a> {
     }
 
     fn item(&self, record: &SessionRecord) -> SessionItem {
-        let summary = match note_of(record) {
-            Some(stored) => stored.clone(),
-            None => Summary::compose(
-                &record.identity,
-                record.status.label(),
-                record.subtask.lines().next().unwrap_or_default(),
-            ),
-        };
         SessionItem {
             id: record.id.clone(),
             relation: self.rank(record).relation,
             status: record.status,
-            summary,
+            summary: summary_of(record),
         }
     }
 
