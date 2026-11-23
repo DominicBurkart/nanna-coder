@@ -1153,7 +1153,7 @@ mod tests {
     use crate::hub::message::{
         DeliveryState, MessageId, MessageKind, Recipient, Seq, StoredMessage, VerdictRef,
     };
-    use crate::hub::store::{InMemoryMessageStore, InMemorySessionStore, Retention};
+    use crate::hub::store::{ActiveSession, InMemoryMessageStore, InMemorySessionStore, Retention};
     use crate::task::TaskId;
     use chrono::TimeZone;
     use proptest::prelude::*;
@@ -2672,6 +2672,10 @@ mod tests {
             self.1.pass()?;
             self.0.prune(now, policy)
         }
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            self.1.pass()?;
+            self.0.active()
+        }
     }
 
     struct FlakyMessages(InMemoryMessageStore, Gate);
@@ -2734,8 +2738,10 @@ mod tests {
             .unwrap();
         assert_eq!(sessions.prune(at(1), &Retention::default()).unwrap(), 0);
         assert_eq!(sessions.in_root(&root(1)).unwrap().len(), 1);
+        assert_eq!(sessions.active().unwrap().len(), 1);
         let closed = FlakySessions(InMemorySessionStore::new(), Gate::from(0));
         assert!(closed.in_root(&root(1)).is_err());
+        assert!(closed.active().is_err());
 
         let messages = FlakyMessages(InMemoryMessageStore::new(), Gate::never());
         let m = message_from(1, "a", "b", DeliveryState::Delivered, "x");

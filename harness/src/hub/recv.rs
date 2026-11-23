@@ -436,8 +436,8 @@ mod tests {
     use crate::hub::registry::SessionRegistry;
     use crate::hub::send::QuarantineSink;
     use crate::hub::store::{
-        HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, MessageStore,
-        SessionStore, StoreError,
+        ActiveSession, HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore,
+        MessageStore, SessionStore, StoreError,
     };
     use crate::leases::{Clock, SimulatedClock, SleepFuture};
     use crate::task::TaskId;
@@ -741,6 +741,10 @@ mod tests {
             policy: &crate::hub::store::Retention,
         ) -> Result<usize, StoreError> {
             self.inner.prune(now, policy)
+        }
+
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            self.inner.active()
         }
     }
 
@@ -2200,6 +2204,7 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         assert_eq!(sessions.prune(start(), &policy).unwrap(), 0);
+        assert!(sessions.active().unwrap().is_empty());
         let provider = Counting {
             reply: String::new(),
             calls: AtomicUsize::new(0),

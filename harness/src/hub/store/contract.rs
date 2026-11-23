@@ -250,6 +250,48 @@ pub(super) fn prune_removes_only_finished_idle_roots<S: SessionStore>(s: &S) {
     assert_eq!(s.prune(now, &policy()).unwrap(), 0);
 }
 
+pub(super) fn active_lists_exactly_the_non_terminal_records_in_id_order<S: SessionStore>(s: &S) {
+    assert!(s.active().unwrap().is_empty());
+    let (r1, r2) = (root(1), root(2));
+    s.upsert(session("e", &r1, SessionStatus::Pending, 0, 5))
+        .unwrap();
+    s.upsert(session("b", &r2, SessionStatus::Running, 0, 2))
+        .unwrap();
+    s.upsert(session("c", &r1, SessionStatus::WaitingOnMessages, 0, 3))
+        .unwrap();
+    s.upsert(session("a", &r1, SessionStatus::Completed, 0, 1))
+        .unwrap();
+    s.upsert(session("d", &r2, SessionStatus::Failed, 0, 4))
+        .unwrap();
+    s.upsert(session("f", &r2, SessionStatus::Cancelled, 0, 6))
+        .unwrap();
+    let listed = s.active().unwrap();
+    let ids: Vec<String> = listed.iter().map(|a| a.id.to_string()).collect();
+    assert_eq!(ids, ["b", "c", "e"]);
+    let seen: Vec<SessionStatus> = listed.iter().map(|a| a.status).collect();
+    assert_eq!(
+        seen,
+        [
+            SessionStatus::Running,
+            SessionStatus::WaitingOnMessages,
+            SessionStatus::Pending
+        ]
+    );
+    let last: Vec<DateTime<Utc>> = listed.iter().map(|a| a.last_activity).collect();
+    assert_eq!(last, [at(2), at(3), at(5)]);
+    s.set_status(sid("b"), SessionStatus::Completed, at(9))
+        .unwrap();
+    s.set_status(sid("a"), SessionStatus::Running, at(10))
+        .unwrap();
+    let after: Vec<String> = s
+        .active()
+        .unwrap()
+        .iter()
+        .map(|a| a.id.to_string())
+        .collect();
+    assert_eq!(after, ["a", "c", "e"]);
+}
+
 pub(super) fn prune_keeps_a_root_exactly_at_the_ttl<S: SessionStore>(s: &S) {
     let r = root(1);
     s.upsert(session("a", &r, SessionStatus::Completed, 0, 0))
@@ -509,6 +551,7 @@ macro_rules! session_contract_tests {
             set_status_tracks_activity_and_end,
             set_note_replaces,
             update_replaces_declines_and_reports_a_missing_id,
+            active_lists_exactly_the_non_terminal_records_in_id_order,
             prune_removes_only_finished_idle_roots,
             prune_keeps_a_root_exactly_at_the_ttl
         );

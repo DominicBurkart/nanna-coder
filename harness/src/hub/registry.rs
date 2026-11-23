@@ -403,7 +403,7 @@ impl SessionRegistry {
 pub(crate) mod test_support {
     use super::*;
     use crate::hub::lineage::RootId;
-    use crate::hub::store::{InMemorySessionStore, Retention};
+    use crate::hub::store::{ActiveSession, InMemorySessionStore, Retention};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     pub(crate) struct Flaky {
@@ -475,7 +475,7 @@ mod tests {
     use super::test_support::Flaky;
     use super::*;
     use crate::hub::lineage::{Lineage, RootId};
-    use crate::hub::store::{InMemorySessionStore, Retention};
+    use crate::hub::store::{ActiveSession, InMemorySessionStore, Retention};
     use crate::task::TaskId;
     use chrono::TimeZone;
     use proptest::prelude::*;
@@ -529,6 +529,10 @@ mod tests {
         let card = crate::identity::example();
         assert_eq!(record.id, sid("t1"));
         assert_eq!(&record.lineage, bound.lineage());
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            Self::gate(&self.reads)?;
+            self.inner.active()
+        }
         assert_eq!(record.kind, SessionKind::Agent);
         assert_eq!(record.identity, "rust-implementer");
         assert_eq!(record.role, card.identity.description);
@@ -1553,6 +1557,11 @@ mod tests {
                 slipped_in: Mutex::new(Some(slipped_in)),
             });
             op(&SessionRegistry::new(racing.clone()));
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            let listed = self.inner.active();
+            self.fire();
+            listed
+        }
             racing.fire();
             let record = stored(&inner, "t");
             assert_eq!(record.status, end, "{name}");
@@ -1566,6 +1575,7 @@ mod tests {
         const EDGES: [(SessionStatus, SessionStatus); 11] = [
             (SessionStatus::Pending, SessionStatus::Running),
             (SessionStatus::Pending, SessionStatus::Failed),
+        assert_eq!(racing.active().unwrap().len(), 1);
             (SessionStatus::Pending, SessionStatus::Cancelled),
             (SessionStatus::Running, SessionStatus::WaitingOnMessages),
             (SessionStatus::Running, SessionStatus::Completed),
