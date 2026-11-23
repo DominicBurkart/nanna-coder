@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-docs-path"
+description = "a plain documentation path"
+
+[input]
+subject = "status update"
+body = "The design is in docs/design/message-hub.md under section 8.3."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

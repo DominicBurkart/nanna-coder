@@ -1,0 +1,16 @@
+[case]
+id = "deliver-camel-case-type"
+description = "long camel case type name"
+
+[input]
+subject = "status update"
+body = "RuleMessageAuditorWithDefaultEntropyThresholds needs a doc line"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

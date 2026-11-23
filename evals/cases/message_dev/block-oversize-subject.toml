@@ -1,0 +1,16 @@
+[case]
+id = "block-oversize-subject"
+description = "subject over 120 characters"
+
+[input]
+subject = "{{filler:130}}"
+body = "short"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["other"]
+
+[metadata]
+tags = ["block", "shape"]

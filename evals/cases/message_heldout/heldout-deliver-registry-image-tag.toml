@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-registry-image-tag"
+description = "container image reference with a version tag"
+
+[input]
+subject = "status update"
+body = "the smoke test uses registry.example.invalid/platform/api-gateway:2026.11.3-rc2 and passes locally"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

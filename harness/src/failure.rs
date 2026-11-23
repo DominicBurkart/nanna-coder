@@ -59,7 +59,7 @@ impl FailureKind {
             "TaskCheckFailed" | "VerificationFailed" => FailureKind::TaskCheckFailed,
             "ProtectedPathViolation" => FailureKind::ProtectedPathViolation,
             "ScopeError" => FailureKind::ScopeError,
-            "LineageInconsistent" => FailureKind::SpawnRefused,
+            "LineageInconsistent" | "SessionRegistryFailed" => FailureKind::SpawnRefused,
             "IdentityUnavailable" => FailureKind::IdentityUnavailable,
             "NoProvider" => FailureKind::ModelUnavailable,
             "ContainerSetupFailed"
@@ -74,7 +74,8 @@ impl FailureKind {
             | "RestoreOverridesInvalid"
             | "RestoreRefused"
             | "RestoreAuditFailed"
-            | "RestoreAuditDeferred" => FailureKind::RestoreRefused,
+            | "RestoreAuditDeferred"
+            | "RestoreSessionRegistryFailed" => FailureKind::RestoreRefused,
             _ => FailureKind::Unclassified,
         }
     }
@@ -115,6 +116,8 @@ mod tests {
         ("RestoreRefused", FailureKind::RestoreRefused),
         ("RestoreAuditFailed", FailureKind::RestoreRefused),
         ("RestoreAuditDeferred", FailureKind::RestoreRefused),
+        ("RestoreSessionRegistryFailed", FailureKind::RestoreRefused),
+        ("SessionRegistryFailed", FailureKind::SpawnRefused),
     ];
 
     #[test]

@@ -1,5 +1,6 @@
 use harness::auditor::eval::{default_catalog_dir, AuditorEvalCase};
 use harness::auditor::VerdictKind;
+use harness::hub::message::MessageReach;
 use harness::identity::IdentityCatalog;
 use std::collections::HashSet;
 use std::fs;
@@ -107,9 +108,33 @@ const EXPECTED_IDS: &[&str] = &[
     "escalate-shepherd-live-config",
 ];
 
+const EXPECTED_REASON_CODES: &[&str] = &[
+    "scope_creep",
+    "loop_mismatch",
+    "prompt_injection",
+    "unknown_identity",
+    "effect_above_ceiling",
+    "window_closed",
+    "lease_unavailable",
+    "repeated_denials",
+    "other",
+    "model_failure",
+    "secret_leak",
+    "cross_scope_steering",
+];
+
 const EXPECTED_DIGEST: u64 = 0xA24C920CB76EDCFB;
 
 const EXPECTED_CATALOG_DIGEST: u64 = 11777880805296023288;
+
+#[test]
+fn reason_codes_match_the_frozen_list() {
+    let got: Vec<&str> = harness::auditor::ReasonCode::ALL
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    assert_eq!(got, EXPECTED_REASON_CODES);
+}
 
 fn load() -> Vec<AuditorEvalCase> {
     AuditorEvalCase::discover(&heldout_dir()).expect("held-out cases parse")
@@ -302,8 +327,14 @@ fn catalog_digest(dir: PathBuf) -> u64 {
     cards.sort_by(|a, b| a.identity.name.cmp(&b.identity.name));
     let mut buf = Vec::new();
     for card in cards {
+        assert_eq!(card.scope.message_reach, MessageReach::None);
+        let s = &card.scope;
+        let scope = format!(
+            "ScopeSection {{ repos: {:?}, paths: {:?}, read_paths: {:?}, max_effect: {:?}, tools: {:?} }}",
+            s.repos, s.paths, s.read_paths, s.max_effect, s.tools
+        );
         buf.extend_from_slice(
-            format!("{:?}|{:?}|{:?}", card.identity, card.scope, card.limits).as_bytes(),
+            format!("{:?}|{}|{:?}", card.identity, scope, card.limits).as_bytes(),
         );
         buf.push(0);
     }

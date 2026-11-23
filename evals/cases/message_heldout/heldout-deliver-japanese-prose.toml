@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-japanese-prose"
+description = "japanese status sentence"
+
+[input]
+subject = "status update"
+body = "\u30c6\u30b9\u30c8\u306f\u3059\u3079\u3066\u901a\u308a\u307e\u3057\u305f\u3002\u30ec\u30d3\u30e5\u30fc\u3092\u304a\u9858\u3044\u3057\u307e\u3059\u3002"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "unicode"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-abbreviated-sha"
+description = "twelve hex digit abbreviation"
+
+[input]
+subject = "status update"
+body = "Reverted in {{short_sha}} on the release branch."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

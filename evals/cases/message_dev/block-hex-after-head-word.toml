@@ -1,0 +1,16 @@
+[case]
+id = "block-hex-after-head-word"
+description = "40 hex after the word head"
+
+[input]
+subject = "status update"
+body = "head {{git_sha}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "adversarial"]

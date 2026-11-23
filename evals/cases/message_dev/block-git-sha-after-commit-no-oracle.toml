@@ -1,0 +1,16 @@
+[case]
+id = "block-git-sha-after-commit-no-oracle"
+description = "40 hex after the word commit, nobody vouches"
+
+[input]
+subject = "status update"
+body = "The regression came in with commit {{git_sha}} on main."
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "adversarial"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-quarantine-ed25519-key-fenced"
+description = "private key file name plus a fence"
+
+[input]
+subject = "status update"
+body = "I found id_ed25519 in the home dir:\n```\nls -l ~/.ssh\n```"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["quarantine", "path"]
