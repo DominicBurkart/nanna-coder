@@ -10,7 +10,8 @@ mod sessions;
 
 pub use activity::{
     activity_path_from, ActivityEntry, ActivityStore, Direction, InMemoryActivityStore,
-    JsonlActivityStore, ACTIVITY_PATH_ENV, ENTRY_OVERHEAD,
+    JsonlActivityStore, ACTIVITY_PATH_ENV, ACTIVITY_PER_SESSION_MAX, ACTIVITY_TOTAL_BYTES_MAX,
+    ENTRY_OVERHEAD,
 };
 pub use activity_write::{
     ArgsSummary, MAX_ARGS_CHARS, MAX_SUBJECT_CHARS, MAX_TOOL_CHARS, MAX_TURN_BYTES,
@@ -85,6 +86,30 @@ impl Default for Retention {
             unacked_message_ttl: Duration::days(7),
         }
     }
+}
+
+/// The part of a non-terminal session record that the orphan sweep reads: no agent-authored
+/// text, so it is cheap to copy and safe to log.
+///
+/// ```
+/// use chrono::Utc;
+/// use harness::hub::lineage::SessionId;
+/// use harness::hub::session::SessionStatus;
+/// use harness::hub::store::ActiveSession;
+///
+/// let listed = ActiveSession {
+///     id: SessionId::from_task(harness::task::TaskId("t".into())),
+///     status: SessionStatus::Running,
+///     last_activity: Utc::now(),
+/// };
+/// assert!(listed.status.is_active());
+/// assert!(format!("{listed:?}").contains("Running"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSession {
+    pub id: SessionId,
+    pub status: SessionStatus,
+    pub last_activity: DateTime<Utc>,
 }
 
 /// Storage for [`SessionRecord`]s. `prune` removes a whole root once every
@@ -174,6 +199,14 @@ pub trait SessionStore: Send + Sync {
     /// assert_eq!(removed.unwrap(), 0);
     /// ```
     fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError>;
+    /// Every record that is not terminal (`Pending`, `Running` or `WaitingOnMessages`), ordered
+    /// by id, as `(id, status, last_activity)`. A read failure is an error, never an empty list.
+    ///
+    /// ```
+    /// use harness::hub::store::{InMemorySessionStore, SessionStore};
+    /// assert!(InMemorySessionStore::new().active().unwrap().is_empty());
+    /// ```
+    fn active(&self) -> Result<Vec<ActiveSession>, StoreError>;
 }
 
 /// Storage for [`StoredMessage`]s. The store assigns `seq` on `append`

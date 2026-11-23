@@ -1,6 +1,6 @@
 use super::engine::{Engine, Table};
 use super::journal::HubLock;
-use super::{Retention, SessionStore, StoreError};
+use super::{ActiveSession, Retention, SessionStore, StoreError};
 use crate::hub::lineage::{RootId, SessionId};
 use crate::hub::session::{SessionRecord, SessionStatus};
 use crate::hub::summary::Summary;
@@ -72,6 +72,20 @@ impl Table for SessionTable {
 }
 
 impl SessionTable {
+    fn active(&self) -> Vec<ActiveSession> {
+        let mut listed = Vec::new();
+        for record in self.by_id.values() {
+            if record.status.is_active() {
+                listed.push(ActiveSession {
+                    id: record.id.clone(),
+                    status: record.status,
+                    last_activity: record.last_activity,
+                });
+            }
+        }
+        listed
+    }
+
     fn expired_ids(&self, now: DateTime<Utc>, policy: &Retention) -> Vec<SessionId> {
         let mut roots: HashMap<&RootId, (bool, DateTime<Utc>, Vec<&SessionId>)> = HashMap::new();
         for record in self.by_id.values() {
@@ -174,6 +188,10 @@ macro_rules! session_store_impl {
                         ids.into_iter().map(|id| Record::Drop { id }).collect(),
                     ))
                 })
+            }
+
+            fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+                Ok(self.engine.read(SessionTable::active))
             }
         }
     };
@@ -348,6 +366,27 @@ mod tests {
             reopened.get(sid("a")).unwrap().unwrap().note,
             Some(note("remember"))
         );
+    }
+
+    #[test]
+    fn the_active_listing_survives_a_reopen_and_follows_the_replayed_status() {
+        let fixture = Fixture::new();
+        let r = root(1);
+        let store = open(&fixture).unwrap();
+        store
+            .upsert(session("a", &r, SessionStatus::Running, 0, 4))
+            .unwrap();
+        store
+            .upsert(session("b", &r, SessionStatus::Pending, 0, 5))
+            .unwrap();
+        store
+            .set_status(sid("b"), SessionStatus::Failed, at(9))
+            .unwrap();
+        let before = store.active().unwrap();
+        assert_eq!(before.len(), 1);
+        drop(store);
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.active().unwrap(), before);
     }
 
     #[test]

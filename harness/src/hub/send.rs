@@ -9,6 +9,8 @@ use super::registry::{RegistryError, SessionRegistry};
 use super::session::SessionRecord;
 use super::store::{MessageStore, SessionStore};
 use super::summary::Summary;
+use super::view::CursorTable;
+use super::waiting::Waiters;
 use crate::action_auditor::{
     message_content_hash, MessageAuditor, MessageVerdict, NullOracle, OutboundReview,
     RecipientScope, RuleMessageAuditor, ThreadMessage,
@@ -69,7 +71,9 @@ pub struct MessageHub {
     pub(super) clock: Arc<dyn Clock>,
     pub(super) limits: HubLimits,
     windows: Mutex<Windows>,
-    registry: Arc<SessionRegistry>,
+    pub(super) registry: Arc<SessionRegistry>,
+    pub(super) waiters: Waiters,
+    pub(super) cursors: CursorTable,
 }
 
 impl std::fmt::Debug for MessageHub {
@@ -105,6 +109,15 @@ fn note_error(error: RegistryError) -> HubError {
         _ => HubError::NotVisible,
     }
 }
+
+struct Prepared {
+    to: Vec<SessionRecord>,
+    depth: u8,
+    thread: Vec<ThreadMessage>,
+}
+
+/// The auditor name stored with a message the action gate quarantined.
+pub const GATE_AUDITOR: &str = "action-gate";
 
 struct Draft {
     depth: u8,
@@ -185,6 +198,8 @@ impl MessageHub {
             limits,
             windows: Mutex::new(Windows::default()),
             registry,
+            waiters: Waiters::default(),
+            cursors: CursorTable::new(),
         }
     }
 
@@ -208,6 +223,11 @@ impl MessageHub {
         self.windows().admit(at, session, root, &self.limits)?;
         let stored = self.registry.set_note_for(caller, note, at);
         stored.map_err(note_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registry(&self) -> &Arc<SessionRegistry> {
+        &self.registry
     }
 
     /// Send quarantine events to `sink`.
@@ -268,6 +288,29 @@ impl MessageHub {
         Ok(thread)
     }
 
+    fn inbox_check(&self, windows: &Windows, to: &[SessionRecord]) -> Result<(), HubError> {
+        for rec in to {
+            let unread = self.messages.unread(rec.id.clone())?;
+            if unread + windows.held(&rec.id) >= self.limits.inbox_max {
+                return Err(HubError::InboxFull);
+            }
+        }
+        Ok(())
+    }
+
+    fn note_precheck(&self, sender: &SessionBinding) -> Result<(), HubError> {
+        let (session, root) = (sender.session(), sender.lineage().root());
+        let windows = self.windows();
+        windows.check(self.clock.now(), session, root, &self.limits)
+    }
+
+    fn precheck(&self, sender: &SessionBinding, to: &[SessionRecord]) -> Result<(), HubError> {
+        let windows = self.windows();
+        self.inbox_check(&windows, to)?;
+        let (session, root) = (sender.session(), sender.lineage().root());
+        windows.check(self.clock.now(), session, root, &self.limits)
+    }
+
     fn reserve(
         &self,
         sender: &SessionBinding,
@@ -275,12 +318,7 @@ impl MessageHub {
     ) -> Result<Reservation<'_>, HubError> {
         let now = self.clock.now();
         let mut windows = self.windows();
-        for rec in to {
-            let unread = self.messages.unread(rec.id.clone())?;
-            if unread + windows.held(&rec.id) >= self.limits.inbox_max {
-                return Err(HubError::InboxFull);
-            }
-        }
+        self.inbox_check(&windows, to)?;
         windows.admit(now, sender.session(), sender.lineage().root(), &self.limits)?;
         let held: Vec<SessionId> = to.iter().map(|rec| rec.id.clone()).collect();
         windows.reserve(&held);
@@ -327,13 +365,8 @@ impl MessageHub {
         Ok(done)
     }
 
-    /// Send `req` from `sender`. Every failure leaves nothing delivered.
-    pub async fn send(
-        &self,
-        sender: &SessionBinding,
-        req: SendRequest,
-    ) -> Result<SendReceipt, HubError> {
-        self.check_size(&req)?;
+    fn prepare(&self, sender: &SessionBinding, req: &SendRequest) -> Result<Prepared, HubError> {
+        self.check_size(req)?;
         let in_root = self.sessions.in_root(sender.lineage().root())?;
         let to = resolve(sender, &req.to, &in_root, self.limits.fanout_max)?;
         let parent = match req.in_reply_to {
@@ -347,7 +380,16 @@ impl MessageHub {
             return Err(HubError::ThreadTooDeep);
         }
         let thread = self.thread_of(&parent)?;
-        let _reservation = self.reserve(sender, &to)?;
+        Ok(Prepared { to, depth, thread })
+    }
+
+    async fn review_prepared(
+        &self,
+        sender: &SessionBinding,
+        req: &SendRequest,
+        prepared: &Prepared,
+    ) -> Result<(MessageVerdict, Arc<dyn MessageAuditor>), HubError> {
+        let to = &prepared.to;
         let window_to = if to.len() == 1 {
             Recipient::Session {
                 id: to[0].id.clone(),
@@ -370,61 +412,166 @@ impl MessageHub {
             subject: &req.subject,
             body: &req.body,
             window: &window,
-            thread: &thread,
+            thread: &prepared.thread,
         };
         let verdict = auditor
             .review_outbound(&review)
             .await
             .map_err(|_| HubError::AuditUnavailable)?;
-        let state = match &verdict {
-            MessageVerdict::Deliver => DeliveryState::Pending,
-            MessageVerdict::Block { .. } => return Err(HubError::Blocked(codes_of(&verdict))),
-            MessageVerdict::Quarantine { .. } => DeliveryState::Quarantined,
-        };
-        let mark = VerdictRef {
-            log_id: auditor.name().to_string(),
-            content_hash: hash_u64(&req.subject, &req.body),
-        };
-        let codes = codes_of(&verdict);
-        let (subject, body) = match state {
-            DeliveryState::Quarantined => (
-                quarantined_text(&req.subject, &codes),
-                quarantined_text(&req.body, &codes),
-            ),
-            _ => (req.subject.clone(), req.body.clone()),
-        };
-        let draft = Draft {
-            depth,
-            verdict: mark,
-            state,
-            subject,
-            body,
-        };
-        let stored: Vec<StoredMessage> = to
-            .iter()
-            .map(|rec| self.record(sender, &req, rec, &draft))
-            .collect();
-        let ids = self.append_all(stored)?;
-        if state == DeliveryState::Quarantined {
-            let event = QuarantineEvent {
-                ids,
-                from: sender.session().clone(),
-                codes,
-                content_hash: message_content_hash(&req.subject, &req.body),
-                body_len: req.body.len(),
-            };
-            if self.sink.quarantined(&event).is_err() {
-                let count = to.len();
-                tracing::error!(count, "quarantine escalation was not delivered");
-            }
-            return Err(HubError::Quarantined {
-                recipients: to.len(),
+        Ok((verdict, auditor))
+    }
+
+    /// Review `req` exactly as [`MessageHub::send`] would, without taking a rate slot or storing
+    /// anything. The action gate calls this before the send tool runs.
+    pub async fn review_send(
+        &self,
+        sender: &SessionBinding,
+        req: &SendRequest,
+    ) -> Result<MessageVerdict, HubError> {
+        let prepared = self.prepare(sender, req)?;
+        self.precheck(sender, &prepared.to)?;
+        let (verdict, _) = self.review_prepared(sender, req, &prepared).await?;
+        Ok(verdict)
+    }
+
+    /// Review a session note as a message to every other active session of the root.
+    pub async fn review_note(
+        &self,
+        sender: &SessionBinding,
+        note: &str,
+    ) -> Result<MessageVerdict, HubError> {
+        if note.chars().count() > NOTE_MAX_CHARS {
+            return Err(HubError::TooLarge {
+                field: "note",
+                max: NOTE_MAX_CHARS,
             });
         }
-        Ok(SendReceipt {
-            recipients: ids.len(),
+        self.note_precheck(sender)?;
+        let in_root = self.sessions.in_root(sender.lineage().root())?;
+        let scopes: Vec<RecipientScope> = in_root
+            .iter()
+            .filter(|rec| rec.id != *sender.session() && rec.status.is_active())
+            .map(scope_of)
+            .collect();
+        let review = OutboundReview {
+            sender,
+            tool: "session_set_note",
+            recipients: &scopes,
+            subject: "",
+            body: note,
+            window: &[],
+            thread: &[],
+        };
+        let auditor = self.auditors.for_sender(sender);
+        let verdict = auditor.review_outbound(&review).await;
+        verdict.map_err(|_| HubError::AuditUnavailable)
+    }
+
+    fn store_quarantined(
+        &self,
+        sender: &SessionBinding,
+        req: &SendRequest,
+        prepared: &Prepared,
+        auditor_name: &str,
+        codes: Vec<ReasonCode>,
+    ) -> Result<usize, HubError> {
+        let draft = Draft {
+            depth: prepared.depth,
+            verdict: VerdictRef {
+                log_id: auditor_name.to_string(),
+                content_hash: hash_u64(&req.subject, &req.body),
+            },
+            state: DeliveryState::Quarantined,
+            subject: quarantined_text(&req.subject, &codes),
+            body: quarantined_text(&req.body, &codes),
+        };
+        let stored: Vec<StoredMessage> = prepared
+            .to
+            .iter()
+            .map(|rec| self.record(sender, req, rec, &draft))
+            .collect();
+        let ids = self.append_all(stored)?;
+        let event = QuarantineEvent {
             ids,
-        })
+            from: sender.session().clone(),
+            codes,
+            content_hash: message_content_hash(&req.subject, &req.body),
+            body_len: req.body.len(),
+        };
+        if self.sink.quarantined(&event).is_err() {
+            let count = prepared.to.len();
+            tracing::error!(count, "quarantine escalation was not delivered");
+        }
+        Ok(prepared.to.len())
+    }
+
+    /// Record a send the action gate quarantined: the same stored form and sink event as a
+    /// quarantine inside [`MessageHub::send`], so no other place keeps the suspect text.
+    pub fn quarantine_send(
+        &self,
+        sender: &SessionBinding,
+        req: &SendRequest,
+        codes: Vec<ReasonCode>,
+    ) -> Result<usize, HubError> {
+        let prepared = self.prepare(sender, req)?;
+        self.store_quarantined(sender, req, &prepared, GATE_AUDITOR, codes)
+    }
+
+    /// Tell the sink a note was quarantined by the gate. A note has no recipients, so nothing is
+    /// stored: the event carries the hash and length only.
+    pub fn quarantine_note(&self, sender: &SessionBinding, note: &str, codes: Vec<ReasonCode>) {
+        let event = QuarantineEvent {
+            ids: Vec::new(),
+            from: sender.session().clone(),
+            codes,
+            content_hash: message_content_hash("", note),
+            body_len: note.len(),
+        };
+        if self.sink.quarantined(&event).is_err() {
+            tracing::error!("note quarantine escalation was not delivered");
+        }
+    }
+
+    /// Send `req` from `sender`. Every failure leaves nothing delivered.
+    pub async fn send(
+        &self,
+        sender: &SessionBinding,
+        req: SendRequest,
+    ) -> Result<SendReceipt, HubError> {
+        let prepared = self.prepare(sender, &req)?;
+        let _reservation = self.reserve(sender, &prepared.to)?;
+        let (verdict, auditor) = self.review_prepared(sender, &req, &prepared).await?;
+        let codes = codes_of(&verdict);
+        match verdict {
+            MessageVerdict::Block { .. } => Err(HubError::Blocked(codes)),
+            MessageVerdict::Quarantine { .. } => {
+                let recipients =
+                    self.store_quarantined(sender, &req, &prepared, auditor.name(), codes)?;
+                Err(HubError::Quarantined { recipients })
+            }
+            MessageVerdict::Deliver => {
+                let draft = Draft {
+                    depth: prepared.depth,
+                    verdict: VerdictRef {
+                        log_id: auditor.name().to_string(),
+                        content_hash: hash_u64(&req.subject, &req.body),
+                    },
+                    state: DeliveryState::Pending,
+                    subject: req.subject.clone(),
+                    body: req.body.clone(),
+                };
+                let stored: Vec<StoredMessage> = prepared
+                    .to
+                    .iter()
+                    .map(|rec| self.record(sender, &req, rec, &draft))
+                    .collect();
+                let ids = self.append_all(stored)?;
+                Ok(SendReceipt {
+                    recipients: ids.len(),
+                    ids,
+                })
+            }
+        }
     }
 }
 
