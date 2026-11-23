@@ -133,27 +133,106 @@ fn a_global_catalog_used_as_repo_root_has_no_overrides() {
     assert!(matches!(err, IdentityError::Io { .. }), "{err}");
 }
 
+const HUB_TOOLS: [&str; 6] = [
+    "msg_send",
+    "msg_recv",
+    "session_set_note",
+    "sessions_list",
+    "session_describe",
+    "sessions_tree",
+];
+
+fn read_cards(dir: &std::path::Path) -> Vec<(String, toml::Table)> {
+    let mut cards = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("directory reads") {
+        let path = entry.expect("entry reads").path();
+        let named = path
+            .file_stem()
+            .expect("card has a name")
+            .to_string_lossy()
+            .to_string();
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            let text = std::fs::read_to_string(&path).expect("card reads");
+            cards.push((named, text.parse().expect("card parses")));
+        }
+    }
+    cards
+}
+
+fn reach_of(card: &toml::Table) -> String {
+    let reach = card["scope"].get("message_reach");
+    let named = reach.and_then(|value| value.as_str());
+    named.unwrap_or("none").to_string()
+}
+
+fn tools_of(card: &toml::Table) -> Vec<String> {
+    let listed = card["scope"]["tools"].as_array().expect("tools is a list");
+    listed
+        .iter()
+        .map(|tool| tool.as_str().expect("tool is text").to_string())
+        .collect()
+}
+
 #[test]
-fn shipped_and_fixture_cards_keep_message_reach_none_until_the_hub_is_wired() {
+fn shipped_cards_reach_the_root_except_the_auditor_and_fixtures_and_the_frozen_catalog_stay_none() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let dirs = [
+    let shipped = [
         (root.join(".nanna/catalog"), 5),
         (root.join(".nanna/agents"), 4),
-        (fixtures().join("global"), 5),
     ];
-    for (dir, floor) in dirs {
-        let mut seen = 0;
-        for entry in std::fs::read_dir(&dir).expect("directory reads") {
-            let path = entry.expect("entry reads").path();
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                let text = std::fs::read_to_string(&path).expect("card reads");
-                let card: toml::Table = text.parse().expect("card parses");
-                let reach = card["scope"].get("message_reach");
-                let none = reach.is_none_or(|value| value.as_str() == Some("none"));
-                assert!(none, "{} grants message reach", path.display());
-                seen += 1;
+    for (dir, floor) in shipped {
+        let cards = read_cards(&dir);
+        assert!(
+            cards.len() >= floor,
+            "{}: only {} cards read",
+            dir.display(),
+            cards.len()
+        );
+        for (name, card) in cards {
+            let reaches = !matches!(name.as_str(), "auditor" | "session-librarian");
+            let want = if reaches { "root" } else { "none" };
+            assert_eq!(reach_of(&card), want, "{name} in {}", dir.display());
+            let tools = tools_of(&card);
+            for hub_tool in HUB_TOOLS {
+                let listed = tools.iter().any(|tool| tool == hub_tool);
+                assert_eq!(listed, reaches, "{name}: {hub_tool}");
             }
         }
-        assert!(seen >= floor, "{}: only {seen} cards read", dir.display());
+    }
+    let quiet = [
+        (fixtures().join("global"), 5),
+        (root.join("evals/cases/auditor_heldout/catalog"), 4),
+    ];
+    for (dir, floor) in quiet {
+        let cards = read_cards(&dir);
+        assert!(
+            cards.len() >= floor,
+            "{}: only {} cards read",
+            dir.display(),
+            cards.len()
+        );
+        for (name, card) in cards {
+            assert_eq!(reach_of(&card), "none", "{name} in {}", dir.display());
+        }
+    }
+}
+
+#[test]
+fn every_repo_card_narrows_its_shipped_twin_in_reach_and_hub_tools() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let base = read_cards(&root.join(".nanna/catalog"));
+    let local = read_cards(&root.join(".nanna/agents"));
+    assert!(local.len() >= 4);
+    for (name, card) in local {
+        let twin = base.iter().find(|(other, _)| *other == name);
+        let (_, twin) = twin.expect("every repo card has a shipped twin");
+        assert_eq!(reach_of(&card), reach_of(twin), "{name}");
+        let allowed = tools_of(twin);
+        for tool in tools_of(&card) {
+            assert!(
+                allowed.contains(&tool),
+                "{name}: {tool} is not in the base card"
+            );
+        }
     }
 }

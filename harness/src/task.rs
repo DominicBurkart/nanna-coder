@@ -4545,6 +4545,64 @@ mod identity_tests {
         assert!(hub_names(&build(&manager, Some(&card))).is_empty());
     }
 
+    fn shipped_card(name: &str) -> AgentIdentity {
+        let path = format!(
+            "{}/../.nanna/catalog/{name}.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut card: toml::Table = text.parse().unwrap();
+        let mut inline = toml::Table::new();
+        inline.insert("inline".to_string(), toml::Value::String("x".to_string()));
+        let identity = card["identity"].as_table_mut().unwrap();
+        identity.insert("system_prompt".to_string(), toml::Value::Table(inline));
+        AgentIdentity::from_toml_str(&card.to_string(), name).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_every_shipped_card_but_the_auditor_is_offered_the_six_hub_tools_on_a_live_audited_hub(
+    ) {
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let task_id = TaskId::new();
+        let workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
+        let queued = queued(repo.path());
+        let runtime = hub_runtime();
+        let manager = runtime.attach(TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS));
+        let table = runtime.router_weak().upgrade().unwrap().table();
+        let mut sorted_all: Vec<String> = crate::hub::tools::HUB_TOOLS
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        sorted_all.sort();
+        for (name, offered) in [
+            ("rust-implementer", true),
+            ("docs-writer", true),
+            ("pr-shepherd", true),
+            ("reviewer", true),
+            ("auditor", false),
+        ] {
+            let card = shipped_card(name);
+            let lineage = Lineage::root_child(RootId::legacy(task_id.clone()));
+            let guard = table.enter(SessionBinding::from_audited(
+                &card,
+                task_id.clone(),
+                lineage,
+            ));
+            let layers = manager
+                .runner
+                .model_facing_layers(&task_id, &queued, Some(&card));
+            let registry = model_facing_registry(&workspace, Some(&card), layers).unwrap();
+            let want = if offered {
+                sorted_all.clone()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(hub_names(&registry), want, "{name}");
+            drop(guard);
+        }
+    }
+
     #[tokio::test]
     async fn test_the_shared_constructor_holds_production_for_every_repository() {
         use crate::escalation::{Escalation, EscalationLog, EscalationSource, Severity};
