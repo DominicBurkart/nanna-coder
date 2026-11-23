@@ -43,7 +43,31 @@ mod fake {
             Self::with_guard(PATH_LOCK.lock().await, fail_on)
         }
 
+        pub(crate) async fn install_without_runtime_async() -> Self {
+            let guard = PATH_LOCK.lock().await;
+            let dir = TempDir::new().unwrap();
+            let old_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", dir.path());
+            Self {
+                dir,
+                old_path,
+                guard: Some(guard),
+            }
+        }
+
+        pub(crate) async fn install_scripted_async(extra: &str) -> Self {
+            Self::with_script(PATH_LOCK.lock().await, None, extra)
+        }
+
         fn with_guard(guard: tokio::sync::MutexGuard<'static, ()>, fail_on: Option<&str>) -> Self {
+            Self::with_script(guard, fail_on, "")
+        }
+
+        fn with_script(
+            guard: tokio::sync::MutexGuard<'static, ()>,
+            fail_on: Option<&str>,
+            extra: &str,
+        ) -> Self {
             let dir = TempDir::new().unwrap();
             let log = dir.path().join("calls.log");
             let env_log = dir.path().join("env.log");
@@ -61,6 +85,8 @@ mod fake {
                  prev=$a\n\
                  done\n\
                  {fail_case}\
+                 d=$(dirname \"$0\")\n\
+                 {extra}\n\
                  exit 0\n",
                 log = log.display(),
                 env_log = env_log.display(),
@@ -85,6 +111,10 @@ mod fake {
                 old_path,
                 guard: Some(guard),
             }
+        }
+
+        pub(crate) fn dir(&self) -> &Path {
+            self.dir.path()
         }
 
         pub(crate) fn calls(&self) -> Vec<String> {

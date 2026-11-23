@@ -490,3 +490,48 @@ fn the_first_unexpected_tool_is_reported_in_name_order() {
         assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "alpha"));
     }
 }
+
+#[tokio::test]
+async fn a_hub_bound_task_is_refused_by_the_bind_so_the_pi_route_fails_closed() {
+    let task = unique_task("t-bind-hub");
+    let _path = crate::test_support::hold_path_async().await;
+    let (mut workspace, _repo) = real_workspace(task.as_str());
+    let card = Card {
+        paths: "[\"api/**\"]",
+        repos: "[\"github.com/example/repo\"]",
+        ..Card::new("\"write_file\", \"msg_send\"", "workspace")
+    };
+    let mut identity = card.identity();
+    identity.scope.message_reach = crate::hub::message::MessageReach::Lineage;
+    let allowed = allowed_for(&identity);
+    let grant = ScopedCapabilities::scope(
+        workspace
+            .build_tool_registry_for(allowed.identity())
+            .unwrap(),
+        allowed.identity(),
+    );
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    assert_eq!(agent.capability_names(), vec!["write_file"]);
+    let rig = crate::hub::router::tests::rig(vec![], true);
+    let mut layers = layers_allowing(allowed.identity(), task.as_str()).layers;
+    layers.hub = Some(crate::hub::tools::HubBinding::new(
+        rig.router.clone(),
+        rig.sender.clone(),
+    ));
+    let err = agent
+        .bind_workspace(
+            AuditedRef::for_test(allowed.identity()),
+            REPO,
+            &workspace,
+            layers,
+        )
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "msg_send"),
+        "{err:?}"
+    );
+    workspace.cleanup().unwrap();
+}
