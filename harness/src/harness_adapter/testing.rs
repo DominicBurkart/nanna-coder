@@ -265,6 +265,7 @@ pub(crate) fn layers_for(
             paths: identity.scope.paths.clone(),
             description: "d".to_string(),
         },
+        hub: None,
     };
     Layered { layers, log }
 }

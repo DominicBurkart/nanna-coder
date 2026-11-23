@@ -64,6 +64,7 @@ const TOOL_TABLE: &[(&str, Solo)] = &[
     ("GithubPrCommentsTool", Solo::Read),
     ("GithubPrOpenTool", Solo::OpensDraftOnly),
     ("GithubPrPromoteTool", Solo::RefusedPromote),
+    ("HubTool", Solo::Local),
     ("ListDirTool", Solo::Local),
     ("QaBrowserTool", Solo::Local),
     ("QaEndpointsTool", Solo::Local),
