@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-assignment-style-token"
+description = "token assignment"
+
+[input]
+subject = "status update"
+body = "export {{tok_assign}} before running"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

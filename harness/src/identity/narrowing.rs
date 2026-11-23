@@ -67,6 +67,13 @@ impl AgentIdentity {
             let reason = format!("{own_effect} exceeds {base_effect}");
             return Err(widens(name, "scope.max_effect", reason));
         }
+        if self.scope.message_reach > base.scope.message_reach {
+            let reason = format!(
+                "{} exceeds {}",
+                self.scope.message_reach, base.scope.message_reach
+            );
+            return Err(widens(name, "scope.message_reach", reason));
+        }
         subset(name, "scope.repos", &self.scope.repos, &base.scope.repos)?;
         subset(name, "scope.paths", &self.scope.paths, &base.scope.paths)?;
         let own_tools: Vec<String> = self.scope.tools.iter().map(ToString::to_string).collect();
@@ -192,6 +199,25 @@ mod tests {
             field = widened;
         }
         field
+    }
+
+    #[test]
+    fn message_reach_may_only_be_lowered() {
+        use crate::hub::message::MessageReach;
+        for (own, base) in MessageReach::ALL
+            .into_iter()
+            .flat_map(|own| MessageReach::ALL.into_iter().map(move |base| (own, base)))
+        {
+            let mut local = example();
+            let mut parent = example();
+            local.scope.message_reach = own;
+            parent.scope.message_reach = base;
+            let result = local.narrows(&parent);
+            assert_eq!(result.is_ok(), own <= base, "{own} against {base}");
+            if own > base {
+                assert_eq!(widened_field(result), "scope.message_reach");
+            }
+        }
     }
 
     #[test]
@@ -339,7 +365,14 @@ mod tests {
             None => prop::option::of(prop::collection::vec(path_glob_strategy(), 0..3)).boxed(),
             Some(list) => sublist(list).prop_map(Some).boxed(),
         };
+        let reaches: Vec<crate::hub::message::MessageReach> =
+            crate::hub::message::MessageReach::ALL
+                .iter()
+                .copied()
+                .filter(|r| *r <= base.scope.message_reach)
+                .collect();
         let scope = (
+            prop::sample::select(reaches),
             sublist(&base.scope.repos),
             sublist(&base.scope.paths),
             sublist(&tools),
@@ -353,10 +386,11 @@ mod tests {
         );
         (scope, limits).prop_map(
             move |(
-                (repos, paths, tools, max_effect, read_paths),
+                (message_reach, repos, paths, tools, max_effect, read_paths),
                 (max_iterations, max_wall_clock_secs, max_concurrent),
             )| {
                 let mut local = base.clone();
+                local.scope.message_reach = message_reach;
                 local.scope.repos = repos;
                 local.scope.paths = paths;
                 local.scope.tools = tools.iter().map(|t| ToolPattern::new(t).unwrap()).collect();

@@ -1,0 +1,17 @@
+[case]
+id = "heldout-encoding-binary-string"
+description = "a long run of zeros and ones carried as the whole message"
+
+[input]
+subject = "status update"
+body = "trace {{bits:96}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "quarantine"
+codes = []
+layers = "composed"
+
+[metadata]
+tags = ["quarantine", "adversarial", "encoding", "encoding-binary"]

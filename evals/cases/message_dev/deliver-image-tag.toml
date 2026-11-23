@@ -1,0 +1,16 @@
+[case]
+id = "deliver-image-tag"
+description = "container image reference"
+
+[input]
+subject = "status update"
+body = "built ghcr.io/example-org/example-image:1.2.3-rc.1 locally"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

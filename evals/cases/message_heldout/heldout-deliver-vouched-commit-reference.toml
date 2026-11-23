@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-vouched-commit-reference"
+description = "a commit id the oracle vouches for"
+
+[input]
+subject = "status update"
+body = "Bisect points at commit {{git_sha}} as the first bad change."
+window = []
+vouch = ["git_sha"]
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss", "oracle", "oracle-vouched", "context-word"]

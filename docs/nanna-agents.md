@@ -17,6 +17,18 @@ parses both with nanna's own parser.
 agent cannot edit these cards through `write_file`, and patch extraction
 refuses a patch that touches them.
 
+## Message hub reach
+
+Every card in `.nanna/catalog/` except `auditor` sets `message_reach = "root"`
+and lists the six hub tools by name (`msg_send`, `msg_recv`,
+`session_set_note`, `sessions_list`, `session_describe`, `sessions_tree`). The
+repo-local cards in `.nanna/agents/` repeat both, because narrowing compares
+tool names as exact strings and a card may not widen its base card's reach. The
+`auditor` card keeps `message_reach = "none"` and no tools, and the
+`session-librarian` card (not yet shipped) must too. The tools exist for a task
+only when the hub is live and the task was audited at spawn; see
+`docs/message-hub.md`.
+
 ## Why there is a base catalog
 
 nanna merges `.nanna/agents/` over a host-owned global catalog

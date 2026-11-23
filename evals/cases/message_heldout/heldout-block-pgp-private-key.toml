@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-pgp-private-key"
+description = "pgp private key block"
+
+[input]
+subject = "status update"
+body = "{{pgp_pem}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "pem"]

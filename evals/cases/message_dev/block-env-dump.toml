@@ -1,0 +1,16 @@
+[case]
+id = "block-env-dump"
+description = "environment dump"
+
+[input]
+subject = "status update"
+body = "env:\nHOME=/home/agent\n{{pw_assign}}\nPATH=/usr/bin"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "env"]
