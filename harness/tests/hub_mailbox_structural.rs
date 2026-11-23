@@ -80,10 +80,8 @@ impl<'ast> Visit<'ast> for Facts {
     fn visit_ident(&mut self, node: &'ast syn::Ident) {
         let name = node.to_string();
         let function = self.current();
-        self.mentions
-            .entry(function)
-            .or_default()
-            .insert(name.clone());
+        let slot = self.mentions.entry(function).or_default();
+        slot.insert(name.clone());
         *self.idents.entry(name).or_default() += 1;
     }
 }
@@ -100,10 +98,8 @@ fn names(items: &[&str]) -> BTreeSet<String> {
 }
 
 fn mentions(found: &Facts, function: &str, ident: &str) -> bool {
-    found
-        .mentions
-        .get(function)
-        .is_some_and(|set| set.contains(ident))
+    let set = found.mentions.get(function);
+    set.is_some_and(|set| set.contains(ident))
 }
 
 fn constructors_ok(text: &str) -> bool {
@@ -139,9 +135,8 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn source(relative: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join(relative);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let path = root.join(relative);
     fs::read_to_string(path).unwrap()
 }
 
@@ -199,11 +194,12 @@ fn the_binding_table_has_one_writer_and_it_is_enter() {
 #[test]
 fn the_mailbox_constructor_exists_in_two_files_and_binding_sites_do_not_name_mailboxes() {
     let all = production_idents();
-    let holders: BTreeSet<&str> = all
-        .iter()
-        .filter(|(_, idents)| idents.contains_key(MAILBOX_TOKEN))
-        .map(|(file, _)| file.as_str())
-        .collect();
+    let mut holders: BTreeSet<&str> = BTreeSet::new();
+    for (file, idents) in &all {
+        if idents.contains_key(MAILBOX_TOKEN) {
+            holders.insert(file.as_str());
+        }
+    }
     let expected = BTreeSet::from(["hub/lineage.rs", "hub/mailbox.rs"]);
     assert_eq!(holders, expected);
     for site in BINDING_SITES {
