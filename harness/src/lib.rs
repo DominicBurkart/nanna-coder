@@ -47,6 +47,7 @@ pub mod task;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod tool_grants;
 pub mod tools;
 pub mod windows;
 pub mod workspace;
