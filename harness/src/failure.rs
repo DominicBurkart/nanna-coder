@@ -66,8 +66,9 @@ impl FailureKind {
             | "SidecarSetupFailed"
             | "VerifierRequiresContainer"
             | "VerifierExecFailed" => FailureKind::ContainerSetupFailed,
-            "VerifierChecksInvalid" => FailureKind::InvalidRequest,
-            "WorkspaceCreationFailed" => FailureKind::WorkspaceSetupFailed,
+            "WorkspaceCreationFailed" | "VerifierChecksInvalid" => {
+                FailureKind::WorkspaceSetupFailed
+            }
             "ImpactError" => FailureKind::ImpactError,
             "QueuePersistFailed" => FailureKind::QueueError,
             "RestoreNoIdentity"
@@ -107,7 +108,7 @@ mod tests {
             FailureKind::ContainerSetupFailed,
         ),
         ("VerifierExecFailed", FailureKind::ContainerSetupFailed),
-        ("VerifierChecksInvalid", FailureKind::InvalidRequest),
+        ("VerifierChecksInvalid", FailureKind::WorkspaceSetupFailed),
         ("WorkspaceCreationFailed", FailureKind::WorkspaceSetupFailed),
         ("ImpactError", FailureKind::ImpactError),
         ("QueuePersistFailed", FailureKind::QueueError),
@@ -174,9 +175,13 @@ mod tests {
             .copied()
             .filter(|kind| !reachable.contains(kind))
             .collect();
-        let expected: HashSet<FailureKind> = [FailureKind::Cancelled, FailureKind::Unclassified]
-            .into_iter()
-            .collect();
+        let expected: HashSet<FailureKind> = [
+            FailureKind::Cancelled,
+            FailureKind::InvalidRequest,
+            FailureKind::Unclassified,
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(unreachable, expected);
     }
 

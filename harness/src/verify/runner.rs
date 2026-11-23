@@ -28,41 +28,93 @@ pub trait CheckRunner: Send + Sync {
 }
 
 #[doc = r#"Runs `sh -c <command>` through a launcher that executes inside a
-container, such as `podman exec -w /workspace <name>`.
+container, such as `podman exec -w /workspace <name>`. When a check times
+out it also force-removes that container (`<runtime> rm -f <name>`), because
+killing the `exec` client does not stop the process inside it. The only way to build
+one outside tests is [`ProcessCheckRunner::for_container`], so the host can
+never be made to run a repository-declared command through it.
 
 ```
-use harness::verify::{CheckRunner, ProcessCheckRunner};
-use std::time::Duration;
+use harness::container::{ContainerHandle, ContainerRuntime};
+use harness::verify::ProcessCheckRunner;
 
-let runner = ProcessCheckRunner::new("env", vec![]);
-let run = runner.run("echo hi", Duration::from_secs(10)).unwrap();
-assert_eq!(run.exit_code, Some(0));
-assert_eq!(run.stdout, "hi\n");
+let handle = ContainerHandle {
+    name: "nanna-task-1".to_string(),
+    runtime: ContainerRuntime::Podman,
+    port: None,
+    needs_cleanup: false,
+};
+let runner = ProcessCheckRunner::for_container(&handle, "/workspace");
+assert_eq!(runner.program(), "podman");
+assert_eq!(runner.prefix(), ["exec", "-w", "/workspace", "nanna-task-1"]);
+```
+
+A launcher for an arbitrary host program cannot be built:
+
+```compile_fail,E0599
+use harness::verify::ProcessCheckRunner;
+
+let _ = ProcessCheckRunner::new("env", vec![]);
 ```"#]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCheckRunner {
     program: String,
     prefix: Vec<String>,
+    teardown: Option<Vec<String>>,
 }
 
 impl ProcessCheckRunner {
-    pub fn new(program: impl Into<String>, prefix: Vec<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(program: impl Into<String>, prefix: Vec<String>) -> Self {
         Self {
             program: program.into(),
             prefix,
+            teardown: None,
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_teardown(mut self, argv: Vec<String>) -> Self {
+        self.teardown = Some(argv);
+        self
+    }
+
     pub fn for_container(handle: &ContainerHandle, working_dir: &str) -> Self {
-        Self::new(
-            handle.runtime.command(),
-            vec![
+        Self {
+            program: handle.runtime.command().to_string(),
+            prefix: vec![
                 "exec".to_string(),
                 "-w".to_string(),
                 working_dir.to_string(),
                 handle.name.clone(),
             ],
-        )
+            teardown: Some(vec![
+                handle.runtime.command().to_string(),
+                "rm".to_string(),
+                "-f".to_string(),
+                handle.name.clone(),
+            ]),
+        }
+    }
+
+    pub fn teardown(&self) -> Option<&[String]> {
+        self.teardown.as_deref()
+    }
+
+    fn tear_down(&self) -> Option<String> {
+        let (program, args) = self.teardown.as_ref()?.split_first()?;
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(format!(
+                "container teardown `{program}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => Some(format!("cannot start container teardown `{program}`: {e}")),
+        }
     }
 
     pub fn program(&self) -> &str {
@@ -160,11 +212,19 @@ impl CheckRunner for ProcessCheckRunner {
                 None => std::thread::sleep(POLL_INTERVAL),
             }
         };
+        let teardown_note = if timed_out { self.tear_down() } else { None };
+        let mut stderr = collect(stderr);
+        if let Some(note) = teardown_note {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&note);
+        }
         Ok(RawRun {
             exit_code,
             timed_out,
             stdout: collect(stdout),
-            stderr: collect(stderr),
+            stderr,
         })
     }
 }
@@ -305,6 +365,64 @@ mod tests {
             runner.prefix(),
             ["exec", "-w", "/workspace", "nanna-task-1"]
         );
+        assert_eq!(
+            runner.teardown().unwrap(),
+            ["podman", "rm", "-f", "nanna-task-1"]
+        );
+    }
+
+    fn marking(dir: &std::path::Path) -> (ProcessCheckRunner, std::path::PathBuf) {
+        let marker = dir.join("removed");
+        let runner = host().with_teardown(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo gone > {}", marker.display()),
+        ]);
+        (runner, marker)
+    }
+
+    #[test]
+    fn a_timeout_force_removes_the_container_but_a_normal_exit_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runner, marker) = marking(dir.path());
+        let run = runner.run("echo fine", LONG).unwrap();
+        assert_eq!(run.exit_code, Some(0));
+        assert!(!marker.exists());
+        let failed = runner.run("exit 3", LONG).unwrap();
+        assert_eq!(failed.exit_code, Some(3));
+        assert!(!marker.exists());
+        let run = runner
+            .run("exec sleep 600", Duration::from_millis(300))
+            .unwrap();
+        assert!(run.timed_out);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "gone\n");
+        assert_eq!(run.stderr, "");
+    }
+
+    #[test]
+    fn a_teardown_that_fails_or_cannot_start_is_reported_in_the_output() {
+        let short = Duration::from_millis(300);
+        let refused = host().with_teardown(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo nope >&2; exit 3".to_string(),
+        ]);
+        let run = refused.run("exec sleep 600", short).unwrap();
+        assert!(run.timed_out);
+        assert_eq!(run.stderr, "container teardown `sh` failed: nope");
+        let missing = host().with_teardown(vec!["/nonexistent/rm".to_string()]);
+        let run = missing
+            .run("echo before >&2; exec sleep 600", short)
+            .unwrap();
+        assert!(run
+            .stderr
+            .starts_with("before\ncannot start container teardown"));
+        let unterminated = missing
+            .run("printf before >&2; exec sleep 600", short)
+            .unwrap();
+        assert!(unterminated.stderr.starts_with("before\ncannot start"));
+        let empty = host().with_teardown(vec![]);
+        assert_eq!(empty.run("exec sleep 600", short).unwrap().stderr, "");
     }
 
     proptest! {

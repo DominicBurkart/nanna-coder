@@ -1,10 +1,9 @@
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::config::VerifyConfig;
+use super::config::{Check, VerifyConfig};
 use super::runner::{CheckRunner, RawRun};
 use crate::entities::context::types::ToolCallRecord;
 
@@ -60,6 +59,7 @@ pub struct ExecError {
     pub check: String,
     pub message: String,
     pub completed: Vec<CheckOutcome>,
+    pub denied: bool,
 }
 
 pub fn truncate_tail(text: &str, max: usize) -> (String, bool) {
@@ -128,6 +128,40 @@ pub fn passed_summary(outcomes: &[CheckOutcome]) -> String {
     format!("{passed}/{} checks passed", outcomes.len())
 }
 
+pub(crate) fn skipped(check: &Check) -> CheckOutcome {
+    CheckOutcome {
+        name: check.name.clone(),
+        command: check.command.clone(),
+        status: CheckStatus::Skipped,
+        exit_code: None,
+        timeout_secs: check.timeout_secs,
+        duration_ms: 0,
+        output: String::new(),
+        output_truncated: false,
+    }
+}
+
+pub(crate) fn finished(check: &Check, raw: RawRun, started: Instant) -> CheckOutcome {
+    let status = if raw.timed_out {
+        CheckStatus::TimedOut
+    } else if raw.exit_code == Some(0) {
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Failed
+    };
+    let (output, output_truncated) = truncate_tail(&combine(&raw), MAX_OUTPUT_BYTES);
+    CheckOutcome {
+        name: check.name.clone(),
+        command: check.command.clone(),
+        status,
+        exit_code: raw.exit_code,
+        timeout_secs: check.timeout_secs,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        output,
+        output_truncated,
+    }
+}
+
 #[doc = r#"Runs every declared check in order and returns one outcome per check. A
 failing check does not stop the rest, so the report is complete; a check
 that times out stops the run and marks the remaining checks skipped,
@@ -157,16 +191,7 @@ pub fn run_checks(
     let mut stopped = false;
     for check in config.checks() {
         if stopped {
-            outcomes.push(CheckOutcome {
-                name: check.name.clone(),
-                command: check.command.clone(),
-                status: CheckStatus::Skipped,
-                exit_code: None,
-                timeout_secs: check.timeout_secs,
-                duration_ms: 0,
-                output: String::new(),
-                output_truncated: false,
-            });
+            outcomes.push(skipped(check));
             continue;
         }
         let started = Instant::now();
@@ -176,41 +201,12 @@ pub fn run_checks(
                 check: check.name.clone(),
                 message,
                 completed: outcomes.clone(),
+                denied: false,
             })?;
-        let status = if raw.timed_out {
-            CheckStatus::TimedOut
-        } else if raw.exit_code == Some(0) {
-            CheckStatus::Passed
-        } else {
-            CheckStatus::Failed
-        };
         stopped = raw.timed_out;
-        let (output, output_truncated) = truncate_tail(&combine(&raw), MAX_OUTPUT_BYTES);
-        outcomes.push(CheckOutcome {
-            name: check.name.clone(),
-            command: check.command.clone(),
-            status,
-            exit_code: raw.exit_code,
-            timeout_secs: check.timeout_secs,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            output,
-            output_truncated,
-        });
+        outcomes.push(finished(check, raw, started));
     }
     Ok(outcomes)
-}
-
-pub async fn run_verification(
-    config: VerifyConfig,
-    runner: Arc<dyn CheckRunner>,
-) -> Result<Vec<CheckOutcome>, ExecError> {
-    tokio::task::spawn_blocking(move || run_checks(&config, runner.as_ref()))
-        .await
-        .map_err(|e| ExecError {
-            check: String::new(),
-            message: format!("the verification worker failed: {e}"),
-            completed: Vec::new(),
-        })?
 }
 
 #[cfg(test)]
@@ -350,21 +346,6 @@ mod tests {
         assert!(record.effect.is_none());
         let back: CheckOutcome = serde_json::from_str(&record.result).unwrap();
         assert_eq!(back, outcome);
-    }
-
-    #[tokio::test]
-    async fn run_verification_runs_off_the_async_thread() {
-        let runner: Arc<dyn CheckRunner> = Arc::new(Scripted::new(vec![raw(Some(0), "ok", "")]));
-        let outcomes = run_verification(config(&["a"]), runner).await.unwrap();
-        assert_eq!(outcomes[0].status, CheckStatus::Passed);
-    }
-
-    #[tokio::test]
-    async fn a_panicking_runner_becomes_an_exec_error() {
-        let runner: Arc<dyn CheckRunner> = Arc::new(Scripted::new(vec![]));
-        let err = run_verification(config(&["a"]), runner).await.unwrap_err();
-        assert!(err.message.contains("worker failed"), "{}", err.message);
-        assert!(err.completed.is_empty());
     }
 
     proptest! {
