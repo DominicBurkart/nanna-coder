@@ -732,7 +732,18 @@ mod tests {
         }
     }
 
-    const MOVED_TO_DECLARATION: [&str; 45] = [
+    const DECLARED_AGENT_CONFIG: [&str; 8] = [
+        "evals/cases/auditor_heldout/catalog/auditor.toml",
+        "evals/cases/auditor_spawn/catalog/auditor.toml",
+        "harness/tests/fixtures/identities/global/auditor.toml",
+        "harness/tests/fixtures/identities/global/prompts/auditor.md",
+        "harness/tests/fixtures/sample_app/catalog/auditor.toml",
+        "harness/tests/fixtures/sample_app/catalog/prompts/auditor.md",
+        ".inchworm/**",
+        "inchworm.toml",
+    ];
+
+    const DROPPED_FROM_DECLARATION: [&str; 40] = [
         "evals/cases/**",
         "harness/src/protected.rs",
         "harness/src/scope.rs",
@@ -772,12 +783,7 @@ mod tests {
         "harness/tests/spawn_gate_structural.rs",
         "harness/tests/protected_audit_hook_structural.rs",
         "harness/tests/escalation_sinks_structural.rs",
-        "harness/tests/fixtures/identities/global/auditor.toml",
-        "harness/tests/fixtures/identities/global/prompts/auditor.md",
-        "harness/tests/fixtures/sample_app/catalog/auditor.toml",
-        "harness/tests/fixtures/sample_app/catalog/prompts/auditor.md",
         "harness/tests/planner_structural.rs",
-        ".inchworm/**",
     ];
 
     fn declaration_example_path(pattern: &str) -> String {
@@ -792,14 +798,17 @@ mod tests {
     }
 
     #[test]
-    fn nanna_coders_own_declaration_is_exactly_the_patterns_that_left_the_shipped_list() {
-        assert_eq!(own_declaration().globs(), MOVED_TO_DECLARATION);
+    fn nanna_coders_own_declaration_is_exactly_its_agent_config() {
+        assert_eq!(own_declaration().globs(), DECLARED_AGENT_CONFIG);
     }
 
     #[test]
-    fn none_of_the_patterns_that_left_the_shipped_list_is_protected_by_default() {
+    fn none_of_the_declared_or_dropped_patterns_is_protected_by_default() {
         let protected = protected();
-        for pattern in MOVED_TO_DECLARATION {
+        for pattern in DECLARED_AGENT_CONFIG
+            .into_iter()
+            .chain(DROPPED_FROM_DECLARATION)
+        {
             assert!(!PROTECTED_PATTERNS.contains(&pattern), "{pattern}");
             let path = declaration_example_path(pattern);
             assert!(!protected.is_protected(Path::new(&path)), "{path}");
@@ -807,9 +816,9 @@ mod tests {
     }
 
     #[test]
-    fn with_its_own_declaration_loaded_every_moved_path_is_protected_by_its_declared_rule() {
+    fn with_its_own_declaration_loaded_every_declared_path_is_protected_by_its_declared_rule() {
         let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
-        for pattern in MOVED_TO_DECLARATION {
+        for pattern in DECLARED_AGENT_CONFIG {
             let path = declaration_example_path(pattern);
             let violation = protected.check(Path::new(&path)).unwrap_err();
             assert_eq!(violation.rule, pattern, "{path}");
@@ -818,6 +827,33 @@ mod tests {
             .check(Path::new(".nanna/protected.toml"))
             .unwrap_err();
         assert_eq!(declaration.rule, ".nanna/**");
+    }
+
+    #[test]
+    fn with_its_own_declaration_loaded_the_source_that_left_the_declaration_is_writable() {
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
+        for pattern in DROPPED_FROM_DECLARATION {
+            let path = declaration_example_path(pattern);
+            assert!(
+                !protected.is_protected(Path::new(&path)),
+                "{path} is source, not agent configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn with_its_own_declaration_loaded_the_shipped_configuration_rules_still_hold() {
+        let protected = ProtectedPaths::with_extras(Path::new("/repo"), None, &own_declaration());
+        for (path, rule) in [
+            (".nanna/agents/implementer.toml", ".nanna/**"),
+            (".nanna/environments/rust/environment.toml", ".nanna/**"),
+            (".nanna/policy.toml", ".nanna/**"),
+            ("sub/.nanna/agents/x.toml", "**/.nanna/**"),
+            (".git/config", ".git/**"),
+        ] {
+            let violation = protected.check(Path::new(path)).unwrap_err();
+            assert_eq!(violation.rule, rule, "{path}");
+        }
     }
 
     fn codeowners_paths() -> Vec<String> {
