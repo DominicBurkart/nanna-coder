@@ -349,7 +349,7 @@ impl OutboundRouter for HubRouter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::action_auditor::{
         ActionAuditLog, ActionAuditor, ActionGate, InboundReview, OutboundReview,
@@ -370,7 +370,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
 
-    fn token() -> String {
+    pub(crate) fn token() -> String {
         format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")
     }
 
@@ -378,7 +378,7 @@ mod tests {
         Utc.timestamp_opt(1_700_000_000, 0).unwrap()
     }
 
-    struct Scripted {
+    pub(crate) struct Scripted {
         replies: Mutex<VecDeque<Result<MessageVerdict, ()>>>,
         calls: AtomicUsize,
     }
@@ -391,7 +391,7 @@ mod tests {
             })
         }
 
-        fn calls(&self) -> usize {
+        pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
     }
@@ -425,7 +425,10 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Recording(Mutex<Vec<QuarantineEvent>>, std::sync::atomic::AtomicBool);
+    pub(crate) struct Recording(
+        pub(crate) Mutex<Vec<QuarantineEvent>>,
+        pub(crate) std::sync::atomic::AtomicBool,
+    );
 
     impl QuarantineSink for Recording {
         fn quarantined(&self, event: &QuarantineEvent) -> Result<(), String> {
@@ -437,7 +440,7 @@ mod tests {
         }
     }
 
-    struct Counting(AtomicUsize);
+    pub(crate) struct Counting(AtomicUsize);
 
     #[async_trait]
     impl ActionAuditor for Counting {
@@ -523,23 +526,26 @@ mod tests {
         }
     }
 
-    struct Rig {
-        messages: Arc<InMemoryMessageStore>,
-        hub: Arc<MessageHub>,
-        table: Arc<BindingTable>,
-        router: Arc<HubRouter>,
-        auditor: Arc<Scripted>,
-        sink: Arc<Recording>,
-        sender: Arc<SessionBinding>,
-        peer: SessionBinding,
-        default: Arc<Counting>,
-        escalations: Arc<crate::test_support::escalation::CapturingSink>,
-        registry: ToolRegistry,
-        log_dir: tempfile::TempDir,
-        _guard: Option<BindingGuard>,
+    pub(crate) struct Rig {
+        pub(crate) messages: Arc<InMemoryMessageStore>,
+        pub(crate) hub: Arc<MessageHub>,
+        pub(crate) table: Arc<BindingTable>,
+        pub(crate) router: Arc<HubRouter>,
+        pub(crate) auditor: Arc<Scripted>,
+        pub(crate) sink: Arc<Recording>,
+        pub(crate) sender: Arc<SessionBinding>,
+        pub(crate) peer: SessionBinding,
+        pub(crate) default: Arc<Counting>,
+        pub(crate) escalations: Arc<crate::test_support::escalation::CapturingSink>,
+        pub(crate) registry: ToolRegistry,
+        pub(crate) log_dir: tempfile::TempDir,
+        pub(crate) gate: Arc<ActionGate>,
+        pub(crate) subject: ActionSubject,
+        pub(crate) escalator: Arc<crate::escalation::Escalator>,
+        pub(crate) _guard: Option<BindingGuard>,
     }
 
-    fn binding(registry: &SessionRegistry, name: &str, root: &RootId) -> SessionBinding {
+    pub(crate) fn binding(registry: &SessionRegistry, name: &str, root: &RootId) -> SessionBinding {
         let mut card = crate::identity::example();
         card.scope.message_reach = MessageReach::Root;
         let lineage = Lineage::root_child(root.clone());
@@ -548,11 +554,11 @@ mod tests {
         binding
     }
 
-    fn rig(replies: Vec<Result<MessageVerdict, ()>>, bound: bool) -> Rig {
+    pub(crate) fn rig(replies: Vec<Result<MessageVerdict, ()>>, bound: bool) -> Rig {
         rig_with(replies, bound, Default::default())
     }
 
-    fn rig_with(
+    pub(crate) fn rig_with(
         replies: Vec<Result<MessageVerdict, ()>>,
         bound: bool,
         limits: crate::hub::limits::HubLimits,
@@ -604,8 +610,8 @@ mod tests {
             description: String::new(),
         };
         let mut registry = ToolRegistry::new()
-            .with_action_gate(gate, subject)
-            .with_action_escalator(escalator);
+            .with_action_gate(gate.clone(), subject.clone())
+            .with_action_escalator(escalator.clone());
         registry.register(Box::new(SendTool {
             hub: hub.clone(),
             sender: sender.clone(),
@@ -624,6 +630,9 @@ mod tests {
             escalations,
             registry,
             log_dir,
+            gate,
+            subject,
+            escalator,
             _guard: guard,
         }
     }
@@ -632,7 +641,7 @@ mod tests {
         rig.registry.execute(tool, args).await
     }
 
-    fn args(rig: &Rig, body: &str) -> Value {
+    pub(crate) fn args(rig: &Rig, body: &str) -> Value {
         json!({
             "to": {"to": "session", "id": rig.peer.session()},
             "kind": MessageKind::Info,
@@ -641,30 +650,30 @@ mod tests {
         })
     }
 
-    fn unread(rig: &Rig) -> usize {
+    pub(crate) fn unread(rig: &Rig) -> usize {
         rig.messages.unread(rig.peer.session().clone()).unwrap()
     }
 
-    fn denied(result: ToolResult<Value>) -> crate::action_auditor::ActionDenied {
+    pub(crate) fn denied(result: ToolResult<Value>) -> crate::action_auditor::ActionDenied {
         use ToolError::ActionDenied as Den;
         let error = result.unwrap_err();
         let Den(denied) = error else { unreachable!() };
         denied
     }
 
-    fn quarantine(code: ReasonCode, detail: &str) -> MessageVerdict {
+    pub(crate) fn quarantine(code: ReasonCode, detail: &str) -> MessageVerdict {
         MessageVerdict::Quarantine {
             reasons: vec![Reason::new(code, detail)],
         }
     }
 
-    fn block(code: ReasonCode, detail: &str) -> MessageVerdict {
+    pub(crate) fn block(code: ReasonCode, detail: &str) -> MessageVerdict {
         MessageVerdict::Block {
             reasons: vec![Reason::new(code, detail)],
         }
     }
 
-    fn everything(rig: &Rig) -> String {
+    pub(crate) fn everything(rig: &Rig) -> String {
         let file = std::fs::read_to_string(rig.log_dir.path().join("action_audit.jsonl"))
             .unwrap_or_default();
         format!(
