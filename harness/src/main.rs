@@ -1495,13 +1495,7 @@ async fn run_backlog_sync(
     use harness::scheduler::JsonlQueueStore;
     use std::sync::Arc;
 
-    let mut ollama = OllamaConfig::default();
-    if let Some(num_ctx) =
-        OllamaConfig::num_ctx_from_env(std::env::var("NANNA_NUM_CTX").ok().as_deref())?
-    {
-        ollama = ollama.with_num_ctx(num_ctx);
-    }
-    tracing::info!(num_ctx = ollama.num_ctx, "model context window");
+    let ollama = OllamaConfig::from_env()?;
     let provider: Arc<dyn model::ModelProvider> = Arc::new(OllamaProvider::new(ollama)?);
     let path = resolve_queue_path(queue_path)?;
     let store = JsonlQueueStore::open(&path)?;
@@ -2158,7 +2152,12 @@ async fn run_mcp_server(
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
+    let config = OllamaConfig::from_env()?;
+    tracing::info!(
+        num_ctx = config.num_ctx,
+        timeout_secs = config.timeout.as_secs(),
+        "model settings"
+    );
     let provider = Arc::new(OllamaProvider::new(config)?);
     let auditor_name = startup_auditor_model(
         audit_model,
@@ -2293,7 +2292,12 @@ async fn run_delegate(
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
 
-    let config = OllamaConfig::default();
+    let config = OllamaConfig::from_env()?;
+    tracing::info!(
+        num_ctx = config.num_ctx,
+        timeout_secs = config.timeout.as_secs(),
+        "model settings"
+    );
     let provider = Arc::new(OllamaProvider::new(config)?);
     let auditor_name = startup_auditor_model(
         audit_model.map(str::to_string),

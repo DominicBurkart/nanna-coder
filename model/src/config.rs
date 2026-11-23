@@ -4,6 +4,8 @@ use std::time::Duration;
 pub const DEFAULT_NUM_CTX: u32 = 16_384;
 pub const MIN_NUM_CTX: u32 = 2_048;
 pub const MAX_NUM_CTX: u32 = 131_072;
+pub const MIN_MODEL_TIMEOUT_SECS: u64 = 10;
+pub const MAX_MODEL_TIMEOUT_SECS: u64 = 7_200;
 
 fn default_num_ctx() -> u32 {
     DEFAULT_NUM_CTX
@@ -53,6 +55,29 @@ impl OllamaConfig {
             ));
         }
         Ok(Some(parsed))
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let mut config = Self::default();
+        if let Some(num_ctx) = Self::num_ctx_from_env(get("NANNA_NUM_CTX").as_deref())? {
+            config = config.with_num_ctx(num_ctx);
+        }
+        if let Some(raw) = get("NANNA_MODEL_TIMEOUT_SECS") {
+            let secs: u64 = raw.trim().parse().map_err(|_| {
+                format!("NANNA_MODEL_TIMEOUT_SECS must be a whole number of seconds, got {raw:?}")
+            })?;
+            if !(MIN_MODEL_TIMEOUT_SECS..=MAX_MODEL_TIMEOUT_SECS).contains(&secs) {
+                return Err(format!(
+                    "NANNA_MODEL_TIMEOUT_SECS must be between {MIN_MODEL_TIMEOUT_SECS} and {MAX_MODEL_TIMEOUT_SECS}, got {secs}"
+                ));
+            }
+            config = config.with_timeout(Duration::from_secs(secs));
+        }
+        Ok(config)
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|key| std::env::var(key).ok())
     }
 
     pub fn new() -> Self {
@@ -235,6 +260,35 @@ mod tests {
             let error = OllamaConfig::num_ctx_from_env(Some(bad)).unwrap_err();
             assert!(error.contains("NANNA_NUM_CTX"), "{bad}: {error}");
         }
+    }
+
+    #[test]
+    fn from_lookup_applies_the_window_and_timeout_overrides_and_rejects_bad_values() {
+        let none = OllamaConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(none.num_ctx, 16_384);
+        assert_eq!(none.timeout, Duration::from_secs(300));
+
+        let set = OllamaConfig::from_lookup(|key| match key {
+            "NANNA_NUM_CTX" => Some("8192".to_string()),
+            "NANNA_MODEL_TIMEOUT_SECS" => Some("1200".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(set.num_ctx, 8_192);
+        assert_eq!(set.timeout, Duration::from_secs(1_200));
+
+        for bad in ["abc", "", "5", "0", "7201", "-1"] {
+            let error = OllamaConfig::from_lookup(|key| {
+                (key == "NANNA_MODEL_TIMEOUT_SECS").then(|| bad.to_string())
+            })
+            .unwrap_err();
+            assert!(error.contains("NANNA_MODEL_TIMEOUT_SECS"), "{bad}: {error}");
+        }
+        assert!(OllamaConfig::from_lookup(|key| {
+            (key == "NANNA_NUM_CTX").then(|| "nope".to_string())
+        })
+        .unwrap_err()
+        .contains("NANNA_NUM_CTX"));
     }
 
     #[test]
