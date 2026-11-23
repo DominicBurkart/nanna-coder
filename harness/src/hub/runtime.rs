@@ -68,16 +68,15 @@ struct Parts {
     _locks: Vec<Arc<HubLock>>,
 }
 
+const SWEEP_DONE: &str = "message hub closed orphaned sessions";
+const SWEEP_FAILED: &str =
+    "message hub orphan sweep failed; orphans it did not reach stay open until the next start";
+
 impl Parts {
     fn close_orphans(&self) {
         match self.registry.sweep_orphans(self.started, self.clock.now()) {
-            Ok(closed) => tracing::info!(
-                closed = closed.len(),
-                "message hub closed orphaned sessions"
-            ),
-            Err(error) => {
-                tracing::error!(%error, "message hub orphan sweep failed; orphans it did not reach stay open until the next start")
-            }
+            Ok(closed) => tracing::info!(closed = closed.len(), "{SWEEP_DONE}"),
+            Err(error) => tracing::error!(%error, "{SWEEP_FAILED}"),
         }
     }
 }
