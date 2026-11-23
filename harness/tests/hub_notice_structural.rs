@@ -1,0 +1,234 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use syn::visit::Visit;
+
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().is_ok_and(|id| id == "test")
+    })
+}
+
+struct Sites {
+    stack: Vec<String>,
+    found: Vec<String>,
+}
+
+impl Sites {
+    fn note(&mut self, what: String) {
+        let function = self.stack.last().cloned().unwrap_or_default();
+        self.found.push(format!("{function}: {what}"));
+    }
+}
+
+fn names(path: &syn::Path) -> String {
+    let parts: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    parts.join("::")
+}
+
+impl<'ast> Visit<'ast> for Sites {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            self.stack.push(node.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, node);
+            self.stack.pop();
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            self.stack.push(node.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, node);
+            self.stack.pop();
+        }
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        let path = names(&node.path);
+        if path.contains("SenderNotice") || path.contains("NoticeTable") {
+            self.note(path);
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        let path = names(&node.path);
+        if path.contains("SenderNotice") || path.contains("Notices") {
+            self.note(format!("{path} {{..}}"));
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method = node.method.to_string();
+        if let syn::Expr::Field(field) = &*node.receiver {
+            if matches!(&field.member, syn::Member::Named(id) if id == "notices") {
+                self.note(format!(".notices.{method}"));
+            }
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn sources() -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    rust_files(&src(), &mut files);
+    let all: Vec<(String, String)> = files
+        .iter()
+        .map(|path| {
+            let rel = path.strip_prefix(src()).unwrap();
+            let name = rel.to_string_lossy().replace('\\', "/");
+            (name, fs::read_to_string(path).unwrap())
+        })
+        .collect();
+    assert!(all.len() > 50, "the source scan found {} files", all.len());
+    all
+}
+
+fn production_sites() -> Vec<String> {
+    let mut found = Vec::new();
+    for (name, text) in sources() {
+        let file = syn::parse_file(&text).expect("source parses");
+        let mut sites = Sites {
+            stack: Vec::new(),
+            found: Vec::new(),
+        };
+        sites.visit_file(&file);
+        found.extend(
+            sites
+                .found
+                .into_iter()
+                .map(|site| format!("{name}: {site}")),
+        );
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn a_sender_notice_is_built_in_exactly_one_place_the_inbound_block_path() {
+    let sites = production_sites();
+    let builds: Vec<&String> = sites
+        .iter()
+        .filter(|s| s.contains("SenderNotice::new"))
+        .collect();
+    assert_eq!(
+        builds,
+        ["hub/recv.rs: retire: SenderNotice::new"],
+        "{sites:#?}"
+    );
+}
+
+#[test]
+fn only_recv_stores_notices_and_only_recv_and_send_hand_them_over() {
+    let sites = production_sites();
+    let table: Vec<&String> = sites.iter().filter(|s| s.contains(".notices.")).collect();
+    assert_eq!(
+        table,
+        [
+            "hub/recv.rs: recv: .notices.take",
+            "hub/recv.rs: retire: .notices.push",
+            "hub/send.rs: send: .notices.take",
+        ],
+        "{sites:#?}"
+    );
+}
+
+#[test]
+fn no_production_code_builds_a_notice_or_a_notice_list_with_a_struct_literal() {
+    let literals: Vec<String> = production_sites()
+        .into_iter()
+        .filter(|s| s.ends_with("{..}"))
+        .collect();
+    assert_eq!(literals, ["hub/notice.rs: take: Notices {..}"]);
+}
+
+fn struct_fields(text: &str, name: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let file = syn::parse_file(text).unwrap();
+    for item in file.items {
+        if let syn::Item::Struct(found) = item {
+            if found.ident == name {
+                let fields = found
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let ident = field.ident.as_ref().unwrap().to_string();
+                        let kind = match &field.ty {
+                            syn::Type::Path(ty) => names(&ty.path),
+                            _ => "?".to_string(),
+                        };
+                        (ident, kind)
+                    })
+                    .collect();
+                let mut derives: Vec<String> = Vec::new();
+                for attr in found.attrs.iter().filter(|a| a.path().is_ident("derive")) {
+                    attr.parse_nested_meta(|meta| {
+                        derives.push(names(&meta.path));
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                return (fields, derives);
+            }
+        }
+    }
+    panic!("struct {name} not found");
+}
+
+#[test]
+fn a_sender_notice_has_no_free_text_field_and_cannot_be_deserialized() {
+    let text = fs::read_to_string(src().join("hub/notice.rs")).unwrap();
+    let (fields, derives) = struct_fields(&text, "SenderNotice");
+    let want = [
+        ("message_id", "MessageId"),
+        ("codes", "Vec"),
+        ("at", "DateTime"),
+        ("rendered", "String"),
+    ];
+    let want: Vec<(String, String)> = want
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    assert_eq!(fields, want);
+    assert!(derives.contains(&"Serialize".to_string()), "{derives:?}");
+    assert!(!derives.contains(&"Deserialize".to_string()), "{derives:?}");
+    assert!(text.contains("codes: Vec<ReasonCode>"));
+    assert!(
+        text.contains("\n    rendered: String,"),
+        "rendered must stay private"
+    );
+}
+
+#[test]
+fn the_tool_layer_never_names_a_notice() {
+    let tools = fs::read_to_string(src().join("hub/tools.rs")).unwrap();
+    let production = tools.split("#[cfg(test)]").next().unwrap();
+    assert!(!production.contains("SenderNotice"));
+    assert!(!production.contains("notices"));
+}

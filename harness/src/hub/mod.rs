@@ -2,6 +2,7 @@ pub mod error;
 pub mod limits;
 pub mod lineage;
 pub mod message;
+pub mod notice;
 pub mod oracle;
 pub mod reach;
 pub mod recv;

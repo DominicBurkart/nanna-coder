@@ -1,6 +1,7 @@
 use super::error::HubError;
 use super::lineage::{SessionBinding, SessionId};
 use super::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
+use super::notice::{Notices, SenderNotice};
 use super::reach::{relation_of, Relation};
 use super::send::{
     codes_of, hash_u64, quarantined_text, scope_of, to_thread, MessageHub, QuarantineEvent,
@@ -102,6 +103,8 @@ pub struct RecvPage {
     pub all_peers_waiting: bool,
     pub withheld: usize,
     pub notice: String,
+    #[serde(skip_serializing_if = "Notices::is_empty")]
+    pub notices: Notices,
 }
 
 impl fmt::Debug for RecvPage {
@@ -183,6 +186,7 @@ impl MessageHub {
             if !judged.is_empty() || left <= 0 {
                 let mut page = self.commit(judged, total)?;
                 page.all_peers_waiting = self.peers_waiting(to);
+                page.notices = self.notices.take(to.session());
                 return Ok(page);
             }
             self.clock
@@ -338,6 +342,7 @@ impl MessageHub {
                 untrusted_notice_as(FenceLabel::AgentMessage),
                 untrusted_notice_as(FenceLabel::AgentText)
             ),
+            notices: Notices::default(),
         })
     }
 
@@ -402,6 +407,10 @@ impl MessageHub {
             if self.sink.quarantined(&event).is_err() {
                 tracing::error!("inbound quarantine escalation was not delivered");
             }
+        }
+        if state == DeliveryState::Withheld {
+            let notice = SenderNotice::new(message.id, codes, self.clock.now());
+            self.notices.push(&message.from, notice);
         }
         Ok(())
     }
@@ -2224,5 +2233,350 @@ mod tests {
             .await
             .unwrap()
             .is_deliver());
+    }
+
+    struct ByBody;
+
+    #[async_trait]
+    impl MessageAuditor for ByBody {
+        fn name(&self) -> &str {
+            "by-body"
+        }
+
+        async fn review_outbound(
+            &self,
+            _r: &OutboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            Ok(MessageVerdict::Deliver)
+        }
+
+        async fn review_inbound(
+            &self,
+            r: &InboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            match r.message.body.as_str() {
+                "block" => Ok(block(ReasonCode::PromptInjection)),
+                "quarantine" => Ok(quarantine(ReasonCode::SecretLeak)),
+                "fail" => Err(ActionAuditError::Timeout {
+                    timeout: std::time::Duration::from_secs(1),
+                }),
+                _ => Ok(MessageVerdict::Deliver),
+            }
+        }
+    }
+
+    fn note_ids(notices: &Notices) -> Vec<MessageId> {
+        notices.items.iter().map(|item| item.message_id).collect()
+    }
+
+    fn send_to(to: &SessionBinding, body: &str) -> crate::hub::message::SendRequest {
+        crate::hub::message::SendRequest {
+            to: Recipient::Session {
+                id: to.session().clone(),
+            },
+            kind: MessageKind::Info,
+            subject: "status".to_string(),
+            body: body.to_string(),
+            in_reply_to: None,
+        }
+    }
+
+    fn blocking(code: ReasonCode) -> Arc<Recorder> {
+        Recorder::new(Say::Verdict(block(code)))
+    }
+
+    #[tokio::test]
+    async fn an_inbound_block_gives_the_sender_a_code_only_notice_and_no_one_else_over_both_stores()
+    {
+        for (store, _, _guard) in stores() {
+            let world = World::new(store);
+            let (a, b, c) = (world.seat("a"), world.seat("b"), world.seat("c"));
+            let hub = world.hub(blocking(ReasonCode::SecretLeak));
+            let id = world.put(&a, &b, "held");
+            let held = hub.recv(&b, recv_of(5)).await.unwrap();
+            assert_eq!((held.messages.len(), held.withheld), (0, 1));
+            assert!(held.notices.is_empty(), "the recipient gets no notice");
+            assert!(hub.recv(&c, recv_of(5)).await.unwrap().notices.is_empty());
+            let told = hub.recv(&a, recv_of(5)).await.unwrap();
+            assert!(told.messages.is_empty());
+            let notice = &told.notices.items[0];
+            assert_eq!(told.notices.items.len(), 1);
+            assert_eq!(notice.message_id, id);
+            assert_eq!(notice.codes, [ReasonCode::SecretLeak]);
+            assert_eq!(notice.at, start());
+            let line = format!(
+                "[nanna] message {} was not delivered: secret_leak",
+                id.as_uuid()
+            );
+            assert_eq!(notice.rendered(), line);
+            assert_eq!(told.notices.dropped, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_notice_is_never_a_stored_message_and_never_fenced_as_agent_text() {
+        for (store, path, _guard) in stores() {
+            let world = World::new(store);
+            let (a, b) = (world.seat("a"), world.seat("b"));
+            let hub = world.hub(blocking(ReasonCode::PromptInjection));
+            world.put(&a, &b, "held");
+            hub.recv(&b, recv_of(5)).await.unwrap();
+            let told = hub.recv(&a, recv_of(5)).await.unwrap();
+            assert_eq!(told.notices.items.len(), 1);
+            assert!(told.messages.is_empty());
+            let inbox = world.messages.inbox(a.session().clone(), None, 64).unwrap();
+            assert!(inbox.is_empty(), "no stored message reaches the sender");
+            assert_eq!(world.messages.unread(a.session().clone()).unwrap(), 0);
+            let json = serde_json::to_string(&told.notices).unwrap();
+            assert!(!json.contains("UNTRUSTED"), "{json}");
+            if let Some(path) = path {
+                let journal = std::fs::read_to_string(path).unwrap();
+                assert!(!journal.contains("was not delivered"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_notice_rides_the_senders_next_send_result_exactly_once() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::CrossScopeSteering));
+        let id = world.put(&a, &b, "held");
+        hub.recv(&b, recv_of(5)).await.unwrap();
+        let first = hub.send(&a, send_to(&b, "next")).await.unwrap();
+        assert_eq!(note_ids(&first.notices), [id]);
+        assert_eq!(first.recipients, 1);
+        let second = hub.send(&a, send_to(&b, "again")).await.unwrap();
+        assert!(second.notices.is_empty());
+        assert!(hub.recv(&a, recv_of(5)).await.unwrap().notices.is_empty());
+        let json = serde_json::to_value(&second).unwrap();
+        assert!(json.get("notices").is_none(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_recv_consumes_the_notice_so_the_next_send_carries_none() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        world.put(&a, &b, "held");
+        hub.recv(&b, recv_of(5)).await.unwrap();
+        assert_eq!(
+            hub.recv(&a, recv_of(5)).await.unwrap().notices.items.len(),
+            1
+        );
+        assert!(hub
+            .send(&a, send_to(&b, "x"))
+            .await
+            .unwrap()
+            .notices
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keeps_the_notice_for_the_next_successful_result() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        let id = world.put(&a, &b, "held");
+        hub.recv(&b, recv_of(5)).await.unwrap();
+        let mut bad = send_to(&b, "x");
+        bad.subject = "s".repeat(10_000);
+        assert!(hub.send(&a, bad).await.is_err());
+        assert_eq!(
+            note_ids(&hub.recv(&a, recv_of(5)).await.unwrap().notices),
+            [id]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_an_inbound_block_notifies_not_a_quarantine_an_outage_or_a_delivery() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(Arc::new(ByBody));
+        for body in ["fine", "quarantine", "fail"] {
+            world.put(&a, &b, body);
+        }
+        let page = hub.recv(&b, recv_of(5)).await.unwrap();
+        assert_eq!((page.messages.len(), page.withheld), (1, 2));
+        let told = hub.recv(&a, recv_of(5)).await.unwrap();
+        assert!(told.notices.is_empty(), "{told:?}");
+    }
+
+    #[tokio::test]
+    async fn a_symmetric_pair_with_a_changed_body_quarantines_and_does_not_notify() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(Recorder::deliver());
+        let mut message = stored(&a, &b, "status", "edited", DeliveryState::Pending);
+        message.outbound_verdict.content_hash = 1;
+        world.messages.append(message).unwrap();
+        let page = hub.recv(&b, recv_of(5)).await.unwrap();
+        assert_eq!(page.withheld, 1);
+        assert!(hub.recv(&a, recv_of(5)).await.unwrap().notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_notice_holds_no_subject_body_reason_detail_or_identity_text() {
+        for (store, _, _guard) in stores() {
+            let world = World::new(store);
+            let (a, b) = (world.seat("a"), world.seat("b"));
+            let verdict = MessageVerdict::Block {
+                reasons: vec![
+                    Reason::new(ReasonCode::SecretLeak, "DETAIL-MARK-91c2"),
+                    Reason::new(ReasonCode::PromptInjection, token()),
+                ],
+            };
+            let hub = world.hub(Recorder::new(Say::Verdict(verdict)));
+            let mut message = stored(
+                &a,
+                &b,
+                "SUBJECT-MARK-42ab",
+                &token(),
+                DeliveryState::Pending,
+            );
+            message.from_identity = "IDENT-MARK-5d10".to_string();
+            message.outbound_verdict.content_hash = hash_u64(&message.subject, &message.body);
+            let id = message.id;
+            world.messages.append(message).unwrap();
+            hub.recv(&b, recv_of(5)).await.unwrap();
+            let told = hub.recv(&a, recv_of(5)).await.unwrap();
+            assert_eq!(note_ids(&told.notices), [id]);
+            let everything = format!(
+                "{told:?}|{:?}|{}|{}",
+                told.notices,
+                serde_json::to_string(&told).unwrap(),
+                told.notices.items[0].rendered()
+            );
+            for mark in ["SUBJECT-MARK-42ab", "DETAIL-MARK-91c2", "IDENT-MARK-5d10"] {
+                assert!(!everything.contains(mark), "{mark} leaked: {everything}");
+            }
+            assert!(!everything.contains(&token()), "{everything}");
+            assert!(everything.contains("secret_leak, prompt_injection"));
+        }
+    }
+
+    #[tokio::test]
+    async fn notices_come_out_oldest_first_in_the_order_the_messages_were_withheld() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        let first = world.put(&a, &b, "one");
+        let second = world.put(&a, &b, "two");
+        hub.recv(&b, recv_of(1)).await.unwrap();
+        hub.recv(&b, recv_of(1)).await.unwrap();
+        let third = world.put(&a, &b, "three");
+        hub.recv(&b, recv_of(1)).await.unwrap();
+        let told = hub.recv(&a, recv_of(5)).await.unwrap();
+        assert_eq!(note_ids(&told.notices), [first, second, third]);
+        assert!(told.notices.items[0].at <= told.notices.items[2].at);
+    }
+
+    #[tokio::test]
+    async fn more_than_sixteen_withheld_messages_keep_the_newest_and_count_the_rest() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        let all: Vec<MessageId> = (0..18)
+            .map(|n| world.put(&a, &b, &format!("m{n}")))
+            .collect();
+        let page = hub.recv(&b, recv_of(20)).await.unwrap();
+        assert_eq!(page.withheld, 18);
+        let told = hub.recv(&a, recv_of(5)).await.unwrap();
+        assert_eq!(note_ids(&told.notices), all[2..].to_vec());
+        assert_eq!(told.notices.dropped, 2);
+    }
+
+    #[tokio::test]
+    async fn a_notice_that_cannot_be_kept_never_changes_the_recipient_side_verdict() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        hub.notices.poison();
+        let id = world.put(&a, &b, "held");
+        let page = hub.recv(&b, recv_of(5)).await.unwrap();
+        assert_eq!((page.messages.len(), page.withheld), (0, 1));
+        assert!(world.states_from(&a).contains(&DeliveryState::Withheld));
+        assert_eq!(world.states_from(&a).len(), 2);
+        assert_eq!(
+            world.messages.get(id).unwrap().unwrap().state,
+            DeliveryState::Expired
+        );
+        assert_eq!(
+            note_ids(&hub.recv(&a, recv_of(5)).await.unwrap().notices),
+            [id]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retire_that_fails_leaves_no_notice_and_the_retry_leaves_exactly_one() {
+        let flaky = Flaky::new();
+        let world = World::new(flaky.clone());
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        let id = world.put(&a, &b, "held");
+        flaky.fail_set_state_at.store(1, Ordering::SeqCst);
+        assert!(hub.recv(&b, recv_of(5)).await.is_err());
+        assert!(hub.recv(&a, recv_of(5)).await.unwrap().notices.is_empty());
+        flaky.fail_set_state_at.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(hub.recv(&b, recv_of(5)).await.unwrap().withheld, 1);
+        assert_eq!(
+            note_ids(&hub.recv(&a, recv_of(5)).await.unwrap().notices),
+            [id]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_recv_does_not_consume_the_senders_notices() {
+        let flaky = Flaky::new();
+        let world = World::new(flaky.clone());
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.hub(blocking(ReasonCode::SecretLeak));
+        let id = world.put(&a, &b, "held");
+        hub.recv(&b, recv_of(5)).await.unwrap();
+        flaky.fail_inbox.store(true, Ordering::SeqCst);
+        assert!(hub.recv(&a, recv_of(5)).await.is_err());
+        flaky.fail_inbox.store(false, Ordering::SeqCst);
+        assert_eq!(
+            note_ids(&hub.recv(&a, recv_of(5)).await.unwrap().notices),
+            [id]
+        );
+    }
+
+    fn verdict_plans() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(0u8..4, 1..14)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn the_senders_notices_are_exactly_its_blocked_messages_in_order(plan in verdict_plans()) {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let world = World::memory();
+                let (a, b) = (world.seat("a"), world.seat("b"));
+                let hub = world.hub(Arc::new(ByBody));
+                let mut blocked: Vec<MessageId> = Vec::new();
+                for kind in &plan {
+                    let body = ["block", "quarantine", "fail", "fine"][usize::from(*kind)];
+                    let id = world.put(&a, &b, body);
+                    if body == "block" {
+                        blocked.push(id);
+                    }
+                }
+                let mut seen = 0usize;
+                while seen < plan.len() {
+                    let page = hub.recv(&b, recv_of(3)).await.unwrap();
+                    prop_assert!(page.notices.is_empty());
+                    let moved = page.messages.len() + page.withheld;
+                    prop_assert!(moved > 0);
+                    seen += moved;
+                }
+                let told = hub.recv(&a, recv_of(20)).await.unwrap();
+                prop_assert_eq!(note_ids(&told.notices), blocked);
+                prop_assert_eq!(told.notices.dropped, 0);
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
     }
 }
