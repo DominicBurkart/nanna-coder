@@ -540,7 +540,9 @@ mod tests {
     use crate::action_auditor::IdentifierOracle;
     use crate::hub::lineage::Lineage;
     use crate::hub::session::SessionKind;
-    use crate::hub::store::{InMemoryActivityStore, InMemorySessionStore, Retention, StoreError};
+    use crate::hub::store::{
+        ActiveSession, InMemoryActivityStore, InMemorySessionStore, Retention, StoreError,
+    };
     use crate::hub::summary::Summary;
     use crate::hub::view::{sessions_list, CursorTable, ListOrder, ListRequest, SessionFilter};
     use chrono::{DateTime, TimeZone, Utc};
@@ -712,6 +714,9 @@ mod tests {
         fn prune(&self, _now: DateTime<Utc>, _policy: &Retention) -> Result<usize, StoreError> {
             Err(StoreError::Locked)
         }
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            Err(StoreError::Locked)
+        }
     }
 
     #[test]
@@ -736,6 +741,7 @@ mod tests {
             .set_note(sid("a"), Summary::compose("a", "b", "c"))
             .is_err());
         assert!(closed.prune(now, &Retention::default()).is_err());
+        assert!(closed.active().is_err());
     }
 
     fn listed_ids(store: &dyn SessionStore, who: &SessionBinding) -> BTreeSet<SessionId> {
