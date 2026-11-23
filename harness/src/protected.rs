@@ -864,6 +864,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agents_md_scopes_the_protected_rule_to_nannas_runtime() {
+        let agents = include_str!("../../AGENTS.md");
+        assert!(agents.contains("does not restrict developers"));
+        assert!(agents.contains("docs/protected-paths.md"));
+        for forbidden in [
+            "Expect protected files to need a human",
+            "human-authored PR",
+            "agents cannot write either file",
+        ] {
+            assert!(
+                !agents.contains(forbidden),
+                "AGENTS.md must not tell developers they cannot edit this repository: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn moved_protected_path_notes_live_in_the_docs() {
+        let doc = include_str!("../../docs/protected-paths.md");
+        for needle in [
+            "Known gaps",
+            "#1020",
+            "human_gate",
+            "Nanna-Identity",
+            "does not restrict developers",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/protected-paths.md lacks {needle}"
+            );
+        }
+    }
+
     fn files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
