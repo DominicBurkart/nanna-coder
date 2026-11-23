@@ -68,6 +68,13 @@ esac
 exit 0
 FAKE
 chmod +x "$WORK/bin/podman"
+PYTHON_ARGV="$WORK/python.argv"
+cat > "$WORK/bin/python3" <<FAKEPY
+#!/usr/bin/env bash
+printf '%s\\n' "\$@" > "$PYTHON_ARGV"
+exec /usr/bin/python3 "\$@"
+FAKEPY
+chmod +x "$WORK/bin/python3"
 export FAKE_STATE="$WORK/state" FAKE_RUN_ARGV="$WORK/run.argv" FAKE_ATTACH_ARGV="$WORK/attach.argv" FAKE_PODMAN_LOG="$WORK/log" \
   FAKE_IMPORT_TAR="$WORK/import.tar" FAKE_IMAGE_ID=sha256:current FAKE_IMAGE_ID_RUNNING=sha256:current
 
@@ -229,9 +236,15 @@ fi
 [[ ! -e "$FAKE_ATTACH_ARGV" ]] || fail "never attach without a socket"
 
 reset_world
-FAKE_ATTACH_EXIT=7 run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > /dev/null 2>&1 && fail "a bridge that dies must make the launcher exit non-zero"
-code=$?
-[[ $code -ne 0 ]] || fail "a dying daemon must surface as a non-zero exit so Lumo reconnects"
+FAKE_ATTACH_EXIT=7 run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > "$WORK/out" 2> /dev/null || fail "the bridge must outlive a dying daemon connection and exit 0 when Lumo closes stdin"
+[[ "$(cat "$WORK/out")" == "$ping" ]] || fail "the bridge must relay what the daemon connection wrote before it died, and nothing else"
+
+reset_world
+rm -f "$PYTHON_ARGV"
+run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > /dev/null 2>&1 || fail "default launch must succeed"
+mapfile -t bridge_argv < "$PYTHON_ARGV"
+[[ "${bridge_argv[0]}" == */scripts/lumo-bridge.py ]] || fail "the launcher must exec scripts/lumo-bridge.py, got: ${bridge_argv[0]:-nothing}"
+[[ "${bridge_argv[*]:1}" == "--daemon nanna-daemon --client lumo --launcher ${bridge_argv[0]%lumo-bridge.py}lumo-mcp.sh" ]] || fail "the bridge must be told the daemon, client tag and launcher, got: ${bridge_argv[*]:1}"
 
 reset_world
 run_launcher NANNA_MODEL=qwen3:0.6b NANNA_TAG=v1 NANNA_REGISTRY=reg.example/ns NANNA_POD=mypod NANNA_CONFIG_VOLUME=othervol \

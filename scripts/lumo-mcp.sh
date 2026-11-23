@@ -256,8 +256,10 @@ usage() {
   cat << EOF
 usage: $0 [--start | --stop | --restart | --status | --install-catalog | --print | --help]
 
-With no argument: make sure the $DAEMON container is running, then bridge
-stdin/stdout to it ('nanna mcp-attach'). This is the command Lumo Desktop runs.
+With no argument: make sure the $DAEMON container is running, then run the
+connection bridge (lumo-bridge.py), which relays stdin/stdout to it through
+'nanna mcp-attach' and reconnects when the daemon restarts or the host sleeps.
+This is the command Lumo Desktop runs.
 
   --start            ensure the daemon is running and its socket is open
   --stop             stop and remove the daemon; the $STATE_VOLUME volume is kept
@@ -325,4 +327,8 @@ case "$mode" in
 esac
 
 ensure_daemon
-exec podman exec -i "$DAEMON" /bin/nanna mcp-attach --client "$CLIENT_TAG"
+if ! command -v python3 > /dev/null 2>&1; then
+  say 'python3 not found on PATH; the connection bridge needs it'
+  exit 127
+fi
+exec python3 "$SCRIPT_DIR/lumo-bridge.py" --daemon "$DAEMON" --client "$CLIENT_TAG" --launcher "$SELF"

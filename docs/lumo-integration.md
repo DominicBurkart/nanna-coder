@@ -9,13 +9,13 @@ Nanna only runs inside containers. The launcher does not change that: the daemon
 ## How it fits together
 
 ```
-Lumo ──stdio──> scripts/lumo-mcp.sh ──podman exec -i──> nanna mcp-attach ──unix socket──> nanna mcp-serve --listen
+Lumo ──stdio──> scripts/lumo-mcp.sh ──exec──> scripts/lumo-bridge.py ──podman exec -i──> nanna mcp-attach ──unix socket──> nanna mcp-serve --listen
                                                           (in container nanna-daemon, socket /run/nanna/mcp.sock)
 ```
 
 - One container, `nanna-daemon`, runs `nanna mcp-serve --listen /run/nanna/mcp.sock`. It owns the task manager, the queue, the leases and the results. There is no network listener: the socket is a file inside the container (mode 0600, in a 0700 directory) and is reachable only through `podman exec`.
 - The named volume `nanna-state` is mounted at `/state` and holds `queue.jsonl`, leases, escalations, telemetry and `results/<task_id>.json`.
-- Each Lumo session runs `podman exec -i nanna-daemon /bin/nanna mcp-attach --client lumo`, which copies stdin to the socket and the socket to stdout (newline-delimited JSON-RPC, nothing else on stdout).
+- Each Lumo session runs `scripts/lumo-bridge.py` (Python 3 standard library only), which owns a child `podman exec -i nanna-daemon /bin/nanna mcp-attach --client lumo` that copies stdin to the socket and the socket to stdout (newline-delimited JSON-RPC, nothing else on stdout). See [The connection bridge](#the-connection-bridge).
 - A Lumo disconnect ends only its own connection. Running tasks continue, and their results are written to disk when they finish, so a later session (or a restart of the daemon) can read them with `get_task_status`, `get_task_result` and `list_tasks`.
 
 `--client` is a label written to the daemon's log, nothing more. It is not authentication: anyone who can run `podman exec` into the container can claim any name. The security boundary is the container and the identity cards, not that tag.
@@ -82,9 +82,31 @@ Behaviours worth knowing:
 - **Daemon stopped or missing**: the next launch starts the stopped container or creates a new one, waits up to `NANNA_DAEMON_WAIT_SECS` (30) for the socket, and prunes stale `git worktree` records in each mounted repository (a `git worktree prune` via `podman exec`, safe and run only when the daemon was just started).
 - **Two launchers at once**: if creating the container fails because the other launcher created it first, the loser re-checks that the container exists and attaches to it.
 - **Stale image**: a new `:latest` image is reported by `--status` (`image: STALE ...`) but a running daemon is never replaced silently, because that would interrupt its tasks. Run `--restart` when idle.
-- **Daemon dies mid-session**: `mcp-attach` exits non-zero, the launcher exits non-zero, and Lumo reconnects; the next launch restarts the daemon.
+- **Daemon dies mid-session**: the bridge notices, errors the calls in flight, restarts the daemon with the launcher's `--start` and reconnects. See [The connection bridge](#the-connection-bridge).
 - **Fail closed**: a missing config volume or repository volume exits 3 without starting anything. A daemon that does not open its socket in time exits 4.
 - Messages go to stderr. Stdout carries only protocol bytes.
+
+### The connection bridge
+
+Lumo does not respawn a stdio server that has exited or hung: every later call would wait out Lumo's own 30 to 60 second client timeout. So the process Lumo owns is `scripts/lumo-bridge.py`, which stays alive and repairs the connection underneath it. It exits only when Lumo closes stdin (it then closes the child's stdin, waits up to 3 seconds, and terminates it) or when `podman` cannot be run at all.
+
+- **Daemon restart or exec session lost** (`podman restart`, `--restart`, `--stop`, a crash): the child ends, and the bridge immediately answers every request still waiting for a response with a JSON-RPC error, code `-32000`, message `nanna daemon connection was lost; the daemon is being reconnected, retry the call`. Notifications in flight are dropped. It then runs `scripts/lumo-mcp.sh --start` (idempotent: starts or creates the daemon and waits for the socket), restarts the child with a 0.5 s backoff growing to 5 s, and repeats the `initialize` request Lumo originally sent (and `notifications/initialized`) with a private id. That handshake response is consumed by the bridge and never reaches Lumo, so Lumo's session is unaffected. Tool lists and task results are held by the daemon, which keeps no per-connection state beyond the handshake.
+- **Requests while reconnecting** are queued for up to 20 seconds and sent once the connection is back. After 20 seconds they get the same `-32000` error. Nothing is dropped silently.
+- **Host sleep and hung links**: while the connection is silent the bridge sends a JSON-RPC `ping` through it. If no reply arrives in time, the link is declared dead, the child is killed and the reconnect above happens. After a suspend the bridge also notices that the wall clock advanced more than 15 seconds beyond the monotonic clock between two one-second ticks, and probes at once instead of waiting for the next interval. Bridge pings use ids starting with `nanna-bridge/`, which are reserved: a client request using such an id is rejected with `-32600`, and ping replies are never forwarded to Lumo.
+- **What Lumo should do on `-32000`**: retry the call. The error means the call may not have reached the daemon or its answer was lost; read-only calls are safe to retry, and for `assign_task` check `list_tasks` first if you need to be sure it was not already accepted.
+- The bridge logs timestamped connect and reconnect lines to stderr and does not log the periodic pings.
+
+| Variable | Default |
+| --- | --- |
+| `NANNA_BRIDGE_PING_INTERVAL_SECS` | `20` (silence before a ping is sent) |
+| `NANNA_BRIDGE_PING_TIMEOUT_SECS` | `10` (wait for the reply, and for the re-handshake) |
+| `NANNA_BRIDGE_QUEUE_SECS` | `20` |
+| `NANNA_BRIDGE_BACKOFF_MIN_SECS` / `NANNA_BRIDGE_BACKOFF_MAX_SECS` | `0.5` / `5` |
+| `NANNA_BRIDGE_JUMP_SECS` | `15` (clock jump that counts as suspend/resume) |
+| `NANNA_BRIDGE_TICK_SECS` | `1` |
+| `NANNA_BRIDGE_CLOSE_GRACE_SECS` | `3` |
+
+`NANNA_BRIDGE_TEST_WALL_OFFSET_FILE` is a test hook that adds the number in the named file to the wall clock; leave it unset.
 
 ### Results and restarts
 
@@ -214,6 +236,8 @@ The launcher reads these environment variables. Those that shape the container o
 - **`--install-catalog` refuses because the container exists**: run `--stop` first, install, then start again.
 - **Launcher exits 3 saying a repository volume is missing**: run `scripts/lumo-repos.sh --only <name>`, or set `NANNA_REPOS` to the repositories you have.
 - **Launcher exits 4, the daemon did not open its socket**: read the log lines it prints, or `podman logs nanna-daemon`. A harness image from before this feature has no `--listen`; update the image.
+- **No `mcp-attach`/bridge process exists and every call times out**: Lumo respawns the connector only when it is removed and re-added or Lumo restarts; with the bridge this should not happen. If it does, check that `python3` is on Lumo's `PATH` (the launcher exits 127 without it) and read the bridge's stderr lines in Lumo's MCP log.
+- **Calls fail with `-32000` for longer than a minute**: the bridge cannot bring the daemon back; run `scripts/lumo-mcp.sh --start` by hand and read what it prints.
 - **`mcp-attach` says it cannot reach the daemon**: `scripts/lumo-mcp.sh --status`, then `--start`.
 - **Tasks vanished after a restart**: they are in `/state/results` for 14 days; check `--status` and that the `nanna-state` volume still exists (`podman volume ls`). A task that was running when the daemon died shows as `failed` with `DaemonRestarted`.
 - **`--status` shows `STALE`**: a newer image exists; `--restart` when no task you care about is running.
@@ -229,6 +253,8 @@ The launcher reads these environment variables. Those that shape the container o
 ## Tests
 
 `tests/integration/test-lumo-mcp.sh` checks the launcher against a stateful fake `podman`: the exact daemon argv (named volumes only, config read-only, state mounted, no ports or relabelling), the bridge argv, attach to a running daemon, restart of a stopped one, the creation race, a late or missing socket, `--start`, `--stop`, `--restart`, `--status` (including a stale image and the cargo-home volume present, absent, mounted or not), the read-only cargo mount with `CARGO_HOME`, `CARGO_NET_OFFLINE` and the sandbox hide list matching the real mounts, startup without the cargo-home volume, `lumo-cargo-vendor.sh --help` consistency, `--install-catalog` (exactly the files present, refusal without `auditor.toml`, refusal while the daemon exists, symlinks, default source), fail-closed startup and `NANNA_REPOS`.
+
+`tests/integration/test-lumo-bridge.sh` runs `tests/integration/lumo_bridge_test.py` (also runnable alone with `python3 -I`) against a fake `podman` whose `exec` runs a fake MCP daemon: forwarding and stdout purity, immediate errors for pending ids when the child dies, transparent re-handshake, ping-timeout detection of a hung child, a simulated clock jump, queueing and its expiry, shutdown on stdin close and the private id namespace.
 
 `tests/integration/test-lumo-repos.sh` checks `lumo-repos.sh`: the volume list derived from the catalog, clone for new volumes and fetch for existing ones, `--only` and `--list`, named-volume-only mounts, no credentials or SELinux changes in argv, cleanup after a failed clone.
 
