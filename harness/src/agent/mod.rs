@@ -48,7 +48,7 @@ const COMPLETION_TEMPERATURE: f32 = 0.2;
 const DECISION_TEMPERATURE: f32 = 0.3;
 const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
 const MAX_TOOL_ITERATIONS: usize = 10;
-const FILE_EDIT_TOOLS: &[&str] = &["write_file"];
+const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
 const DEFAULT_MAX_NO_PROGRESS_NUDGES: usize = 2;
 const MAX_NO_PROGRESS_MESSAGE_CHARS: usize = 500;
 
@@ -508,6 +508,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     fn write_tool_names(&self) -> Vec<String> {
         let mut names = self.tool_names_where(|class| class > crate::effects::EffectClass::None);
         names.retain(|name| FILE_EDIT_TOOLS.contains(&name.as_str()));
+        names.sort_by_key(|name| FILE_EDIT_TOOLS.iter().position(|t| t == name));
         names
     }
 
@@ -3393,6 +3394,63 @@ mod tests {
         assert_eq!(nudges.len(), 1);
         assert!(nudges[0].contains("write_file"), "{}", nudges[0]);
         assert!(nudges[0].contains("read_file"), "{}", nudges[0]);
+    }
+
+    fn edit_call() -> ChatResponse {
+        tool_call_response(
+            "edit_file",
+            serde_json::json!({"path": "t.txt", "old_string": "alpha", "new_string": "beta"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_loop_counts_an_edit_file_call_as_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut agent = progress_agent(
+            vec![edit_call(), plain_response("done")],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.result_summary, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.txt")).unwrap(),
+            "beta\n"
+        );
+        assert!(nudge_messages(&agent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_loop_nudge_names_edit_file_before_write_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = progress_agent(
+            vec![plain_response("I will fix it."), plain_response("still no")],
+            write_capable_registry(dir.path()),
+            1,
+        );
+        agent.run_tool_loop(progress_context()).await.unwrap_err();
+        let nudges = nudge_messages(&agent);
+        assert_eq!(nudges.len(), 1);
+        let edit = nudges[0].find("edit_file").expect(&nudges[0]);
+        let write = nudges[0].find("write_file").expect(&nudges[0]);
+        assert!(edit < write, "{}", nudges[0]);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_does_not_nudge_for_edit_file_when_the_card_lacks_write_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = crate::identity::example();
+        identity.scope.max_effect = crate::effects::EffectClass::Workspace;
+        identity.scope.paths = vec!["**".to_string()];
+        identity.scope.tools = vec!["read_file".parse().unwrap()];
+        let registry = crate::tools::create_tool_registry_for(dir.path(), &identity).unwrap();
+        assert!(registry.get_tool("edit_file").is_none());
+        let mut agent = progress_agent(vec![plain_response("Looks fine.")], registry, 2);
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert!(nudge_messages(&agent).is_empty());
     }
 
     #[tokio::test]
