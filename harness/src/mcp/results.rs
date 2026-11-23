@@ -93,7 +93,7 @@ pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, Strin
             ),
             (
                 "prompt_injection",
-                "Remove instructions aimed at the agent from the task text.",
+                "The auditor read the task text as orders aimed at the agent. Describe the change in plain terms: the file, the function and the expected behaviour. Avoid commands about how the agent should work (must, numbered steps, output formats). Then submit again with a new client_ref.",
             ),
         ];
         for (code, fix) in known {
@@ -803,6 +803,20 @@ mod tests {
             .await,
         );
         assert_eq!(view["no_changes"], false);
+    }
+
+    #[test]
+    fn a_prompt_injection_refusal_asks_for_a_plain_description_not_less_detail() {
+        let (code, retryable, fix) = classify_failure(
+            "SpawnRefused",
+            "spawn refused: block: prompt_injection: The subtask text contains extensive, directive instructions",
+        );
+        assert_eq!(code, "prompt_injection");
+        assert!(!retryable);
+        assert!(fix.contains("plain terms"), "{fix}");
+        assert!(fix.contains("file"), "{fix}");
+        assert!(fix.contains("new client_ref"), "{fix}");
+        assert!(!fix.contains("Remove instructions"), "{fix}");
     }
 
     #[tokio::test]
