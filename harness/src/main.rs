@@ -1930,21 +1930,38 @@ fn build_delegate_task_manager(
 fn pi_route_from_env(
     enabled: bool,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
-    Ok(pi_route_with(enabled, &|key| std::env::var_os(key))?)
+    pi_route_with(enabled, &|key| std::env::var_os(key))
+}
+
+#[cfg(unix)]
+fn pi_executor(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::PodmanPiExecutor::from_lookup(lookup)?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn pi_executor(
+    _lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    warn!(
+        "the pi route is on and this platform has no pi executor: every audited task fails closed"
+    );
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::UnwiredPiExecutor,
+    ))
 }
 
 fn pi_route_with(
     enabled: bool,
     lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Result<Option<harness::harness_adapter::PiRoute>, harness::harness_adapter::PiRouteError> {
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
     if !enabled {
         return Ok(None);
     }
-    let route = harness::harness_adapter::PiRoute::from_lookup(
-        lookup,
-        std::sync::Arc::new(harness::harness_adapter::UnwiredPiExecutor),
-    )?;
-    warn!("the pi route is on and its executor is not wired: every audited task fails closed");
+    let route = harness::harness_adapter::PiRoute::from_lookup(lookup, pi_executor(lookup)?)?;
     Ok(Some(route))
 }
 
@@ -3860,6 +3877,36 @@ mod tests {
         assert!(pi_route_with(false, &|_| None).unwrap().is_none());
         assert!(pi_route_with(true, &configured).unwrap().is_some());
         assert!(pi_route_with(true, &|_| None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enabled_pi_route_runs_pi_in_a_container_with_no_network_by_default() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let route = pi_route_with(true, &configured).unwrap().unwrap();
+        let shown = format!("{:?}", route.executor());
+        assert!(shown.contains("PodmanPiExecutor"), "{shown}");
+        assert!(shown.contains("None"), "{shown}");
+        let named = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("model-net")),
+            other => configured(other),
+        };
+        let route = pi_route_with(true, &named).unwrap().unwrap();
+        assert!(format!("{:?}", route.executor()).contains("model-net"));
+        let reserved = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("host")),
+            other => configured(other),
+        };
+        assert!(pi_route_with(true, &reserved).is_err());
     }
 
     #[test]
