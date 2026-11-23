@@ -514,10 +514,21 @@ mod tests {
             Err(AgentError::StateError {
                 message,
                 iterations_completed,
-                ..
+                tool_calls_made,
+                conversation_snapshot,
+                last_agent_state,
             }) => {
-                assert!(message.contains("t-1"), "{message}");
+                assert_eq!(
+                    message,
+                    "the pi executor is not wired into this build; task t-1 was not run"
+                );
                 assert_eq!(iterations_completed, 0);
+                assert!(tool_calls_made.is_empty());
+                assert!(conversation_snapshot.is_empty());
+                assert_eq!(
+                    last_agent_state,
+                    AgentState::Error("pi executor not wired".to_string())
+                );
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
