@@ -376,7 +376,8 @@ mod tests {
         let runner = host().with_teardown(vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("echo gone > {}", marker.display()),
+            "echo gone > \"$0\"".to_string(),
+            marker.display().to_string(),
         ]);
         (runner, marker)
     }

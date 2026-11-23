@@ -4993,7 +4993,8 @@ mod identity_tests {
         let runner = crate::verify::ProcessCheckRunner::new("env", vec![]).with_teardown(vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("echo \"$0 $1\" > {}", marker.display()),
+            "echo \"$1 $2\" > \"$0\"".to_string(),
+            marker.display().to_string(),
             "rm".to_string(),
             "nanna-task-fake".to_string(),
         ]);

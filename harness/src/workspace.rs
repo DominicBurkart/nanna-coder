@@ -3765,7 +3765,8 @@ mod tests {
         let wanted = ReadOnlyMount::new(root.join(".nanna"), "/workspace/.nanna");
         assert!(config.read_only_mounts.contains(&wanted));
         let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
-        let flag = format!("-v={}/.nanna:/workspace/.nanna:ro", root.display());
+        let flag = wanted.run_arg();
+        assert!(flag.ends_with(":/workspace/.nanna:ro"), "{flag}");
         let writable = args
             .iter()
             .position(|a| a.ends_with(":/workspace:z"))
