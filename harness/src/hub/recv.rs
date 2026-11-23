@@ -1,5 +1,5 @@
 use super::error::HubError;
-use super::lineage::{SessionBinding, SessionId};
+use super::lineage::{RootId, SessionBinding, SessionId};
 use super::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
 use super::reach::{relation_of, Relation};
 use super::send::{
@@ -161,8 +161,11 @@ impl MessageHub {
     /// `wait_secs` and nothing to return the call polls the inbox once per
     /// [`RECV_POLL_MILLIS`] on the hub's clock, at most [`RECV_WAIT_MAX_SECS`] seconds in all.
     /// The review runs before any state changes and nothing is held across a wait, so dropping
-    /// the future leaves every message as it was. The call does not set `WaitingOnMessages`:
-    /// the registry refuses that transition until the lifecycle work lands.
+    /// the future leaves every message as it was. Only a call that is about to block marks the
+    /// session `WaitingOnMessages` (a call that returns at once writes nothing); the session is
+    /// `Running` again on every exit: a message, the timeout, an error or a dropped future. A
+    /// per-session waiter count keeps concurrent calls of one session waiting until the last of
+    /// them ends, and the leave never revives a session that was finished meanwhile.
     pub async fn recv(&self, to: &SessionBinding, req: RecvRequest) -> Result<RecvPage, HubError> {
         let root = to.lineage().root();
         let in_root = self.sessions.in_root(root)?;
@@ -178,12 +181,16 @@ impl MessageHub {
         }
         let max = usize::from(req.max.clamp(1, RECV_MAX));
         let mut left = i64::from(req.wait_secs.min(RECV_WAIT_MAX_SECS)) * 1000;
+        let mut waiting = None;
         loop {
             let (judged, total) = self.judge_all(to, &in_root, max).await?;
             if !judged.is_empty() || left <= 0 {
                 let mut page = self.commit(judged, total)?;
                 page.all_peers_waiting = self.peers_waiting(to);
                 return Ok(page);
+            }
+            if waiting.is_none() {
+                waiting = Some(self.enter_wait(to.session()));
             }
             self.clock
                 .sleep(Duration::milliseconds(RECV_POLL_MILLIS))
@@ -193,7 +200,10 @@ impl MessageHub {
     }
 
     fn pending(&self, to: &SessionBinding) -> Result<Vec<StoredMessage>, HubError> {
-        let (me, root) = (to.session(), to.lineage().root());
+        self.pending_for(to.session(), to.lineage().root())
+    }
+
+    fn pending_for(&self, me: &SessionId, root: &RootId) -> Result<Vec<StoredMessage>, HubError> {
         let mut found: Vec<StoredMessage> = Vec::new();
         let mut seen: HashSet<MessageId> = HashSet::new();
         let mut after: Option<Seq> = None;
@@ -407,18 +417,20 @@ impl MessageHub {
     }
 
     fn peers_waiting(&self, to: &SessionBinding) -> bool {
-        self.sessions
-            .in_root(to.lineage().root())
-            .is_ok_and(|sessions| {
-                let others: Vec<&SessionRecord> = sessions
-                    .iter()
-                    .filter(|rec| rec.id != *to.session() && rec.status.is_active())
-                    .collect();
-                !others.is_empty()
-                    && others
-                        .iter()
-                        .all(|rec| rec.status == SessionStatus::WaitingOnMessages)
-            })
+        let root = to.lineage().root();
+        self.sessions.in_root(root).is_ok_and(|sessions| {
+            let others: Vec<&SessionRecord> = sessions
+                .iter()
+                .filter(|rec| rec.id != *to.session() && rec.status.is_active())
+                .collect();
+            !others.is_empty()
+                && others.iter().all(|rec| {
+                    rec.status == SessionStatus::WaitingOnMessages
+                        && self
+                            .pending_for(&rec.id, root)
+                            .is_ok_and(|mail| mail.is_empty())
+                })
+        })
     }
 }
 
@@ -444,6 +456,7 @@ mod tests {
     use crate::task::TaskId;
     use async_trait::async_trait;
     use chrono::TimeZone;
+    use futures::FutureExt;
     use model::types::{ChatMessage, ChatRequest, ChatResponse, Choice, FinishReason, MessageRole};
     use model::{ModelProvider, ModelResult};
     use proptest::prelude::*;
@@ -583,6 +596,7 @@ mod tests {
         fail_append: AtomicBool,
         fail_ack: AtomicBool,
         fail_inbox: AtomicBool,
+        fail_inbox_from: AtomicUsize,
         fail_get: AtomicBool,
         fail_set_state_at: AtomicUsize,
         set_states: AtomicUsize,
@@ -598,6 +612,7 @@ mod tests {
                 fail_append: AtomicBool::new(false),
                 fail_ack: AtomicBool::new(false),
                 fail_inbox: AtomicBool::new(false),
+                fail_inbox_from: AtomicUsize::new(0),
                 fail_get: AtomicBool::new(false),
                 fail_set_state_at: AtomicUsize::new(0),
                 set_states: AtomicUsize::new(0),
@@ -637,6 +652,10 @@ mod tests {
                 return Err(disk());
             }
             let call = self.inboxes.fetch_add(1, Ordering::SeqCst) + 1;
+            let from = self.fail_inbox_from.load(Ordering::SeqCst);
+            if from != 0 && call >= from {
+                return Err(disk());
+            }
             let due = matches!(&*self.arrival.lock().unwrap(), Some((at, _)) if *at == call);
             if due {
                 let taken = self.arrival.lock().unwrap().take();
@@ -749,6 +768,155 @@ mod tests {
         }
     }
 
+    type Hook = Box<dyn FnOnce(&InMemorySessionStore) + Send>;
+
+    struct Spy {
+        inner: InMemorySessionStore,
+        log: Mutex<Vec<SessionStatus>>,
+        fail_updates: AtomicBool,
+        before_update: Mutex<Option<Hook>>,
+    }
+
+    impl Spy {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemorySessionStore::new(),
+                log: Mutex::new(Vec::new()),
+                fail_updates: AtomicBool::new(false),
+                before_update: Mutex::new(None),
+            })
+        }
+
+        fn written(&self) -> Vec<SessionStatus> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+
+        fn before_next_update(&self, hook: impl FnOnce(&InMemorySessionStore) + Send + 'static) {
+            *self.before_update.lock().unwrap() = Some(Box::new(hook));
+        }
+    }
+
+    impl SessionStore for Spy {
+        fn upsert(&self, rec: SessionRecord) -> Result<(), StoreError> {
+            self.inner.upsert(rec)
+        }
+
+        fn get(&self, id: SessionId) -> Result<Option<SessionRecord>, StoreError> {
+            self.inner.get(id)
+        }
+
+        fn update(
+            &self,
+            id: SessionId,
+            change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+        ) -> Result<(), StoreError> {
+            if self.fail_updates.load(Ordering::SeqCst) {
+                return Err(disk());
+            }
+            let hook = self.before_update.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&self.inner);
+            }
+            let log = &self.log;
+            let record = move |record: SessionRecord| {
+                let next = change(record);
+                if let Some(applied) = &next {
+                    log.lock().unwrap().push(applied.status);
+                }
+                next
+            };
+            self.inner.update(id, Box::new(record))
+        }
+
+        fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
+            self.inner.in_root(root)
+        }
+
+        fn set_status(
+            &self,
+            id: SessionId,
+            s: SessionStatus,
+            at: DateTime<Utc>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_status(id, s, at)
+        }
+
+        fn set_note(
+            &self,
+            id: SessionId,
+            note: crate::hub::summary::Summary,
+        ) -> Result<(), StoreError> {
+            self.inner.set_note(id, note)
+        }
+
+        fn prune(
+            &self,
+            now: DateTime<Utc>,
+            policy: &crate::hub::store::Retention,
+        ) -> Result<usize, StoreError> {
+            self.inner.prune(now, policy)
+        }
+
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            self.inner.active()
+        }
+    }
+
+    struct GateClock {
+        inner: SimulatedClock,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GateClock {
+        fn over(inner: &SimulatedClock) -> Arc<Self> {
+            Arc::new(Self {
+                inner: inner.clone(),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn release(&self, ticks: usize) {
+            self.gate.add_permits(ticks);
+        }
+    }
+
+    impl Clock for GateClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.inner.now()
+        }
+
+        fn sleep(&self, duration: Duration) -> SleepFuture<'_> {
+            Box::pin(async move {
+                self.gate.acquire().await.unwrap().forget();
+                self.inner.advance(duration);
+            })
+        }
+    }
+
+    type Call<'a> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<RecvPage, HubError>> + 'a>>;
+
+    fn call<'a>(hub: &'a MessageHub, who: &'a SessionBinding, wait_secs: u8) -> Call<'a> {
+        let request = RecvRequest {
+            wait_secs,
+            ..RecvRequest::default()
+        };
+        Box::pin(hub.recv(who, request))
+    }
+
+    fn step(call: &mut Call<'_>) -> std::task::Poll<Result<RecvPage, HubError>> {
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        call.as_mut().poll(&mut cx)
+    }
+
+    fn finished(call: Call<'_>) -> Result<RecvPage, HubError> {
+        call.now_or_never().expect("the call did not finish")
+    }
+
+    fn parked(call: &mut Call<'_>) -> bool {
+        step(call).is_pending()
+    }
+
     struct StuckClock(SimulatedClock);
 
     impl Clock for StuckClock {
@@ -762,7 +930,7 @@ mod tests {
     }
 
     struct World {
-        sessions: Arc<InMemorySessionStore>,
+        sessions: Arc<Spy>,
         messages: Arc<dyn MessageStore>,
         registry: Arc<SessionRegistry>,
         clock: SimulatedClock,
@@ -771,7 +939,7 @@ mod tests {
 
     impl World {
         fn new(messages: Arc<dyn MessageStore>) -> Self {
-            let sessions = Arc::new(InMemorySessionStore::new());
+            let sessions = Spy::new();
             Self {
                 registry: Arc::new(SessionRegistry::new(sessions.clone())),
                 sessions,
@@ -850,6 +1018,27 @@ mod tests {
                 self.messages.clone(),
                 Arc::new(auditor),
                 Arc::new(self.clock.clone()),
+                HubLimits::default(),
+                self.registry.clone(),
+            )
+        }
+
+        fn run(&self, who: &SessionBinding) {
+            self.registry
+                .set_status(who.session(), SessionStatus::Running, self.clock.now())
+                .unwrap();
+        }
+
+        fn record(&self, who: &SessionBinding) -> SessionRecord {
+            self.sessions.get(who.session().clone()).unwrap().unwrap()
+        }
+
+        fn gated(&self, gate: &Arc<GateClock>) -> MessageHub {
+            MessageHub::new(
+                self.sessions.clone(),
+                self.messages.clone(),
+                Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
+                gate.clone(),
                 HubLimits::default(),
                 self.registry.clone(),
             )
@@ -2008,6 +2197,469 @@ mod tests {
         assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 3);
     }
 
+    fn waiting_world() -> (World, SessionBinding, SessionBinding, Arc<GateClock>) {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        world.run(&a);
+        world.run(&b);
+        world.sessions.written();
+        let gate = GateClock::over(&world.clock);
+        (world, a, b, gate)
+    }
+
+    #[test]
+    fn a_blocking_recv_enters_waiting_without_touching_activity_and_leaves_on_arrival() {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        world.clock.advance(Duration::seconds(5));
+        let before = world.record(&b);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        let record = world.record(&b);
+        assert_eq!(record.status, SessionStatus::WaitingOnMessages);
+        assert_eq!(record.last_activity, before.last_activity);
+        assert_eq!(world.sessions.written(), [SessionStatus::WaitingOnMessages]);
+        world.put(&a, &b, "m1");
+        gate.release(1);
+        let page = finished(waiting).unwrap();
+        assert_eq!(bodies(&page), ["m1"]);
+        let record = world.record(&b);
+        assert_eq!(record.status, SessionStatus::Running);
+        assert_eq!(record.last_activity, world.clock.now());
+        assert!(record.last_activity > before.last_activity);
+        assert_eq!(world.sessions.written(), [SessionStatus::Running]);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_wait_enters_once_and_leaves_once() {
+        let world = World::memory();
+        let b = world.seat("b");
+        world.run(&b);
+        let hub = world.hub(Recorder::deliver());
+        world.sessions.written();
+        let request = RecvRequest {
+            wait_secs: 3,
+            ..RecvRequest::default()
+        };
+        let page = hub.recv(&b, request).await.unwrap();
+        assert!(page.messages.is_empty());
+        assert_eq!(world.clock.sleeps().len(), 3);
+        assert_eq!(
+            world.sessions.written(),
+            [SessionStatus::WaitingOnMessages, SessionStatus::Running]
+        );
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn a_store_error_during_the_wait_leaves_waiting() {
+        let flaky = Flaky::new();
+        let world = World::new(flaky.clone());
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        world.run(&b);
+        let gate = GateClock::over(&world.clock);
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
+        world.put(&a, &b, "m1");
+        flaky.fail_inbox.store(true, Ordering::SeqCst);
+        gate.release(1);
+        let outcome = finished(waiting);
+        assert!(matches!(outcome, Err(HubError::Store(_))));
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn dropping_the_future_mid_wait_leaves_waiting() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
+        drop(waiting);
+        let record = world.record(&b);
+        assert_eq!(record.status, SessionStatus::Running);
+        assert_eq!(record.ended_at, None);
+    }
+
+    #[test]
+    fn a_call_that_returns_at_once_writes_nothing() {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        world.sessions.written();
+        let mut none_wanted = call(&hub, &b, 0);
+        assert!(!parked(&mut none_wanted));
+        world.put(&a, &b, "m1");
+        let mut mail_waiting = call(&hub, &b, 30);
+        assert!(!parked(&mut mail_waiting));
+        assert_eq!(world.sessions.written(), []);
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn concurrent_waiters_of_one_session_enter_once_and_leave_with_the_last() {
+        let table: [&[usize]; 6] = [&[0], &[0, 1], &[1, 0], &[0, 1, 2], &[2, 0, 1], &[1, 2, 0]];
+        for order in table {
+            let (world, _a, b, gate) = waiting_world();
+            let hub = world.gated(&gate);
+            let mut calls: Vec<Option<Call<'_>>> = Vec::new();
+            for _ in 0..order.len() {
+                let mut waiting = call(&hub, &b, 30);
+                assert!(parked(&mut waiting));
+                calls.push(Some(waiting));
+            }
+            assert_eq!(world.sessions.written(), [SessionStatus::WaitingOnMessages]);
+            let mut live = order.len();
+            for which in order {
+                drop(calls[*which].take());
+                live -= 1;
+                let expected = if live > 0 {
+                    SessionStatus::WaitingOnMessages
+                } else {
+                    SessionStatus::Running
+                };
+                assert_eq!(world.record(&b).status, expected, "{order:?}");
+            }
+            assert_eq!(world.sessions.written(), [SessionStatus::Running]);
+        }
+    }
+
+    #[test]
+    fn the_first_waiter_to_finish_does_not_end_the_second_ones_wait() {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut first = call(&hub, &b, 30);
+        let mut second = call(&hub, &b, 30);
+        assert!(parked(&mut first) && parked(&mut second));
+        world.put(&a, &b, "m1");
+        gate.release(1);
+        assert!(!parked(&mut first));
+        assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
+        drop(second);
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn a_wait_cancelled_by_the_task_manager_never_resurrects_the_session() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        world
+            .registry
+            .finish(
+                b.session(),
+                SessionStatus::Cancelled,
+                None,
+                world.clock.now(),
+            )
+            .unwrap();
+        drop(waiting);
+        let record = world.record(&b);
+        assert_eq!(record.status, SessionStatus::Cancelled);
+        assert!(record.ended_at.is_some());
+        assert_eq!(
+            world.sessions.written(),
+            [SessionStatus::WaitingOnMessages, SessionStatus::Cancelled]
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_lands_between_the_leave_read_and_write_stays_cancelled() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        let (id, ended) = (b.session().clone(), world.clock.now());
+        world.sessions.before_next_update(move |store| {
+            store
+                .update(
+                    id,
+                    Box::new(move |mut record| {
+                        record.status = SessionStatus::Cancelled;
+                        record.ended_at = Some(ended);
+                        Some(record)
+                    }),
+                )
+                .unwrap();
+        });
+        drop(waiting);
+        let record = world.record(&b);
+        assert_eq!(record.status, SessionStatus::Cancelled);
+        assert_eq!(record.ended_at, Some(ended));
+    }
+
+    #[test]
+    fn a_session_that_is_not_running_is_never_moved_by_a_wait() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let gate = GateClock::over(&world.clock);
+        let hub = world.gated(&gate);
+        world.sessions.written();
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        drop(waiting);
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        assert_eq!(world.sessions.written(), []);
+    }
+
+    #[test]
+    fn a_record_reset_to_pending_during_the_wait_is_not_moved_by_the_leave() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        world
+            .registry
+            .reregister(&b, "subtask", world.clock.now())
+            .unwrap();
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        world.sessions.written();
+        drop(waiting);
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        assert_eq!(world.sessions.written(), []);
+    }
+
+    #[test]
+    fn a_failed_enter_still_waits_and_a_failed_leave_still_returns() {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        world.sessions.fail_updates.store(true, Ordering::SeqCst);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+        world.put(&a, &b, "m1");
+        gate.release(1);
+        let page = finished(waiting).unwrap();
+        assert_eq!(bodies(&page), ["m1"]);
+        world.sessions.fail_updates.store(false, Ordering::SeqCst);
+        assert_eq!(world.sessions.written(), []);
+
+        let mut again = call(&hub, &b, 30);
+        assert!(parked(&mut again));
+        assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
+        world.sessions.fail_updates.store(true, Ordering::SeqCst);
+        world.put(&a, &b, "m2");
+        gate.release(1);
+        let page = finished(again).unwrap();
+        assert_eq!(bodies(&page), ["m2"]);
+        assert_eq!(world.record(&b).status, SessionStatus::WaitingOnMessages);
+    }
+
+    #[test]
+    fn one_sessions_wait_never_changes_another_sessions_record() {
+        let (world, a, b, gate) = waiting_world();
+        let c = world.seat("c");
+        world.run(&c);
+        let hub = world.gated(&gate);
+        let (before_a, before_c) = (world.record(&a), world.record(&c));
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        assert_eq!(world.record(&a), before_a);
+        assert_eq!(world.record(&c), before_c);
+        drop(waiting);
+        assert_eq!(world.record(&a), before_a);
+        assert_eq!(world.record(&c), before_c);
+    }
+
+    #[test]
+    fn all_peers_waiting_goes_live_from_real_waits_and_needs_no_pending_mail() {
+        let (world, a, b, gate) = waiting_world();
+        let c = world.seat("c");
+        world.run(&c);
+        let hub = world.gated(&gate);
+        let mine = world.hub(Recorder::deliver());
+        let flag = || finished(call(&mine, &a, 0)).unwrap().all_peers_waiting;
+        assert!(!flag());
+        let mut b_waits = call(&hub, &b, 30);
+        assert!(parked(&mut b_waits));
+        assert!(!flag());
+        let mut c_waits = call(&hub, &c, 30);
+        assert!(parked(&mut c_waits));
+        assert!(flag());
+        world.put(&a, &c, "for c");
+        assert!(!flag());
+        gate.release(1);
+        assert!(parked(&mut b_waits));
+        assert!(!flag());
+        drop(c_waits);
+        assert_eq!(world.record(&c).status, SessionStatus::Running);
+        assert!(!flag());
+        drop(b_waits);
+        assert!(!flag());
+    }
+
+    #[test]
+    fn all_peers_waiting_becomes_true_when_the_last_peer_blocks_and_false_when_it_wakes() {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mine = world.hub(Recorder::deliver());
+        let mut b_waits = call(&hub, &b, 30);
+        assert!(parked(&mut b_waits));
+        let page = finished(call(&mine, &a, 0)).unwrap();
+        assert!(page.all_peers_waiting);
+        world.put(&a, &b, "wake");
+        gate.release(1);
+        assert!(!parked(&mut b_waits));
+        let page = finished(call(&mine, &a, 0)).unwrap();
+        assert!(!page.all_peers_waiting);
+        assert_eq!(world.record(&b).status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn a_session_alone_is_never_all_peers_waiting() {
+        let world = World::memory();
+        let a = world.seat("a");
+        world.run(&a);
+        let hub = world.hub(Recorder::deliver());
+        let page = futures::executor::block_on(hub.recv(&a, RecvRequest::default())).unwrap();
+        assert!(!page.all_peers_waiting);
+    }
+
+    #[test]
+    fn an_unreadable_inbox_never_claims_that_peers_are_waiting() {
+        let flaky = Flaky::new();
+        let world = World::new(flaky.clone());
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        world.run(&a);
+        world.run(&b);
+        let gate = GateClock::over(&world.clock);
+        let hub = world.gated(&gate);
+        let mut b_waits = call(&hub, &b, 30);
+        assert!(parked(&mut b_waits));
+        let mine = world.hub(Recorder::deliver());
+        let calls_so_far = flaky.inboxes.load(Ordering::SeqCst);
+        flaky
+            .fail_inbox_from
+            .store(calls_so_far + 2, Ordering::SeqCst);
+        let page = futures::executor::block_on(mine.recv(&a, RecvRequest::default())).unwrap();
+        assert!(!page.all_peers_waiting);
+        flaky.fail_inbox_from.store(0, Ordering::SeqCst);
+        let page = futures::executor::block_on(mine.recv(&a, RecvRequest::default())).unwrap();
+        assert!(page.all_peers_waiting);
+    }
+
+    #[test]
+    fn the_hub_a_runtime_builds_marks_the_shared_registry_waiting() {
+        let clock = SimulatedClock::new(start());
+        let gate = GateClock::over(&clock);
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let auditor = Recorder::deliver() as Arc<dyn MessageAuditor>;
+        let runtime = crate::hub::runtime::HubRuntime::assemble(
+            sessions.clone(),
+            Arc::new(InMemoryMessageStore::new()),
+            crate::hub::runtime::tests::constant_auditors(auditor),
+            gate,
+        );
+        let (hub, registry) = (runtime.hub().unwrap(), runtime.registry().unwrap());
+        let mut card = crate::identity::example();
+        card.scope.message_reach = MessageReach::Root;
+        let lineage = Lineage::root_child(RootId::mcp(Uuid::from_u128(7)));
+        let binding = SessionBinding::from_audited(&card, TaskId("w".to_string()), lineage);
+        registry.register(&binding, "subtask", start()).unwrap();
+        registry
+            .set_status(binding.session(), SessionStatus::Running, start())
+            .unwrap();
+        let mut waiting = call(&hub, &binding, 30);
+        assert!(parked(&mut waiting));
+        let stored = |who: &SessionBinding| sessions.get(who.session().clone()).unwrap().unwrap();
+        assert_eq!(stored(&binding).status, SessionStatus::WaitingOnMessages);
+        drop(waiting);
+        assert_eq!(stored(&binding).status, SessionStatus::Running);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Life {
+        Start(usize),
+        Drop(usize),
+        Deliver,
+        Finish(SessionStatus),
+    }
+
+    fn lives() -> impl Strategy<Value = Vec<Life>> {
+        let finish = prop_oneof![
+            Just(SessionStatus::Completed),
+            Just(SessionStatus::Failed),
+            Just(SessionStatus::Cancelled)
+        ];
+        prop::collection::vec(
+            prop_oneof![
+                4 => (0usize..3).prop_map(Life::Start),
+                4 => (0usize..3).prop_map(Life::Drop),
+                2 => Just(Life::Deliver),
+                1 => finish.prop_map(Life::Finish),
+            ],
+            1..40,
+        )
+    }
+
+    fn check_lives(plan: Vec<Life>) -> Result<(), TestCaseError> {
+        let (world, a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut slots: Vec<Option<Call<'_>>> = vec![None, None, None];
+        let mut ended: Option<SessionStatus> = None;
+        for event in plan {
+            match event {
+                Life::Start(k) => {
+                    if slots[k].is_none() {
+                        let mut fresh = call(&hub, &b, 60);
+                        if parked(&mut fresh) {
+                            slots[k] = Some(fresh);
+                        }
+                    }
+                }
+                Life::Drop(k) => drop(slots[k].take()),
+                Life::Deliver => {
+                    world.put(&a, &b, "m");
+                    let alive = slots.iter().flatten().count();
+                    gate.release(alive);
+                    for slot in slots.iter_mut() {
+                        let done = slot.as_mut().is_some_and(|open| !parked(open));
+                        if done {
+                            slot.take();
+                        }
+                    }
+                }
+                Life::Finish(status) => {
+                    let result =
+                        world
+                            .registry
+                            .finish(b.session(), status, None, world.clock.now());
+                    if result.is_ok() {
+                        ended = Some(status);
+                    }
+                }
+            }
+            let alive = slots.iter().flatten().count();
+            let expected = ended.unwrap_or(if alive > 0 {
+                SessionStatus::WaitingOnMessages
+            } else {
+                SessionStatus::Running
+            });
+            let record = world.record(&b);
+            prop_assert_eq!(record.status, expected);
+            prop_assert_eq!(record.ended_at.is_some(), ended.is_some());
+        }
+        slots.clear();
+        let record = world.record(&b);
+        prop_assert_eq!(record.status, ended.unwrap_or(SessionStatus::Running));
+        let written = world.sessions.written();
+        if let Some(at) = written.iter().position(|status| !status.is_active()) {
+            prop_assert_eq!(at + 1, written.len(), "{:?}", written);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn the_session_status_follows_the_live_waiters_and_never_leaves_a_terminal(plan in lives()) {
+            check_lives(plan)?;
+        }
+    }
+
     fn production_source() -> String {
         let source = include_str!("recv.rs");
         source.split("#[cfg(test)]").next().unwrap().to_string()
@@ -2283,6 +2935,15 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         assert_eq!(sessions.prune(start(), &policy).unwrap(), 0);
+        let spy = Spy::new();
+        let note = crate::hub::summary::Summary::compose("a", "running", "n");
+        let unknown = SessionId::from_task(TaskId("y".into()));
+        assert!(matches!(
+            spy.set_note(unknown, note),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(spy.prune(start(), &policy).unwrap(), 0);
+        assert!(spy.active().unwrap().is_empty());
         assert!(sessions.active().unwrap().is_empty());
         let provider = Counting {
             reply: String::new(),
