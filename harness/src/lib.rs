@@ -100,9 +100,9 @@ pub use tools::{
     create_container_tool_registry_for, create_tool_registry, create_tool_registry_for,
     member_working_dir, sqlx_migrate_args, trunk_build_args, CalculatorTool, CargoAuditTool,
     CargoBenchTool, CargoBuildTool, CargoCheckTool, CargoDenyTool, CargoRunTool, CargoTestTool,
-    EchoTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus, GitStatusTool, ListDirTool,
-    PrStatusData, ReadFileTool, RunCommandTool, SearchTool, SqlxMigrateTool, Tool, ToolError,
-    ToolRegistry, ToolResult, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
+    EchoTool, EditFileTool, GitDiffTool, GitHubPrStatusTool, GitHubStatus, GitStatusTool,
+    ListDirTool, PrStatusData, ReadFileTool, RunCommandTool, SearchTool, SqlxMigrateTool, Tool,
+    ToolError, ToolRegistry, ToolResult, TrunkBuildTool, WriteFileTool, CONTAINER_WORKSPACE_DIR,
     SQLX_MIGRATE_COMMANDS,
 };
 

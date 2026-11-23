@@ -8926,6 +8926,14 @@ mod impact_tests {
         repo: &std::path::Path,
         calls: Vec<model::types::ChatResponse>,
     ) -> (TaskManager, Task) {
+        run_with_tools(repo, calls, &["write_file"]).await
+    }
+
+    async fn run_with_tools(
+        repo: &std::path::Path,
+        calls: Vec<model::types::ChatResponse>,
+        tools: &[&str],
+    ) -> (TaskManager, Task) {
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let mut tool_responses = calls;
         tool_responses.push(stop_response("done"));
@@ -8940,7 +8948,7 @@ mod impact_tests {
         let mut identity = crate::identity::example();
         identity.scope.max_effect = EffectClass::Workspace;
         identity.scope.paths = vec!["**".to_string()];
-        identity.scope.tools = vec!["write_file".parse().unwrap()];
+        identity.scope.tools = tools.iter().map(|t| t.parse().unwrap()).collect();
         let id = manager
             .submit_with_identity(
                 "Test".to_string(),
@@ -8963,6 +8971,53 @@ mod impact_tests {
             } => (diagnostics.error_type.as_str(), error.as_str()),
             other => panic!("expected a failed task, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_scripted_read_then_edit_file_changes_one_line_in_the_task_patch() {
+        let repo = repo_with(&[(
+            "src/lib.rs",
+            "pub fn answer() -> u32 {\n    let x = 1;\n    x\n}\n\npub fn other() -> u32 {\n    7\n}\n",
+        )]);
+        let read = tool_call_response("read_file", serde_json::json!({"path": "src/lib.rs"}));
+        let edit = tool_call_response(
+            "edit_file",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "old_string": "let x = 1;",
+                "new_string": "let x = 2;"
+            }),
+        );
+        let (manager, task) =
+            run_with_tools(repo.path(), vec![read, edit], &["read_file", "write_file"]).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+        let result = manager.get_result(&task.id).await.unwrap();
+        assert_eq!(result.files_modified, ["src/lib.rs"]);
+        let patch = result.changes_patch.as_deref().unwrap();
+        assert!(patch.contains("-    let x = 1;"), "{patch}");
+        assert!(patch.contains("+    let x = 2;"), "{patch}");
+        let changed = patch
+            .lines()
+            .filter(|l| {
+                (l.starts_with('+') || l.starts_with('-'))
+                    && !l.starts_with("+++")
+                    && !l.starts_with("---")
+            })
+            .count();
+        assert_eq!(changed, 2, "{patch}");
+        let edit_call = result
+            .tool_calls_made
+            .iter()
+            .find(|c| c.tool_name == "edit_file")
+            .unwrap();
+        assert_eq!(
+            edit_call.effect.as_ref().unwrap().class,
+            EffectClass::Workspace
+        );
     }
 
     #[tokio::test]
