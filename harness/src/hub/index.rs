@@ -119,7 +119,7 @@ impl IndexedSession {
 
 /// A frozen, bounded snapshot of one root's sessions for the librarian. It holds session
 /// metadata, notes, result summaries, touched paths and a per-session tool-name histogram, never
-/// a message body or file content, and only [`IndexView::freeze`] builds one.
+/// a message body or file content, and only `IndexView::freeze` builds one.
 ///
 /// ```
 /// use harness::hub::index::IndexView;
