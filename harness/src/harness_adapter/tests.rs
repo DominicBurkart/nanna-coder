@@ -545,7 +545,13 @@ fn scoped_capabilities_describe_tools_with_their_effect() {
         .unwrap();
     assert_eq!(write.effect, EffectClass::Workspace);
     assert_eq!(write.parameters["type"], "object");
-    assert_eq!(grant.specs().len(), 1);
+    let edit = grant
+        .specs()
+        .iter()
+        .find(|s| s.name == "edit_file")
+        .unwrap();
+    assert_eq!(edit.effect, EffectClass::Workspace);
+    assert_eq!(grant.specs().len(), 2);
 }
 
 #[test]

@@ -421,7 +421,7 @@ impl ResolvedAgent {
         for spec in &scoped.specs {
             let unscopable = restricted && PATH_UNSCOPABLE_TOOLS.contains(&spec.name.as_str());
             if unscopable
-                || !identity.allows_tool(&spec.name)
+                || !crate::tool_grants::identity_grants_tool(identity, &spec.name)
                 || !identity.allows_effect(spec.effect)
             {
                 return Err(ResolveError::GrantWiderThanIdentity {

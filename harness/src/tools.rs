@@ -16,6 +16,7 @@ use crate::scope::{
     UNSCOPED_IDENTITY,
 };
 use crate::task::TaskId;
+use crate::tool_grants::identity_grants_tool;
 use async_trait::async_trait;
 use chrono::Utc;
 use model::types::{FunctionDefinition, JsonSchema, PropertySchema, SchemaType, ToolDefinition};
@@ -251,7 +252,7 @@ impl ToolRegistry {
     ///
     /// let mut names = scoped.list_tools();
     /// names.sort_unstable();
-    /// assert_eq!(names, vec!["read_file", "write_file"]);
+    /// assert_eq!(names, vec!["edit_file", "read_file", "write_file"]);
     /// assert_eq!(scoped.identity(), Some("reader"));
     /// assert!(scoped.get_tool("github_pr_status").is_none(), "repository class exceeds the ceiling");
     /// assert!(scoped.get_tool("search").is_none(), "not named in scope.tools");
@@ -260,7 +261,7 @@ impl ToolRegistry {
     pub fn scoped_for(mut self, identity: &AgentIdentity) -> Self {
         let restricted = identity.restricts_paths();
         let keep = |name: &String, tool: &mut Box<dyn Tool>| {
-            identity.allows_tool(name)
+            identity_grants_tool(identity, name)
                 && identity.allows_effect(tool.effect_class())
                 && !(restricted && PATH_UNSCOPABLE_TOOLS.contains(&name.as_str()))
         };
@@ -676,7 +677,7 @@ impl ToolRegistry {
     /// let registry = create_tool_registry(std::path::Path::new("."));
     /// let grouped = registry.by_class();
     /// assert_eq!(grouped.len(), EffectClass::ALL.len());
-    /// assert_eq!(grouped[&EffectClass::Workspace], vec!["write_file"]);
+    /// assert_eq!(grouped[&EffectClass::Workspace], vec!["edit_file", "write_file"]);
     /// assert!(grouped[&EffectClass::Ci].is_empty());
     /// ```
     pub fn by_class(&self) -> BTreeMap<EffectClass, Vec<&str>> {
@@ -1109,9 +1110,8 @@ impl Tool for WriteFileTool {
         let path = Path::new(path_str);
         let scope = self.scope.as_ref();
         let root = &self.workspace_root;
-        let access = PathAccess::Write;
         let protected = &self.protected;
-        let safe_path = resolve_path_guarded(scope, protected, "write_file", access, path, root)?;
+        let safe_path = resolve_write_target(scope, protected, "write_file", path, root)?;
 
         if let Some(parent) = safe_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1122,11 +1122,7 @@ impl Tool for WriteFileTool {
             .create(true)
             .truncate(false)
             .open(&safe_path)?;
-        if crate::protected::is_hardlinked(&file.metadata()?) {
-            return Err(ToolError::ProtectedPath(
-                crate::protected::hardlink_violation(path),
-            ));
-        }
+        reject_hardlinked(&file, path)?;
         file.set_len(0)?;
         std::io::Write::write_all(&mut file, content.as_bytes())?;
 
@@ -1139,6 +1135,333 @@ impl Tool for WriteFileTool {
 
     fn name(&self) -> &str {
         "write_file"
+    }
+
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::Workspace
+    }
+}
+
+const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const EDIT_HINT_LINE_CHARS: usize = 80;
+const EDIT_HINT_MAX_LINES: usize = 5;
+
+fn resolve_write_target(
+    scope: Option<&PathScope>,
+    protected: &ProtectedPaths,
+    tool: &str,
+    path: &Path,
+    workspace_root: &Path,
+) -> ToolResult<PathBuf> {
+    resolve_path_guarded(
+        scope,
+        protected,
+        tool,
+        PathAccess::Write,
+        path,
+        workspace_root,
+    )
+}
+
+fn reject_hardlinked(file: &std::fs::File, path: &Path) -> ToolResult<()> {
+    if crate::protected::is_hardlinked(&file.metadata()?) {
+        return Err(ToolError::ProtectedPath(
+            crate::protected::hardlink_violation(path),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid(message: &str) -> ToolError {
+    ToolError::InvalidArguments {
+        message: message.to_string(),
+    }
+}
+
+fn too_large(path: &str) -> ToolError {
+    invalid(&format!(
+        "{path} is too large for edit_file (limit {} MiB).",
+        MAX_EDIT_FILE_BYTES / (1024 * 1024)
+    ))
+}
+
+fn uses_crlf(content: &str) -> bool {
+    content.contains("\r\n") && !content.replace("\r\n", "").contains('\n')
+}
+
+fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+fn line_of(content: &str, byte: usize) -> usize {
+    content[..byte].matches('\n').count() + 1
+}
+
+fn line_list(lines: &[usize]) -> String {
+    lines
+        .iter()
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn no_match_message(path: &str, content: &str, old_string: &str) -> String {
+    let mut message = format!(
+        "old_string matched 0 times in {path}. Call read_file on this path and copy the text \
+         exactly, including indentation and blank lines."
+    );
+    let first = old_string
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return message;
+    }
+    let shown: String = first.chars().take(EDIT_HINT_LINE_CHARS).collect();
+    let hits: Vec<usize> = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(first))
+        .map(|(i, _)| i + 1)
+        .take(EDIT_HINT_MAX_LINES)
+        .collect();
+    if hits.is_empty() {
+        message.push_str(&format!(
+            " The first line of old_string `{shown}` does not appear in the file."
+        ));
+    } else {
+        message.push_str(&format!(
+            " The first line of old_string `{shown}` appears at {}; only the rest or the indentation differs.",
+            line_list(&hits)
+        ));
+    }
+    message
+}
+
+fn multiple_match_message(path: &str, content: &str, positions: &[usize], count: usize) -> String {
+    let lines: Vec<usize> = positions
+        .iter()
+        .take(EDIT_HINT_MAX_LINES)
+        .map(|p| line_of(content, *p))
+        .collect();
+    format!(
+        "old_string matched {count} times in {path} (at {}). It must match exactly once. \
+         Add more surrounding lines to old_string so it is unique, or set replace_all to true to \
+         change every match. Call read_file and copy the text exactly, including indentation.",
+        line_list(&lines)
+    )
+}
+
+fn snippet(content: &str, byte: usize) -> String {
+    let line = content[..byte].matches('\n').count();
+    content
+        .lines()
+        .enumerate()
+        .skip(line.saturating_sub(1))
+        .take(3)
+        .map(|(i, text)| format!("{:>6}  {}", i + 1, text.trim_end_matches('\r')))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub struct EditFileTool {
+    workspace_root: PathBuf,
+    scope: Option<PathScope>,
+    protected: ProtectedPaths,
+}
+
+impl EditFileTool {
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self::scoped(workspace_root, None)
+    }
+
+    pub fn scoped(workspace_root: PathBuf, scope: Option<PathScope>) -> Self {
+        let protected = ProtectedPaths::for_repo(&workspace_root);
+        Self::guarded(workspace_root, scope, protected)
+    }
+
+    pub fn guarded(
+        workspace_root: PathBuf,
+        scope: Option<PathScope>,
+        protected: ProtectedPaths,
+    ) -> Self {
+        Self {
+            workspace_root,
+            scope,
+            protected,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for EditFileTool {
+    fn definition(&self) -> ToolDefinition {
+        let string = |d: &str| PropertySchema {
+            schema_type: SchemaType::String,
+            description: Some(d.to_string()),
+            items: None,
+        };
+        let mut props = HashMap::new();
+        props.insert(
+            "path".to_string(),
+            string("Path to an existing file (relative to workspace root)"),
+        );
+        props.insert(
+            "old_string".to_string(),
+            string("Exact text to replace, copied from read_file including indentation"),
+        );
+        props.insert("new_string".to_string(), string("Text to put in its place"));
+        props.insert(
+            "replace_all".to_string(),
+            PropertySchema {
+                schema_type: SchemaType::Boolean,
+                description: Some(
+                    "Replace every match instead of requiring exactly one (default false)"
+                        .to_string(),
+                ),
+                items: None,
+            },
+        );
+        ToolDefinition {
+            function: FunctionDefinition {
+                name: "edit_file".to_string(),
+                description: "Replace an exact piece of text in an existing file. Call read_file first and copy old_string exactly, including indentation. Use write_file only to create a new file.".to_string(),
+                parameters: JsonSchema {
+                    schema_type: SchemaType::Object,
+                    properties: Some(props),
+                    required: Some(vec!["path".to_string(), "old_string".to_string(), "new_string".to_string()]),
+                },
+            },
+        }
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult<Value> {
+        let required = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArguments {
+                    message: format!("Missing or invalid '{key}' parameter"),
+                })
+        };
+        let path_str = required("path")?;
+        let old_string = required("old_string")?;
+        let new_string = required("new_string")?;
+        let replace_all = match args.get("replace_all") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments {
+                    message: "'replace_all' must be true or false".to_string(),
+                })
+            }
+        };
+        if old_string.is_empty() {
+            return Err(invalid(
+                "old_string is empty. Copy the exact text to replace from read_file. \
+                 To create or fully rewrite a file use write_file.",
+            ));
+        }
+        if old_string == new_string {
+            return Err(invalid(
+                "old_string and new_string are identical, so nothing would change. \
+                 Put the corrected text in new_string.",
+            ));
+        }
+
+        let path = Path::new(path_str);
+        let safe_path = resolve_write_target(
+            self.scope.as_ref(),
+            &self.protected,
+            "edit_file",
+            path,
+            &self.workspace_root,
+        )?;
+        match std::fs::metadata(&safe_path) {
+            Ok(meta) if meta.is_file() => {
+                if meta.len() > MAX_EDIT_FILE_BYTES {
+                    return Err(too_large(path_str));
+                }
+            }
+            Ok(_) => {
+                return Err(invalid(&format!(
+                    "{path_str} is not a file. edit_file only edits existing files."
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(invalid(&format!(
+                    "{path_str} does not exist. edit_file only edits existing files; \
+                     use write_file to create a new file."
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&safe_path)?;
+        reject_hardlinked(&file, path)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        let content = match String::from_utf8(bytes) {
+            Ok(text) if !text.contains('\0') => text,
+            _ => {
+                return Err(invalid(&format!(
+                    "{path_str} is a binary file or not valid UTF-8 text; edit_file cannot edit it."
+                )))
+            }
+        };
+
+        let crlf = uses_crlf(&content);
+        let (old, new) = if crlf {
+            (to_crlf(old_string), to_crlf(new_string))
+        } else {
+            (old_string.to_string(), new_string.to_string())
+        };
+        let positions: Vec<usize> = content
+            .match_indices(old.as_str())
+            .map(|(i, _)| i)
+            .collect();
+        match positions.len() {
+            0 => return Err(invalid(&no_match_message(path_str, &content, old_string))),
+            1 => {}
+            n if !replace_all => {
+                return Err(invalid(&multiple_match_message(
+                    path_str, &content, &positions, n,
+                )))
+            }
+            _ => {}
+        }
+
+        let updated = if replace_all {
+            content.replace(old.as_str(), &new)
+        } else {
+            content.replacen(old.as_str(), &new, 1)
+        };
+        if updated.len() as u64 > MAX_EDIT_FILE_BYTES {
+            return Err(too_large(path_str));
+        }
+
+        let first = positions[0];
+        let before = snippet(&content, first);
+        let after = snippet(&updated, first);
+
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+        file.set_len(0)?;
+        std::io::Write::write_all(&mut file, updated.as_bytes())?;
+
+        Ok(json!({
+            "path": path_str,
+            "replacements": if replace_all { positions.len() } else { 1 },
+            "before": before,
+            "after": after,
+            "success": true
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "edit_file"
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -3507,6 +3830,11 @@ fn create_tool_registry_with_scope(
         scope.clone(),
         protected.clone(),
     )));
+    registry.register(Box::new(EditFileTool::guarded(
+        root.clone(),
+        scope.clone(),
+        protected.clone(),
+    )));
     registry.register(Box::new(ListDirTool::scoped(root.clone(), scope.clone())));
     registry.register(Box::new(SearchTool::scoped(root, scope)));
     registry.register(Box::new(GitStatusTool::new(workspace_root.to_path_buf())));
@@ -3775,9 +4103,10 @@ mod tests {
         tools.iter().map(|tool| tool.name().to_string()).collect()
     }
 
-    const EXPECTED_CLASSES: [(&str, EffectClass); 9] = [
+    const EXPECTED_CLASSES: [(&str, EffectClass); 10] = [
         ("calculate", EffectClass::None),
         ("echo", EffectClass::None),
+        ("edit_file", EffectClass::Workspace),
         ("git_diff", EffectClass::None),
         ("git_status", EffectClass::None),
         ("github_pr_status", EffectClass::Repository),
@@ -3848,6 +4177,7 @@ mod tests {
             vec![
                 "calculate",
                 "echo",
+                "edit_file",
                 "git_diff",
                 "git_status",
                 "list_directory",
@@ -4126,6 +4456,7 @@ mod tests {
             vec![
                 "calculate",
                 "echo",
+                "edit_file",
                 "git_diff",
                 "git_status",
                 "list_directory",
@@ -4266,7 +4597,10 @@ mod tests {
         let ws = scoped_workspace();
         let identity = identity_with(EffectClass::Workspace, &["write_file", "read_file"]);
         let registry = create_tool_registry_for(ws.path(), &identity).unwrap();
-        assert_eq!(sorted_names(&registry), vec!["read_file", "write_file"]);
+        assert_eq!(
+            sorted_names(&registry),
+            vec!["edit_file", "read_file", "write_file"]
+        );
 
         let ok = registry
             .execute(
@@ -5051,7 +5385,10 @@ mod tests {
 
     async fn assert_all_protected_writes_refused(registry: &ToolRegistry, root: &Path) {
         let tools = write_capable_tools(registry);
-        assert_eq!(tools, vec!["write_file".to_string()]);
+        assert_eq!(
+            tools,
+            vec!["edit_file".to_string(), "write_file".to_string()]
+        );
         for pattern in crate::protected::PROTECTED_PATTERNS {
             assert!(
                 PROTECTED_EXAMPLES.iter().any(|(rule, _)| rule == pattern),
@@ -5060,7 +5397,11 @@ mod tests {
         }
         for tool in &tools {
             for (rule, path) in PROTECTED_EXAMPLES {
-                let args = json!({ "path": path, "content": "tampered" });
+                let args = if tool == "edit_file" {
+                    json!({ "path": path, "old_string": "a", "new_string": "tampered" })
+                } else {
+                    json!({ "path": path, "content": "tampered" })
+                };
                 let err = registry.execute(tool, args).await.unwrap_err();
                 match err {
                     ToolError::ProtectedPath(violation) => {
@@ -5080,9 +5421,10 @@ mod tests {
         let registry = create_tool_registry(dir.path());
         assert_all_protected_writes_refused(&registry, dir.path()).await;
         let denials = registry.denials();
-        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert_eq!(denials.len(), 2 * PROTECTED_EXAMPLES.len());
         assert_eq!(denials[0].identity, crate::scope::UNSCOPED_IDENTITY);
-        assert_eq!(denials[0].tool, "write_file");
+        assert_eq!(denials[0].tool, "edit_file");
+        assert!(denials.iter().any(|d| d.tool == "write_file"));
         assert!(matches!(
             denials[0].reason,
             DenialReason::ProtectedPath { .. }
@@ -5097,7 +5439,7 @@ mod tests {
         let registry = create_tool_registry_for(dir.path(), &identity).unwrap();
         assert_all_protected_writes_refused(&registry, dir.path()).await;
         let denials = registry.denials();
-        assert_eq!(denials.len(), PROTECTED_EXAMPLES.len());
+        assert_eq!(denials.len(), 2 * PROTECTED_EXAMPLES.len());
         assert!(denials.iter().all(|d| d.identity == identity.name()));
         let ok = registry
             .execute(
