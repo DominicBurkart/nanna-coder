@@ -1,6 +1,8 @@
 use harness::container::{detect_runtime, ContainerHandle};
-use harness::verify::{first_failure, run_checks, CheckStatus, ProcessCheckRunner, VerifyConfig};
+use harness::tools::Tool;
+use harness::verify::{CheckOutcome, CheckStatus, CheckTool, ProcessCheckRunner, VerifyConfig};
 use std::process::Command;
+use std::sync::Arc;
 
 const IMAGE_VAR: &str = "NANNA_VERIFIER_TEST_IMAGE";
 
@@ -62,12 +64,22 @@ fn declared_checks_run_in_a_network_less_container_with_exact_exit_codes() {
     let config = VerifyConfig::parse(
         "[[check]]\nname = \"ok\"\ncommand = \"echo from-container\"\n\n\
          [[check]]\nname = \"bad\"\ncommand = \"echo oops >&2; exit 7\"\n\n\
-         [[check]]\nname = \"slow\"\ncommand = \"exec sleep 60\"\ntimeout_secs = 1\n\n\
-         [[check]]\nname = \"never\"\ncommand = \"true\"\n",
+         [[check]]\nname = \"slow\"\ncommand = \"exec sleep 60\"\ntimeout_secs = 1\n",
     )
     .unwrap();
+    let tool = CheckTool::new(Arc::new(runner), Arc::new(config));
 
-    let outcomes = run_checks(&config, &runner).unwrap();
+    let runtime_ok = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut outcomes = Vec::new();
+    for name in ["ok", "bad", "slow"] {
+        let value = runtime_ok
+            .block_on(tool.execute(serde_json::json!({ "name": name })))
+            .unwrap();
+        outcomes.push(serde_json::from_value::<CheckOutcome>(value).unwrap());
+    }
 
     let statuses: Vec<_> = outcomes.iter().map(|o| o.status).collect();
     assert_eq!(
@@ -75,13 +87,11 @@ fn declared_checks_run_in_a_network_less_container_with_exact_exit_codes() {
         [
             CheckStatus::Passed,
             CheckStatus::Failed,
-            CheckStatus::TimedOut,
-            CheckStatus::Skipped
+            CheckStatus::TimedOut
         ]
     );
     assert_eq!(outcomes[0].exit_code, Some(0));
     assert!(outcomes[0].output.contains("from-container"));
     assert_eq!(outcomes[1].exit_code, Some(7));
     assert!(outcomes[1].output.contains("oops"));
-    assert_eq!(first_failure(&outcomes).unwrap().name, "bad");
 }

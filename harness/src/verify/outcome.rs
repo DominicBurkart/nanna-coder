@@ -1,10 +1,16 @@
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::config::{Check, VerifyConfig};
-use super::runner::{CheckRunner, RawRun};
+use super::config::Check;
+#[cfg(test)]
+use super::config::VerifyConfig;
+#[cfg(test)]
+use super::runner::CheckRunner;
+use super::runner::RawRun;
 use crate::entities::context::types::ToolCallRecord;
 
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024;
@@ -162,28 +168,8 @@ pub(crate) fn finished(check: &Check, raw: RawRun, started: Instant) -> CheckOut
     }
 }
 
-#[doc = r#"Runs every declared check in order and returns one outcome per check. A
-failing check does not stop the rest, so the report is complete; a check
-that times out stops the run and marks the remaining checks skipped,
-because its process may still be running in the container.
-
-```
-use harness::verify::{run_checks, CheckRunner, CheckStatus, RawRun, VerifyConfig};
-use std::time::Duration;
-
-struct Fixed(i32);
-impl CheckRunner for Fixed {
-    fn run(&self, _: &str, _: Duration) -> Result<RawRun, String> {
-        Ok(RawRun { exit_code: Some(self.0), timed_out: false, stdout: "ok".into(), stderr: String::new() })
-    }
-}
-
-let config = VerifyConfig::parse("[[check]]\nname = \"a\"\ncommand = \"true\"\n").unwrap();
-let outcomes = run_checks(&config, &Fixed(1)).unwrap();
-assert_eq!(outcomes[0].status, CheckStatus::Failed);
-assert_eq!(outcomes[0].exit_code, Some(1));
-```"#]
-pub fn run_checks(
+#[cfg(test)]
+pub(crate) fn run_checks(
     config: &VerifyConfig,
     runner: &dyn CheckRunner,
 ) -> Result<Vec<CheckOutcome>, ExecError> {

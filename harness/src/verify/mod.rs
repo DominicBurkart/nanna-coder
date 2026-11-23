@@ -10,7 +10,7 @@ pub use config::{
     MAX_NAME_LEN, MAX_TIMEOUT_SECS, MAX_VERIFY_BYTES, VERIFY_FILE,
 };
 pub use outcome::{
-    first_failure, passed_summary, run_checks, truncate_tail, CheckOutcome, CheckStatus, ExecError,
+    first_failure, passed_summary, truncate_tail, CheckOutcome, CheckStatus, ExecError,
     CHECK_TOOL_NAME, MAX_OUTPUT_BYTES,
 };
 pub use preflight::{preflight, Refusal};

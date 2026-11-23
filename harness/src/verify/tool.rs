@@ -114,7 +114,12 @@ check and each one is recorded in [`ToolRegistry::action_reviews`]. A
 failing check does not stop the rest; a check that times out stops the run
 and the remaining checks are reported `skipped` without a call. A refused
 call, a launcher error or an unreadable result aborts with an [`ExecError`]
-that keeps the outcomes already collected."#]
+that keeps the outcomes already collected. There is no ungated way to run
+the checks outside tests:
+
+```compile_fail,E0432
+use harness::verify::run_checks;
+```"#]
 pub async fn run_gated(
     config: &VerifyConfig,
     registry: &ToolRegistry,
@@ -319,6 +324,14 @@ mod tests {
             error.message.starts_with("unreadable check result"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_tool_is_workspace_class_and_named_for_the_card_tool() {
+        let tool = CheckTool::new(Arc::new(Recording::default()), config(&["a"]));
+        assert_eq!(tool.effect_class(), EffectClass::Workspace);
+        assert_eq!(tool.name(), "run_checks");
+        assert_eq!(tool.name(), tool.definition().function.name);
     }
 
     #[test]

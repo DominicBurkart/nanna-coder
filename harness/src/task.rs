@@ -4895,6 +4895,48 @@ mod identity_tests {
         }
     }
 
+    #[test]
+    fn test_a_verifiers_container_never_gets_a_network() {
+        assert_eq!(
+            network_policy_for(Some(&verifier_identity())),
+            NetworkPolicy::Disabled
+        );
+    }
+
+    fn opt_in_to_the_container(repo: &std::path::Path) {
+        std::fs::write(repo.join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo.join(".devcontainer")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_every_verifier_refusal_happens_before_any_container_is_set_up() {
+        for effect in EffectClass::ALL
+            .into_iter()
+            .filter(|e| *e != EffectClass::Workspace)
+        {
+            let repo = repo_with_origin("git@github.com:example/repo.git");
+            declare_checks(repo.path(), TWO_CHECKS);
+            opt_in_to_the_container(repo.path());
+            let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+            let mut identity = verifier_identity();
+            identity.scope.max_effect = effect;
+            let (_, task) = run_verifier_as(&manager, repo.path(), identity, 20).await;
+            assert_eq!(failed_with(&task.status).0, "ScopeError", "{effect}");
+        }
+        let missing = repo_with_origin("git@github.com:example/repo.git");
+        opt_in_to_the_container(missing.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, task) = run_verifier(&manager, missing.path()).await;
+        assert_eq!(failed_with(&task.status).0, "VerifierChecksInvalid");
+        let declared = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(declared.path(), TWO_CHECKS);
+        opt_in_to_the_container(declared.path());
+        let (_, task) = run_verifier_as(&manager, declared.path(), verifier_identity(), 1).await;
+        assert_eq!(failed_with(&task.status).0, "MaxIterationsExceeded");
+        let (_, task) = run_verifier(&manager, declared.path()).await;
+        assert_eq!(failed_with(&task.status).0, "ContainerSetupFailed");
+    }
+
     #[tokio::test]
     async fn test_a_verifier_with_more_checks_than_iterations_is_refused_up_front() {
         use crate::verify::test_support::Recording;
