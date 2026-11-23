@@ -12,5 +12,6 @@ pub mod send;
 pub mod session;
 pub mod store;
 pub mod summary;
+pub mod tools;
 pub mod view;
 mod waiting;

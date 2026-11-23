@@ -9,6 +9,7 @@ use super::registry::{RegistryError, SessionRegistry};
 use super::session::SessionRecord;
 use super::store::{MessageStore, SessionStore};
 use super::summary::Summary;
+use super::view::CursorTable;
 use super::waiting::Waiters;
 use crate::action_auditor::{
     message_content_hash, MessageAuditor, MessageVerdict, NullOracle, OutboundReview,
@@ -72,6 +73,7 @@ pub struct MessageHub {
     windows: Mutex<Windows>,
     pub(super) registry: Arc<SessionRegistry>,
     pub(super) waiters: Waiters,
+    pub(super) cursors: CursorTable,
 }
 
 impl std::fmt::Debug for MessageHub {
@@ -197,6 +199,7 @@ impl MessageHub {
             windows: Mutex::new(Windows::default()),
             registry,
             waiters: Waiters::default(),
+            cursors: CursorTable::new(),
         }
     }
 
