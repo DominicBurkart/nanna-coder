@@ -170,9 +170,10 @@ fn settled(aborted: bool) -> String {
 
 const SCRIPT: &str = r#"
 case "$1" in
-create) [ -f "$d/fail-create" ] && exit 1;;
-cp) cat > "$d/cp.tar";;
+create) [ -f "$d/hang-create" ] && exec sleep 30; [ -f "$d/fail-create" ] && exit 1;;
+cp) [ -f "$d/hang-cp" ] && exec sleep 30; cat > "$d/cp.tar";;
 start)
+  echo $$ > "$d/start.pid"
   read -r prompt
   printf '%s\n' "$prompt" > "$d/prompt.txt"
   [ -f "$d/hang" ] && exec sleep 30
@@ -199,6 +200,12 @@ fn executor(root: &Path) -> PodmanPiExecutor {
 }
 
 async fn call_broker(socket: &Path, line: &str) -> String {
+    let mut bytes = line.as_bytes().to_vec();
+    bytes.push(b'\n');
+    call_broker_bytes(socket, &bytes).await
+}
+
+async fn call_broker_bytes(socket: &Path, bytes: &[u8]) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = loop {
         match tokio::net::UnixStream::connect(socket).await {
@@ -208,8 +215,7 @@ async fn call_broker(socket: &Path, line: &str) -> String {
     };
     let mut reply = String::new();
     let sent = async {
-        stream.write_all(line.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
+        stream.write_all(bytes).await?;
         stream.read_to_string(&mut reply).await
     }
     .await;
@@ -1046,4 +1052,80 @@ async fn a_huge_final_message_is_clipped_in_the_result_summary() {
     assert!(result.result_summary.len() <= MAX_SUMMARY_BYTES + 16);
     assert!(result.result_summary.ends_with("[clipped]"));
     assert!(removed(&fake));
+}
+
+#[tokio::test]
+async fn a_create_or_copy_that_hangs_is_cut_off_at_the_deadline_and_cleaned_up() {
+    for marker in ["hang-create", "hang-cp"] {
+        let (outcome, fake, _) =
+            failing_run(&[marker], vec![], two_tools(), Duration::from_millis(500)).await;
+        assert!(
+            is_state_error(&outcome, "exceeded the wall-clock limit"),
+            "{marker}"
+        );
+        assert!(removed(&fake), "{marker}");
+    }
+}
+
+#[tokio::test]
+async fn cancelling_the_run_kills_the_attached_client_process() {
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    std::fs::write(fake.dir().join("hang"), "").unwrap();
+    let root = private_root();
+    let mut rig = rig(two_tools());
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(60));
+    let cancelled = tokio::time::timeout(Duration::from_millis(700), exec.run(launch)).await;
+    assert!(cancelled.is_err());
+    let pid = std::fs::read_to_string(fake.dir().join("start.pid"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let mut gone = false;
+    for _ in 0..100 {
+        let state = std::fs::read_to_string(proc_dir.join("stat")).unwrap_or_default();
+        if state.is_empty() || state.contains(") Z ") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the attached podman client {pid} outlived the run");
+}
+
+#[tokio::test]
+async fn an_unreadable_or_oversized_request_gets_a_bad_request_reply_and_the_run_continues() {
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    let root = private_root();
+    write_parts(
+        &fake,
+        &[
+            prompt_ok(),
+            turn_start(),
+            system_start(&["read_file", "search"]),
+        ],
+        &[agent_end("stop", "ok", None), settled(false)],
+    );
+    let mut rig = rig(two_tools());
+    let socket = root.path().join("broker.sock");
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let mut oversized = vec![b'a'; MAX_REQUEST_BYTES + 10];
+    oversized.push(b'\n');
+    let (outcome, invalid, large, good) = tokio::join!(
+        exec.run(launch),
+        call_broker_bytes(&socket, b"\xff\xfe\n"),
+        call_broker_bytes(&socket, &oversized),
+        call_broker(&socket, r#"{"tool":"read_file","args":{}}"#),
+    );
+    std::fs::write(fake.dir().join("go"), "").unwrap();
+    assert!(
+        invalid.contains("bad request: not valid UTF-8"),
+        "{invalid}"
+    );
+    assert!(large.contains("request too large"), "{large}");
+    assert!(good.contains("\"ok\":true"), "{good}");
+    assert_eq!(calls(&rig.counters, "read_file"), 1);
+    let _ = outcome;
 }

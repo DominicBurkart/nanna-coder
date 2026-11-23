@@ -518,7 +518,11 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
         let before = ticks.load(std::sync::atomic::Ordering::SeqCst);
-        drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        tokio::spawn(async {
+            drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        })
+        .await
+        .unwrap();
         let after = ticks.load(std::sync::atomic::Ordering::SeqCst);
         ticker.abort();
         assert!(fake.calls().contains(&"rm -f nanna-pi-t-1".to_string()));
