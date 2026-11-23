@@ -1117,6 +1117,7 @@ mod tests {
             let hub = world.hub_with(Arc::new(shared), HubLimits::default());
             hub.review_send(&a, &req(&b, "x")).await.unwrap();
             hub.review_note(&a, "all good").await.unwrap();
+            assert_eq!(spy.name(), "reads-seen");
             assert_eq!(*spy.seen.lock().unwrap(), vec![expected.clone(), expected]);
         }
     }
