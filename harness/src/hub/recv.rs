@@ -448,8 +448,8 @@ mod tests {
     use crate::hub::registry::SessionRegistry;
     use crate::hub::send::QuarantineSink;
     use crate::hub::store::{
-        HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, MessageStore,
-        SessionStore, StoreError,
+        ActiveSession, HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore,
+        MessageStore, SessionStore, StoreError,
     };
     use crate::leases::{Clock, SimulatedClock, SleepFuture};
     use crate::task::TaskId;
@@ -761,6 +761,10 @@ mod tests {
         ) -> Result<usize, StoreError> {
             self.inner.prune(now, policy)
         }
+
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            self.inner.active()
+        }
     }
 
     type Hook = Box<dyn FnOnce(&InMemorySessionStore) + Send>;
@@ -850,6 +854,10 @@ mod tests {
             policy: &crate::hub::store::Retention,
         ) -> Result<usize, StoreError> {
             self.inner.prune(now, policy)
+        }
+
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            self.inner.active()
         }
     }
 
@@ -2389,6 +2397,23 @@ mod tests {
     }
 
     #[test]
+    fn a_record_reset_to_pending_during_the_wait_is_not_moved_by_the_leave() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.gated(&gate);
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        world
+            .registry
+            .reregister(&b, "subtask", world.clock.now())
+            .unwrap();
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        world.sessions.written();
+        drop(waiting);
+        assert_eq!(world.record(&b).status, SessionStatus::Pending);
+        assert_eq!(world.sessions.written(), []);
+    }
+
+    #[test]
     fn a_failed_enter_still_waits_and_a_failed_leave_still_returns() {
         let (world, a, b, gate) = waiting_world();
         let hub = world.gated(&gate);
@@ -2839,6 +2864,8 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         assert_eq!(spy.prune(start(), &policy).unwrap(), 0);
+        assert!(spy.active().unwrap().is_empty());
+        assert!(sessions.active().unwrap().is_empty());
         let provider = Counting {
             reply: String::new(),
             calls: AtomicUsize::new(0),

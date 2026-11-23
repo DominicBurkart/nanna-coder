@@ -1,4 +1,5 @@
 use super::lineage::SessionId;
+use super::registry::RegistryError;
 use super::send::MessageHub;
 use super::session::SessionStatus;
 use std::collections::HashMap;
@@ -41,7 +42,12 @@ impl MessageHub {
         let mut waiters = self.waiters.lock();
         let waiter = waiters.entry(session.clone()).or_default();
         if waiter.count == 0 {
-            waiter.entered = self.move_to(session, SessionStatus::WaitingOnMessages);
+            let entered = self.registry.set_status(
+                session,
+                SessionStatus::WaitingOnMessages,
+                self.clock.now(),
+            );
+            waiter.entered = self.settled(entered);
         }
         waiter.count += 1;
         WaitGuard {
@@ -58,13 +64,13 @@ impl MessageHub {
             let entered = waiter.entered;
             waiters.remove(session);
             if entered {
-                self.move_to(session, SessionStatus::Running);
+                let left = self.registry.leave_waiting(session, self.clock.now());
+                self.settled(left);
             }
         }
     }
 
-    fn move_to(&self, session: &SessionId, to: SessionStatus) -> bool {
-        let moved = self.registry.set_status(session, to, self.clock.now());
+    fn settled<T>(&self, moved: Result<T, RegistryError>) -> bool {
         if moved.is_err() {
             tracing::debug!("the hub could not move a session between running and waiting");
         }
@@ -114,16 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn the_hub_moves_only_between_running_and_waiting_through_set_status() {
+    fn the_hub_enters_with_set_status_and_leaves_only_through_leave_waiting() {
         let source = production_source();
         let variants: Vec<&str> = source
             .split("SessionStatus::")
             .skip(1)
             .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
             .collect();
-        assert_eq!(variants, ["WaitingOnMessages", "Running"]);
-        assert_eq!(source.matches("self.registry.").count(), 1);
+        assert_eq!(variants, ["WaitingOnMessages"]);
+        assert_eq!(source.matches("self.registry.").count(), 2);
         assert_eq!(source.matches("self.registry.set_status(").count(), 1);
+        assert_eq!(source.matches("self.registry.leave_waiting(").count(), 1);
         for banned in [".finish(", ".cancel(", ".abandon(", ".sessions", "set_note"] {
             assert!(!source.contains(banned), "{banned}");
         }
