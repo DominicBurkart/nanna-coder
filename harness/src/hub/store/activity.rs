@@ -1,7 +1,7 @@
 use super::activity_write::{
     process, ArgsSummary, Limit, MAX_SUBJECT_CHARS, MAX_TOOL_CHARS, MAX_TURN_BYTES,
 };
-use super::engine::{Engine, Table};
+use super::engine::{invalid, Engine, Table};
 use super::journal::HubLock;
 use super::{state_path_from, Retention, StoreError};
 use crate::action_auditor::{IdentifierOracle, NullOracle};
@@ -21,6 +21,41 @@ pub const ACTIVITY_PATH_ENV: &str = "NANNA_ACTIVITY_PATH";
 /// Fixed bytes charged to every entry on top of its text, so a run of
 /// entries without text still counts against a byte budget.
 pub const ENTRY_OVERHEAD: usize = 32;
+
+/// Most entries kept for one session. Appending one more drops the session's
+/// oldest entry, except that the session's newest status change is kept while
+/// any other entry of the session exists, so retention can still tell a
+/// finished session from a running one. Replay applies the same cap, so it is
+/// part of the log's meaning and is not configurable.
+///
+/// ```
+/// use harness::hub::lineage::SessionId;
+/// use harness::hub::store::{ActivityEntry, ActivityStore, InMemoryActivityStore};
+/// use harness::hub::store::ACTIVITY_PER_SESSION_MAX;
+///
+/// let store = InMemoryActivityStore::new();
+/// let session = SessionId::from_task(harness::task::TaskId("s".into()));
+/// for n in 0..=ACTIVITY_PER_SESSION_MAX {
+///     let text = format!("turn {n}");
+///     let at = chrono::Utc::now();
+///     let entry = ActivityEntry::AssistantTurn { session: session.clone(), at, text };
+///     store.append(entry).unwrap();
+/// }
+/// let kept = store.for_session(session, usize::MAX).unwrap();
+/// assert_eq!(kept.len(), ACTIVITY_PER_SESSION_MAX);
+/// ```
+pub const ACTIVITY_PER_SESSION_MAX: usize = 512;
+
+/// Most bytes ([`ActivityEntry::cost`] summed over every session) the whole
+/// log keeps. Past it, entries are dropped oldest first from the session with
+/// the most entries (ties: the smallest session id), so a flooding session
+/// pays for its own flood. Not configurable. The live journal file is not
+/// shortened by an eviction; it shrinks at the next open.
+///
+/// ```
+/// assert_eq!(harness::hub::store::ACTIVITY_TOTAL_BYTES_MAX, 8 * 1024 * 1024);
+/// ```
+pub const ACTIVITY_TOTAL_BYTES_MAX: usize = 8 * 1024 * 1024;
 
 /// Which way a message went, from the logging session's point of view.
 ///
@@ -397,9 +432,21 @@ pub(super) enum Record {
     Forget { session: SessionId },
 }
 
+#[derive(Clone, Copy)]
+struct Limits {
+    per_session: usize,
+    total_bytes: usize,
+}
+
+const LIMITS: Limits = Limits {
+    per_session: ACTIVITY_PER_SESSION_MAX,
+    total_bytes: ACTIVITY_TOTAL_BYTES_MAX,
+};
+
 #[derive(Clone, Default)]
 pub(super) struct ActivityTable {
     by_session: BTreeMap<SessionId, Vec<ActivityEntry>>,
+    bytes: usize,
 }
 
 impl Table for ActivityTable {
@@ -408,15 +455,12 @@ impl Table for ActivityTable {
     fn apply(&mut self, record: &Record) -> Result<(), StoreError> {
         match record {
             Record::Entry { entry } => {
-                self.by_session
-                    .entry(entry.session().clone())
-                    .or_default()
-                    .push(entry.clone());
+                self.insert(entry, LIMITS)?;
             }
             Record::Forget { session } => {
-                self.by_session
-                    .remove(session)
-                    .ok_or(StoreError::NotFound)?;
+                let removed = self.by_session.remove(session);
+                let log = removed.ok_or(StoreError::NotFound)?;
+                self.bytes = self.bytes.saturating_sub(cost_of(&log));
             }
         }
         Ok(())
@@ -433,7 +477,53 @@ impl Table for ActivityTable {
     }
 }
 
+fn evict_oldest(log: &mut Vec<ActivityEntry>) -> Option<usize> {
+    let pinned = log.iter().rposition(|e| e.terminal_status().is_some());
+    let victim = usize::from(pinned == Some(0) && log.len() > 1);
+    let gone = (victim < log.len()).then(|| log.remove(victim));
+    gone.map(|entry| entry.cost())
+}
+
+fn cost_of(log: &[ActivityEntry]) -> usize {
+    log.iter().map(ActivityEntry::cost).sum()
+}
+
 impl ActivityTable {
+    fn insert(&mut self, entry: &ActivityEntry, limits: Limits) -> Result<(), StoreError> {
+        if entry.cost() > limits.total_bytes {
+            return Err(invalid("entry larger than the activity byte cap"));
+        }
+        self.bytes = self.bytes.saturating_add(entry.cost());
+        let log = self.by_session.entry(entry.session().clone()).or_default();
+        log.push(entry.clone());
+        let mut freed = 0usize;
+        while log.len() > limits.per_session {
+            freed = freed.saturating_add(evict_oldest(log).unwrap_or(0));
+        }
+        self.bytes = self.bytes.saturating_sub(freed);
+        while self.bytes > limits.total_bytes && self.evict_from_largest() {}
+        Ok(())
+    }
+
+    fn largest(&self) -> Option<SessionId> {
+        let mut best: Option<(&SessionId, usize)> = None;
+        for (id, log) in &self.by_session {
+            if best.is_none_or(|(_, most)| log.len() > most) {
+                best = Some((id, log.len()));
+            }
+        }
+        best.map(|(id, _)| id.clone())
+    }
+
+    fn evict_from_largest(&mut self) -> bool {
+        let largest = self.largest();
+        let log = largest.and_then(|id| self.by_session.get_mut(&id));
+        let freed = log.and_then(evict_oldest);
+        self.bytes = self.bytes.saturating_sub(freed.unwrap_or(0));
+        self.by_session.retain(|_, log| !log.is_empty());
+        freed.is_some()
+    }
+
     fn expired(&self, now: DateTime<Utc>, policy: &Retention) -> Vec<SessionId> {
         self.by_session
             .iter()
@@ -1053,6 +1143,98 @@ mod tests {
         assert!(rendered.contains("?=str:1 path=str:1"));
     }
 
+    fn tagged(session: &str, n: usize) -> ActivityEntry {
+        turn(session, &format!("t{n}"), n as i64)
+    }
+
+    fn kept_texts<S: ActivityStore>(s: &S, session: &str) -> Vec<String> {
+        let mut texts = turn_texts(&s.for_session(sid(session), usize::MAX).unwrap());
+        texts.reverse();
+        texts
+    }
+
+    fn exactly_the_cap_is_accepted_and_one_more_evicts_the_oldest<S: ActivityStore>(s: &S) {
+        for n in 0..ACTIVITY_PER_SESSION_MAX {
+            s.append(tagged("a", n)).unwrap();
+        }
+        let at_cap = kept_texts(s, "a");
+        assert_eq!(at_cap.len(), 512);
+        assert_eq!(at_cap[0], "t0");
+        s.append(tagged("a", 512)).unwrap();
+        let over = kept_texts(s, "a");
+        assert_eq!(over.len(), 512);
+        assert_eq!(over[0], "t1");
+        assert_eq!(over[511], "t512");
+        s.append(tagged("a", 513)).unwrap();
+        let again = kept_texts(s, "a");
+        assert_eq!((again[0].as_str(), again[511].as_str()), ("t2", "t513"));
+    }
+
+    fn the_cap_below_the_limit_evicts_nothing<S: ActivityStore>(s: &S) {
+        for n in 0..ACTIVITY_PER_SESSION_MAX - 1 {
+            s.append(tagged("a", n)).unwrap();
+        }
+        let kept = kept_texts(s, "a");
+        assert_eq!(kept.len(), 511);
+        assert_eq!(kept[0], "t0");
+    }
+
+    fn a_flood_keeps_the_newest_cap_in_order_and_leaves_other_sessions_alone<S: ActivityStore>(
+        s: &S,
+    ) {
+        s.append(turn("quiet", "before", 0)).unwrap();
+        for n in 0..10 * ACTIVITY_PER_SESSION_MAX {
+            s.append(tagged("flood", n)).unwrap();
+        }
+        s.append(turn("quiet", "after", 1)).unwrap();
+        let kept = kept_texts(s, "flood");
+        let expected: Vec<String> = (4608..5120).map(|n| format!("t{n}")).collect();
+        assert_eq!(kept, expected);
+        assert_eq!(kept_texts(s, "quiet"), ["before", "after"]);
+        let newest_first = s.for_session(sid("flood"), usize::MAX).unwrap();
+        assert_eq!(field(&newest_first[0], "text"), "t5119");
+    }
+
+    fn the_newest_status_change_survives_a_flood_so_a_finished_session_still_expires<
+        S: ActivityStore,
+    >(
+        s: &S,
+    ) {
+        s.append(status("a", SessionStatus::Completed, 0)).unwrap();
+        for n in 0..2 * ACTIVITY_PER_SESSION_MAX {
+            s.append(tagged("a", n)).unwrap();
+        }
+        let kept = s.for_session(sid("a"), usize::MAX).unwrap();
+        assert_eq!(kept.len(), 512);
+        let last_is_status = matches!(kept.last(), Some(ActivityEntry::StatusChange { .. }));
+        assert!(last_is_status);
+        assert_eq!(s.prune(at(100_000), &policy()).unwrap(), 1);
+        assert!(s.for_session(sid("a"), usize::MAX).unwrap().is_empty());
+    }
+
+    fn forget_still_works_after_eviction<S: ActivityStore>(s: &S) {
+        for n in 0..ACTIVITY_PER_SESSION_MAX + 5 {
+            s.append(tagged("a", n)).unwrap();
+        }
+        assert_eq!(s.forget(&[sid("a")]).unwrap(), 1);
+        assert!(s.for_session(sid("a"), usize::MAX).unwrap().is_empty());
+        s.append(tagged("a", 0)).unwrap();
+        assert_eq!(kept_texts(s, "a"), ["t0"]);
+    }
+
+    fn flood_after<S: ActivityStore>(s: &S, first: &str) {
+        s.append(turn("a", first, 0)).unwrap();
+        for n in 0..ACTIVITY_PER_SESSION_MAX {
+            s.append(tagged("a", n)).unwrap();
+        }
+    }
+
+    fn eviction_logs_nothing_and_never_shows_the_evicted_text<S: ActivityStore>(s: &S) {
+        let ((), log) = logged(|| flood_after(s, "EVICTED-MARKER"));
+        assert!(!log.contains("EVICTED-MARKER"));
+        assert!(!kept_texts(s, "a").contains(&"EVICTED-MARKER".to_string()));
+    }
+
     macro_rules! activity_contract_tests {
         ($make:expr) => {
             activity_contract_tests!(@each $make,
@@ -1074,7 +1256,13 @@ mod tests {
                 an_oracle_can_vouch_for_the_exact_identifier_it_is_given,
                 message_metadata_is_the_only_trace_of_a_message,
                 the_token_leaks_nowhere_in_memory,
-                undeclared_identifier_shaped_keys_never_reach_the_store
+                undeclared_identifier_shaped_keys_never_reach_the_store,
+                exactly_the_cap_is_accepted_and_one_more_evicts_the_oldest,
+                the_cap_below_the_limit_evicts_nothing,
+                a_flood_keeps_the_newest_cap_in_order_and_leaves_other_sessions_alone,
+                the_newest_status_change_survives_a_flood_so_a_finished_session_still_expires,
+                forget_still_works_after_eviction,
+                eviction_logs_nothing_and_never_shows_the_evicted_text
             );
         };
         (@each $make:expr, $($name:ident),+) => {
@@ -1630,5 +1818,587 @@ mod tests {
                 Box::new(open(&fixture).unwrap())
             });
         }
+    }
+
+    fn limits(per_session: usize, total_bytes: usize) -> Limits {
+        Limits {
+            per_session,
+            total_bytes,
+        }
+    }
+
+    fn put(table: &mut ActivityTable, entry: &ActivityEntry, limits: Limits) {
+        table.insert(entry, limits).unwrap();
+    }
+
+    fn pad(session: &str, n: i64, len: usize) -> ActivityEntry {
+        turn(session, &"x".repeat(len), n)
+    }
+
+    fn marker(session: &str, n: i64) -> ActivityEntry {
+        status(session, SessionStatus::Running, n)
+    }
+
+    fn kept_at(table: &ActivityTable, session: &str) -> Vec<i64> {
+        let log = table.by_session.get(&sid(session));
+        let stamps = log.map(|log| log.iter().map(|e| e.at().timestamp() - at(0).timestamp()));
+        stamps.map(Iterator::collect).unwrap_or_default()
+    }
+
+    fn sessions_left(table: &ActivityTable) -> Vec<String> {
+        let ids = table.by_session.keys();
+        ids.map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn the_caps_are_the_documented_numbers() {
+        assert_eq!(ACTIVITY_PER_SESSION_MAX, 512);
+        assert_eq!(ACTIVITY_TOTAL_BYTES_MAX, 8_388_608);
+        assert_eq!(LIMITS.per_session, ACTIVITY_PER_SESSION_MAX);
+        assert_eq!(LIMITS.total_bytes, ACTIVITY_TOTAL_BYTES_MAX);
+    }
+
+    #[test]
+    fn a_literal_edge_table_for_the_per_session_cap() {
+        let rows: [(usize, usize, i64); 5] =
+            [(0, 3, 0), (1, 3, 0), (3, 3, 0), (4, 3, 1), (7, 3, 4)];
+        for (appended, expected_len, first) in rows {
+            let mut table = ActivityTable::default();
+            for n in 0..appended {
+                put(&mut table, &pad("a", n as i64, 0), limits(3, usize::MAX));
+            }
+            let kept = kept_at(&table, "a");
+            let want = if appended == 0 {
+                0
+            } else {
+                expected_len.min(appended)
+            };
+            assert_eq!(kept.len(), want, "appended {appended}");
+            if let Some(oldest) = kept.first() {
+                assert_eq!(*oldest, first, "appended {appended}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_literal_edge_table_for_the_byte_cap() {
+        let cost = ENTRY_OVERHEAD + 10;
+        let rows: [(usize, usize); 4] = [(2, 2), (3, 3), (4, 3), (5, 3)];
+        for (appended, retained) in rows {
+            let mut table = ActivityTable::default();
+            for n in 0..appended {
+                put(&mut table, &pad("a", n as i64, 10), limits(100, 3 * cost));
+            }
+            assert_eq!(kept_at(&table, "a").len(), retained, "appended {appended}");
+            assert_eq!(table.bytes, retained * cost);
+        }
+    }
+
+    #[test]
+    fn the_byte_cap_counts_bytes_not_entries() {
+        let mut table = ActivityTable::default();
+        put(&mut table, &pad("a", 0, 500), limits(100, 1000));
+        put(&mut table, &pad("a", 1, 500), limits(100, 1000));
+        assert_eq!(kept_at(&table, "a"), [1]);
+    }
+
+    #[test]
+    fn the_global_cap_takes_from_the_session_with_the_most_entries() {
+        let mut table = ActivityTable::default();
+        let cap = limits(100, 6 * (ENTRY_OVERHEAD + 4));
+        for n in 0..4 {
+            put(&mut table, &pad("big", n, 4), cap);
+        }
+        put(&mut table, &pad("small", 10, 4), cap);
+        put(&mut table, &pad("small", 11, 4), cap);
+        put(&mut table, &pad("small", 12, 4), cap);
+        assert_eq!(kept_at(&table, "big"), [1, 2, 3]);
+        assert_eq!(kept_at(&table, "small"), [10, 11, 12]);
+        put(&mut table, &pad("big", 13, 4), cap);
+        assert_eq!(kept_at(&table, "big"), [2, 3, 13]);
+        assert_eq!(kept_at(&table, "small"), [10, 11, 12]);
+    }
+
+    #[test]
+    fn a_tie_for_the_largest_session_goes_to_the_smallest_id() {
+        let mut table = ActivityTable::default();
+        let cap = limits(100, 4 * (ENTRY_OVERHEAD + 4));
+        for (n, name) in ["b", "a", "b", "a", "c"].into_iter().enumerate() {
+            put(&mut table, &pad(name, n as i64, 4), cap);
+        }
+        assert_eq!(kept_at(&table, "a"), [3]);
+        assert_eq!(kept_at(&table, "b"), [0, 2]);
+        assert_eq!(kept_at(&table, "c"), [4]);
+    }
+
+    #[test]
+    fn the_largest_session_is_the_one_that_loses_even_when_it_is_not_the_writer() {
+        let mut table = ActivityTable::default();
+        let cap = limits(100, 4 * (ENTRY_OVERHEAD + 4));
+        for n in 0..3 {
+            put(&mut table, &pad("big", n, 4), cap);
+        }
+        put(&mut table, &pad("small", 10, 4), cap);
+        put(&mut table, &pad("small", 11, 4), cap);
+        assert_eq!(kept_at(&table, "big"), [1, 2]);
+        assert_eq!(kept_at(&table, "small"), [10, 11]);
+    }
+
+    #[test]
+    fn a_session_emptied_by_the_global_cap_disappears() {
+        let mut table = ActivityTable::default();
+        let cap = limits(100, ENTRY_OVERHEAD + 4);
+        put(&mut table, &pad("a", 0, 4), cap);
+        put(&mut table, &pad("b", 1, 4), cap);
+        assert_eq!(sessions_left(&table).len(), 1);
+        assert_eq!(table.bytes, ENTRY_OVERHEAD + 4);
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_byte_cap_is_refused_and_changes_nothing() {
+        let mut table = ActivityTable::default();
+        put(&mut table, &pad("a", 0, 4), limits(10, 1000));
+        let exact = pad("b", 1, 1000 - ENTRY_OVERHEAD);
+        put(&mut table, &exact, limits(10, 1000));
+        assert_eq!(kept_at(&table, "b"), [1]);
+        assert_eq!(kept_at(&table, "a"), Vec::<i64>::new());
+        let bytes = table.bytes;
+        let secret = format!("SECRET-{}", "q".repeat(1200));
+        let refused = table.insert(&turn("c", &secret, 2), limits(10, 1000));
+        let error = refused.unwrap_err();
+        let shown = format!("{error} {error:?}");
+        assert!(!shown.contains("SECRET"));
+        assert_eq!(table.bytes, bytes);
+        assert_eq!(sessions_left(&table).len(), 1);
+        assert_eq!(kept_at(&table, "b"), [1]);
+    }
+
+    #[test]
+    fn the_newest_status_change_is_never_the_victim_while_another_entry_exists() {
+        let mut table = ActivityTable::default();
+        let cap = limits(3, usize::MAX);
+        put(&mut table, &status("a", SessionStatus::Completed, 0), cap);
+        for n in 1..6 {
+            put(&mut table, &pad("a", n, 1), cap);
+        }
+        assert_eq!(kept_at(&table, "a"), [0, 4, 5]);
+        put(&mut table, &marker("a", 6), cap);
+        assert_eq!(kept_at(&table, "a"), [4, 5, 6]);
+    }
+
+    #[test]
+    fn a_lone_pinned_status_change_is_evicted_only_by_the_global_cap() {
+        let mut table = ActivityTable::default();
+        let cap = limits(3, 2 * ENTRY_OVERHEAD + 4);
+        put(&mut table, &status("a", SessionStatus::Failed, 0), cap);
+        put(&mut table, &status("b", SessionStatus::Failed, 1), cap);
+        assert_eq!(kept_at(&table, "a"), [0]);
+        put(&mut table, &pad("c", 2, 4), cap);
+        assert_eq!(table.by_session.len(), 2);
+        assert_eq!(table.bytes, 2 * ENTRY_OVERHEAD + 4);
+    }
+
+    #[test]
+    fn forgetting_a_session_returns_its_bytes() {
+        let mut table = ActivityTable::default();
+        put(&mut table, &pad("a", 0, 10), LIMITS);
+        put(&mut table, &pad("b", 1, 20), LIMITS);
+        table.apply(&Record::Forget { session: sid("a") }).unwrap();
+        assert_eq!(table.bytes, ENTRY_OVERHEAD + 20);
+        let again = table.apply(&Record::Forget { session: sid("a") });
+        assert!(matches!(again, Err(StoreError::NotFound)));
+        assert_eq!(table.bytes, ENTRY_OVERHEAD + 20);
+    }
+
+    #[test]
+    fn the_real_caps_hold_for_the_largest_entries_across_many_sessions() {
+        let mut table = ActivityTable::default();
+        for n in 0..9 * 600 {
+            let name = format!("s{}", n % 9);
+            put(&mut table, &pad(&name, n as i64, 2048), LIMITS);
+            assert!(table.bytes <= ACTIVITY_TOTAL_BYTES_MAX);
+        }
+        let recount: usize = table.by_session.values().map(|log| cost_of(log)).sum();
+        assert_eq!(recount, table.bytes);
+        let longest = table.by_session.values().map(Vec::len).max().unwrap();
+        assert!(longest <= ACTIVITY_PER_SESSION_MAX);
+        assert_eq!(table.by_session.len(), 9);
+    }
+
+    #[test]
+    fn a_processed_entry_is_far_smaller_than_the_global_cap() {
+        let store = InMemoryActivityStore::new();
+        let huge = "word ".repeat(40_000);
+        store.append(turn("a", &huge, 0)).unwrap();
+        let kept = store.for_session(sid("a"), usize::MAX).unwrap();
+        assert!(kept[0].cost() <= ENTRY_OVERHEAD + 2048);
+    }
+
+    #[test]
+    fn the_global_cap_holds_through_the_store_and_a_quiet_session_is_untouched() {
+        let store = InMemoryActivityStore::new();
+        store.append(turn("quiet", "still here", 0)).unwrap();
+        let text = "reading the failing test ".repeat(81);
+        for n in 0..9 * ACTIVITY_PER_SESSION_MAX {
+            let session = format!("s{}", n % 9);
+            store.append(turn(&session, &text, n as i64)).unwrap();
+        }
+        let mut total = 0;
+        for name in [
+            "quiet", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8",
+        ] {
+            let kept = store.for_session(sid(name), usize::MAX).unwrap();
+            assert!(kept.len() <= ACTIVITY_PER_SESSION_MAX);
+            total += kept.iter().map(ActivityEntry::cost).sum::<usize>();
+        }
+        assert!(total <= ACTIVITY_TOTAL_BYTES_MAX);
+        assert!(total > ACTIVITY_TOTAL_BYTES_MAX - 4 * 2100);
+        assert_eq!(only_text(&store, "quiet"), "still here");
+    }
+
+    #[derive(Clone)]
+    struct Item {
+        at: i64,
+        cost: usize,
+        status: bool,
+    }
+
+    type Naive = BTreeMap<String, Vec<Item>>;
+
+    fn naive_total(model: &Naive) -> usize {
+        let mut total = 0;
+        for log in model.values() {
+            total += log.iter().map(|i| i.cost).sum::<usize>();
+        }
+        total
+    }
+
+    fn naive_drop_oldest(log: &mut Vec<Item>) {
+        let pinned = (0..log.len()).rfind(|i| log[*i].status);
+        let candidates: Vec<usize> = (0..log.len()).filter(|i| Some(*i) != pinned).collect();
+        let victim = candidates.first().copied().unwrap_or(0);
+        log.remove(victim);
+    }
+
+    fn naive_largest(model: &Naive) -> String {
+        let mut order: Vec<(usize, String)> = Vec::new();
+        for (name, log) in model {
+            order.push((log.len(), name.clone()));
+        }
+        order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        order[0].1.clone()
+    }
+
+    fn naive_append(model: &mut Naive, name: &str, item: Item, limits: Limits) -> bool {
+        let admitted = item.cost <= limits.total_bytes;
+        if admitted {
+            naive_place(model, name, item, limits);
+        }
+        admitted
+    }
+
+    fn naive_place(model: &mut Naive, name: &str, item: Item, limits: Limits) {
+        model.entry(name.to_string()).or_default().push(item);
+        while model[name].len() > limits.per_session {
+            naive_drop_oldest(model.get_mut(name).unwrap());
+        }
+        while naive_total(model) > limits.total_bytes {
+            let victim = naive_largest(model);
+            naive_drop_oldest(model.get_mut(&victim).unwrap());
+            if model[&victim].is_empty() {
+                model.remove(&victim);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum CapOp {
+        Append { s: u8, len: usize, kind: u8 },
+        Forget { s: u8 },
+    }
+
+    fn cap_op() -> impl Strategy<Value = CapOp> {
+        prop_oneof![
+            8 => (0u8..4, 0usize..120, 0u8..4).prop_map(|(s, len, kind)| CapOp::Append { s, len, kind }),
+            1 => (0u8..4).prop_map(|s| CapOp::Forget { s }),
+        ]
+    }
+
+    fn check_table_against(table: &ActivityTable, model: &Naive, limits: Limits) {
+        let expected: Vec<String> = model.keys().cloned().collect();
+        assert_eq!(sessions_left(table), expected);
+        for (name, log) in model {
+            let want: Vec<i64> = log.iter().map(|i| i.at).collect();
+            assert_eq!(kept_at(table, name), want, "session {name}");
+            assert!(log.len() <= limits.per_session);
+        }
+        assert_eq!(table.bytes, naive_total(model));
+        assert!(table.bytes <= limits.total_bytes);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn the_table_matches_a_naive_largest_session_oracle(
+            per_session in 1usize..6,
+            total in 100usize..1500,
+            ops in proptest::collection::vec(cap_op(), 0..80),
+        ) {
+            let cap = limits(per_session, total);
+            let mut table = ActivityTable::default();
+            let mut model = Naive::new();
+            for (n, op) in ops.iter().enumerate() {
+                match op {
+                    CapOp::Append { s, len, kind } => {
+                        let name = format!("s{s}");
+                        let stamp = n as i64;
+                        let is_status = *kind == 3;
+                        let entry = if is_status { marker(&name, stamp) } else { pad(&name, stamp, *len) };
+                        let item = Item { at: stamp, cost: entry.cost(), status: is_status };
+                        let placed = table.insert(&entry, cap);
+                        let admitted = naive_append(&mut model, &name, item, cap);
+                        prop_assert_eq!(placed.is_ok(), admitted);
+                    }
+                    CapOp::Forget { s } => {
+                        let name = format!("s{s}");
+                        let applied = table.apply(&Record::Forget { session: sid(&name) });
+                        prop_assert_eq!(applied.is_ok(), model.remove(&name).is_some());
+                    }
+                }
+                check_table_against(&table, &model, cap);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum Burst {
+        Appends { s: u8, n: usize },
+        Done { s: u8 },
+        Reopen,
+    }
+
+    fn burst() -> impl Strategy<Value = Burst> {
+        prop_oneof![
+            4 => (0u8..3, 0usize..700).prop_map(|(s, n)| Burst::Appends { s, n }),
+            1 => (0u8..3).prop_map(|s| Burst::Done { s }),
+            2 => Just(Burst::Reopen),
+        ]
+    }
+
+    fn stamps_of(entries: &[ActivityEntry]) -> Vec<i64> {
+        let base = at(0).timestamp();
+        entries.iter().map(|e| e.at().timestamp() - base).collect()
+    }
+
+    fn assert_store_matches(store: &JsonlActivityStore, model: &Naive) {
+        for s in 0..3 {
+            let name = format!("s{s}");
+            let kept = store.for_session(sid(&name), usize::MAX).unwrap();
+            let mut stamps = stamps_of(&kept);
+            stamps.reverse();
+            let log = model.get(&name);
+            let want: Vec<i64> = log.map_or_else(Vec::new, |l| l.iter().map(|i| i.at).collect());
+            assert_eq!(stamps, want, "session {name}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(6))]
+
+        #[test]
+        fn replaying_the_journal_after_a_reopen_equals_the_capped_model(
+            ops in proptest::collection::vec(burst(), 0..6),
+        ) {
+            let fixture = Fixture::new();
+            let mut store = open(&fixture).unwrap();
+            let mut model = Naive::new();
+            let mut stamp = 0i64;
+            let real = limits(ACTIVITY_PER_SESSION_MAX, ACTIVITY_TOTAL_BYTES_MAX);
+            for op in &ops {
+                match op {
+                    Burst::Appends { s, n } => {
+                        let name = format!("s{s}");
+                        for _ in 0..*n {
+                            stamp += 1;
+                            let entry = turn(&name, "w", stamp);
+                            let item = Item { at: stamp, cost: entry.cost(), status: false };
+                            store.append(entry).unwrap();
+                            assert!(naive_append(&mut model, &name, item, real));
+                        }
+                    }
+                    Burst::Done { s } => {
+                        let name = format!("s{s}");
+                        stamp += 1;
+                        let entry = status(&name, SessionStatus::Completed, stamp);
+                        let item = Item { at: stamp, cost: entry.cost(), status: true };
+                        store.append(entry).unwrap();
+                        assert!(naive_append(&mut model, &name, item, real));
+                    }
+                    Burst::Reopen => {
+                        drop(store);
+                        store = open(&fixture).unwrap();
+                    }
+                }
+                assert_store_matches(&store, &model);
+            }
+            drop(store);
+            let reopened = open(&fixture).unwrap();
+            assert_store_matches(&reopened, &model);
+        }
+    }
+
+    fn journaled(journal: Flaky) -> InMemoryActivityStore {
+        let engine = Engine::with_journal(Box::new(journal) as Box<dyn Journal>);
+        InMemoryActivityStore { engine }
+    }
+
+    fn nine_session_lens(store: &dyn ActivityStore) -> Vec<usize> {
+        let mut lens = Vec::new();
+        for s in 0..9 {
+            lens.push(
+                store
+                    .for_session(sid(&format!("s{s}")), usize::MAX)
+                    .unwrap()
+                    .len(),
+            );
+        }
+        lens
+    }
+
+    fn nine_session_bytes(store: &dyn ActivityStore) -> usize {
+        let mut total = 0;
+        for s in 0..9 {
+            let kept = store
+                .for_session(sid(&format!("s{s}")), usize::MAX)
+                .unwrap();
+            total += kept.iter().map(ActivityEntry::cost).sum::<usize>();
+        }
+        total
+    }
+
+    fn write_raw(fixture: &Fixture, entries: &[ActivityEntry]) {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            let entry = entry.clone();
+            let record = Record::Entry { entry };
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(fixture.path("activity.jsonl"), bytes).unwrap();
+    }
+
+    #[test]
+    fn a_journal_from_an_older_uncapped_build_loads_capped_and_is_compacted() {
+        let fixture = Fixture::new();
+        let all = 0..3 * ACTIVITY_PER_SESSION_MAX;
+        let entries: Vec<ActivityEntry> = all.map(|n| tagged("a", n)).collect();
+        write_raw(&fixture, &entries);
+        assert_eq!(lines(&fixture).len(), 1536);
+        let store = open(&fixture).unwrap();
+        let kept = kept_texts(&store, "a");
+        assert_eq!(kept.len(), 512);
+        assert_eq!(kept[0], "t1024");
+        assert_eq!(kept[511], "t1535");
+        assert_eq!(lines(&fixture).len(), 512);
+    }
+
+    #[test]
+    fn the_live_journal_grows_until_the_next_open_and_then_shrinks_to_the_caps() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        for n in 0..3 * ACTIVITY_PER_SESSION_MAX {
+            store.append(tagged("a", n)).unwrap();
+        }
+        assert_eq!(lines(&fixture).len(), 1536);
+        let live = store.for_session(sid("a"), usize::MAX).unwrap();
+        assert_eq!(live.len(), 512);
+        drop(store);
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.for_session(sid("a"), usize::MAX).unwrap(), live);
+        assert_eq!(lines(&fixture).len(), 512);
+        drop(reopened);
+        let third = open(&fixture).unwrap();
+        assert_eq!(third.for_session(sid("a"), usize::MAX).unwrap(), live);
+        assert_eq!(lines(&fixture).len(), 512);
+    }
+
+    #[test]
+    fn an_old_journal_larger_than_the_byte_cap_loads_within_it() {
+        let fixture = Fixture::new();
+        let text = "y".repeat(2000);
+        let mut entries = Vec::new();
+        for n in 0..9 * 500 {
+            entries.push(turn(&format!("s{}", n % 9), &text, n as i64));
+        }
+        write_raw(&fixture, &entries);
+        let store = open(&fixture).unwrap();
+        let total = nine_session_bytes(&store);
+        assert!(total <= ACTIVITY_TOTAL_BYTES_MAX);
+        assert!(total > ACTIVITY_TOTAL_BYTES_MAX - 2100);
+    }
+
+    #[test]
+    fn a_journal_entry_larger_than_the_byte_cap_is_corrupt_and_the_file_is_untouched() {
+        let fixture = Fixture::new();
+        let giant = "z".repeat(ACTIVITY_TOTAL_BYTES_MAX + 1);
+        write_raw(&fixture, &[turn("a", "small", 0), turn("b", &giant, 1)]);
+        let before = std::fs::read(fixture.path("activity.jsonl")).unwrap();
+        let refused = open(&fixture).err();
+        assert!(matches!(refused, Some(StoreError::Corrupt(2))));
+        assert_eq!(
+            std::fs::read(fixture.path("activity.jsonl")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_live_commit_of_an_entry_over_the_byte_cap_changes_nothing() {
+        let (journal, _fail, written) = flaky();
+        let store = journaled(journal);
+        store.append(turn("a", "kept", 0)).unwrap();
+        let written_before = written.lock().unwrap().clone();
+        let giant = turn("a", &"z".repeat(ACTIVITY_TOTAL_BYTES_MAX), 1);
+        let plan = vec![Record::Entry { entry: giant }];
+        let refused = store.engine.commit(|_| Ok(((), plan)));
+        assert!(matches!(refused, Err(StoreError::Io(_))));
+        assert_eq!(only_text(&store, "a"), "kept");
+        assert_eq!(*written.lock().unwrap(), written_before);
+    }
+
+    #[test]
+    fn a_failed_write_at_the_cap_evicts_nothing_and_journals_nothing() {
+        let (journal, fail, written) = flaky();
+        let store = journaled(journal);
+        for n in 0..ACTIVITY_PER_SESSION_MAX {
+            store.append(tagged("a", n)).unwrap();
+        }
+        let before = store.for_session(sid("a"), usize::MAX).unwrap();
+        let written_before = written.lock().unwrap().clone();
+        fail.store(true, Ordering::SeqCst);
+        let refused = store.append(tagged("a", 512));
+        assert!(matches!(refused, Err(StoreError::Io(_))));
+        assert_eq!(store.for_session(sid("a"), usize::MAX).unwrap(), before);
+        assert_eq!(*written.lock().unwrap(), written_before);
+        fail.store(false, Ordering::SeqCst);
+        store.append(tagged("a", 512)).unwrap();
+        assert_eq!(kept_texts(&store, "a")[0], "t1");
+    }
+
+    #[test]
+    fn a_failed_write_at_the_global_cap_leaves_every_session_whole() {
+        let (journal, fail, _written) = flaky();
+        let store = journaled(journal);
+        let text = "reading the failing test ".repeat(81);
+        for n in 0..4200 {
+            let session = format!("s{}", n % 9);
+            store.append(turn(&session, &text, n as i64)).unwrap();
+        }
+        let snapshot = nine_session_lens(&store);
+        assert!(snapshot.iter().sum::<usize>() < 4200);
+        fail.store(true, Ordering::SeqCst);
+        assert!(store.append(turn("s0", &text, 9999)).is_err());
+        let after = nine_session_lens(&store);
+        assert_eq!(after, snapshot);
     }
 }
