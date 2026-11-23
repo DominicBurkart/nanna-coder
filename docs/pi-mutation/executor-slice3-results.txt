@@ -1,0 +1,67 @@
+1 executor.rs '"--pull=never".to_string(),' -> '"--pull=missing".to_string(),': KILLED
+2 executor.rs '            "--read-only".to_string(),\n' -> '': KILLED
+3 executor.rs 'const CONTAINER_USER: &str = "65534:65534";' -> 'const CONTAINER_USER: &str = "0:0";': KILLED
+4 executor.rs '"--cap-drop=ALL".to_string(),' -> '"--cap-add=ALL".to_string(),': KILLED
+5 executor.rs '            "--security-opt=no-new-privileges".to_string(),\n' -> '': KILLED
+6 executor.rs 'PiNetwork::None => "--network=none".to_string(),' -> 'PiNetwork::None => "--network=host".to_s': KILLED
+7 executor.rs 'Self::new(PiNetwork::None)' -> 'Self::new(PiNetwork::Named("bridge".to_s': KILLED
+8 executor.rs '    "host",\n    "none",' -> '    "hostx",\n    "none",': KILLED
+9 executor.rs 'if RESERVED_NETWORKS.contains(&name.to_ascii_lowercase().as_' -> 'if false {': KILLED
+10 executor.rs 'RESERVED_NETWORKS.contains(&name.to_ascii_lowercase().as_str' -> 'RESERVED_NETWORKS.contains(&name.as_str(': KILLED
+11 executor.rs "&& !name.starts_with('-')" -> '&& true': KILLED
+12 executor.rs "if socket.contains([',', '=', '\\n']) {" -> 'if false {': KILLED
+13 executor.rs '            format!("--memory={}m", limits.memory_mb),' -> '            format!("--memory={}m", limi': KILLED
+14 executor.rs '            format!("--pids-limit={}", limits.pids),' -> '            format!("--pids-limit={}", l': KILLED
+15 executor.rs '        super::route::off_runtime(|| {\n            super::ro' -> '        let _ = &self.name;': KILLED
+16 executor.rs '        drop(guard);\n        outcome' -> '        std::mem::forget(guard);\n       ': KILLED
+17 executor.rs '["rm", "-f", "--volumes", name]' -> '["rm", "--volumes", name]': KILLED
+18 executor.rs '_ = tokio::time::sleep_until(deadline) => {' -> '_ = std::future::pending::<()>() => {': KILLED
+19 executor.rs 'let deadline = Instant::now() + launch.deadline();' -> 'let deadline = Instant::now() + launch.d': KILLED
+20 executor.rs 'match tokio::time::timeout_at(deadline, work).await {' -> 'match Ok::<_, tokio::time::error::Elapse': KILLED
+21 executor.rs 'let written = tokio::time::timeout_at(deadline, sent).await;' -> 'let written = Ok::<_, tokio::time::error': SURVIVED
+22 executor.rs '        if self.tools.is_none() {\n            return Step::F' -> '        if false {\n            return St': KILLED
+23 executor.rs 'Some(first) if *first == set => Step::Continue,' -> 'Some(_) => Step::Continue,': KILLED
+24 executor.rs 'Err(e) => break Ended::Failed(format!("lockdown not verified' -> 'Err(_) => {}': KILLED
+25 executor.rs 'match broker.arm(&self.plan, &names) {' -> 'match broker.arm(&self.plan, &[]) {': KILLED
+26 executor.rs 'ServeEnd::Halted(reason) => break Ended::Halted(reason),' -> 'ServeEnd::Halted(_) => break Ended::Sett': KILLED
+27 executor.rs 'Ended::Halted(reason) => failure(reason.message(), calls),' -> 'Ended::Halted(_) => PiRunOutcome { resul': KILLED
+28 executor.rs 'if self.turns > self.max_turns {' -> 'if self.turns >= self.max_turns {': KILLED
+29 executor.rs 'self.progress.fetch_add(1, Ordering::SeqCst);' -> 'self.progress.fetch_add(0, Ordering::Seq': KILLED
+30 executor.rs 'last.get("stopReason").and_then(Value::as_str) == Some("erro' -> 'last.get("stopReason").and_then(Value::a': KILLED
+31 executor.rs 'if prompt && event.get("success").and_then(Value::as_bool) !' -> 'if false {': KILLED
+32 executor.rs 'if event.get("aborted").and_then(Value::as_bool) == Some(fal' -> 'if true {': KILLED
+33 executor.rs 'let action_audit = armed.map(ArmedBroker::action_audit).unwr' -> 'let action_audit: Vec<_> = Vec::new();': SURVIVED
+34 executor.rs 'let mine = meta.uid() == unsafe { libc::geteuid() };' -> 'let mine = true;': SURVIVED
+35 executor.rs 'meta.mode() & 0o077 != 0' -> 'false': KILLED
+36 executor.rs '.mode(0o700)' -> '.mode(0o755)': KILLED
+37 executor.rs 'if name != super::pi_container_name(launch.task_id()) {' -> 'if false {': KILLED
+38 executor.rs 'if broker.task_id().0 != launch_task_id {' -> 'if false {': KILLED
+39 executor.rs 'block[124..136].copy_from_slice(&octal(size, 12));' -> 'block[124..136].copy_from_slice(&octal(s': KILLED
+40 executor.rs '["cp", "-", &format!("{name}:/")]' -> '["cp", "-", &format!("{name}:/tmp")]': KILLED
+41 executor.rs '["start", "--attach", "--interactive", name]' -> '["start", "--interactive", name]': KILLED
+42 executor.rs '            .stderr(Stdio::null())\n            .kill_on_drop' -> '            .stderr(Stdio::null())\n     ': KILLED
+43 executor.rs 'pub(super) const MAX_SUMMARY_BYTES: usize = 64 * 1024;' -> 'pub(super) const MAX_SUMMARY_BYTES: usiz': KILLED
+44 executor.rs 'result_summary: clip_text(text, MAX_SUMMARY_BYTES),' -> 'result_summary: text,': KILLED
+45 executor.rs 'while !text.is_char_boundary(end) {' -> 'while false {': KILLED
+46 rpc.rs 'if self.pending.len() > self.limits.max_line {' -> 'if false {': KILLED
+47 rpc.rs 'if end > self.limits.max_line {' -> 'if end > self.limits.max_line + 1 {': KILLED
+48 rpc.rs 'if self.total + end + 1 > self.limits.max_total {' -> 'if self.total + end > self.limits.max_to': KILLED
+49 rpc.rs ".position(|b| *b == b'\\n')" -> ".position(|b| *b == b'\\n' || *b == b'\\r'": KILLED
+50 rpc.rs 'if self.failed {' -> 'if false {': KILLED
+51 rpc.rs '            self.failed = true;\n' -> '': KILLED
+52 rpc.rs 'return if self.pending.is_empty() {' -> 'return if true {': KILLED
+53 rpc.rs 'String::from_utf8(line).map_err(|_| RpcError::NotUtf8)' -> 'Ok(String::from_utf8_lossy(&line).into_o': KILLED
+54 rpc.rs "if reply.contains('\\n') {" -> 'if false {': KILLED
+55 rpc.rs '        .replace(\'\\u{2028}\', "\\\\u2028")\n' -> '': KILLED
+56 rpc.rs '.replace(\'\\u{2029}\', "\\\\u2029");' -> ';': KILLED
+57 rpc.rs 'if text.len() > max {' -> 'if text.len() > max + 1 {': KILLED
+58 rpc.rs 'if text.len() > max {' -> 'if false {': KILLED
+59 rpc.rs 'pub const MAX_REPLY_BYTES: usize = 1_048_576;' -> 'pub const MAX_REPLY_BYTES: usize = 1_048': KILLED
+60 rpc.rs 'return ServeEnd::Halted(reason);' -> 'return ServeEnd::Failed(String::new());': KILLED
+61 rpc.rs '(_, Some(reason)) => Ok(Some(reason)),' -> '(_, Some(_)) => Ok(None),': KILLED
+62 rpc.rs 'RpcError::NotUtf8 => Some("bad request: not valid UTF-8"),' -> 'RpcError::NotUtf8 => None,': KILLED
+63 rpc.rs 'pub const RELAY_HOST: &str = "host.containers.internal";' -> 'pub const RELAY_HOST: &str = "host.inter': KILLED
+64 route.rs 'Ok(handle) if handle.runtime_flavor() == tokio::runtime::Run' -> 'Ok(_) if false => {': KILLED
+65 route.rs 'Ok(None) if started.elapsed() < limit => {' -> 'Ok(None) => {': KILLED
+66 route.rs '                let _ = child.kill();\n' -> '': KILLED
+67 route.rs '                let args = ["rm", "-f", self.name.as_str()].' -> 'let _ = runtime;': KILLED

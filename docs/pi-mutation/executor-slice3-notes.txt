@@ -1,0 +1,7 @@
+Survivors of executor-slice3-mutants.py and why they stay. The results file is written by the runner and is not edited.
+
+21 executor.rs, the deadline on the prompt write: equivalent against the fake. The prompt line is the audited subtask and fits the pipe buffer, so the write never blocks; killing the mutant needs a runtime that stops reading stdin and a prompt larger than the pipe buffer.
+
+33 executor.rs, the action audit is dropped from the outcome: equivalent today. The executor serves with BrokerPolicy::default(), whose ceiling is Workspace, and the action gate reviews Repository and above, so no gated call can reach the executor and the audit is always empty on this route. The pass-through from ArmedBroker::action_audit is covered by the slice 1 broker tests; it becomes reachable, and needs an executor-level test, when a wider policy is configured.
+
+34 executor.rs, the owner check of the socket directory: not killable unprivileged. It needs a 0700 directory owned by another user, which a test cannot create without root.
