@@ -158,6 +158,18 @@ pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, Strin
             false,
             "The task touched a protected path; remove that change from the task.".to_string(),
         ),
+        "StateError"
+            if lower.contains("llm perform failed")
+                && (lower.contains("request timeout")
+                    || lower.contains("service unavailable")
+                    || lower.contains("connection refused")) =>
+        {
+            (
+                "model_unavailable".to_string(),
+                true,
+                "The local model did not answer in time, usually because the machine is busy. Submit the task again with a new client_ref; a smaller, more specific task finishes faster.".to_string(),
+            )
+        }
         "TaskCheckFailed" | "StateError" => (
             error_type.to_string(),
             false,
@@ -803,6 +815,24 @@ mod tests {
             .await,
         );
         assert_eq!(view["no_changes"], false);
+    }
+
+    #[test]
+    fn a_model_timeout_is_retryable_and_says_the_machine_is_busy() {
+        for message in [
+            "Agent state error: LLM perform failed after 3 attempts: Service unavailable: Request timeout",
+            "Agent state error: LLM perform failed after 3 attempts: Service unavailable: connection refused",
+        ] {
+            let (code, retryable, fix) = classify_failure("StateError", message);
+            assert_eq!(code, "model_unavailable", "{message}");
+            assert!(retryable, "{message}");
+            assert!(fix.contains("busy"), "{fix}");
+            assert!(fix.contains("new client_ref"), "{fix}");
+        }
+        let (code, retryable, _) =
+            classify_failure("StateError", "Agent state error: unexpected finish reason");
+        assert_eq!(code, "StateError");
+        assert!(!retryable);
     }
 
     #[test]
