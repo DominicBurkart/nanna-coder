@@ -268,15 +268,9 @@ pub(super) fn active_lists_exactly_the_non_terminal_records_in_id_order<S: Sessi
     let listed = s.active().unwrap();
     let ids: Vec<String> = listed.iter().map(|a| a.id.to_string()).collect();
     assert_eq!(ids, ["b", "c", "e"]);
-    let seen: Vec<SessionStatus> = listed.iter().map(|a| a.status).collect();
-    assert_eq!(
-        seen,
-        [
-            SessionStatus::Running,
-            SessionStatus::WaitingOnMessages,
-            SessionStatus::Pending
-        ]
-    );
+    assert_eq!(listed[0].status, SessionStatus::Running);
+    assert_eq!(listed[1].status, SessionStatus::WaitingOnMessages);
+    assert_eq!(listed[2].status, SessionStatus::Pending);
     let last: Vec<DateTime<Utc>> = listed.iter().map(|a| a.last_activity).collect();
     assert_eq!(last, [at(2), at(3), at(5)]);
     s.set_status(sid("b"), SessionStatus::Completed, at(9))

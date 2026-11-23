@@ -539,6 +539,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn restore_registers_every_queued_session_before_it_closes_the_orphans() {
             let (buf, _guard) = capture();
+            std::io::Write::flush(&mut buf.clone()).unwrap();
             let repo = tempfile::tempdir().unwrap();
             let restored = queued(repo.path(), "Check PR status");
             let store = Arc::new(InMemorySessionStore::new());
