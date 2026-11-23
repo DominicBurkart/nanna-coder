@@ -1,6 +1,6 @@
 use super::lineage::{Lineage, SessionBinding, SessionId};
 use super::session::{SessionKind, SessionRecord, SessionStatus};
-use super::store::{SessionStore, StoreError};
+use super::store::{ActiveSession, SessionStore, StoreError};
 use super::summary::Summary;
 use crate::action_auditor::{is_credential_path, IdentifierOracle, NullOracle, RuleMessageAuditor};
 use chrono::{DateTime, Utc};
@@ -43,6 +43,14 @@ pub enum RegistryError {
     UseFinish,
     #[error("finish needs a terminal status")]
     NotTerminal,
+}
+
+/// The result summary of a session the orphan sweep closes. It is fixed text and carries nothing
+/// from the record.
+pub const ORPHAN_SUMMARY: &str = "failed: orphaned";
+
+fn is_orphan(tracked: &HashSet<SessionId>, entry: &ActiveSession, started: DateTime<Utc>) -> bool {
+    !tracked.contains(&entry.id) && entry.last_activity < started
 }
 
 fn illegal(from: SessionStatus, to: SessionStatus) -> RegistryError {
@@ -275,6 +283,17 @@ impl SessionRegistry {
         at: DateTime<Utc>,
     ) -> Result<(), RegistryError> {
         let mut tracked = self.lock();
+        self.finish_locked(&mut tracked, id, to, summary, at)
+    }
+
+    fn finish_locked(
+        &self,
+        tracked: &mut HashSet<SessionId>,
+        id: &SessionId,
+        to: SessionStatus,
+        summary: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
         if to.is_active() {
             return Err(RegistryError::NotTerminal);
         }
@@ -309,6 +328,49 @@ impl SessionRegistry {
         match self.finish(id, SessionStatus::Failed, None, at) {
             Ok(()) => Ok(true),
             Err(RegistryError::Unknown) | Err(RegistryError::IllegalTransition { .. }) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Close the orphans left in the store by an earlier process: every active record that this
+    /// registry does not track and whose `last_activity` is strictly older than `started`, the
+    /// time the runtime began. Both conditions are required: a session this process registered is
+    /// tracked, and one registered after `started` is newer, so a live session is never closed.
+    /// Each orphan is finished as `Failed` with [`ORPHAN_SUMMARY`] at `at`, through the same
+    /// compare-and-set as [`Self::finish`], so a record that a concurrent writer finished since the
+    /// listing keeps what that writer wrote. The registry mutex is held for the whole pass, so no
+    /// registration can interleave. One listing and at most one write per listed record; no
+    /// retry, no text is read or logged. A listing error is returned before anything is closed,
+    /// and a write error stops the pass. Returns the ids this call closed.
+    ///
+    /// The runtime calls this once, inside `HubRuntime::restore`, after the task manager has
+    /// registered every restored session.
+    pub(crate) fn sweep_orphans(
+        &self,
+        started: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<SessionId>, RegistryError> {
+        let mut tracked = self.lock();
+        let listed = self.store.active()?;
+        let mut closed = Vec::new();
+        for entry in listed {
+            let orphan = is_orphan(&tracked, &entry, started);
+            if orphan && self.close_orphan(&mut tracked, &entry.id, at)? {
+                closed.push(entry.id);
+            }
+        }
+        Ok(closed)
+    }
+
+    fn close_orphan(
+        &self,
+        tracked: &mut HashSet<SessionId>,
+        id: &SessionId,
+        at: DateTime<Utc>,
+    ) -> Result<bool, RegistryError> {
+        match self.finish_locked(tracked, id, SessionStatus::Failed, Some(ORPHAN_SUMMARY), at) {
+            Ok(()) => Ok(true),
+            Err(RegistryError::Unknown | RegistryError::IllegalTransition { .. }) => Ok(false),
             Err(other) => Err(other),
         }
     }
@@ -467,6 +529,10 @@ pub(crate) mod test_support {
         fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
             self.inner.prune(now, policy)
         }
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            Self::gate(&self.reads)?;
+            self.inner.active()
+        }
     }
 }
 
@@ -529,10 +595,6 @@ mod tests {
         let card = crate::identity::example();
         assert_eq!(record.id, sid("t1"));
         assert_eq!(&record.lineage, bound.lineage());
-        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
-            Self::gate(&self.reads)?;
-            self.inner.active()
-        }
         assert_eq!(record.kind, SessionKind::Agent);
         assert_eq!(record.identity, "rust-implementer");
         assert_eq!(record.role, card.identity.description);
@@ -1495,6 +1557,11 @@ mod tests {
         fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
             self.inner.prune(now, policy)
         }
+        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+            let listed = self.inner.active();
+            self.fire();
+            listed
+        }
     }
 
     #[test]
@@ -1508,6 +1575,7 @@ mod tests {
         registry.register(&binding("t"), "s", at(0)).unwrap();
         let root = RootId::mcp(Uuid::from_u128(1));
         assert_eq!(racing.in_root(&root).unwrap().len(), 1);
+        assert_eq!(racing.active().unwrap().len(), 1);
         let kept = racing.get(sid("t")).unwrap().unwrap();
         racing.upsert(kept.clone()).unwrap();
         racing.update(sid("t"), Box::new(Some)).unwrap();
@@ -1557,11 +1625,6 @@ mod tests {
                 slipped_in: Mutex::new(Some(slipped_in)),
             });
             op(&SessionRegistry::new(racing.clone()));
-        fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
-            let listed = self.inner.active();
-            self.fire();
-            listed
-        }
             racing.fire();
             let record = stored(&inner, "t");
             assert_eq!(record.status, end, "{name}");
@@ -1575,7 +1638,6 @@ mod tests {
         const EDGES: [(SessionStatus, SessionStatus); 11] = [
             (SessionStatus::Pending, SessionStatus::Running),
             (SessionStatus::Pending, SessionStatus::Failed),
-        assert_eq!(racing.active().unwrap().len(), 1);
             (SessionStatus::Pending, SessionStatus::Cancelled),
             (SessionStatus::Running, SessionStatus::WaitingOnMessages),
             (SessionStatus::Running, SessionStatus::Completed),
@@ -1919,6 +1981,319 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    mod orphan_sweep {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        type Hook = Box<dyn FnOnce() + Send>;
+        type Parked = Arc<Mutex<Option<std::thread::JoinHandle<Result<(), RegistryError>>>>>;
+
+        const STARTED: i64 = 100;
+        const NOW: i64 = 200;
+
+        const TABLE: [(bool, bool, bool, bool); 8] = [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, true),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+        ];
+
+        fn seeded(store: &InMemorySessionStore, name: &str, status: SessionStatus, last: i64) {
+            let scratch = Arc::new(InMemorySessionStore::new());
+            let origin = SessionRegistry::new(scratch.clone());
+            origin.register(&binding(name), "old", at(last)).unwrap();
+            let mut record = stored(&scratch, name);
+            record.status = status;
+            record.ended_at = (!status.is_active()).then_some(at(last));
+            store.upsert(record).unwrap();
+        }
+
+        fn cell(
+            tracked: bool,
+            active: bool,
+            last: i64,
+        ) -> (Arc<InMemorySessionStore>, SessionRegistry) {
+            let (store, registry) = registry();
+            if tracked {
+                registry.register(&binding("t"), "s", at(last)).unwrap();
+            }
+            let status = if active {
+                SessionStatus::Running
+            } else {
+                SessionStatus::Completed
+            };
+            if tracked && !active {
+                store.set_status(sid("t"), status, at(last)).unwrap();
+            }
+            if !tracked {
+                seeded(&store, "t", status, last);
+            }
+            (store, registry)
+        }
+
+        fn racing(inner: &Arc<InMemorySessionStore>, hook: Hook) -> Arc<Racing> {
+            Arc::new(Racing {
+                inner: inner.clone(),
+                slipped_in: Mutex::new(Some(hook)),
+            })
+        }
+
+        #[test]
+        fn the_sweep_closes_exactly_the_untracked_active_records_older_than_the_start() {
+            for (tracked, active, older, swept) in TABLE {
+                let last = if older { STARTED - 50 } else { STARTED + 50 };
+                let (store, registry) = cell(tracked, active, last);
+                let before = stored(&store, "t");
+                let closed = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+                let after = stored(&store, "t");
+                let cell = format!("tracked={tracked} active={active} older={older}");
+                assert_eq!(closed.len(), usize::from(swept), "{cell}");
+                assert_eq!(after.status == SessionStatus::Failed, swept, "{cell}");
+                assert_eq!(after == before, !swept, "{cell}");
+                assert_eq!(registry.tracks(&sid("t")), tracked, "{cell}");
+            }
+        }
+
+        #[test]
+        fn every_non_terminal_status_is_closed_as_failed_with_the_fixed_summary_and_nothing_else_changes(
+        ) {
+            let statuses = [
+                SessionStatus::Pending,
+                SessionStatus::Running,
+                SessionStatus::WaitingOnMessages,
+            ];
+            for status in statuses {
+                let (store, registry) = registry();
+                seeded(&store, "t", status, 0);
+                let planted = "PLANTED-SUBTASK-31";
+                store
+                    .update(
+                        sid("t"),
+                        Box::new(|mut record| {
+                            record.subtask = planted.to_string();
+                            Some(record)
+                        }),
+                    )
+                    .unwrap();
+                let before = stored(&store, "t");
+                let closed = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+                assert_eq!(closed, [sid("t")], "{status:?}");
+                let mut expected = before.clone();
+                expected.status = SessionStatus::Failed;
+                expected.ended_at = Some(at(NOW));
+                expected.last_activity = at(NOW);
+                expected.result_summary = Some(ORPHAN_SUMMARY.to_string());
+                assert_eq!(stored(&store, "t"), expected, "{status:?}");
+                assert_eq!(ORPHAN_SUMMARY, "failed: orphaned");
+                assert!(!registry.tracks(&sid("t")));
+            }
+        }
+
+        #[test]
+        fn a_record_exactly_at_the_start_is_kept_and_one_second_older_is_closed() {
+            let (store, registry) = registry();
+            seeded(&store, "edge", SessionStatus::Running, STARTED);
+            seeded(&store, "older", SessionStatus::Running, STARTED - 1);
+            let closed = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            assert_eq!(closed, [sid("older")]);
+            assert_eq!(stored(&store, "edge").status, SessionStatus::Running);
+            assert_eq!(stored(&store, "older").status, SessionStatus::Failed);
+        }
+
+        #[test]
+        fn a_second_registry_over_the_same_store_cannot_close_a_session_registered_after_the_start()
+        {
+            let store = Arc::new(InMemorySessionStore::new());
+            let live = SessionRegistry::new(store.clone());
+            live.register(&binding("live"), "s", at(STARTED + 10))
+                .unwrap();
+            let running = SessionStatus::Running;
+            live.set_status(&sid("live"), running, at(STARTED + 12))
+                .unwrap();
+            let before = stored(&store, "live");
+            let stray = SessionRegistry::new(store.clone());
+            let closed = stray.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            assert!(closed.is_empty());
+            assert_eq!(stored(&store, "live"), before);
+            assert!(live.tracks(&sid("live")));
+        }
+
+        #[test]
+        fn a_failing_listing_closes_nothing_and_is_reported_not_swallowed() {
+            let flaky = Flaky::new();
+            let registry = SessionRegistry::new(flaky.clone());
+            seeded(&flaky.inner, "a", SessionStatus::Running, 0);
+            seeded(&flaky.inner, "b", SessionStatus::Pending, 0);
+            let before = (stored(&flaky.inner, "a"), stored(&flaky.inner, "b"));
+            flaky.reads.store(true, Ordering::SeqCst);
+            let error = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap_err();
+            assert!(matches!(error, RegistryError::Store(_)), "{error:?}");
+            flaky.reads.store(false, Ordering::SeqCst);
+            assert_eq!(before.0, stored(&flaky.inner, "a"));
+            assert_eq!(before.1, stored(&flaky.inner, "b"));
+            let recovered = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            assert_eq!(recovered.len(), 2);
+        }
+
+        #[test]
+        fn a_failing_write_stops_the_pass_with_the_error_and_leaves_the_registry_usable() {
+            let flaky = Flaky::new();
+            let registry = SessionRegistry::new(flaky.clone());
+            seeded(&flaky.inner, "a", SessionStatus::Running, 0);
+            seeded(&flaky.inner, "b", SessionStatus::Pending, 0);
+            flaky.writes.store(true, Ordering::SeqCst);
+            let error = registry.sweep_orphans(at(STARTED), at(NOW)).unwrap_err();
+            assert!(matches!(error, RegistryError::Store(_)), "{error:?}");
+            assert!(!format!("{error} {error:?}").contains("old"));
+            flaky.writes.store(false, Ordering::SeqCst);
+            assert_eq!(stored(&flaky.inner, "a").status, SessionStatus::Running);
+            assert_eq!(stored(&flaky.inner, "b").status, SessionStatus::Pending);
+            registry.register(&binding("fresh"), "s", at(NOW)).unwrap();
+            assert!(registry.tracks(&sid("fresh")));
+        }
+
+        #[test]
+        fn a_session_finished_by_another_writer_between_the_listing_and_the_close_stays_as_left() {
+            let inner = Arc::new(InMemorySessionStore::new());
+            seeded(&inner, "raced", SessionStatus::Running, 0);
+            seeded(&inner, "plain", SessionStatus::Running, 0);
+            let manager = Arc::new(SessionRegistry::new(inner.clone()));
+            let done = SessionStatus::Completed;
+            let hook: Hook = Box::new(move || {
+                manager
+                    .finish(&sid("raced"), done, Some("all done"), at(3))
+                    .unwrap();
+            });
+            let sweeper = SessionRegistry::new(racing(&inner, hook));
+            let closed = sweeper.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            assert_eq!(closed, [sid("plain")]);
+            let raced = stored(&inner, "raced");
+            assert_eq!(raced.status, SessionStatus::Completed);
+            assert_eq!(raced.ended_at, Some(at(3)));
+            assert_eq!(raced.last_activity, at(3));
+            assert_eq!(raced.result_summary.as_deref(), Some("all done"));
+            assert_eq!(stored(&inner, "plain").status, SessionStatus::Failed);
+        }
+
+        #[test]
+        fn a_record_pruned_between_the_listing_and_the_close_is_skipped() {
+            let inner = Arc::new(InMemorySessionStore::new());
+            seeded(&inner, "gone", SessionStatus::Running, 0);
+            let manager = Arc::new(SessionRegistry::new(inner.clone()));
+            let forget = Retention {
+                completed_session_ttl: chrono::Duration::zero(),
+                ..Retention::default()
+            };
+            let store = inner.clone();
+            let hook: Hook = Box::new(move || {
+                manager.cancel(&sid("gone"), at(3)).unwrap();
+                assert_eq!(store.prune(at(NOW), &forget).unwrap(), 1);
+            });
+            let sweeper = SessionRegistry::new(racing(&inner, hook));
+            let closed = sweeper.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            assert!(closed.is_empty());
+            assert!(inner.get(sid("gone")).unwrap().is_none());
+        }
+
+        #[test]
+        fn a_registration_that_succeeds_while_the_sweep_runs_is_never_undone() {
+            let inner = Arc::new(InMemorySessionStore::new());
+            seeded(&inner, "orphan", SessionStatus::Running, 0);
+            let racing = racing(&inner, Box::new(|| {}));
+            let sweeper = Arc::new(SessionRegistry::new(racing.clone()));
+            let parked: Parked = Arc::default();
+            let (registrar, slot) = (sweeper.clone(), parked.clone());
+            let hook: Hook = Box::new(move || {
+                let again = registrar.clone();
+                let work = move || again.reregister(&binding("orphan"), "s", at(150));
+                *slot.lock().unwrap() = Some(std::thread::spawn(work));
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            });
+            *racing.slipped_in.lock().unwrap() = Some(hook);
+            let closed = sweeper.sweep_orphans(at(STARTED), at(NOW)).unwrap();
+            let handle = parked.lock().unwrap().take().unwrap();
+            let registered = handle.join().unwrap().is_ok();
+            let record = stored(&inner, "orphan");
+            assert_eq!(registered, record.status == SessionStatus::Pending);
+            assert_eq!(sweeper.tracks(&sid("orphan")), registered);
+            assert_eq!(closed.len(), usize::from(!registered));
+        }
+
+        #[test]
+        fn the_sweep_holds_the_registry_mutex_once_and_never_waits_on_itself() {
+            let (store, registry) = registry();
+            seeded(&store, "a", SessionStatus::Running, 0);
+            seeded(&store, "b", SessionStatus::Pending, 0);
+            let (send, receive) = std::sync::mpsc::channel();
+            let shared = Arc::new(registry);
+            let worker = shared.clone();
+            let run = move || send.send(worker.sweep_orphans(at(STARTED), at(NOW)));
+            std::thread::spawn(run);
+            let outcome = receive.recv_timeout(std::time::Duration::from_secs(20));
+            assert_eq!(outcome.unwrap().unwrap().len(), 2);
+        }
+
+        #[derive(Debug, Clone)]
+        struct Spec {
+            tracked: bool,
+            status: usize,
+            last: i64,
+        }
+
+        fn specs() -> impl Strategy<Value = Vec<Spec>> {
+            let one =
+                (any::<bool>(), 0usize..6, -40i64..40).prop_map(|(tracked, status, last)| Spec {
+                    tracked,
+                    status,
+                    last,
+                });
+            proptest::collection::vec(one, 0..10)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            #[test]
+            fn the_sweep_closes_exactly_what_an_independent_model_says(specs in specs()) {
+                let (store, registry) = registry();
+                let mut kept = BTreeSet::new();
+                let mut every = BTreeSet::new();
+                for (n, spec) in specs.iter().enumerate() {
+                    let name = format!("s{n}");
+                    let status = STATUSES[spec.status];
+                    if spec.tracked {
+                        registry.register(&binding(&name), "s", at(spec.last)).unwrap();
+                        store.set_status(sid(&name), status, at(spec.last)).unwrap();
+                        kept.insert(name.clone());
+                    } else {
+                        seeded(&store, &name, status, spec.last);
+                    }
+                    if spec.status >= 3 || spec.last >= 0 {
+                        kept.insert(name.clone());
+                    }
+                    every.insert(name);
+                }
+                let before: Vec<SessionRecord> = every.iter().map(|name| stored(&store, name)).collect();
+                let expected: BTreeSet<String> = every.difference(&kept).map(|name| sid(name).to_string()).collect();
+                let closed = registry.sweep_orphans(at(0), at(1000)).unwrap();
+                let got: BTreeSet<String> = closed.iter().map(|id| id.to_string()).collect();
+                prop_assert_eq!(&got, &expected);
+                prop_assert_eq!(closed.len(), got.len());
+                for (name, old) in every.iter().zip(before) {
+                    let now = stored(&store, name);
+                    let swept = expected.contains(&sid(name).to_string());
+                    prop_assert_eq!(now.status == SessionStatus::Failed && now.last_activity == at(1000) && swept, swept);
+                    prop_assert_eq!(now == old, !swept);
+                }
+                prop_assert!(registry.sweep_orphans(at(0), at(1000)).unwrap().is_empty());
             }
         }
     }
