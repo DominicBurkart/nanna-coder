@@ -140,7 +140,7 @@ fn unknown_sender(message: &StoredMessage) -> RecipientScope {
 
 fn known_sender(rec: &SessionRecord) -> RecipientScope {
     RecipientScope {
-        read_paths: Some(Vec::new()),
+        read_paths: rec.read_paths.for_sender(),
         ..scope_of(rec)
     }
 }
@@ -435,6 +435,7 @@ mod tests {
     use crate::hub::message::{MessageReach, Recipient, VerdictRef};
     use crate::hub::registry::SessionRegistry;
     use crate::hub::send::QuarantineSink;
+    use crate::hub::session::ReadScope;
     use crate::hub::store::{
         ActiveSession, HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore,
         MessageStore, SessionStore, StoreError,
@@ -805,6 +806,14 @@ mod tests {
                 .register(&binding, "subtask", start())
                 .unwrap();
             binding
+        }
+
+        fn record_reads(&self, who: &SessionBinding, scope: ReadScope) {
+            let change = Box::new(move |mut record: SessionRecord| {
+                record.read_paths = scope;
+                Some(record)
+            });
+            self.sessions.update(who.session().clone(), change).unwrap();
         }
 
         fn bare_binding(&self, name: &str, effect: EffectClass) -> SessionBinding {
@@ -2181,6 +2190,76 @@ mod tests {
             assert_eq!(page.messages.len(), 1);
             assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
         }
+    }
+
+    async fn model_calls(sender: ReadScope, recipient_reads: Option<Vec<String>>) -> usize {
+        let world = World::memory();
+        let a = world.seat("a");
+        world.record_reads(&a, sender);
+        let b = world.seat_reading(&world.root, "b", EffectClass::None, recipient_reads);
+        let provider = Arc::new(Counting {
+            reply: r#"{"verdict":"deliver"}"#.to_string(),
+            calls: AtomicUsize::new(0),
+        });
+        let auditor = ModelMessageAuditor::new(provider.clone(), "scripted");
+        let hub = world.hub(Arc::new(auditor));
+        world.put(&a, &b, "all green");
+        let page = hub.recv(&b, RecvRequest::default()).await.unwrap();
+        assert_eq!(page.messages.len(), 1);
+        provider.calls.load(Ordering::SeqCst)
+    }
+
+    fn listed(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_recorded_sender_read_scope_decides_whether_the_model_judges_the_pair() {
+        let docs = || ReadScope::Paths(listed(&["docs/**"]));
+        let rows = [
+            (ReadScope::Unknown, Some(listed(&[])), 0usize),
+            (ReadScope::Unknown, Some(listed(&["docs/**"])), 1),
+            (ReadScope::Unknown, None, 1),
+            (ReadScope::Unrestricted, None, 0),
+            (ReadScope::Unrestricted, Some(listed(&["docs/**"])), 0),
+            (docs(), Some(listed(&["docs/**"])), 0),
+            (docs(), Some(listed(&["src/**"])), 1),
+            (docs(), Some(listed(&[])), 0),
+            (docs(), None, 1),
+        ];
+        for (sender, recipient, calls) in rows {
+            let label = format!("sender {sender:?} recipient {recipient:?}");
+            assert_eq!(model_calls(sender, recipient).await, calls, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sender_registered_before_read_paths_existed_is_least_privileged_not_unrestricted() {
+        let world = World::memory();
+        let a = world.seat("a");
+        let mut legacy =
+            serde_json::to_value(world.sessions.get(a.session().clone()).unwrap().unwrap())
+                .unwrap();
+        legacy.as_object_mut().unwrap().remove("read_paths");
+        let record: SessionRecord = serde_json::from_value(legacy).unwrap();
+        world.sessions.upsert(record).unwrap();
+        let b = world.seat_reading(
+            &world.root,
+            "b",
+            EffectClass::None,
+            Some(listed(&["docs/**"])),
+        );
+        let provider = Arc::new(Counting {
+            reply: r#"{"verdict":"quarantine","reasons":[{"code":"cross_scope_steering"}]}"#
+                .to_string(),
+            calls: AtomicUsize::new(0),
+        });
+        let auditor = ModelMessageAuditor::new(provider.clone(), "scripted");
+        let hub = world.hub(Arc::new(auditor));
+        world.put(&a, &b, "all green");
+        let page = hub.recv(&b, RecvRequest::default()).await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!((page.messages.len(), page.withheld), (0, 1));
     }
 
     #[tokio::test]
