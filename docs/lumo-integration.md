@@ -229,6 +229,7 @@ The launcher reads these environment variables. Those that shape the container o
 
 ## Troubleshooting
 
+- **A task answers as if it never saw the request ("the provided code", "no specific task is mentioned") and never edits anything**: the model's context window was too small. Ollama gives a CPU-only host 4096 tokens by default (check `context_length` in `curl localhost:11434/api/ps`), and one `read_file` of a source file overflows that, so the oldest messages, including the task, are dropped silently. Nanna now asks Ollama for a 16384-token window on every chat request (`options.num_ctx`); set `NANNA_NUM_CTX` (2048 to 131072) on the daemon to change it. Other clients of the same Ollama that use the default window make Ollama reload the model when requests alternate; setting `OLLAMA_CONTEXT_LENGTH` in the Ollama service environment to the same value avoids that.
 - **Connector fails to connect, stderr mentions podman**: `podman` is not on Lumo's `PATH`. Start Lumo from a shell that has it, or add it to the session environment.
 - **`pod nanna-coder-pod not found`**: run `scripts/install.sh` or `podman pod start nanna-coder-pod`.
 - **Launcher exits 3 saying the catalog volume is missing**: run `scripts/lumo-mcp.sh --install-catalog`.

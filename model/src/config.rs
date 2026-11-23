@@ -1,11 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub const DEFAULT_NUM_CTX: u32 = 16_384;
+pub const MIN_NUM_CTX: u32 = 2_048;
+pub const MAX_NUM_CTX: u32 = 131_072;
+
+fn default_num_ctx() -> u32 {
+    DEFAULT_NUM_CTX
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
     pub timeout: Duration,
     pub default_context_length: u32,
+    #[serde(default = "default_num_ctx")]
+    pub num_ctx: u32,
     pub default_temperature: f32,
     pub default_max_tokens: Option<u32>,
 }
@@ -16,6 +26,7 @@ impl Default for OllamaConfig {
             base_url: "http://localhost:11434".to_string(),
             timeout: Duration::from_secs(300),
             default_context_length: 110_000,
+            num_ctx: DEFAULT_NUM_CTX,
             default_temperature: 0.7,
             default_max_tokens: None,
         }
@@ -23,6 +34,27 @@ impl Default for OllamaConfig {
 }
 
 impl OllamaConfig {
+    pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
+        self.num_ctx = num_ctx;
+        self
+    }
+
+    pub fn num_ctx_from_env(value: Option<&str>) -> Result<Option<u32>, String> {
+        let Some(raw) = value else {
+            return Ok(None);
+        };
+        let parsed: u32 = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("NANNA_NUM_CTX must be a whole number, got {raw:?}"))?;
+        if !(MIN_NUM_CTX..=MAX_NUM_CTX).contains(&parsed) {
+            return Err(format!(
+                "NANNA_NUM_CTX must be between {MIN_NUM_CTX} and {MAX_NUM_CTX}, got {parsed}"
+            ));
+        }
+        Ok(Some(parsed))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -63,6 +95,12 @@ impl OllamaConfig {
 
         if self.default_context_length == 0 {
             return Err("Context length must be greater than 0".to_string());
+        }
+
+        if !(MIN_NUM_CTX..=MAX_NUM_CTX).contains(&self.num_ctx) {
+            return Err(format!(
+                "num_ctx must be between {MIN_NUM_CTX} and {MAX_NUM_CTX}"
+            ));
         }
 
         if !(0.0..=2.0).contains(&self.default_temperature) {
@@ -170,6 +208,47 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn num_ctx_defaults_to_a_window_that_holds_a_real_task_and_is_validated() {
+        let config = OllamaConfig::default();
+        assert_eq!(config.num_ctx, 16_384);
+        assert_eq!(config.clone().with_num_ctx(8_192).num_ctx, 8_192);
+        assert!(config.clone().with_num_ctx(2_047).validate().is_err());
+        assert!(config.clone().with_num_ctx(131_073).validate().is_err());
+        assert!(config.clone().with_num_ctx(2_048).validate().is_ok());
+        assert!(config.with_num_ctx(131_072).validate().is_ok());
+    }
+
+    #[test]
+    fn num_ctx_from_env_accepts_a_whole_number_in_range_and_names_the_variable_otherwise() {
+        assert_eq!(OllamaConfig::num_ctx_from_env(None), Ok(None));
+        assert_eq!(
+            OllamaConfig::num_ctx_from_env(Some("32768")),
+            Ok(Some(32_768))
+        );
+        assert_eq!(
+            OllamaConfig::num_ctx_from_env(Some(" 8192 ")),
+            Ok(Some(8_192))
+        );
+        for bad in ["abc", "", "-5", "1.5", "100", "999999"] {
+            let error = OllamaConfig::num_ctx_from_env(Some(bad)).unwrap_err();
+            assert!(error.contains("NANNA_NUM_CTX"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_stored_config_without_num_ctx_still_loads_with_the_default() {
+        let stored = serde_json::json!({
+            "base_url": "http://localhost:11434",
+            "timeout": {"secs": 300, "nanos": 0},
+            "default_context_length": 110000,
+            "default_temperature": 0.7,
+            "default_max_tokens": null
+        });
+        let config: OllamaConfig = serde_json::from_value(stored).unwrap();
+        assert_eq!(config.num_ctx, 16_384);
+    }
 
     #[test]
     fn test_default_config() {

@@ -301,11 +301,8 @@ struct OllamaRawFunction {
     arguments: serde_json::Value,
 }
 
-#[async_trait]
-impl ModelProvider for OllamaProvider {
-    async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
-        debug!("Starting chat request with model: {}", request.model);
-
+impl OllamaProvider {
+    pub fn chat_payload(&self, request: &ChatRequest) -> Value {
         let messages = Self::messages_to_json(&request.messages);
 
         let temperature = request
@@ -317,7 +314,8 @@ impl ModelProvider for OllamaProvider {
             "messages": messages,
             "stream": false,
             "options": {
-                "temperature": temperature
+                "temperature": temperature,
+                "num_ctx": self.config.num_ctx
             }
         });
 
@@ -326,6 +324,17 @@ impl ModelProvider for OllamaProvider {
                 payload["tools"] = Value::Array(Self::tools_to_json(tools));
             }
         }
+
+        payload
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OllamaProvider {
+    async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+        debug!("Starting chat request with model: {}", request.model);
+
+        let payload = self.chat_payload(&request);
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -1039,6 +1048,23 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "only-on-the-stub:1");
         provider.health_check().await.unwrap();
+    }
+
+    #[test]
+    fn the_chat_payload_asks_for_a_context_window_that_holds_a_real_task() {
+        let provider = OllamaProvider::new(OllamaConfig::default()).unwrap();
+        let request = ChatRequest::new("m", vec![ChatMessage::user("hello")]);
+        let payload = provider.chat_payload(&request);
+        assert_eq!(payload["options"]["num_ctx"], 16_384);
+        assert_eq!(payload["options"]["temperature"], 0.7_f32 as f64);
+        assert_eq!(payload["stream"], false);
+    }
+
+    #[test]
+    fn a_configured_num_ctx_reaches_the_chat_payload() {
+        let provider = OllamaProvider::new(OllamaConfig::default().with_num_ctx(8_192)).unwrap();
+        let request = ChatRequest::new("m", vec![ChatMessage::user("hello")]);
+        assert_eq!(provider.chat_payload(&request)["options"]["num_ctx"], 8_192);
     }
 
     fn endpoint_of(base_url: &str) -> reqwest::Url {
