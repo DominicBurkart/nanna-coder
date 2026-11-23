@@ -182,12 +182,8 @@ fn shipped_cards_reach_the_root_except_the_auditor_and_fixtures_and_the_frozen_c
     ];
     for (dir, floor) in shipped {
         let cards = read_cards(&dir);
-        assert!(
-            cards.len() >= floor,
-            "{}: only {} cards read",
-            dir.display(),
-            cards.len()
-        );
+        let (shown, count) = (dir.display().to_string(), cards.len());
+        assert!(count >= floor, "{shown}: only {count} cards read");
         for (name, card) in cards {
             let reaches = !matches!(name.as_str(), "auditor" | "session-librarian");
             let want = if reaches { "root" } else { "none" };
@@ -205,12 +201,8 @@ fn shipped_cards_reach_the_root_except_the_auditor_and_fixtures_and_the_frozen_c
     ];
     for (dir, floor) in quiet {
         let cards = read_cards(&dir);
-        assert!(
-            cards.len() >= floor,
-            "{}: only {} cards read",
-            dir.display(),
-            cards.len()
-        );
+        let (shown, count) = (dir.display().to_string(), cards.len());
+        assert!(count >= floor, "{shown}: only {count} cards read");
         for (name, card) in cards {
             assert_eq!(reach_of(&card), "none", "{name} in {}", dir.display());
         }
