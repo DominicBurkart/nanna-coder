@@ -378,6 +378,14 @@ pub enum DeliveryState { Pending, Delivered, Acked, Withheld, Quarantined, Expir
 pub struct SendReceipt { pub ids: Vec<MessageId>, pub recipients: usize }
 ```
 
+**Root mailbox address (as built, #1074 part 1, `harness/src/hub/mailbox.rs`).** The root is not a session, so its mailbox is addressed by a synthetic `SessionId`: `MailboxId::for_root(&RootId)`. The text is `@mailbox/` followed by a kind-tagged canonical form of the root (`mcp/<uuid>`, `plan/<id>`, `backlog/<repo>#<issue>`, `legacy/<lowercase hex of the task id>`), so two roots never share an address and an address names its root back (`MailboxId::root`). It is not a hash: the arbitrary field (the legacy task) is hex-encoded and last. The mailbox is never registered in the `SessionStore`, so it is absent from every view and from `in_root`, and it never enters the `BindingTable` (a structural test pins both the single constructor and the binding sites).
+- `@` is reserved in session ids. `SessionId::from_task` prefixes a task id that starts with `@` with `@task/`, so no task id, even one spelled exactly like a mailbox id, can equal a mailbox id. A real `TaskId` is a v4 UUID, so the escape never fires in production; it is there so the guarantee does not depend on how task ids are minted. `SessionId::task_id()` returns the escaped form for such an id.
+- Serde, `Display` and `FromStr` use one form and accept only a string with no leading `@`, an escaped task id (`@task/@...`) or a canonical mailbox id (re-encoding the parsed root must give the same text, so upper-case hex, a simple-form UUID or a leading-zero issue is refused). Every other `@` text is refused, and the error never echoes the text.
+- `is_mailbox(&SessionId)` is a shape check on that canonical form. It is not an authority over text an agent supplied (`from_task` escapes such text): the operator flag of a stored message is computed from it on the stored `from` and never from an identity name.
+- `Debug` of a mailbox id prints the kind only (`SessionId(Mailbox)`, `MailboxId`), never the root.
+- A backlog or legacy mailbox id can be longer than the 128-character limit that the agent tools apply to an id argument; agents cannot name a mailbox as a session either way (the escape and `NotVisible`).
+- Delivery to the mailbox, the reach rule (`Recipient::Root`) and the MCP and CLI surfaces are later parts of #1074 (§9.4).
+
 ### 5.2 Reach policy
 
 The hub checks reach deterministically, after the outbound audit passes.
