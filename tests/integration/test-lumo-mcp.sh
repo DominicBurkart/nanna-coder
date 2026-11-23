@@ -112,7 +112,7 @@ reset_world
 run_launcher "$BASH" "$LAUNCHER" <<< "$ping" > "$WORK/out" 2> "$WORK/err" || fail "default launch must succeed: $(cat "$WORK/err")"
 [[ "$(cat "$WORK/out")" == "$ping" ]] || fail "stdin must pass through the bridge to the container unchanged, and stdout carry nothing else"
 
-expected=$'run\n-d\n--name\nnanna-daemon\n--pod\nnanna-coder-pod\n--restart=no\n-v\nnanna-state:/state\n-v\nnanna-lumo-config:/etc/nanna:ro\n-v\nnanna-repo-marigold:/repos/marigold\n-v\nnanna-repo-personal-site-actix:/repos/personal-site-actix\n-v\nnanna-repo-nanna-coder:/repos/nanna-coder\n-v\nnanna-repo-one_track:/repos/one_track\n-e\nNANNA_CONFIG_DIR=/etc/nanna\n-e\nNANNA_QUEUE_PATH=/state/queue.jsonl\n-e\nNANNA_STATE_DIR=/state\n-e\nNANNA_AUDIT_TIMEOUT_SECS=300\n'"$BASEURL"$'\n/bin/nanna\nmcp-serve\n--listen\n/run/nanna/mcp.sock\n--model\ngemma4:e4b'
+expected=$'run\n-d\n--name\nnanna-daemon\n--pod\nnanna-coder-pod\n--restart=no\n-v\nnanna-state:/state\n-v\nnanna-lumo-config:/etc/nanna:ro\n-v\nnanna-repo-marigold:/repos/marigold\n-v\nnanna-repo-personal-site-actix:/repos/personal-site-actix\n-v\nnanna-repo-nanna-coder:/repos/nanna-coder\n-v\nnanna-repo-one_track:/repos/one_track\n-e\nNANNA_CONFIG_DIR=/etc/nanna\n-e\nNANNA_QUEUE_PATH=/state/queue.jsonl\n-e\nNANNA_STATE_DIR=/state\n-e\nNANNA_AUDIT_TIMEOUT_SECS=300\n-e\nNANNA_MODEL_TIMEOUT_SECS=900\n'"$BASEURL"$'\n/bin/nanna\nmcp-serve\n--listen\n/run/nanna/mcp.sock\n--model\ngemma4:e4b'
 [[ "$(cat "$FAKE_RUN_ARGV")" == "$expected" ]] || fail "daemon argv mismatch: $(cat "$FAKE_RUN_ARGV")"
 expected_attach=$'/bin/nanna\nmcp-attach\n--client\nlumo'
 [[ "$(cat "$FAKE_ATTACH_ARGV")" == "$expected_attach" ]] || fail "the bridge must run nanna mcp-attach --client lumo, got: $(cat "$FAKE_ATTACH_ARGV")"
@@ -251,13 +251,15 @@ run_launcher NANNA_MODEL=qwen3:0.6b NANNA_TAG=v1 NANNA_REGISTRY=reg.example/ns N
   NANNA_AUDIT_TIMEOUT_SECS=45 NANNA_STATE_VOLUME=otherstate NANNA_RESULT_RETENTION_DAYS=3 "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2>&1 && fail "an override to a config volume that does not exist must fail closed"
 touch "$FAKE_STATE/volumes/othervol"
 run_launcher NANNA_MODEL=qwen3:0.6b NANNA_TAG=v1 NANNA_REGISTRY=reg.example/ns NANNA_POD=mypod NANNA_CONFIG_VOLUME=othervol \
-  NANNA_AUDIT_TIMEOUT_SECS=45 NANNA_STATE_VOLUME=otherstate NANNA_RESULT_RETENTION_DAYS=3 "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2>&1
+  NANNA_AUDIT_TIMEOUT_SECS=45 NANNA_MODEL_TIMEOUT_SECS=1500 NANNA_NUM_CTX=8192 NANNA_STATE_VOLUME=otherstate NANNA_RESULT_RETENTION_DAYS=3 "$BASH" "$LAUNCHER" < /dev/null > /dev/null 2>&1
 grep -qx 'qwen3:0.6b' "$FAKE_RUN_ARGV" || fail "NANNA_MODEL override ignored"
 grep -qx 'reg.example/ns/harness:v1' "$FAKE_RUN_ARGV" || fail "NANNA_REGISTRY/NANNA_TAG override ignored"
 grep -qx 'mypod' "$FAKE_RUN_ARGV" || fail "NANNA_POD override ignored"
 grep -qx 'othervol:/etc/nanna:ro' "$FAKE_RUN_ARGV" || fail "NANNA_CONFIG_VOLUME override ignored"
 grep -qx 'otherstate:/state' "$FAKE_RUN_ARGV" || fail "NANNA_STATE_VOLUME override ignored"
 grep -qx 'NANNA_AUDIT_TIMEOUT_SECS=45' "$FAKE_RUN_ARGV" || fail "NANNA_AUDIT_TIMEOUT_SECS override ignored"
+grep -qx 'NANNA_MODEL_TIMEOUT_SECS=1500' "$FAKE_RUN_ARGV" || fail "NANNA_MODEL_TIMEOUT_SECS override ignored"
+grep -qx 'NANNA_NUM_CTX=8192' "$FAKE_RUN_ARGV" || fail "NANNA_NUM_CTX override ignored"
 grep -qx 'NANNA_RESULT_RETENTION_DAYS=3' "$FAKE_RUN_ARGV" || fail "NANNA_RESULT_RETENTION_DAYS must be passed through when set"
 
 reset_world

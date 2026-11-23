@@ -17,6 +17,7 @@ DAEMON="${NANNA_DAEMON_NAME:-nanna-daemon}"
 SOCKET="${NANNA_DAEMON_SOCKET:-/run/nanna/mcp.sock}"
 WAIT_SECS="${NANNA_DAEMON_WAIT_SECS:-30}"
 AUDIT_TIMEOUT="${NANNA_AUDIT_TIMEOUT_SECS:-300}"
+MODEL_TIMEOUT="${NANNA_MODEL_TIMEOUT_SECS:-900}"
 CLIENT_TAG="lumo"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -120,13 +121,17 @@ create_daemon() {
   if [[ -n "${NANNA_RESULT_RETENTION_DAYS:-}" ]]; then
     retention=(-e "NANNA_RESULT_RETENTION_DAYS=$NANNA_RESULT_RETENTION_DAYS")
   fi
+  if [[ -n "${NANNA_NUM_CTX:-}" ]]; then
+    retention+=(-e "NANNA_NUM_CTX=$NANNA_NUM_CTX")
+  fi
   podman run -d --name "$DAEMON" --pod "$POD" --restart=no \
     -v "$STATE_VOLUME:$STATE_PATH" \
     -v "$CONFIG_VOLUME:$CONFIG_PATH:ro" "${repo_mounts[@]}" "${cargo[@]}" \
     -e NANNA_CONFIG_DIR="$CONFIG_PATH" \
     -e NANNA_QUEUE_PATH="$STATE_PATH/queue.jsonl" \
     -e NANNA_STATE_DIR="$STATE_PATH" \
-    -e "NANNA_AUDIT_TIMEOUT_SECS=$AUDIT_TIMEOUT" "${retention[@]}" \
+    -e "NANNA_AUDIT_TIMEOUT_SECS=$AUDIT_TIMEOUT" \
+    -e "NANNA_MODEL_TIMEOUT_SECS=$MODEL_TIMEOUT" "${retention[@]}" \
     "$IMAGE" /bin/nanna mcp-serve --listen "$SOCKET" --model "$MODEL" > /dev/null
 }
 
