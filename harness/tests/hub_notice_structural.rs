@@ -232,3 +232,56 @@ fn the_tool_layer_never_names_a_notice() {
     assert!(!production.contains("SenderNotice"));
     assert!(!production.contains("notices"));
 }
+
+const BELL: &str = "new message(s) waiting";
+
+#[test]
+fn the_doorbell_text_has_one_integer_hole_one_parameter_and_one_source() {
+    let holders: Vec<String> = sources()
+        .into_iter()
+        .filter(|(_, text)| text.contains(BELL))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(holders, ["hub/doorbell.rs"]);
+    let text = fs::read_to_string(src().join("hub/doorbell.rs")).unwrap();
+    let file = syn::parse_file(&text).unwrap();
+    let mut functions = Vec::new();
+    let mut templates = Vec::new();
+    for item in &file.items {
+        match item {
+            syn::Item::Fn(function) => functions.push(function),
+            syn::Item::Const(constant) => templates.push(constant),
+            _ => {}
+        }
+    }
+    assert_eq!(functions.len(), 1);
+    assert_eq!(templates.len(), 1);
+    let function = functions[0];
+    assert_eq!(function.sig.ident, "doorbell_text");
+    assert_eq!(function.sig.inputs.len(), 1);
+    let syn::FnArg::Typed(argument) = &function.sig.inputs[0] else {
+        panic!("doorbell_text must not take self");
+    };
+    assert!(matches!(&*argument.ty, syn::Type::Path(ty) if names(&ty.path) == "usize"));
+    let syn::Expr::Lit(literal) = &*templates[0].expr else {
+        panic!("the template must be a literal");
+    };
+    let syn::Lit::Str(template) = &literal.lit else {
+        panic!("the template must be a string");
+    };
+    let template = template.value();
+    assert_eq!(template.matches("{}").count(), 1, "{template}");
+    assert_eq!(template.matches('{').count(), 1, "{template}");
+    assert_eq!(template.matches('}').count(), 1, "{template}");
+    let production = text.split("#[cfg(test)]").next().unwrap();
+    assert!(
+        !production.contains("format!"),
+        "the doorbell must not format"
+    );
+    let defined: Vec<String> = sources()
+        .into_iter()
+        .filter(|(_, text)| text.contains("fn doorbell_text("))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(defined, ["hub/doorbell.rs"]);
+}
