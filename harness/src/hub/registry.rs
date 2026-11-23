@@ -273,6 +273,38 @@ impl SessionRegistry {
         })
     }
 
+    /// Move a session from `WaitingOnMessages` back to `Running`, and only from there. The check
+    /// runs inside the store's atomic `update`, so a record in any other status (a `Pending` one
+    /// included, which [`Self::set_status`] would start) or one a concurrent `finish` just closed
+    /// is left exactly as it is. Returns whether the record moved; an unknown id is an error.
+    /// `last_activity` becomes `at`.
+    ///
+    /// ```
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::store::InMemorySessionStore;
+    /// use std::sync::Arc;
+    ///
+    /// let registry = SessionRegistry::new(Arc::new(InMemorySessionStore::new()));
+    /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("t".into()));
+    /// assert!(registry.leave_waiting(&id, chrono::Utc::now()).is_err());
+    /// ```
+    pub fn leave_waiting(&self, id: &SessionId, at: DateTime<Utc>) -> Result<bool, RegistryError> {
+        let _guard = self.lock();
+        let moved = self.edit(id, |mut record| {
+            if record.status != SessionStatus::WaitingOnMessages {
+                return Err(illegal(record.status, SessionStatus::Running));
+            }
+            record.status = SessionStatus::Running;
+            record.last_activity = at;
+            Ok(record)
+        });
+        match moved {
+            Ok(()) => Ok(true),
+            Err(RegistryError::IllegalTransition { .. }) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
     /// End the session in the terminal status `to`. `Pending` may only fail or be cancelled, a
     /// running or waiting session may complete, fail or be cancelled; the first terminal status wins. `summary` is stored as untrusted text.
     pub fn finish(
@@ -2295,6 +2327,90 @@ mod tests {
                 }
                 prop_assert!(registry.sweep_orphans(at(0), at(1000)).unwrap().is_empty());
             }
+        }
+    }
+
+    mod leave_waiting {
+        use super::*;
+
+        fn seeded(store: &InMemorySessionStore, status: SessionStatus) {
+            let scratch = Arc::new(InMemorySessionStore::new());
+            let origin = SessionRegistry::new(scratch.clone());
+            origin.register(&binding("t"), "s", at(0)).unwrap();
+            let mut record = stored(&scratch, "t");
+            record.status = status;
+            record.ended_at = (!status.is_active()).then_some(at(0));
+            store.upsert(record).unwrap();
+        }
+
+        #[test]
+        fn only_a_waiting_record_moves_and_every_other_status_is_left_untouched() {
+            for status in STATUSES {
+                let (store, registry) = registry();
+                seeded(&store, status);
+                let before = stored(&store, "t");
+                let moved = registry.leave_waiting(&sid("t"), at(50)).unwrap();
+                let after = stored(&store, "t");
+                let waiting = status == SessionStatus::WaitingOnMessages;
+                assert_eq!(moved, waiting, "{status:?}");
+                assert_eq!(after == before, !waiting, "{status:?}");
+                assert_eq!(
+                    after.status == SessionStatus::Running,
+                    waiting || status == SessionStatus::Running,
+                    "{status:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_waiting_record_becomes_running_with_a_fresh_last_activity_and_nothing_else_changes() {
+            let (store, registry) = registry();
+            seeded(&store, SessionStatus::WaitingOnMessages);
+            let before = stored(&store, "t");
+            assert!(registry.leave_waiting(&sid("t"), at(50)).unwrap());
+            let mut expected = before;
+            expected.status = SessionStatus::Running;
+            expected.last_activity = at(50);
+            assert_eq!(stored(&store, "t"), expected);
+            assert!(!registry.leave_waiting(&sid("t"), at(60)).unwrap());
+            assert_eq!(stored(&store, "t"), expected);
+        }
+
+        #[test]
+        fn an_unknown_id_and_a_failing_store_are_errors_and_change_nothing() {
+            let (_, registry) = registry();
+            let unknown = registry.leave_waiting(&sid("nobody"), at(1));
+            assert!(matches!(unknown, Err(RegistryError::Unknown)));
+            let flaky = Flaky::new();
+            let registry = SessionRegistry::new(flaky.clone());
+            seeded(&flaky.inner, SessionStatus::WaitingOnMessages);
+            flaky.writes.store(true, Ordering::SeqCst);
+            let failed = registry.leave_waiting(&sid("t"), at(1));
+            assert!(matches!(failed, Err(RegistryError::Store(_))));
+            flaky.writes.store(false, Ordering::SeqCst);
+            assert_eq!(
+                stored(&flaky.inner, "t").status,
+                SessionStatus::WaitingOnMessages
+            );
+        }
+
+        #[test]
+        fn a_finish_that_lands_between_the_read_and_the_leave_is_never_undone() {
+            let inner = Arc::new(InMemorySessionStore::new());
+            seeded(&inner, SessionStatus::WaitingOnMessages);
+            let other = Arc::new(SessionRegistry::new(inner.clone()));
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                other.cancel(&sid("t"), at(3)).unwrap();
+            });
+            let racing = Arc::new(Racing {
+                inner: inner.clone(),
+                slipped_in: Mutex::new(Some(hook)),
+            });
+            let registry = SessionRegistry::new(racing);
+            assert!(!registry.leave_waiting(&sid("t"), at(50)).unwrap());
+            let record = stored(&inner, "t");
+            assert_eq!(record.status, SessionStatus::Cancelled);
+            assert_eq!(record.ended_at, Some(at(3)));
         }
     }
 }
