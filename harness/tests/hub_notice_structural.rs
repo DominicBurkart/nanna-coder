@@ -218,7 +218,8 @@ fn a_sender_notice_has_no_free_text_field_and_cannot_be_deserialized() {
     let want = want_owned;
     assert_eq!(fields, want);
     assert!(derives.contains(&"Serialize".to_string()), "{derives:?}");
-    assert!(!derives.contains(&"Deserialize".to_string()), "{derives:?}");
+    let deserializable = derives.iter().any(|d| d.ends_with("Deserialize"));
+    assert!(!deserializable, "{derives:?}");
     assert!(text.contains("codes: Vec<ReasonCode>"));
     assert!(
         text.contains("\n    rendered: String,"),
