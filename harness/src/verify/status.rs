@@ -19,38 +19,38 @@ pub const ERROR_VERIFICATION_FAILED: &str = "VerificationFailed";
 
 pub const REQUIRES_CONTAINER_MESSAGE: &str = "a verifier runs its checks inside the repository's dev container, but this repository has not opted in to one (flake.nix and .devcontainer/); the host never runs repository commands";
 
-/// Whether `identity` is a verifier card: its only tool is `run_checks`, so
-/// it has no model-facing capability and the harness runs the repository's
-/// declared checks itself.
-///
-/// ```
-/// use harness::identity::AgentIdentity;
-/// use harness::verify::is_verifier;
-///
-/// let card = |tools: &str| format!(r#"
-/// [identity]
-/// name = "verifier"
-/// description = "Runs the declared checks."
-/// loop = "inner"
-/// model = "m"
-/// system_prompt = {{ inline = "Verify." }}
-///
-/// [scope]
-/// repos = ["github.com/example/repo"]
-/// paths = []
-/// max_effect = "workspace"
-/// tools = {tools}
-///
-/// [limits]
-/// max_iterations = 1
-/// max_wall_clock_secs = 3600
-/// max_concurrent = 1
-/// "#);
-/// let verifier = AgentIdentity::from_toml_str(&card(r#"["run_checks"]"#), "v.toml").unwrap();
-/// assert!(is_verifier(&verifier));
-/// let mixed = AgentIdentity::from_toml_str(&card(r#"["run_checks", "read_file"]"#), "m.toml").unwrap();
-/// assert!(!is_verifier(&mixed));
-/// ```
+#[doc = r##"Whether `identity` is a verifier card: its only tool is `run_checks`, so
+it has no model-facing capability and the harness runs the repository's
+declared checks itself.
+
+```
+use harness::identity::AgentIdentity;
+use harness::verify::is_verifier;
+
+let card = |tools: &str| format!(r#"
+[identity]
+name = "verifier"
+description = "Runs the declared checks."
+loop = "inner"
+model = "m"
+system_prompt = {{ inline = "Verify." }}
+
+[scope]
+repos = ["github.com/example/repo"]
+paths = []
+max_effect = "workspace"
+tools = {tools}
+
+[limits]
+max_iterations = 1
+max_wall_clock_secs = 3600
+max_concurrent = 1
+"#);
+let verifier = AgentIdentity::from_toml_str(&card(r#"["run_checks"]"#), "v.toml").unwrap();
+assert!(is_verifier(&verifier));
+let mixed = AgentIdentity::from_toml_str(&card(r#"["run_checks", "read_file"]"#), "m.toml").unwrap();
+assert!(!is_verifier(&mixed));
+```"##]
 pub fn is_verifier(identity: &AgentIdentity) -> bool {
     matches!(identity.scope.tools.as_slice(), [only] if only.as_str() == VERIFIER_TOOL)
 }
@@ -81,11 +81,11 @@ fn diagnostics(
     }
 }
 
-/// Turns the outcomes of a verification run into the task's terminal
-/// status. Any failing or timed-out check makes the task `failed`, naming
-/// that check in the error and as `last_tool_call`; every outcome is in
-/// `tool_call_history`. A fully passing run is `completed` with the outcomes
-/// in `qa_summary.checks`.
+#[doc = r#"Turns the outcomes of a verification run into the task's terminal
+status. Any failing or timed-out check makes the task `failed`, naming
+that check in the error and as `last_tool_call`; every outcome is in
+`tool_call_history`. A fully passing run is `completed` with the outcomes
+in `qa_summary.checks`."#]
 pub fn status_from_outcomes(
     outcomes: Vec<CheckOutcome>,
     model: String,

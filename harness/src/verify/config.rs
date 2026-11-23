@@ -57,28 +57,28 @@ struct RawCheck {
     timeout_secs: Option<u64>,
 }
 
-/// The checks a repository declares in `.nanna/verify.toml`, in the order
-/// they run. A missing, empty or malformed declaration is an error, never an
-/// empty set, so a verifier cannot pass without running anything.
-///
-/// ```
-/// use harness::verify::VerifyConfig;
-///
-/// let config = VerifyConfig::parse(r#"
-/// [[check]]
-/// name = "fmt"
-/// command = "cargo fmt --all -- --check"
-///
-/// [[check]]
-/// name = "tests"
-/// command = "cargo test --workspace"
-/// timeout_secs = 1800
-/// "#).unwrap();
-/// assert_eq!(config.checks().len(), 2);
-/// assert_eq!(config.checks()[0].timeout_secs, 900);
-/// assert_eq!(config.checks()[1].timeout_secs, 1800);
-/// assert!(VerifyConfig::parse("").is_err());
-/// ```
+#[doc = r##"The checks a repository declares in `.nanna/verify.toml`, in the order
+they run. A missing, empty or malformed declaration is an error, never an
+empty set, so a verifier cannot pass without running anything.
+
+```
+use harness::verify::VerifyConfig;
+
+let config = VerifyConfig::parse(r#"
+[[check]]
+name = "fmt"
+command = "cargo fmt --all -- --check"
+
+[[check]]
+name = "tests"
+command = "cargo test --workspace"
+timeout_secs = 1800
+"#).unwrap();
+assert_eq!(config.checks().len(), 2);
+assert_eq!(config.checks()[0].timeout_secs, 900);
+assert_eq!(config.checks()[1].timeout_secs, 1800);
+assert!(VerifyConfig::parse("").is_err());
+```"##]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyConfig(Vec<Check>);
 

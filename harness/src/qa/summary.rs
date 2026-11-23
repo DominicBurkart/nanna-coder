@@ -28,7 +28,7 @@ pub struct QaSummary {
     pub console_errors: usize,
     /// Host paths of every report and screenshot, in the order written.
     pub artifacts: Vec<String>,
-    /// Outcomes of the repository-declared checks a verifier ran, in order.
+    #[doc = r#"Outcomes of the repository-declared checks a verifier ran, in order."#]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<crate::verify::CheckOutcome>,
 }
