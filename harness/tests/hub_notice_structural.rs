@@ -99,16 +99,24 @@ fn src() -> PathBuf {
 fn sources() -> Vec<(String, String)> {
     let mut files = Vec::new();
     rust_files(&src(), &mut files);
-    let all: Vec<(String, String)> = files
-        .iter()
-        .map(|path| {
-            let rel = path.strip_prefix(src()).unwrap();
-            let name = rel.to_string_lossy().replace('\\', "/");
-            (name, fs::read_to_string(path).unwrap())
-        })
-        .collect();
+    let mut all: Vec<(String, String)> = Vec::new();
+    for path in &files {
+        let rel = path.strip_prefix(src()).unwrap();
+        let name = rel.to_string_lossy().replace('\\', "/");
+        all.push((name, fs::read_to_string(path).unwrap()));
+    }
     assert!(all.len() > 50, "the source scan found {} files", all.len());
     all
+}
+
+fn files_containing(needle: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (name, text) in sources() {
+        if text.contains(needle) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 fn production_sites() -> Vec<String> {
@@ -120,12 +128,9 @@ fn production_sites() -> Vec<String> {
             found: Vec::new(),
         };
         sites.visit_file(&file);
-        found.extend(
-            sites
-                .found
-                .into_iter()
-                .map(|site| format!("{name}: {site}")),
-        );
+        for site in sites.found {
+            found.push(format!("{name}: {site}"));
+        }
     }
     found.sort();
     found
@@ -162,10 +167,8 @@ fn only_recv_stores_notices_and_only_recv_and_send_hand_them_over() {
 
 #[test]
 fn no_production_code_builds_a_notice_or_a_notice_list_with_a_struct_literal() {
-    let literals: Vec<String> = production_sites()
-        .into_iter()
-        .filter(|s| s.ends_with("{..}"))
-        .collect();
+    let sites = production_sites();
+    let literals: Vec<&String> = sites.iter().filter(|s| s.ends_with("{..}")).collect();
     assert_eq!(literals, ["hub/notice.rs: take: Notices {..}"]);
 }
 
@@ -174,25 +177,22 @@ fn struct_fields(text: &str, name: &str) -> (Vec<(String, String)>, Vec<String>)
     for item in file.items {
         if let syn::Item::Struct(found) = item {
             if found.ident == name {
-                let fields = found
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        let ident = field.ident.as_ref().unwrap().to_string();
-                        let kind = match &field.ty {
-                            syn::Type::Path(ty) => names(&ty.path),
-                            _ => "?".to_string(),
-                        };
-                        (ident, kind)
-                    })
-                    .collect();
+                let mut fields = Vec::new();
+                for field in found.fields.iter() {
+                    let ident = field.ident.as_ref().unwrap().to_string();
+                    let kind = match &field.ty {
+                        syn::Type::Path(ty) => names(&ty.path),
+                        _ => "?".to_string(),
+                    };
+                    fields.push((ident, kind));
+                }
                 let mut derives: Vec<String> = Vec::new();
                 for attr in found.attrs.iter().filter(|a| a.path().is_ident("derive")) {
-                    attr.parse_nested_meta(|meta| {
+                    let collect = |meta: syn::meta::ParseNestedMeta| {
                         derives.push(names(&meta.path));
                         Ok(())
-                    })
-                    .unwrap();
+                    };
+                    attr.parse_nested_meta(collect).unwrap();
                 }
                 return (fields, derives);
             }
@@ -211,10 +211,11 @@ fn a_sender_notice_has_no_free_text_field_and_cannot_be_deserialized() {
         ("at", "DateTime"),
         ("rendered", "String"),
     ];
-    let want: Vec<(String, String)> = want
-        .iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect();
+    let mut want_owned: Vec<(String, String)> = Vec::new();
+    for (a, b) in want {
+        want_owned.push((a.to_string(), b.to_string()));
+    }
+    let want = want_owned;
     assert_eq!(fields, want);
     assert!(derives.contains(&"Serialize".to_string()), "{derives:?}");
     assert!(!derives.contains(&"Deserialize".to_string()), "{derives:?}");
@@ -237,11 +238,7 @@ const BELL: &str = "new message(s) waiting";
 
 #[test]
 fn the_doorbell_text_has_one_integer_hole_one_parameter_and_one_source() {
-    let holders: Vec<String> = sources()
-        .into_iter()
-        .filter(|(_, text)| text.contains(BELL))
-        .map(|(name, _)| name)
-        .collect();
+    let holders = files_containing(BELL);
     assert_eq!(holders, ["hub/doorbell.rs"]);
     let text = fs::read_to_string(src().join("hub/doorbell.rs")).unwrap();
     let file = syn::parse_file(&text).unwrap();
@@ -278,10 +275,6 @@ fn the_doorbell_text_has_one_integer_hole_one_parameter_and_one_source() {
         !production.contains("format!"),
         "the doorbell must not format"
     );
-    let defined: Vec<String> = sources()
-        .into_iter()
-        .filter(|(_, text)| text.contains("fn doorbell_text("))
-        .map(|(name, _)| name)
-        .collect();
+    let defined = files_containing("fn doorbell_text(");
     assert_eq!(defined, ["hub/doorbell.rs"]);
 }

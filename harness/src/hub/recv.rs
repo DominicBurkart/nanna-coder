@@ -3030,12 +3030,8 @@ mod tests {
             hub.recv(&a, recv_of(5)).await.unwrap().notices.items.len(),
             1
         );
-        assert!(hub
-            .send(&a, send_to(&b, "x"))
-            .await
-            .unwrap()
-            .notices
-            .is_empty());
+        let receipt = hub.send(&a, send_to(&b, "x")).await.unwrap();
+        assert!(receipt.notices.is_empty());
     }
 
     #[tokio::test]
@@ -3142,9 +3138,10 @@ mod tests {
         let world = World::memory();
         let (a, b) = (world.seat("a"), world.seat("b"));
         let hub = world.hub(blocking(ReasonCode::SecretLeak));
-        let all: Vec<MessageId> = (0..18)
-            .map(|n| world.put(&a, &b, &format!("m{n}")))
-            .collect();
+        let mut all: Vec<MessageId> = Vec::new();
+        for n in 0..18 {
+            all.push(world.put(&a, &b, &format!("m{n}")));
+        }
         let page = hub.recv(&b, recv_of(20)).await.unwrap();
         assert_eq!(page.withheld, 18);
         let told = hub.recv(&a, recv_of(5)).await.unwrap();

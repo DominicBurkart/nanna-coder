@@ -165,11 +165,11 @@ mod tests {
     }
 
     fn ids(notices: &Notices) -> Vec<u128> {
-        notices
-            .items
-            .iter()
-            .map(|item| item.message_id.as_uuid().as_u128())
-            .collect()
+        let mut out = Vec::new();
+        for item in &notices.items {
+            out.push(item.message_id.as_uuid().as_u128());
+        }
+        out
     }
 
     #[test]
@@ -254,20 +254,21 @@ mod tests {
             #[serde(skip_serializing_if = "Notices::is_empty")]
             notices: Notices,
         }
-        let bare = serde_json::to_value(Page {
+        let bare_page = Page {
             seen: 1,
             notices: Notices::default(),
-        })
-        .unwrap();
+        };
+        let bare = serde_json::to_value(bare_page).unwrap();
         assert_eq!(bare, serde_json::json!({"seen": 1}));
-        let full = serde_json::to_value(Page {
+        let held = Notices {
+            items: vec![notice(5)],
+            dropped: 1,
+        };
+        let full_page = Page {
             seen: 1,
-            notices: Notices {
-                items: vec![notice(5)],
-                dropped: 1,
-            },
-        })
-        .unwrap();
+            notices: held,
+        };
+        let full = serde_json::to_value(full_page).unwrap();
         assert_eq!(full["notices"]["dropped"], 1);
         assert_eq!(full["notices"]["items"].as_array().unwrap().len(), 1);
     }
@@ -285,12 +286,11 @@ mod tests {
     fn concurrent_pushes_are_all_kept_up_to_the_cap() {
         let table = Arc::new(NoticeTable::default());
         let a = session("a");
-        let workers: Vec<std::thread::JoinHandle<()>> = (0..4u128)
-            .map(|worker| {
-                let (table, a) = (table.clone(), a.clone());
-                std::thread::spawn(move || table.push(&a, notice(worker)))
-            })
-            .collect();
+        let mut workers = Vec::new();
+        for worker in 0..4u128 {
+            let (table, a) = (table.clone(), a.clone());
+            workers.push(std::thread::spawn(move || table.push(&a, notice(worker))));
+        }
         for worker in workers {
             worker.join().unwrap();
         }
