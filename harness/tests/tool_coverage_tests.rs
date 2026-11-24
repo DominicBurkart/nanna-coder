@@ -878,6 +878,7 @@ async fn trunk_build_execute_error_path_covered() {
     assert!(matches!(err, ToolError::ExecutionFailed { .. }));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(env_path)]
 async fn trunk_build_execute_success_path_runs_in_member_dir() {
@@ -897,6 +898,7 @@ async fn trunk_build_execute_success_path_runs_in_member_dir() {
     assert_eq!(result["success"], json!(true));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(env_path)]
 async fn trunk_build_release_flag_is_forwarded() {
@@ -936,6 +938,7 @@ async fn sqlx_migrate_rejects_unknown_command() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(env_path)]
 async fn sqlx_migrate_execute_success_path_defaults_to_run_in_migrations_owner() {
