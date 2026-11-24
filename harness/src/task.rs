@@ -2041,8 +2041,8 @@ impl TaskRunner {
     async fn verify_checks(
         &self,
         task_id: &TaskId,
-        model: String,
-        identity_name: &str,
+        queued: &QueuedTask,
+        identity: &AgentIdentity,
         config: crate::verify::VerifyConfig,
         container: Option<Arc<crate::container::ContainerHandle>>,
     ) -> TaskStatus {
@@ -2058,15 +2058,26 @@ impl TaskRunner {
         let Some(runner) = runner else {
             return crate::verify::status_requires_container(Utc::now());
         };
-        match crate::verify::run_verification(config, runner).await {
+        let layers = self.model_facing_layers(task_id, queued, Some(identity));
+        let config = Arc::new(config);
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(crate::verify::CheckTool::new(
+            runner,
+            Arc::clone(&config),
+        )));
+        let registry = with_model_facing_layers(registry.scoped_for(identity), layers);
+        let run = crate::verify::run_gated(&config, &registry).await;
+        let audit = registry.action_reviews();
+        match run {
             Ok(outcomes) => crate::verify::status_from_outcomes(
                 outcomes,
-                model,
+                queued.model.clone(),
                 self.cost_accountant()
-                    .task_summary(identity_name, &task_id.0),
+                    .task_summary(identity.name(), &task_id.0),
+                audit,
                 Utc::now(),
             ),
-            Err(e) => crate::verify::status_from_exec_error(e, Utc::now()),
+            Err(e) => crate::verify::status_from_exec_error(e, audit, Utc::now()),
         }
     }
 
@@ -2175,14 +2186,15 @@ impl TaskRunner {
             _ => None,
         };
         let verifier_checks = match identity.as_ref().filter(|i| crate::verify::is_verifier(i)) {
-            Some(_) => match crate::verify::VerifyConfig::load(&queued.repo_path) {
-                Ok(config) => Some(config),
-                Err(e) => {
-                    self.fail(&task_id, e.to_string(), crate::verify::ERROR_CHECKS_INVALID)
-                        .await;
-                    return;
+            Some(verifier) => {
+                match crate::verify::preflight(verifier, &queued.repo_path, queued.max_iterations) {
+                    Ok(config) => Some((verifier, config)),
+                    Err(refusal) => {
+                        self.fail(&task_id, refusal.message, refusal.label).await;
+                        return;
+                    }
                 }
-            },
+            }
             None => None,
         };
         tracing::info!(
@@ -2283,11 +2295,10 @@ impl TaskRunner {
         if let Some(guard) = &bound_session {
             guard.set_workspace(workspace.workspace_path.clone());
         }
-        if let Some(config) = verifier_checks {
-            let name = identity.as_ref().map_or("", |i| i.name());
+        if let Some((verifier, config)) = verifier_checks {
             let container = workspace.container_handle().cloned();
             let status = self
-                .verify_checks(&task_id, queued.model, name, config, container)
+                .verify_checks(&task_id, &queued, verifier, config, container)
                 .await;
             let _ = workspace.cleanup();
             self.progress.write().await.remove(&task_id);
@@ -2554,10 +2565,17 @@ pub(crate) fn model_facing_registry(
     if let (Some(hub), Some(identity)) = (&layers.hub, identity) {
         crate::hub::tools::register(&mut registry, hub, identity);
     }
-    Ok(registry
+    Ok(with_model_facing_layers(registry, layers))
+}
+
+pub(crate) fn with_model_facing_layers(
+    registry: crate::tools::ToolRegistry,
+    layers: ModelFacingLayers,
+) -> crate::tools::ToolRegistry {
+    registry
         .with_production_hold(layers.escalation_log, None)
         .with_action_gate(layers.action_gate, layers.subject)
-        .with_action_escalator(layers.action_escalator))
+        .with_action_escalator(layers.action_escalator)
 }
 
 fn reject(e: crate::leases::LeaseError) -> QueueStoreError {
@@ -4976,6 +4994,15 @@ mod identity_tests {
     const TWO_CHECKS: &str = "[[check]]\nname = \"fmt\"\ncommand = \"cargo fmt --check\"\n\n[[check]]\nname = \"lint\"\ncommand = \"cargo clippy\"\n";
 
     async fn run_verifier(manager: &TaskManager, repo: &std::path::Path) -> (TaskId, Task) {
+        run_verifier_as(manager, repo, verifier_identity(), 20).await
+    }
+
+    async fn run_verifier_as(
+        manager: &TaskManager,
+        repo: &std::path::Path,
+        identity: AgentIdentity,
+        max_iterations: usize,
+    ) -> (TaskId, Task) {
         let provider: Arc<dyn ModelProvider> = MockProvider::new(vec![]);
         let id = manager
             .submit_with_identity(
@@ -4983,9 +5010,9 @@ mod identity_tests {
                 repo.to_path_buf(),
                 "HEAD".to_string(),
                 "mock".to_string(),
-                20,
+                max_iterations,
                 provider,
-                Some(verifier_identity()),
+                Some(identity),
             )
             .await;
         let task = wait_for(manager, &id, terminal).await;
@@ -5000,6 +5027,10 @@ mod identity_tests {
         let (error_type, error) = failed_with(&task.status);
         assert_eq!(error_type, "VerifierChecksInvalid");
         assert!(error.contains(".nanna/verify.toml"), "{error}");
+        assert_eq!(
+            task_failure_kind(&task.status),
+            crate::failure::FailureKind::WorkspaceSetupFailed
+        );
     }
 
     #[tokio::test]
@@ -5024,6 +5055,214 @@ mod identity_tests {
         let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
         let (_, task) = run_verifier(&manager, repo.path()).await;
         assert_eq!(failed_with(&task.status).0, "VerifierChecksInvalid");
+        assert_eq!(
+            task_failure_kind(&task.status),
+            crate::failure::FailureKind::WorkspaceSetupFailed
+        );
+    }
+
+    fn task_failure_kind(status: &TaskStatus) -> crate::failure::FailureKind {
+        match status {
+            TaskStatus::Failed { diagnostics, .. } => diagnostics.failure_kind(),
+            other => panic!("expected a failed task, got {other:?}"),
+        }
+    }
+
+    fn no_worktree_remains(task: &Task) -> bool {
+        !std::env::temp_dir()
+            .join(format!("nanna-task-{}", task.id.0))
+            .exists()
+    }
+
+    #[tokio::test]
+    async fn test_a_verifier_whose_card_has_a_higher_ceiling_is_refused_before_any_workspace() {
+        use crate::verify::test_support::Recording;
+        assert_eq!(EffectClass::ALL.len(), 6);
+        for effect in EffectClass::ALL
+            .into_iter()
+            .filter(|e| *e != EffectClass::Workspace)
+        {
+            let repo = repo_with_origin("git@github.com:example/repo.git");
+            declare_checks(repo.path(), TWO_CHECKS);
+            let runner = Arc::new(Recording::default());
+            let manager =
+                TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(runner.clone());
+            let mut identity = verifier_identity();
+            identity.scope.max_effect = effect;
+            let (_, task) = run_verifier_as(&manager, repo.path(), identity, 20).await;
+            let (error_type, error) = failed_with(&task.status);
+            assert_eq!(error_type, "ScopeError", "{effect}");
+            assert!(error.contains("fixed at `workspace`"), "{effect}: {error}");
+            assert_eq!(
+                task_failure_kind(&task.status),
+                crate::failure::FailureKind::ScopeError
+            );
+            assert!(runner.0.lock().unwrap().is_empty(), "{effect}");
+            assert!(no_worktree_remains(&task), "{effect}");
+        }
+    }
+
+    #[test]
+    fn test_a_verifiers_container_never_gets_a_network() {
+        assert_eq!(
+            network_policy_for(Some(&verifier_identity())),
+            NetworkPolicy::Disabled
+        );
+    }
+
+    fn opt_in_to_the_container(repo: &std::path::Path) {
+        std::fs::write(repo.join("flake.nix"), "{}").unwrap();
+        std::fs::create_dir(repo.join(".devcontainer")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_every_verifier_refusal_happens_before_any_container_is_set_up() {
+        for effect in EffectClass::ALL
+            .into_iter()
+            .filter(|e| *e != EffectClass::Workspace)
+        {
+            let repo = repo_with_origin("git@github.com:example/repo.git");
+            declare_checks(repo.path(), TWO_CHECKS);
+            opt_in_to_the_container(repo.path());
+            let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+            let mut identity = verifier_identity();
+            identity.scope.max_effect = effect;
+            let (_, task) = run_verifier_as(&manager, repo.path(), identity, 20).await;
+            assert_eq!(failed_with(&task.status).0, "ScopeError", "{effect}");
+        }
+        let missing = repo_with_origin("git@github.com:example/repo.git");
+        opt_in_to_the_container(missing.path());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, task) = run_verifier(&manager, missing.path()).await;
+        assert_eq!(failed_with(&task.status).0, "VerifierChecksInvalid");
+        let declared = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(declared.path(), TWO_CHECKS);
+        opt_in_to_the_container(declared.path());
+        let (_, task) = run_verifier_as(&manager, declared.path(), verifier_identity(), 1).await;
+        assert_eq!(failed_with(&task.status).0, "MaxIterationsExceeded");
+        let (_, task) = run_verifier(&manager, declared.path()).await;
+        assert_eq!(failed_with(&task.status).0, "ContainerSetupFailed");
+    }
+
+    #[tokio::test]
+    async fn test_a_verifier_with_more_checks_than_iterations_is_refused_up_front() {
+        use crate::verify::test_support::Recording;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = Arc::new(Recording::default());
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(runner.clone());
+        let (_, task) = run_verifier_as(&manager, repo.path(), verifier_identity(), 1).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "MaxIterationsExceeded");
+        assert!(error.contains("2 checks"), "{error}");
+        assert_eq!(
+            task_failure_kind(&task.status),
+            crate::failure::FailureKind::MaxIterations
+        );
+        assert!(runner.0.lock().unwrap().is_empty());
+        assert!(no_worktree_remains(&task));
+        let (_, task) = run_verifier_as(&manager, repo.path(), verifier_identity(), 2).await;
+        assert!(
+            matches!(task.status, TaskStatus::Completed { .. }),
+            "{:?}",
+            task.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_every_check_is_reviewed_by_the_production_gate_and_audited() {
+        use crate::verify::test_support::{raw, ScriptedRunner};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = ScriptedRunner::new(vec![raw(Some(0), "ok", ""), raw(Some(1), "", "bad")]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+            panic!("expected a failed task: {:?}", task.status);
+        };
+        assert_eq!(diagnostics.error_type, "VerificationFailed");
+        assert_eq!(diagnostics.action_audit.len(), 2);
+        assert_eq!(diagnostics.iterations_completed, 2);
+        for (entry, name) in diagnostics.action_audit.iter().zip(["fmt", "lint"]) {
+            assert_eq!(entry.review.tool, "run_checks");
+            assert_eq!(entry.review.args["name"], name);
+            assert!(entry.verdict.is_allow());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_passing_run_exports_one_audit_record_per_check() {
+        use crate::verify::test_support::{raw, ScriptedRunner};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = ScriptedRunner::new(vec![raw(Some(0), "", ""), raw(Some(0), "", "")]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (id, _) = run_verifier(&manager, repo.path()).await;
+        let result = manager.get_result(&id).await.unwrap();
+        assert_eq!(result.action_audit.len(), 2);
+        assert_eq!(result.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_gate_that_blocks_the_check_fails_the_task_without_running_it() {
+        use crate::verify::test_support::{gate, Recording};
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(repo.path(), TWO_CHECKS);
+        let runner = Arc::new(Recording::default());
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS)
+            .with_check_runner(runner.clone())
+            .with_action_gate(gate(false));
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "ScopeError");
+        assert!(error.contains("blocked for the test"), "{error}");
+        assert_eq!(
+            task_failure_kind(&task.status),
+            crate::failure::FailureKind::ScopeError
+        );
+        assert!(runner.0.lock().unwrap().is_empty());
+        let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+            unreachable!()
+        };
+        assert_eq!(diagnostics.action_audit.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_check_that_never_finishes_times_out_and_force_removes_the_container() {
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        declare_checks(
+            repo.path(),
+            "[[check]]\nname = \"slow\"\ncommand = \"exec sleep 600\"\ntimeout_secs = 1\n\n[[check]]\nname = \"after\"\ncommand = \"true\"\n",
+        );
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("removed");
+        let runner = crate::verify::ProcessCheckRunner::new("env", vec![]).with_teardown(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo \"$1 $2\" > \"$0\"".to_string(),
+            marker.display().to_string(),
+            "rm".to_string(),
+            "nanna-task-fake".to_string(),
+        ]);
+        let manager =
+            TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS).with_check_runner(Arc::new(runner));
+        let (_, task) = run_verifier(&manager, repo.path()).await;
+        let (error_type, error) = failed_with(&task.status);
+        assert_eq!(error_type, "VerificationFailed");
+        assert_eq!(error, "check `slow` timed out after 1s");
+        let TaskStatus::Failed { diagnostics, .. } = &task.status else {
+            unreachable!()
+        };
+        assert_eq!(diagnostics.to_json()["failure_kind"], "task_check_failed");
+        assert_eq!(diagnostics.tool_call_history.len(), 2);
+        assert_eq!(diagnostics.action_audit.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "rm nanna-task-fake"
+        );
     }
 
     #[tokio::test]
@@ -5059,7 +5298,7 @@ mod identity_tests {
         assert_eq!(result.qa_summary.checks.len(), 2);
         assert_eq!(result.qa_summary.checks[0].name, "fmt");
         assert_eq!(result.qa_summary.checks[1].output, "clean");
-        assert_eq!(result.iterations, 0);
+        assert_eq!(result.iterations, 2);
         assert_eq!(result.model_used, "mock");
         assert!(result.changes_patch.is_none());
     }
@@ -5122,12 +5361,19 @@ mod identity_tests {
             port: None,
             needs_cleanup: false,
         });
+        let queued = QueuedTask::new(
+            "Verify".to_string(),
+            std::path::PathBuf::new(),
+            "HEAD".to_string(),
+            "m".to_string(),
+            20,
+        );
         let status = manager
             .runner
             .verify_checks(
                 &TaskId::new(),
-                "m".to_string(),
-                "verifier",
+                &queued,
+                &verifier_identity(),
                 config,
                 Some(handle),
             )
@@ -9181,8 +9427,11 @@ mod impact_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[allow(clippy::mixed_attributes_style)]
 mod pi_route_tests {
+    #![cfg(unix)]
+
     use super::scheduler_tests::{git_repo, wait_for};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;

@@ -498,6 +498,7 @@ impl ToolRegistry {
 
     fn inspects_content(&self, name: &str) -> bool {
         name == crate::action_auditor::RUN_COMMAND_TOOL
+            || name == crate::verify::VERIFIER_TOOL
             || crate::action_auditor::is_message_tool(name)
     }
 
