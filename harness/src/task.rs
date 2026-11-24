@@ -9427,8 +9427,11 @@ mod impact_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[allow(clippy::mixed_attributes_style)]
 mod pi_route_tests {
+    #![cfg(unix)]
+
     use super::scheduler_tests::{git_repo, wait_for};
     use super::tests::{stop_response, wrap_with_state_machine_responses, MockProvider};
     use super::*;
