@@ -1930,7 +1930,14 @@ fn build_delegate_task_manager(
 fn pi_route_from_env(
     enabled: bool,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
-    pi_route_with(enabled, &|key| std::env::var_os(key), &warn_notice)
+    pi_route_logged(enabled, &|key| std::env::var_os(key))
+}
+
+fn pi_route_logged(
+    enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    pi_route_with(enabled, lookup, &warn_notice)
 }
 
 const PI_ROUTE_INERT_NOTICE: &str =
@@ -3913,7 +3920,57 @@ mod tests {
         assert_eq!(heard.len(), 1);
         assert!(heard[0].contains("inert"), "{}", heard[0]);
         assert!(heard[0].contains("fails closed"), "{}", heard[0]);
-        warn_notice(&heard[0]);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_logged_pi_route_writes_the_inert_notice_at_warn_level() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(pi_route_logged(false, &configured).unwrap().is_none());
+            assert!(captured.0.lock().unwrap().is_empty());
+            assert!(pi_route_logged(true, &configured).unwrap().is_some());
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("inert"), "{text}");
+        assert!(text.contains("fails closed"), "{text}");
+        assert!(pi_route_from_env(false).unwrap().is_none());
     }
 
     #[cfg(unix)]
