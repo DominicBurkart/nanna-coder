@@ -580,6 +580,7 @@ mod tests {
             max_effect: crate::effects::EffectClass::Workspace,
             tools: vec!["read_file".into()],
             write_paths: vec!["src".into()],
+            read_paths: crate::hub::session::ReadScope::Unknown,
             subtask: format!("subtask of {id}"),
             note: None,
             result_summary: None,
