@@ -544,11 +544,29 @@ mod tests {
     fn a_removal_that_hangs_is_killed_at_the_limit() {
         let started = std::time::Instant::now();
         bounded_status(
-            "sh",
+            "/bin/sh",
             &["-c".to_string(), "sleep 30".to_string()],
             Duration::from_millis(200),
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_removal_limit_is_ten_seconds() {
+        assert_eq!(REMOVE_LIMIT, Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_guard_gives_a_hung_removal_the_removal_limit_and_then_kills_it() {
+        let fake =
+            FakePodman::install_scripted_async("case \"$1\" in rm) exec sleep 60;; esac").await;
+        let started = std::time::Instant::now();
+        drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        let elapsed = started.elapsed();
+        assert!(fake.calls().contains(&"rm -f nanna-pi-t-1".to_string()));
+        assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
     }
 
     #[cfg(unix)]
@@ -556,7 +574,7 @@ mod tests {
     fn a_removal_that_finishes_returns_before_the_limit() {
         let started = std::time::Instant::now();
         bounded_status(
-            "sh",
+            "/bin/sh",
             &["-c".to_string(), "exit 0".to_string()],
             Duration::from_secs(20),
         );
