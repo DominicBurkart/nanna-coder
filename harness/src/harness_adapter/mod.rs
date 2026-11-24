@@ -1,6 +1,8 @@
 //! Harness-neutral seam between nanna's agent definitions and the agent
-//! runtimes that execute them. Nothing here runs a runtime yet: the broker,
-//! executor and `TaskRunner` switch are not written, so this module is
+//! runtimes that execute them. Nothing here runs a runtime yet. The seam
+//! (resolve, adapter, isolation policy) is delivered; the host-side `binding` and
+//! `broker` modules exist but nothing calls them: the socket server, the
+//! executor and the `TaskRunner` switch are not written, so this module is
 //! planned infrastructure, not a delivered isolation guarantee.
 //!
 //! An audited spawn ([`Allowed`]) is resolved against
@@ -62,18 +64,51 @@
 //! # }
 //! ```
 
+mod binding;
+#[cfg(test)]
+mod binding_tests;
+mod broker;
+#[cfg(test)]
+mod broker_tests;
 mod checked;
+#[cfg(unix)]
+mod executor;
+#[cfg(all(test, unix))]
+mod executor_tests;
 mod isolation;
 mod pi;
 mod pi_extension;
+mod route;
+mod rpc;
+#[cfg(test)]
+mod rpc_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use binding::{require_audited, AuditedRef, BindError, BoundWorkspace};
+#[cfg(test)]
+pub(crate) use broker::Broker;
+pub use broker::{
+    AuditOutcome, AuditSink, BrokerOutcome, BrokerPolicy, BrokerRequest, BrokerResponse,
+    CallRecord, HaltReason, RingAuditSink, ToolErrorKind, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES,
+    MAX_REQUEST_BYTES,
+};
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
+#[cfg(unix)]
+pub use executor::{PiNetwork, PiNetworkError, PodmanPiExecutor, PI_NETWORK_ENV};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
+pub(crate) use route::{pi_container_name, PiContainerGuard};
+pub use route::{
+    PiExecutor, PiLaunch, PiLimits, PiRoute, PiRouteError, PiRunOutcome, UnwiredPiExecutor,
+    PI_BROKER_DIR_ENV, PI_IMAGE_ENV,
+};
+pub use rpc::{
+    write_reply, LineReader, ReadLimits, RpcError, MAX_REPLY_BYTES, MAX_RPC_LINE_BYTES,
+    MAX_RPC_TOTAL_BYTES, RELAY_HOST, REQUEST_READ_TIMEOUT,
+};
 
 use crate::auditor::Allowed;
 use crate::effects::EffectClass;
@@ -372,6 +407,8 @@ pub struct ScopeGrant {
     pub paths: Vec<String>,
     /// Readable globs; `None` leaves reads unrestricted inside the worktree.
     pub read_paths: Option<Vec<String>>,
+    /// The identity's tool-name patterns.
+    pub tools: Vec<String>,
 }
 
 /// An audited spawn bound to a task: everything a runtime needs, already
@@ -430,6 +467,7 @@ impl ResolvedAgent {
                 });
             }
         }
+        let tools = &identity.scope.tools;
         let model = identity.identity.model.clone();
         if !model_is_valid(&model) {
             return Err(ResolveError::InvalidModel { model });
@@ -455,6 +493,7 @@ impl ResolvedAgent {
                 repos: identity.scope.repos.clone(),
                 paths: identity.scope.paths.clone(),
                 read_paths: identity.scope.read_paths.clone(),
+                tools: tools.iter().map(ToString::to_string).collect(),
             },
             image,
             broker_socket,
@@ -543,6 +582,10 @@ pub struct PlanFile {
 /// other than the broker socket are not expressible here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
+    /// Name of the agent the plan was built for.
+    pub agent: String,
+    /// Model name the runtime is told to use.
+    pub model: String,
     /// Container image.
     pub image: String,
     /// Files to place in the container.

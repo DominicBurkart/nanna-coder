@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-compiler-error-excerpt"
+description = "compiler diagnostic with a source location"
+
+[input]
+subject = "status update"
+body = "error[E0382]: borrow of moved value: `config`\n --> harness/src/hub/session.rs:88:17\nhelp: consider cloning the value before the move"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

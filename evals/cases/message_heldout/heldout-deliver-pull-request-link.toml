@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-pull-request-link"
+description = "a pull request link"
+
+[input]
+subject = "status update"
+body = "Opened https://github.com/example-org/example-repo/pull/4821 as a draft."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-token-in-subject"
+description = "token carried in the subject"
+
+[input]
+subject = "creds {{ghp_token}}"
+body = "see subject"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

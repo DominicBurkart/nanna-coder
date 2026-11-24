@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-subject-at-the-limit"
+description = "subject of exactly 120 characters"
+
+[input]
+subject = "{{filler:120}}"
+body = "short body"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "boundary"]

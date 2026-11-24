@@ -4,6 +4,7 @@
 use super::{DevLoop, IdentityError, ToolPattern};
 use crate::budget::{BudgetClass, BudgetConfig, BudgetLimits};
 use crate::effects::EffectClass;
+use crate::hub::message::MessageReach;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -106,6 +107,9 @@ pub struct ScopeSection {
     pub max_effect: EffectClass,
     /// Tool-name patterns the identity may call.
     pub tools: Vec<ToolPattern>,
+    /// How far the identity may message other sessions. A card that does not
+    /// state it gets [`MessageReach::None`].
+    pub message_reach: MessageReach,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +192,8 @@ struct RawScopeSection {
     read_paths: Option<Vec<String>>,
     max_effect: String,
     tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_reach: Option<String>,
 }
 
 impl From<AgentIdentity> for RawIdentity {
@@ -209,6 +215,8 @@ impl From<AgentIdentity> for RawIdentity {
                 paths: identity.scope.paths,
                 read_paths: identity.scope.read_paths,
                 max_effect: identity.scope.max_effect.as_str().to_string(),
+                message_reach: (identity.scope.message_reach != MessageReach::None)
+                    .then(|| identity.scope.message_reach.as_str().to_string()),
                 tools: identity
                     .scope
                     .tools
@@ -403,6 +411,15 @@ impl Validator<'_> {
                 format!("{e}; expected one of {}", effect_names()),
             )
         })?;
+        let message_reach = match &raw.scope.message_reach {
+            None => MessageReach::None,
+            Some(name) => name.parse::<MessageReach>().map_err(|()| {
+                self.invalid(
+                    "scope.message_reach",
+                    format!("expected one of {}", reach_names()),
+                )
+            })?,
+        };
         let tools = self.tools(&raw.scope.tools)?;
 
         self.positive("limits.max_iterations", raw.limits.max_iterations as u64)?;
@@ -413,7 +430,7 @@ impl Validator<'_> {
         self.within_host("limits.sandbox", &raw.limits.sandbox, &host.sandbox)?;
         let source = self.file.to_path_buf();
 
-        Ok(AgentIdentity {
+        let identity = AgentIdentity {
             identity: IdentitySection {
                 name: raw.identity.name,
                 description: raw.identity.description,
@@ -427,10 +444,15 @@ impl Validator<'_> {
                 read_paths: raw.scope.read_paths,
                 max_effect,
                 tools,
+                message_reach,
             },
             limits: raw.limits,
             source,
-        })
+        };
+        match crate::verify::ceiling_violation(&identity) {
+            Some(reason) => Err(self.invalid("scope.max_effect", reason)),
+            None => Ok(identity),
+        }
     }
 }
 
@@ -439,6 +461,14 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> IdentityError + '_ {
         file: path.to_path_buf(),
         source,
     }
+}
+
+fn reach_names() -> String {
+    MessageReach::ALL
+        .iter()
+        .map(|reach| reach.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn effect_names() -> String {
@@ -992,6 +1022,41 @@ max_concurrent = 4
     }
 
     #[test]
+    fn a_card_without_message_reach_gets_none() {
+        assert_eq!(example().scope.message_reach, MessageReach::None);
+    }
+
+    #[test]
+    fn message_reach_parses_each_value() {
+        for reach in MessageReach::ALL {
+            let by = format!("max_effect = \"repository\"\nmessage_reach = \"{reach}\"");
+            let identity = with("max_effect = \"repository\"", &by).unwrap();
+            assert_eq!(identity.scope.message_reach, reach);
+        }
+    }
+
+    #[test]
+    fn an_unknown_message_reach_names_the_field_and_fails() {
+        let by = "max_effect = \"repository\"\nmessage_reach = \"everyone\"";
+        let (field, reason) = invalid_field(with("max_effect = \"repository\"", by));
+        assert_eq!(field, "scope.message_reach");
+        assert!(reason.contains("none, lineage, root"), "{reason}");
+    }
+
+    #[test]
+    fn message_reach_round_trips_and_none_is_omitted() {
+        let mut identity = example();
+        assert!(!identity.to_toml_string().unwrap().contains("message_reach"));
+        for reach in MessageReach::ALL {
+            identity.scope.message_reach = reach;
+            let toml = identity.to_toml_string().unwrap();
+            let back = AgentIdentity::from_toml_str(&toml, identity.source()).unwrap();
+            assert_eq!(back, identity);
+            assert_eq!(toml.contains("message_reach"), reach != MessageReach::None);
+        }
+    }
+
+    #[test]
     fn to_toml_string_round_trips_the_example() {
         let identity = example();
         let toml = identity.to_toml_string().unwrap();
@@ -1136,13 +1201,15 @@ max_concurrent = 4
             prop::option::of(unique_list(path_glob_strategy(), 4)),
             prop::sample::select(EffectClass::ALL.to_vec()),
             unique_list(tool_pattern_strategy(), 5),
+            prop::sample::select(MessageReach::ALL.to_vec()),
         )
             .prop_map(
-                |(repos, paths, read_paths, max_effect, tools)| ScopeSection {
+                |(repos, paths, read_paths, max_effect, tools, message_reach)| ScopeSection {
                     repos,
                     paths,
                     read_paths,
                     max_effect,
+                    message_reach,
                     tools: tools.iter().map(|t| ToolPattern::new(t).unwrap()).collect(),
                 },
             );

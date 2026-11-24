@@ -19,7 +19,8 @@ fn global_catalog_loads_all_fixture_identities() {
             "deployer",
             "incident-responder",
             "pr-shepherd",
-            "rust-implementer"
+            "rust-implementer",
+            "verifier"
         ]
     );
 
@@ -50,6 +51,12 @@ fn global_catalog_loads_all_fixture_identities() {
     assert!(shepherd.allows_tool("github_pr_status"));
     assert!(shepherd.allows_effect(EffectClass::Ci));
     assert!(!shepherd.allows_effect(EffectClass::Sandbox));
+
+    let verifier = catalog.get("verifier").unwrap();
+    assert!(harness::verify::is_verifier(verifier));
+    assert_eq!(verifier.scope.max_effect, EffectClass::Workspace);
+    assert!(verifier.scope.paths.is_empty());
+    assert!(!harness::verify::is_verifier(implementer));
 
     let deployer = catalog.get("deployer").unwrap();
     assert_eq!(deployer.identity.dev_loop, DevLoop::Outer);
@@ -118,7 +125,11 @@ fn fixture_catalog_renders_a_table() {
         lines[2].split_whitespace().collect::<Vec<_>>(),
         vec!["deployer", "outer", "gemma4:e4b", "sandbox"]
     );
-    assert_eq!(lines.len(), 6);
+    assert_eq!(
+        lines[6].split_whitespace().collect::<Vec<_>>(),
+        vec!["verifier", "inner", "gemma4:e4b", "workspace"]
+    );
+    assert_eq!(lines.len(), 7);
 }
 
 #[test]
@@ -131,4 +142,100 @@ fn a_global_catalog_used_as_repo_root_has_no_overrides() {
     assert_eq!(same, global);
     let err = IdentityCatalog::load(fixtures().join("does-not-exist")).unwrap_err();
     assert!(matches!(err, IdentityError::Io { .. }), "{err}");
+}
+
+const HUB_TOOLS: [&str; 6] = [
+    "msg_send",
+    "msg_recv",
+    "session_set_note",
+    "sessions_list",
+    "session_describe",
+    "sessions_tree",
+];
+
+fn read_cards(dir: &std::path::Path) -> Vec<(String, toml::Table)> {
+    let mut cards = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("directory reads") {
+        let path = entry.expect("entry reads").path();
+        let named = path
+            .file_stem()
+            .expect("card has a name")
+            .to_string_lossy()
+            .to_string();
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            let text = std::fs::read_to_string(&path).expect("card reads");
+            cards.push((named, text.parse().expect("card parses")));
+        }
+    }
+    cards
+}
+
+fn reach_of(card: &toml::Table) -> String {
+    let reach = card["scope"].get("message_reach");
+    let named = reach.and_then(|value| value.as_str());
+    named.unwrap_or("none").to_string()
+}
+
+fn tools_of(card: &toml::Table) -> Vec<String> {
+    let listed = card["scope"]["tools"].as_array().expect("tools is a list");
+    listed
+        .iter()
+        .map(|tool| tool.as_str().expect("tool is text").to_string())
+        .collect()
+}
+
+#[test]
+fn shipped_cards_reach_the_root_except_the_auditor_and_fixtures_and_the_frozen_catalog_stay_none() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let shipped = [
+        (root.join(".nanna/catalog"), 5),
+        (root.join(".nanna/agents"), 4),
+    ];
+    for (dir, floor) in shipped {
+        let cards = read_cards(&dir);
+        let (shown, count) = (dir.display().to_string(), cards.len());
+        assert!(count >= floor, "{shown}: only {count} cards read");
+        for (name, card) in cards {
+            let reaches = !matches!(name.as_str(), "auditor" | "session-librarian");
+            let want = if reaches { "root" } else { "none" };
+            assert_eq!(reach_of(&card), want, "{name} in {}", dir.display());
+            let tools = tools_of(&card);
+            for hub_tool in HUB_TOOLS {
+                let listed = tools.iter().any(|tool| tool == hub_tool);
+                assert_eq!(listed, reaches, "{name}: {hub_tool}");
+            }
+        }
+    }
+    let quiet = [
+        (fixtures().join("global"), 5),
+        (root.join("evals/cases/auditor_heldout/catalog"), 4),
+    ];
+    for (dir, floor) in quiet {
+        let cards = read_cards(&dir);
+        let (shown, count) = (dir.display().to_string(), cards.len());
+        assert!(count >= floor, "{shown}: only {count} cards read");
+        for (name, card) in cards {
+            assert_eq!(reach_of(&card), "none", "{name} in {}", dir.display());
+        }
+    }
+}
+
+#[test]
+fn every_repo_card_narrows_its_shipped_twin_in_reach_and_hub_tools() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let base = read_cards(&root.join(".nanna/catalog"));
+    let local = read_cards(&root.join(".nanna/agents"));
+    assert!(local.len() >= 4);
+    for (name, card) in local {
+        let twin = base.iter().find(|(other, _)| *other == name);
+        let (_, twin) = twin.expect("every repo card has a shipped twin");
+        assert_eq!(reach_of(&card), reach_of(twin), "{name}");
+        let allowed = tools_of(twin);
+        for tool in tools_of(&card) {
+            assert!(
+                allowed.contains(&tool),
+                "{name}: {tool} is not in the base card"
+            );
+        }
+    }
 }

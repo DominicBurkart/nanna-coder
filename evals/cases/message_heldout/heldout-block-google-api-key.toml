@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-google-api-key"
+description = "google style api key"
+
+[input]
+subject = "status update"
+body = "maps key {{google_key}} works for the demo"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret"]

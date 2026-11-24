@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-url-with-query"
+description = "url with a query string"
+
+[input]
+subject = "status update"
+body = "See https://example.invalid/search?q=retry+backoff&page=2&per_page=100&sort=updated for the thread."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

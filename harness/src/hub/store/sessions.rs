@@ -1,8 +1,9 @@
 use super::engine::{Engine, Table};
 use super::journal::HubLock;
-use super::{Retention, SessionStore, StoreError};
+use super::{ActiveSession, Retention, SessionStore, StoreError};
 use crate::hub::lineage::{RootId, SessionId};
 use crate::hub::session::{SessionRecord, SessionStatus};
+use crate::hub::summary::Summary;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +23,8 @@ pub(super) enum Record {
     },
     Note {
         id: SessionId,
-        note: String,
+        #[serde(default, deserialize_with = "crate::hub::session::lenient_note")]
+        note: Option<Summary>,
     },
     Drop {
         id: SessionId,
@@ -50,7 +52,7 @@ impl Table for SessionTable {
             }
             Record::Note { id, note } => {
                 let found = self.by_id.get_mut(id).ok_or(StoreError::NotFound)?;
-                found.note = Some(note.clone());
+                found.note = note.clone();
             }
             Record::Drop { id } => {
                 self.by_id.remove(id).ok_or(StoreError::NotFound)?;
@@ -70,6 +72,20 @@ impl Table for SessionTable {
 }
 
 impl SessionTable {
+    fn active(&self) -> Vec<ActiveSession> {
+        let mut listed = Vec::new();
+        for record in self.by_id.values() {
+            if record.status.is_active() {
+                listed.push(ActiveSession {
+                    id: record.id.clone(),
+                    status: record.status,
+                    last_activity: record.last_activity,
+                });
+            }
+        }
+        listed
+    }
+
     fn expired_ids(&self, now: DateTime<Utc>, policy: &Retention) -> Vec<SessionId> {
         let mut roots: HashMap<&RootId, (bool, DateTime<Utc>, Vec<&SessionId>)> = HashMap::new();
         for record in self.by_id.values() {
@@ -127,6 +143,20 @@ macro_rules! session_store_impl {
                 Ok(found)
             }
 
+            fn update(
+                &self,
+                id: SessionId,
+                change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+            ) -> Result<(), StoreError> {
+                self.engine.commit(|table| {
+                    let current = table.by_id.get(&id).ok_or(StoreError::NotFound)?;
+                    let kept = change(current.clone()).map(|next| Record::Upsert {
+                        record: Box::new(next),
+                    });
+                    Ok(((), kept.into_iter().collect()))
+                })
+            }
+
             fn set_status(
                 &self,
                 id: SessionId,
@@ -137,9 +167,16 @@ macro_rules! session_store_impl {
                     .commit(|_| Ok(((), vec![Record::Status { id, status: s, at }])))
             }
 
-            fn set_note(&self, id: SessionId, note: String) -> Result<(), StoreError> {
-                self.engine
-                    .commit(|_| Ok(((), vec![Record::Note { id, note }])))
+            fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError> {
+                self.engine.commit(|_| {
+                    Ok((
+                        (),
+                        vec![Record::Note {
+                            id,
+                            note: Some(note),
+                        }],
+                    ))
+                })
             }
 
             fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
@@ -151,6 +188,10 @@ macro_rules! session_store_impl {
                         ids.into_iter().map(|id| Record::Drop { id }).collect(),
                     ))
                 })
+            }
+
+            fn active(&self) -> Result<Vec<ActiveSession>, StoreError> {
+                Ok(self.engine.read(SessionTable::active))
             }
         }
     };
@@ -271,6 +312,10 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::atomic::Ordering;
 
+    fn note(text: &str) -> Summary {
+        Summary::compose("a", "running", text)
+    }
+
     mod memory {
         use super::*;
         session_contract_tests!(((), InMemorySessionStore::new()));
@@ -312,15 +357,36 @@ mod tests {
         store
             .set_status(sid("a"), SessionStatus::Completed, at(9))
             .unwrap();
-        store.set_note(sid("a"), "remember".into()).unwrap();
+        store.set_note(sid("a"), note("remember")).unwrap();
         let before = store.in_root(&r).unwrap();
         drop(store);
         let reopened = open(&fixture).unwrap();
         assert_eq!(reopened.in_root(&r).unwrap(), before);
         assert_eq!(
-            reopened.get(sid("a")).unwrap().unwrap().note.as_deref(),
-            Some("remember")
+            reopened.get(sid("a")).unwrap().unwrap().note,
+            Some(note("remember"))
         );
+    }
+
+    #[test]
+    fn the_active_listing_survives_a_reopen_and_follows_the_replayed_status() {
+        let fixture = Fixture::new();
+        let r = root(1);
+        let store = open(&fixture).unwrap();
+        store
+            .upsert(session("a", &r, SessionStatus::Running, 0, 4))
+            .unwrap();
+        store
+            .upsert(session("b", &r, SessionStatus::Pending, 0, 5))
+            .unwrap();
+        store
+            .set_status(sid("b"), SessionStatus::Failed, at(9))
+            .unwrap();
+        let before = store.active().unwrap();
+        assert_eq!(before.len(), 1);
+        drop(store);
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.active().unwrap(), before);
     }
 
     #[test]
@@ -392,6 +458,28 @@ mod tests {
         .unwrap();
         let _reopened = open(&fixture).unwrap();
         assert_eq!(mode(fixture.path("sessions.jsonl")), 0o600);
+    }
+
+    #[test]
+    fn a_journal_written_before_summary_notes_replays_and_drops_an_invalid_note() {
+        let fixture = Fixture::new();
+        let r = root(1);
+        let store = open(&fixture).unwrap();
+        store
+            .upsert(session("a", &r, SessionStatus::Running, 0, 0))
+            .unwrap();
+        store.set_note(sid("a"), note("kept")).unwrap();
+        drop(store);
+        let mut text = std::fs::read_to_string(fixture.path("sessions.jsonl")).unwrap();
+        text.push_str(&format!(
+            "{{\"op\":\"note\",\"id\":\"a\",\"note\":\"{TOKEN}   {TOKEN}\"}}\n"
+        ));
+        std::fs::write(fixture.path("sessions.jsonl"), text).unwrap();
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.get(sid("a")).unwrap().unwrap().note, None);
+        assert!(!std::fs::read_to_string(fixture.path("sessions.jsonl"))
+            .unwrap()
+            .contains(TOKEN));
     }
 
     #[test]
@@ -551,7 +639,7 @@ mod tests {
             Err(StoreError::Io(_))
         ));
         assert!(matches!(
-            store.set_note(sid("a"), "n".into()),
+            store.set_note(sid("a"), note("n")),
             Err(StoreError::Io(_))
         ));
         assert!(matches!(
@@ -652,7 +740,7 @@ mod tests {
         created: i64,
         last: i64,
         ended: Option<i64>,
-        note: Option<String>,
+        note: Option<Summary>,
     }
 
     fn model_prune(model: &mut Vec<ModelEntry>, now: i64) -> usize {
@@ -782,13 +870,14 @@ mod tests {
                         }
                     }
                 }
-                Op::Note { n, note } => {
-                    let result = store.set_note(sid(&format!("s{n}")), note.clone());
+                Op::Note { n, note: note_text } => {
+                    let summary = note(note_text);
+                    let result = store.set_note(sid(&format!("s{n}")), summary.clone());
                     match model.iter_mut().find(|e| e.n == *n) {
                         None => assert!(matches!(result, Err(StoreError::NotFound))),
                         Some(entry) => {
                             result.unwrap();
-                            entry.note = Some(note.clone());
+                            entry.note = Some(summary);
                         }
                     }
                 }
