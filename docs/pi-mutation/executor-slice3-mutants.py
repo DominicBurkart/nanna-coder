@@ -4,6 +4,8 @@ import sys
 
 DIR = "harness/src/harness_adapter/"
 E, R, RT = DIR + "executor.rs", DIR + "rpc.rs", DIR + "route.rs"
+MN = "harness/src/main.rs"
+B = ["--bin", "nanna"]
 T = ["--lib", "harness_adapter"]
 
 EXIT_OK_MUTANT = (
@@ -115,6 +117,10 @@ MUTANTS = [
     (R, "        kind: Some(super::ToolErrorKind::BadRequest),\n        halt: false,\n    };\n    serde_json::to_string(&response)", "        kind: Some(super::ToolErrorKind::ExecutionFailed),\n        halt: false,\n    };\n    serde_json::to_string(&response)", T),
     (R, 'ServeEnd::Failed(format!("broker socket accept failed: {error}"))', 'ServeEnd::Failed(format!("accept failed: {error}"))', T),
     (E, "match tokio::task::spawn_blocking(detect_runtime).await? {", "match Ok::<_, tokio::task::JoinError>(detect_runtime())? {", T),
+    (MN, "pi_route_with(enabled, lookup, &warn_notice)", "pi_route_with(enabled, lookup, &|_| {})", B),
+    (MN, 'fn warn_notice(message: &str) {\n    warn!("{message}");\n}', "fn warn_notice(message: &str) {\n    let _ = message;\n}", B),
+    (MN, 'warn!("{message}");', 'info!("{message}");', B),
+    (MN, "    notify(PI_ROUTE_INERT_NOTICE);\n", "", B),
 ]
 
 

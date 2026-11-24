@@ -101,3 +101,7 @@
 101 rpc.rs '        kind: Some(super::ToolErrorKind::BadRequest),\n      ' -> '        kind: Some(super::ToolErrorKind:': KILLED
 102 rpc.rs 'ServeEnd::Failed(format!("broker socket accept failed: {erro' -> 'ServeEnd::Failed(format!("accept failed:': KILLED
 103 executor.rs 'match tokio::task::spawn_blocking(detect_runtime).await? {' -> 'match Ok::<_, tokio::task::JoinError>(de': KILLED
+104 main.rs 'pi_route_with(enabled, lookup, &warn_notice)' -> 'pi_route_with(enabled, lookup, &|_| {})': KILLED
+105 main.rs 'fn warn_notice(message: &str) {\n    warn!("{message}");\n}' -> 'fn warn_notice(message: &str) {\n    let ': KILLED
+106 main.rs 'warn!("{message}");' -> 'info!("{message}");': KILLED
+107 main.rs '    notify(PI_ROUTE_INERT_NOTICE);\n' -> '': KILLED
