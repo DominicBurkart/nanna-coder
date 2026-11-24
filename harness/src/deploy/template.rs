@@ -895,6 +895,34 @@ mirror_percent = 0
 compare = ["status", "latency"]
 "#;
 
+    fn fullstack_fixture_repo() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tests")
+            .join("fixtures")
+            .join("fullstack")
+    }
+
+    #[test]
+    fn fullstack_fixture_file_loads_through_the_loader() {
+        let repo = fullstack_fixture_repo();
+        let loaded = DeployTemplate::load_from_repo(&repo).unwrap();
+        let mut inline = DeployTemplate::parse(FIXTURE).unwrap();
+        assert_eq!(loaded.file(), DeployTemplate::path_in(&repo));
+        inline.file = loaded.file().to_path_buf();
+        assert_eq!(loaded, inline);
+    }
+
+    #[test]
+    fn drifted_fullstack_fixture_fails_validation() {
+        let path = DeployTemplate::path_in(&fullstack_fixture_repo());
+        let src = std::fs::read_to_string(path).unwrap();
+        let drifted = src.replace("strategy = \"gradual\"", "strategy = \"teleport\"");
+        assert_ne!(drifted, src);
+        assert!(DeployTemplate::parse(&drifted).is_err());
+    }
+
     fn field_error(src: &str) -> (&'static str, String) {
         match DeployTemplate::parse(src).unwrap_err() {
             DeployError::InvalidField { field, reason, .. } => (field, reason),
