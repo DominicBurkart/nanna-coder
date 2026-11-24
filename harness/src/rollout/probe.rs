@@ -500,18 +500,47 @@ mod tests {
         );
     }
 
+    struct RecordingProbe {
+        inner: ReqwestProbe,
+        errors: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HttpProbe for RecordingProbe {
+        async fn probe(&self, url: &str) -> Result<ProbeResponse, HealthError> {
+            let result = self.inner.probe(url).await;
+            if let Err(error) = &result {
+                self.errors.lock().unwrap().push(error.to_string());
+            }
+            result
+        }
+    }
+
     #[tokio::test]
     async fn unbuildable_client_is_reported_by_the_health_source_as_total_failure() {
         let clock = Arc::new(SimulatedClock::new(Utc::now()));
+        let probe = Arc::new(RecordingProbe {
+            inner: unbuildable_probe(),
+            errors: std::sync::Mutex::new(Vec::new()),
+        });
         let source = EndpointHealthSource::new(
             "http://fixture.invalid",
             vec!["/health/v1".to_string()],
-            Arc::new(unbuildable_probe()),
+            probe.clone(),
             clock,
         );
         let sample = source.sample(&slot(), Duration::minutes(1)).await.unwrap();
         assert_eq!(sample.error_rate, 1.0);
         assert!(sample.endpoint_statuses.is_empty());
+        let errors = probe.errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].starts_with(
+                "health source failed: http://fixture.invalid/health/v1: http client unavailable: "
+            ),
+            "{}",
+            errors[0]
+        );
     }
 
     #[test]

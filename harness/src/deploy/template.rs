@@ -908,14 +908,10 @@ compare = ["status", "latency"]
     fn fullstack_fixture_file_loads_through_the_loader() {
         let repo = fullstack_fixture_repo();
         let loaded = DeployTemplate::load_from_repo(&repo).unwrap();
-        let inline = DeployTemplate::parse(FIXTURE).unwrap();
+        let mut inline = DeployTemplate::parse(FIXTURE).unwrap();
         assert_eq!(loaded.file(), DeployTemplate::path_in(&repo));
-        assert_eq!(loaded.target, inline.target);
-        assert_eq!(loaded.risk, inline.risk);
-        assert_eq!(loaded.rollout, inline.rollout);
-        assert_eq!(loaded.health, inline.health);
-        assert_eq!(loaded.rollback, inline.rollback);
-        assert_eq!(loaded.shadow, inline.shadow);
+        inline.file = loaded.file().to_path_buf();
+        assert_eq!(loaded, inline);
     }
 
     #[test]
