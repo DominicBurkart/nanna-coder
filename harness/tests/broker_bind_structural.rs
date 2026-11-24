@@ -26,7 +26,7 @@ const CONSTRUCTORS: [&str; 11] = [
     "create_container_tool_registry_for_guarded",
 ];
 
-const PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 0;
+const PRODUCTION_BIND_CALLERS_IN_THIS_SLICE: usize = 1;
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {

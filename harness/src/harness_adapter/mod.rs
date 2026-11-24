@@ -64,7 +64,6 @@
 //! # }
 //! ```
 
-#[cfg_attr(not(test), expect(dead_code))]
 mod binding;
 #[cfg(test)]
 mod binding_tests;
@@ -76,11 +75,15 @@ mod checked;
 mod isolation;
 mod pi;
 mod pi_extension;
+mod route;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use binding::{require_audited, AuditedRef, BindError, BoundWorkspace};
+#[cfg(test)]
+pub(crate) use broker::Broker;
 pub use broker::{
     AuditOutcome, AuditSink, BrokerOutcome, BrokerPolicy, BrokerRequest, BrokerResponse,
     CallRecord, HaltReason, RingAuditSink, ToolErrorKind, MAX_MESSAGE_BYTES, MAX_OUTPUT_BYTES,
@@ -89,6 +92,11 @@ pub use broker::{
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
+pub(crate) use route::{pi_container_name, PiContainerGuard};
+pub use route::{
+    PiExecutor, PiLaunch, PiLimits, PiRoute, PiRouteError, PiRunOutcome, UnwiredPiExecutor,
+    PI_BROKER_DIR_ENV, PI_IMAGE_ENV,
+};
 
 use crate::auditor::Allowed;
 use crate::effects::EffectClass;
