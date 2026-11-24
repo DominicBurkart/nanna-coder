@@ -176,3 +176,30 @@ fn the_relay_endpoint_names_the_podman_host_alias() {
     assert_eq!(RELAY_HOST, "host.containers.internal");
     assert_eq!(MAX_REPLY_BYTES, 1_048_576);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_times_out_after_exactly_the_read_timeout() {
+    let (tx, rx) = duplex(64);
+    let mut r = LineReader::new(
+        rx,
+        ReadLimits {
+            max_line: 16,
+            max_total: 64,
+            read_timeout: Duration::from_secs(10),
+        },
+    );
+    let started = tokio::time::Instant::now();
+    assert!(matches!(r.next_line().await, Err(RpcError::Timeout)));
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    drop(tx);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_nobody_reads_times_out_after_exactly_the_write_timeout() {
+    let (mut tx, rx) = duplex(4);
+    let started = tokio::time::Instant::now();
+    let written = write_reply(&mut tx, "0123456789", 64, Duration::from_secs(10)).await;
+    assert!(matches!(written, Err(RpcError::Timeout)));
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    drop(rx);
+}

@@ -55,6 +55,30 @@ mod fake {
             }
         }
 
+        pub(crate) async fn install_docker_only_async() -> Self {
+            let guard = PATH_LOCK.lock().await;
+            let dir = TempDir::new().unwrap();
+            let log = dir.path().join("calls.log");
+            let bin = dir.path().join("docker");
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+            settle_executable(&bin);
+            let _ = std::fs::remove_file(&log);
+            let old_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", dir.path());
+            Self {
+                dir,
+                old_path,
+                guard: Some(guard),
+            }
+        }
+
         pub(crate) async fn install_scripted_async(extra: &str) -> Self {
             Self::with_script(PATH_LOCK.lock().await, None, extra)
         }

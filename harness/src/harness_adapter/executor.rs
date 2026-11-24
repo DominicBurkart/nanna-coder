@@ -26,7 +26,7 @@ const CONTAINER_USER: &str = "65534:65534";
 const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 const HOME_ENV: &str = "HOME";
 const WORK_TMPFS_OPTIONS: &str = "rw,noexec,nosuid,size=64m,uid=65534,gid=65534";
-const RESERVED_NETWORKS: [&str; 7] = [
+const RESERVED_NETWORKS: [&str; 8] = [
     "host",
     "none",
     "bridge",
@@ -34,6 +34,7 @@ const RESERVED_NETWORKS: [&str; 7] = [
     "slirp4netns",
     "pasta",
     "default",
+    "podman",
 ];
 
 #[doc = "A refused network name."]
@@ -254,12 +255,16 @@ impl Drop for RemoveGuard {
     }
 }
 
-struct SocketGuard(PathBuf);
+pub(super) struct SocketGuard(PathBuf);
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+pub(super) fn is_private(owner: u32, effective: u32, mode: u32, is_dir: bool) -> bool {
+    is_dir && owner == effective && mode & 0o077 == 0
 }
 
 pub(super) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -269,8 +274,12 @@ pub(super) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
-    let mine = meta.uid() == unsafe { libc::geteuid() };
-    if !meta.is_dir() || !mine || meta.mode() & 0o077 != 0 {
+    if !is_private(
+        meta.uid(),
+        unsafe { libc::geteuid() },
+        meta.mode(),
+        meta.is_dir(),
+    ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
@@ -282,7 +291,7 @@ pub(super) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn bind_socket(path: &Path) -> std::io::Result<(tokio::net::UnixListener, SocketGuard)> {
+pub(super) fn bind_socket(path: &Path) -> std::io::Result<(tokio::net::UnixListener, SocketGuard)> {
     use std::os::unix::fs::PermissionsExt;
     let parent = path
         .parent()
@@ -637,12 +646,37 @@ async fn run_runtime(
         }
         child.wait().await
     };
-    match tokio::time::timeout_at(deadline, work).await {
-        Err(_) => Err(format!("podman {what} exceeded the wall-clock limit")),
-        Ok(Err(e)) => Err(format!("podman {what}: {e}")),
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(format!("podman {what} failed: {status}")),
+    judge(&what, tokio::time::timeout_at(deadline, work).await.ok())
+}
+
+pub(super) fn judge(
+    what: &str,
+    outcome: Option<std::io::Result<std::process::ExitStatus>>,
+) -> Result<(), String> {
+    match outcome {
+        None => Err(format!("podman {what} exceeded the wall-clock limit")),
+        Some(Err(e)) => Err(format!("podman {what}: {e}")),
+        Some(Ok(status)) if status.success() => Ok(()),
+        Some(Ok(status)) => Err(format!("podman {what} failed: {status}")),
     }
+}
+
+pub(super) async fn send_lines<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    lines: &[String],
+    deadline: Instant,
+) -> bool {
+    for line in lines {
+        let sent = async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await
+        };
+        if !matches!(tokio::time::timeout_at(deadline, sent).await, Ok(Ok(()))) {
+            return false;
+        }
+    }
+    true
 }
 
 #[async_trait::async_trait]
@@ -683,10 +717,16 @@ impl PiExecutor for PodmanPiExecutor {
         if broker.task_id().0 != launch_task_id {
             return refusal("the broker was bound to another task".to_string());
         }
-        let runtime = detect_runtime();
-        if !runtime.is_available() {
-            return refusal("no container runtime is available".to_string());
-        }
+        let runtime = match tokio::task::spawn_blocking(detect_runtime).await {
+            Ok(ContainerRuntime::Podman) => ContainerRuntime::Podman,
+            Ok(ContainerRuntime::Docker) => {
+                return refusal("pi runs only under podman; docker is not accepted".to_string())
+            }
+            Ok(ContainerRuntime::None) => {
+                return refusal("no container runtime is available".to_string())
+            }
+            Err(e) => return refusal(format!("runtime detection failed: {e}")),
+        };
         let (listener, _socket_guard) = match bind_socket(&socket) {
             Ok(bound) => bound,
             Err(e) => return refusal(format!("broker socket {}: {e}", socket.display())),
@@ -755,16 +795,8 @@ impl Session {
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return self.finish(Ended::Failed("podman start has no pipes".to_string()), None);
         };
-        for line in &self.plan.stdin {
-            let sent = async {
-                stdin.write_all(line.as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                stdin.flush().await
-            };
-            let written = tokio::time::timeout_at(deadline, sent).await;
-            if !matches!(written, Ok(Ok(()))) {
-                return self.finish(Ended::Failed("writing the prompt failed".to_string()), None);
-            }
+        if !send_lines(&mut stdin, &self.plan.stdin, deadline).await {
+            return self.finish(Ended::Failed("writing the prompt failed".to_string()), None);
         }
         let mut events = LineReader::new(stdout, ReadLimits::for_events(self.wall));
         let mut listener = Some(listener);

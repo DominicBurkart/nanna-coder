@@ -170,8 +170,9 @@ fn settled(aborted: bool) -> String {
 
 const SCRIPT: &str = r#"
 case "$1" in
-create) [ -f "$d/hang-create" ] && exec sleep 30; [ -f "$d/fail-create" ] && exit 1;;
-cp) [ -f "$d/hang-cp" ] && exec sleep 30; cat > "$d/cp.tar";;
+create) echo $$ > "$d/create.pid"; [ -f "$d/hang-create" ] && exec sleep 30; [ -f "$d/fail-create" ] && exit 1;;
+cp) echo $$ > "$d/cp.pid"; [ -f "$d/hang-cp" ] && exec sleep 30; cat > "$d/cp.tar";;
+rm) [ -f "$d/hang-rm" ] && exec sleep 60;;
 start)
   echo $$ > "$d/start.pid"
   read -r prompt
@@ -207,11 +208,18 @@ async fn call_broker(socket: &Path, line: &str) -> String {
 
 async fn call_broker_bytes(socket: &Path, bytes: &[u8]) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = loop {
+    let mut stream = None;
+    for _ in 0..1500 {
         match tokio::net::UnixStream::connect(socket).await {
-            Ok(stream) => break stream,
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
+    }
+    let Some(mut stream) = stream else {
+        return String::new();
     };
     let mut reply = String::new();
     let sent = async {
@@ -364,6 +372,8 @@ fn network_names_are_validated() {
     }
     for reserved in [
         "host",
+        "podman",
+        "PODMAN",
         "NONE",
         "bridge",
         "private",
@@ -792,16 +802,18 @@ async fn a_second_connection_after_the_first_is_served_in_order() {
     let socket = root.path().join("broker.sock");
     let exec = executor(root.path());
     let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
-    let (outcome, first, second) = tokio::join!(
-        exec.run(launch),
-        async { call_broker(&socket, r#"{"tool":"read_file","args":{}}"#).await },
-        async { call_broker(&socket, r#"{"tool":"search","args":{}}"#).await },
-    );
-    std::fs::write(fake.dir().join("go"), "").unwrap();
+    let (outcome, (first, second)) = tokio::join!(exec.run(launch), async {
+        let pair = tokio::join!(
+            call_broker(&socket, r#"{"tool":"read_file","args":{}}"#),
+            call_broker(&socket, r#"{"tool":"search","args":{}}"#),
+        );
+        std::fs::write(fake.dir().join("go"), "").unwrap();
+        pair
+    });
     assert!(first.contains("\"ok\":true") && second.contains("\"ok\":true"));
     assert_eq!(calls(&rig.counters, "read_file"), 1);
     assert_eq!(calls(&rig.counters, "search"), 1);
-    let _ = outcome;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
 }
 
 async fn failing_run(
@@ -1064,7 +1076,28 @@ async fn a_create_or_copy_that_hangs_is_cut_off_at_the_deadline_and_cleaned_up()
             "{marker}"
         );
         assert!(removed(&fake), "{marker}");
+        let pid_file = marker.replace("hang-", "") + ".pid";
+        assert!(
+            process_gone(&fake.dir().join(&pid_file)).await,
+            "the timed-out {marker} client outlived the run"
+        );
     }
+}
+
+async fn process_gone(pid_file: &Path) -> bool {
+    let pid = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    let stat = PathBuf::from(format!("/proc/{pid}/stat"));
+    for _ in 0..100 {
+        let state = std::fs::read_to_string(&stat).unwrap_or_default();
+        if state.is_empty() || state.contains(") Z ") {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 #[tokio::test]
@@ -1077,21 +1110,8 @@ async fn cancelling_the_run_kills_the_attached_client_process() {
     let launch = rig.launch(TASK, NAME, Duration::from_secs(60));
     let cancelled = tokio::time::timeout(Duration::from_millis(700), exec.run(launch)).await;
     assert!(cancelled.is_err());
-    let pid = std::fs::read_to_string(fake.dir().join("start.pid"))
-        .unwrap()
-        .trim()
-        .to_string();
-    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
-    let mut gone = false;
-    for _ in 0..100 {
-        let state = std::fs::read_to_string(proc_dir.join("stat")).unwrap_or_default();
-        if state.is_empty() || state.contains(") Z ") {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(gone, "the attached podman client {pid} outlived the run");
+    let gone = process_gone(&fake.dir().join("start.pid")).await;
+    assert!(gone, "the attached podman client outlived the run");
 }
 
 #[tokio::test]
@@ -1113,13 +1133,15 @@ async fn an_unreadable_or_oversized_request_gets_a_bad_request_reply_and_the_run
     let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
     let mut oversized = vec![b'a'; MAX_REQUEST_BYTES + 10];
     oversized.push(b'\n');
-    let (outcome, invalid, large, good) = tokio::join!(
-        exec.run(launch),
-        call_broker_bytes(&socket, b"\xff\xfe\n"),
-        call_broker_bytes(&socket, &oversized),
-        call_broker(&socket, r#"{"tool":"read_file","args":{}}"#),
-    );
-    std::fs::write(fake.dir().join("go"), "").unwrap();
+    let (outcome, (invalid, large, good)) = tokio::join!(exec.run(launch), async {
+        let replies = tokio::join!(
+            call_broker_bytes(&socket, b"\xff\xfe\n"),
+            call_broker_bytes(&socket, &oversized),
+            call_broker(&socket, r#"{"tool":"read_file","args":{}}"#),
+        );
+        std::fs::write(fake.dir().join("go"), "").unwrap();
+        replies
+    });
     assert!(
         invalid.contains("bad request: not valid UTF-8"),
         "{invalid}"
@@ -1127,5 +1149,267 @@ async fn an_unreadable_or_oversized_request_gets_a_bad_request_reply_and_the_run
     assert!(large.contains("request too large"), "{large}");
     assert!(good.contains("\"ok\":true"), "{good}");
     assert_eq!(calls(&rig.counters, "read_file"), 1);
-    let _ = outcome;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+}
+
+#[test]
+fn only_a_directory_we_own_with_no_group_or_other_bits_is_private() {
+    use super::executor::is_private;
+    assert!(is_private(1000, 1000, 0o040700, true));
+    assert!(is_private(1000, 1000, 0o040500, true));
+    assert!(!is_private(1000, 1000, 0o040770, true));
+    assert!(!is_private(1000, 1000, 0o040707, true));
+    assert!(!is_private(1000, 1000, 0o040750, true));
+    assert!(!is_private(1001, 1000, 0o040700, true));
+    assert!(!is_private(1000, 1000, 0o100600, false));
+    assert!(!is_private(1000, 1000, 0o120777, false));
+}
+
+#[test]
+fn a_podman_exit_is_judged_by_deadline_error_and_status() {
+    use super::executor::judge;
+    use std::os::unix::process::ExitStatusExt;
+    let ok = std::process::ExitStatus::from_raw(0);
+    let bad = std::process::ExitStatus::from_raw(1 << 8);
+    assert_eq!(judge("cp", Some(Ok(ok))), Ok(()));
+    let late = judge("cp", None).unwrap_err();
+    assert_eq!(late, "podman cp exceeded the wall-clock limit");
+    let io = judge("cp", Some(Err(std::io::Error::other("pipe")))).unwrap_err();
+    assert_eq!(io, "podman cp: pipe");
+    let failed = judge("create", Some(Ok(bad))).unwrap_err();
+    assert!(failed.starts_with("podman create failed: "), "{failed}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_prompt_write_gives_up_at_the_deadline_when_the_runtime_never_reads() {
+    use super::executor::send_lines;
+    let (mut writer, _reader) = tokio::io::duplex(8);
+    let lines = vec!["x".repeat(4096)];
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(3);
+    let sent = tokio::time::timeout(
+        Duration::from_secs(600),
+        send_lines(&mut writer, &lines, deadline),
+    )
+    .await;
+    assert_eq!(sent, Ok(false));
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn every_prompt_line_is_written_with_its_line_feed() {
+    use super::executor::send_lines;
+    use tokio::io::AsyncReadExt;
+    let (mut writer, mut reader) = tokio::io::duplex(1024);
+    let lines = vec!["a".to_string(), "b".to_string()];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    assert!(send_lines(&mut writer, &lines, deadline).await);
+    drop(writer);
+    let mut text = String::new();
+    reader.read_to_string(&mut text).await.unwrap();
+    assert_eq!(text, "a\nb\n");
+}
+
+#[tokio::test]
+async fn the_broker_socket_is_connectable_by_the_mapped_container_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = private_root();
+    let socket = root.path().join("s.sock");
+    let (_listener, guard) = super::executor::bind_socket(&socket).unwrap();
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o666);
+    drop(guard);
+    assert!(!socket.exists());
+}
+
+#[test]
+fn the_size_and_time_limits_are_pinned_to_their_values() {
+    assert_eq!(MAX_CALL_RESULT_BYTES, 16 * 1024);
+    assert_eq!(MAX_SUMMARY_BYTES, 64 * 1024);
+    assert_eq!(REQUEST_READ_TIMEOUT, Duration::from_secs(10));
+    assert_eq!(
+        ReadLimits::for_requests().read_timeout,
+        Duration::from_secs(10)
+    );
+    assert_eq!(MAX_REPLY_BYTES, 1_048_576);
+}
+
+#[tokio::test]
+async fn docker_is_never_used_to_run_pi() {
+    let fake = FakePodman::install_docker_only_async().await;
+    let root = private_root();
+    let mut rig = rig(two_tools());
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(5));
+    let outcome = exec.run(launch).await;
+    assert!(is_state_error(&outcome, "only under podman"));
+    assert!(!fake.calls().iter().any(|c| c.starts_with("create")));
+    assert!(!removed(&fake));
+}
+
+fn armed_broker(rig: &mut Rig) -> super::broker::ArmedBroker {
+    let plan = rig.plan();
+    let bound = BoundWorkspace::for_test(
+        rig.registry.take().unwrap(),
+        &rig.identity,
+        &rig.repo,
+        &rig.agent,
+    );
+    let broker = Broker::for_agent(
+        &rig.agent,
+        bound,
+        BrokerPolicy::default(),
+        Arc::new(RingAuditSink::default()),
+    )
+    .unwrap();
+    broker
+        .arm(&plan, &plan.exposed_capabilities.clone())
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_the_client_never_reads_times_out_after_the_request_read_timeout() {
+    use super::rpc::serve_connection;
+    use tokio::io::AsyncWriteExt;
+    let mut rig = rig(two_tools());
+    let armed = armed_broker(&mut rig);
+    let (mut client, server) = tokio::io::duplex(8);
+    let writer = tokio::spawn(async move {
+        client
+            .write_all(b"{\"tool\":\"read_file\",\"args\":{}}\n")
+            .await
+            .unwrap();
+        client
+    });
+    let limits = ReadLimits {
+        read_timeout: Duration::from_secs(7),
+        ..ReadLimits::for_requests()
+    };
+    let started = tokio::time::Instant::now();
+    let served = serve_connection(server, &armed, limits).await;
+    assert!(matches!(served, Err(RpcError::Timeout)), "{served:?}");
+    assert_eq!(started.elapsed(), Duration::from_secs(7));
+    drop(writer);
+}
+
+#[tokio::test]
+async fn a_call_runs_the_action_gate_and_its_audit_survives_the_run() {
+    use super::testing::{gated_registry_with_stub, layers_for, real_workspace, unique_task};
+    use crate::action_auditor::ActionVerdict;
+    use crate::auditor::{Reason, ReasonCode};
+    let unique = unique_task("t-exec-gate");
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    let root = private_root();
+    write_parts(
+        &fake,
+        &[prompt_ok(), turn_start(), system_start(&["run_command"])],
+        &[agent_end("stop", "done", None), settled(false)],
+    );
+    let (mut workspace, _repo) = real_workspace(unique.as_str());
+    let mut rig = rig(vec![(
+        "run_command",
+        EffectClass::Workspace,
+        ok_with(serde_json::json!("ran")),
+    )]);
+    let layers = layers_for(
+        &rig.identity,
+        TASK,
+        "example/repo",
+        ActionVerdict::block(vec![Reason::new(ReasonCode::Other, "no")]),
+    )
+    .layers;
+    let (registry, ran) =
+        gated_registry_with_stub(&workspace, &rig.identity, layers, "run_command");
+    rig.registry = Some(registry);
+    let socket = root.path().join("broker.sock");
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let (outcome, reply) = tokio::join!(exec.run(launch), async {
+        let reply = call_broker(
+            &socket,
+            r#"{"tool":"run_command","args":{"command":"true"}}"#,
+        )
+        .await;
+        std::fs::write(fake.dir().join("go"), "").unwrap();
+        reply
+    });
+    assert!(reply.contains("\"ok\":false"), "{reply}");
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(outcome.action_audit.len(), 1);
+    let result = outcome.result.unwrap();
+    assert_eq!(result.action_audit.len(), 1);
+    workspace.cleanup().unwrap();
+}
+
+#[tokio::test]
+async fn a_halt_keeps_the_tool_calls_made_before_it() {
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    let root = private_root();
+    write_parts(
+        &fake,
+        &[
+            prompt_ok(),
+            turn_start(),
+            system_start(&["read_file", "search", "t_escalate"]),
+            tool_start("c1", "read_file"),
+            tool_end("c1", "read_file", "contents"),
+        ],
+        &[],
+    );
+    let mut tools = two_tools();
+    tools.extend(escalating());
+    let mut rig = rig(tools);
+    let socket = root.path().join("broker.sock");
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let (outcome, reply) = tokio::join!(exec.run(launch), async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        call_broker(&socket, r#"{"tool":"t_escalate","args":{}}"#).await
+    });
+    assert!(reply.contains("\"halt\":true"), "{reply}");
+    match outcome.result {
+        Err(AgentError::StateError {
+            tool_calls_made, ..
+        }) => assert_eq!(tool_calls_made.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_executor_guard_gives_a_hung_removal_the_removal_limit_and_then_kills_it() {
+    let started = std::time::Instant::now();
+    let (outcome, fake, _) = failing_run(
+        &["fail-create", "hang-rm"],
+        vec![],
+        two_tools(),
+        Duration::from_secs(20),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(is_state_error(&outcome, "podman create failed"));
+    assert!(removed(&fake));
+    assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(40), "{elapsed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_error_reply_the_client_never_reads_times_out_after_the_request_read_timeout() {
+    use super::rpc::serve_connection;
+    use tokio::io::AsyncWriteExt;
+    let mut rig = rig(two_tools());
+    let armed = armed_broker(&mut rig);
+    let (mut client, server) = tokio::io::duplex(8);
+    let writer = tokio::spawn(async move {
+        client.write_all(b"\xff\xfe\n").await.unwrap();
+        client
+    });
+    let limits = ReadLimits {
+        read_timeout: Duration::from_secs(7),
+        ..ReadLimits::for_requests()
+    };
+    let started = tokio::time::Instant::now();
+    let served = serve_connection(server, &armed, limits).await;
+    assert!(matches!(served, Err(RpcError::NotUtf8)), "{served:?}");
+    assert_eq!(started.elapsed(), Duration::from_secs(7));
+    drop(writer);
 }

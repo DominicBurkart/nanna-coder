@@ -270,6 +270,25 @@ pub(crate) fn layers_for(
     Layered { layers, log }
 }
 
+pub(crate) fn gated_registry_with_stub(
+    workspace: &crate::workspace::TaskWorkspace,
+    identity: &AgentIdentity,
+    layers: crate::task::ModelFacingLayers,
+    stub: &str,
+) -> (ToolRegistry, Arc<AtomicUsize>) {
+    let mut registry = crate::task::model_facing_registry(workspace, Some(identity), layers)
+        .expect("the workspace registry builds");
+    let calls = Arc::new(AtomicUsize::new(0));
+    registry.register(Box::new(StubTool {
+        name: stub.to_string(),
+        description: format!("{stub} tool"),
+        effect: EffectClass::Workspace,
+        behavior: ok_with(serde_json::json!("ran")),
+        calls: Arc::clone(&calls),
+    }));
+    (registry, calls)
+}
+
 pub(crate) fn layers_allowing(identity: &AgentIdentity, task: &str) -> Layered {
     layers_for(
         identity,
