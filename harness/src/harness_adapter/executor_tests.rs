@@ -3,7 +3,7 @@ use super::executor::{
     clip_text, copy_args, ensure_private_dir, plan_archive, remove_args, start_args, tar_header,
     Step, Tracker, MAX_CALL_RESULT_BYTES, MAX_SUMMARY_BYTES,
 };
-use super::testing::{allowed_for, base_registry, calls, fail_with, ok_with, scoped, Behavior};
+use super::testing::{base_registry, calls, fail_with, ok_with, scoped, Behavior};
 use super::tests::{gateway, Card, SOCKET};
 use super::*;
 use crate::agent::AgentError;
@@ -42,8 +42,13 @@ struct Rig {
 }
 
 fn rig(tools: Vec<(&str, EffectClass, Behavior)>) -> Rig {
+    rig_with_subtask(tools, "Add a regression test.")
+}
+
+fn rig_with_subtask(tools: Vec<(&str, EffectClass, Behavior)>, subtask: &str) -> Rig {
     let card = Card::new("\"*\"", "workspace");
-    let allowed = allowed_for(&card.identity());
+    let allowed =
+        super::testing::allowed_for_subtask(&card.identity(), "github.com/example/repo", subtask);
     let grant = scoped(allowed.identity(), &spec_of(&tools));
     let agent =
         ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
@@ -76,19 +81,16 @@ impl Rig {
     }
 
     fn launch<'a>(&'a mut self, task: &'a str, name: &'a str, deadline: Duration) -> PiLaunch<'a> {
-        let bound = BoundWorkspace::for_test(
-            self.registry.take().unwrap(),
-            &self.identity,
-            &self.repo,
-            &self.agent,
-        );
+        let registry = self.registry.take().unwrap();
+        let bound = BoundWorkspace::for_test(registry, &self.identity, &self.repo, &self.agent);
+        let progress = Arc::clone(&self.progress);
         PiLaunch::new(
             task,
             name,
             &self.agent,
             bound,
             &self.route,
-            Arc::clone(&self.progress),
+            progress,
             deadline,
         )
     }
@@ -175,6 +177,7 @@ cp) echo $$ > "$d/cp.pid"; [ -f "$d/hang-cp" ] && exec sleep 30; cat > "$d/cp.ta
 rm) [ -f "$d/hang-rm" ] && exec sleep 60;;
 start)
   echo $$ > "$d/start.pid"
+  [ -f "$d/noread" ] && exec sleep 30
   read -r prompt
   printf '%s\n' "$prompt" > "$d/prompt.txt"
   [ -f "$d/hang" ] && exec sleep 30
@@ -218,9 +221,7 @@ async fn call_broker_bytes(socket: &Path, bytes: &[u8]) -> String {
             Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     }
-    let Some(mut stream) = stream else {
-        return String::new();
-    };
+    let mut stream = stream.expect("the broker socket came up");
     let mut reply = String::new();
     let sent = async {
         stream.write_all(bytes).await?;
@@ -234,14 +235,7 @@ async fn call_broker_bytes(socket: &Path, bytes: &[u8]) -> String {
 }
 
 fn is_state_error(outcome: &PiRunOutcome, needle: &str) -> bool {
-    let matched = matches!(&outcome.result, Err(AgentError::StateError { message, .. }) if message.contains(needle));
-    if !matched {
-        eprintln!(
-            "expected a state error containing {needle:?}, got {:?}",
-            outcome.result
-        );
-    }
-    matched
+    matches!(&outcome.result, Err(AgentError::StateError { message, .. }) if message.contains(needle))
 }
 
 fn removed(fake: &FakePodman) -> bool {
@@ -1090,14 +1084,16 @@ async fn process_gone(pid_file: &Path) -> bool {
         .trim()
         .to_string();
     let stat = PathBuf::from(format!("/proc/{pid}/stat"));
+    let mut gone = false;
     for _ in 0..100 {
-        let state = std::fs::read_to_string(&stat).unwrap_or_default();
-        if state.is_empty() || state.contains(") Z ") {
-            return true;
-        }
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let state = std::fs::read_to_string(&stat).unwrap_or_default();
+        gone = state.is_empty() || state.contains(") Z ");
+        if gone {
+            break;
+        }
     }
-    false
+    gone
 }
 
 #[tokio::test]
@@ -1412,4 +1408,192 @@ async fn an_error_reply_the_client_never_reads_times_out_after_the_request_read_
     assert!(matches!(served, Err(RpcError::NotUtf8)), "{served:?}");
     assert_eq!(started.elapsed(), Duration::from_secs(7));
     drop(writer);
+}
+
+#[test]
+fn every_refusal_cause_converts_into_a_refusal_message() {
+    use super::executor::Refused;
+    assert_eq!(Refused::from("plain".to_string()).0, "plain");
+    let plan = PlanError::Isolation(IsolationViolation::BrokerSocket {
+        path: PathBuf::from("/x"),
+    });
+    assert!(Refused::from(plan).0.starts_with("launch plan refused: "));
+    let broker = Refused::from(super::broker::BrokerError::BoundWorkspaceMismatch);
+    assert!(broker.0.starts_with("broker refused: "));
+}
+
+#[tokio::test]
+async fn a_failed_runtime_detection_converts_into_a_refusal_message() {
+    use super::executor::Refused;
+    let handle = tokio::spawn(std::future::pending::<()>());
+    handle.abort();
+    let error = handle.await.unwrap_err();
+    assert!(Refused::from(error)
+        .0
+        .starts_with("runtime detection failed: "));
+}
+
+struct WithoutEnv(&'static str);
+
+impl HarnessAdapter for WithoutEnv {
+    fn plan(&self, agent: &ResolvedAgent) -> Result<LaunchPlan, Unsupported> {
+        let mut plan = PiAdapter.plan(agent)?;
+        plan.env.retain(|(name, _)| name != self.0);
+        Ok(plan)
+    }
+}
+
+#[test]
+fn a_plan_without_the_agent_directory_or_home_cannot_be_created() {
+    let rig = rig(two_tools());
+    for missing in ["PI_CODING_AGENT_DIR", "HOME"] {
+        let plan = launch_plan(&WithoutEnv(missing), &rig.agent).unwrap();
+        let refused = PodmanPiExecutor::isolated()
+            .create_args(&plan, NAME, PiLimits::default(), Path::new("/run/s.sock"))
+            .unwrap_err();
+        assert_eq!(refused, format!("the plan has no {missing}"));
+    }
+}
+
+#[tokio::test]
+async fn a_socket_path_without_a_parent_cannot_be_bound() {
+    let refused = super::executor::bind_socket(Path::new("/")).err().unwrap();
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn a_client_that_connects_and_closes_is_served_as_nothing() {
+    use super::rpc::serve_connection;
+    let mut rig = rig(two_tools());
+    let armed = armed_broker(&mut rig);
+    let (client, server) = tokio::io::duplex(64);
+    drop(client);
+    let served = serve_connection(server, &armed, ReadLimits::for_requests()).await;
+    assert!(matches!(served, Ok(None)), "{served:?}");
+}
+
+#[test]
+fn only_oversized_and_non_utf8_requests_get_a_reply() {
+    use super::rpc::{bad_request, refusal_text};
+    assert_eq!(
+        refusal_text(&RpcError::LineTooLong { limit: 1 }),
+        Some("request too large")
+    );
+    assert_eq!(
+        refusal_text(&RpcError::TotalTooLong { limit: 1 }),
+        Some("request too large")
+    );
+    assert_eq!(
+        refusal_text(&RpcError::NotUtf8),
+        Some("bad request: not valid UTF-8")
+    );
+    assert_eq!(refusal_text(&RpcError::Timeout), None);
+    assert_eq!(refusal_text(&RpcError::Truncated), None);
+    let reply: serde_json::Value = serde_json::from_str(&bad_request("nope")).unwrap();
+    assert_eq!(reply["ok"], false);
+    assert_eq!(reply["output"], "nope");
+    assert_eq!(reply["halt"], false);
+    assert_eq!(
+        reply["kind"],
+        serde_json::to_value(ToolErrorKind::BadRequest).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_accept_failure_ends_serving_as_a_failure() {
+    use super::rpc::{serve_with, ServeEnd};
+    let mut rig = rig(two_tools());
+    let armed = armed_broker(&mut rig);
+    let accept = || async { Err::<tokio::io::DuplexStream, _>(std::io::Error::other("fd limit")) };
+    let end = serve_with(accept, &armed, ReadLimits::for_requests()).await;
+    assert!(
+        matches!(&end, ServeEnd::Failed(message) if message == "broker socket accept failed: fd limit"),
+        "{end:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_start_that_cannot_be_spawned_is_reported() {
+    let body = "echo \"$@\" >> \"${0%/*}/calls.log\"\ncase \"$1\" in cp) /bin/cat > /dev/null; /bin/rm -f \"$0\";; esac";
+    let fake = FakePodman::install_isolated_async("podman", body).await;
+    let root = private_root();
+    let mut rig = rig(two_tools());
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let outcome = exec.run(launch).await;
+    assert!(is_state_error(&outcome, "podman start:"));
+    assert!(fake.calls().iter().any(|c| c.starts_with("cp ")));
+}
+
+#[tokio::test]
+async fn a_runtime_that_never_reads_the_prompt_is_cut_off_at_the_deadline() {
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    std::fs::write(fake.dir().join("noread"), "").unwrap();
+    let root = private_root();
+    let mut rig = rig_with_subtask(two_tools(), &"x".repeat(300_000));
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(2));
+    let outcome = exec.run(launch).await;
+    assert!(is_state_error(&outcome, "writing the prompt failed"));
+    assert!(removed(&fake));
+}
+
+#[tokio::test]
+async fn runtime_detection_does_not_block_the_async_thread() {
+    let fake = FakePodman::install_scripted_async(
+        "case \"$1\" in --version) sleep 1;; create) exit 1;; esac",
+    )
+    .await;
+    let root = private_root();
+    let mut rig = rig(two_tools());
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let ticker = {
+        let ticks = Arc::clone(&ticks);
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    };
+    let outcome = tokio::select! {
+        outcome = exec.run(launch) => outcome,
+        _ = ticker => unreachable!("the ticker never ends"),
+    };
+    assert!(is_state_error(&outcome, "podman create failed"));
+    assert!(ticks.load(Ordering::SeqCst) >= 10, "{ticks:?}");
+    assert!(removed(&fake));
+}
+
+#[tokio::test]
+async fn a_panic_inside_the_run_still_removes_the_container() {
+    use futures::FutureExt;
+    let fake = FakePodman::install_scripted_async(SCRIPT).await;
+    let root = private_root();
+    write_parts(
+        &fake,
+        &[
+            prompt_ok(),
+            turn_start(),
+            system_start(&["read_file", "search"]),
+        ],
+        &[],
+    );
+    let panicking: Behavior = Arc::new(|| panic!("the tool panicked"));
+    let mut rig = rig(vec![
+        ("read_file", EffectClass::None, panicking),
+        ("search", EffectClass::None, ok_with(serde_json::json!(2))),
+    ]);
+    let socket = root.path().join("broker.sock");
+    let exec = executor(root.path());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let (outcome, reply) = tokio::join!(
+        std::panic::AssertUnwindSafe(exec.run(launch)).catch_unwind(),
+        call_broker(&socket, r#"{"tool":"read_file","args":{}}"#)
+    );
+    assert!(outcome.is_err(), "the run should have panicked");
+    assert!(reply.is_empty(), "{reply}");
+    assert!(removed(&fake));
 }

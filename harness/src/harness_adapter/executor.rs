@@ -1,8 +1,8 @@
-use super::broker::{ArmedBroker, Broker};
+use super::broker::{ArmedBroker, Broker, BrokerError};
 use super::rpc::{serve_listener, LineReader, ReadLimits, ServeEnd};
 use super::{
     launch_plan, BrokerPolicy, CheckedPlan, PiAdapter, PiExecutor, PiLaunch, PiRunOutcome,
-    RingAuditSink, BROKER_SOCKET_CONTAINER_PATH,
+    PlanError, RingAuditSink, BROKER_SOCKET_CONTAINER_PATH,
 };
 use crate::agent::{AgentError, AgentRunResult, AgentState};
 use crate::container::{detect_runtime, ContainerRuntime};
@@ -36,6 +36,14 @@ const RESERVED_NETWORKS: [&str; 8] = [
     "default",
     "podman",
 ];
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('-') && name.chars().all(is_name_char)
+}
 
 #[doc = "A refused network name."]
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -71,12 +79,7 @@ impl PiNetwork {
     #[doc = "Validate a network name. Reserved built-in modes are refused."]
     pub fn named(name: impl Into<String>) -> Result<Self, PiNetworkError> {
         let name = name.into();
-        let plain = !name.is_empty()
-            && !name.starts_with('-')
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-        if !plain {
+        if !is_plain_name(&name) {
             return Err(PiNetworkError::Invalid(name));
         }
         if RESERVED_NETWORKS.contains(&name.to_ascii_lowercase().as_str()) {
@@ -679,58 +682,106 @@ pub(super) async fn send_lines<W: tokio::io::AsyncWrite + Unpin>(
     true
 }
 
-#[async_trait::async_trait]
-impl PiExecutor for PodmanPiExecutor {
-    async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome {
+pub(super) struct Refused(pub(super) String);
+
+impl From<String> for Refused {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl From<PlanError> for Refused {
+    fn from(error: PlanError) -> Self {
+        Self(format!("launch plan refused: {error}"))
+    }
+}
+
+impl From<BrokerError> for Refused {
+    fn from(error: BrokerError) -> Self {
+        Self(format!("broker refused: {error}"))
+    }
+}
+
+impl From<tokio::task::JoinError> for Refused {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self(format!("runtime detection failed: {error}"))
+    }
+}
+
+struct Started {
+    session: Session,
+    runtime: ContainerRuntime,
+    name: String,
+    create: Vec<String>,
+    archive: Vec<u8>,
+    broker: Broker,
+    listener: tokio::net::UnixListener,
+    deadline: Instant,
+    guard: RemoveGuard,
+    socket_guard: SocketGuard,
+}
+
+impl Started {
+    async fn go(self) -> PiRunOutcome {
+        let Started {
+            session,
+            runtime,
+            name,
+            create,
+            archive,
+            broker,
+            listener,
+            deadline,
+            guard,
+            socket_guard,
+        } = self;
+        let outcome = session
+            .drive(&runtime, &name, create, archive, broker, listener, deadline)
+            .await;
+        drop(guard);
+        drop(socket_guard);
+        outcome
+    }
+}
+
+impl PodmanPiExecutor {
+    async fn start(&self, launch: PiLaunch<'_>) -> Result<Started, Refused> {
         let deadline = Instant::now() + launch.deadline();
         let name = launch.container_name().to_string();
         let launch_task_id = launch.task_id().to_string();
         if name != super::pi_container_name(launch.task_id()) {
-            return refusal(format!("container name `{name}` is not the task's name"));
+            return Err(Refused(format!(
+                "container name `{name}` is not the task's name"
+            )));
         }
         let agent = launch.agent().clone();
         let limits = launch.route().limits();
         let progress = Arc::clone(launch.progress());
         let wall = launch.deadline();
-        let plan = match launch_plan(&PiAdapter, &agent) {
-            Ok(plan) => plan,
-            Err(e) => return refusal(format!("launch plan refused: {e}")),
-        };
+        let plan = launch_plan(&PiAdapter, &agent)?;
         let socket = self.host_socket(&plan.broker_socket);
-        let create = match self.create_args(&plan, &name, limits, &socket) {
-            Ok(args) => args,
-            Err(e) => return refusal(e),
-        };
-        let archive = match plan_archive(&plan) {
-            Ok(archive) => archive,
-            Err(e) => return refusal(e),
-        };
-        let broker = match Broker::for_agent(
-            &agent,
-            launch.into_binding(),
-            BrokerPolicy::default(),
-            Arc::new(RingAuditSink::default()),
-        ) {
-            Ok(broker) => broker,
-            Err(e) => return refusal(format!("broker refused: {e}")),
-        };
+        let create = self.create_args(&plan, &name, limits, &socket)?;
+        let archive = plan_archive(&plan)?;
+        let binding = launch.into_binding();
+        let policy = BrokerPolicy::default();
+        let sink = Arc::new(RingAuditSink::default());
+        let broker = Broker::for_agent(&agent, binding, policy, sink)?;
         if broker.task_id().0 != launch_task_id {
-            return refusal("the broker was bound to another task".to_string());
+            return Err(Refused("the broker was bound to another task".to_string()));
         }
-        let runtime = match tokio::task::spawn_blocking(detect_runtime).await {
-            Ok(ContainerRuntime::Podman) => ContainerRuntime::Podman,
-            Ok(ContainerRuntime::Docker) => {
-                return refusal("pi runs only under podman; docker is not accepted".to_string())
+        let runtime = match tokio::task::spawn_blocking(detect_runtime).await? {
+            ContainerRuntime::Podman => ContainerRuntime::Podman,
+            ContainerRuntime::Docker => {
+                return Err(Refused(
+                    "pi runs only under podman; docker is not accepted".to_string(),
+                ))
             }
-            Ok(ContainerRuntime::None) => {
-                return refusal("no container runtime is available".to_string())
+            ContainerRuntime::None => {
+                return Err(Refused("no container runtime is available".to_string()))
             }
-            Err(e) => return refusal(format!("runtime detection failed: {e}")),
         };
-        let (listener, _socket_guard) = match bind_socket(&socket) {
-            Ok(bound) => bound,
-            Err(e) => return refusal(format!("broker socket {}: {e}", socket.display())),
-        };
+        let (listener, socket_guard) = bind_socket(&socket)
+            .map_err(|e| Refused(format!("broker socket {}: {e}", socket.display())))?;
         let guard = RemoveGuard::arm(&runtime, &name);
         let max_turns = agent.limits().max_iterations;
         let session = Session {
@@ -738,11 +789,28 @@ impl PiExecutor for PodmanPiExecutor {
             tracker: Tracker::new(max_turns, progress),
             wall,
         };
-        let outcome = session
-            .drive(&runtime, &name, create, archive, broker, listener, deadline)
-            .await;
-        drop(guard);
-        outcome
+        Ok(Started {
+            session,
+            runtime,
+            name,
+            create,
+            archive,
+            broker,
+            listener,
+            deadline,
+            guard,
+            socket_guard,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PiExecutor for PodmanPiExecutor {
+    async fn run(&self, launch: PiLaunch<'_>) -> PiRunOutcome {
+        match self.start(launch).await {
+            Ok(started) => started.go().await,
+            Err(Refused(message)) => refusal(message),
+        }
     }
 }
 
@@ -792,9 +860,11 @@ impl Session {
             Ok(child) => child,
             Err(e) => return self.finish(Ended::Failed(format!("podman start: {e}")), None),
         };
-        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            return self.finish(Ended::Failed("podman start has no pipes".to_string()), None);
-        };
+        let mut stdin = child.stdin.take().expect("podman start has a piped stdin");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("podman start has a piped stdout");
         if !send_lines(&mut stdin, &self.plan.stdin, deadline).await {
             return self.finish(Ended::Failed("writing the prompt failed".to_string()), None);
         }

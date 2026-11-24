@@ -56,20 +56,20 @@ mod fake {
         }
 
         pub(crate) async fn install_docker_only_async() -> Self {
+            Self::install_isolated_async("docker", "echo \"$@\" >> \"${0%/*}/calls.log\"\nexit 0")
+                .await
+        }
+
+        pub(crate) async fn install_isolated_async(name: &str, body: &str) -> Self {
             let guard = PATH_LOCK.lock().await;
             let dir = TempDir::new().unwrap();
-            let log = dir.path().join("calls.log");
-            let bin = dir.path().join("docker");
-            std::fs::write(
-                &bin,
-                format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
-            )
-            .unwrap();
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
             let mut perms = std::fs::metadata(&bin).unwrap().permissions();
             std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
             std::fs::set_permissions(&bin, perms).unwrap();
             settle_executable(&bin);
-            let _ = std::fs::remove_file(&log);
+            let _ = std::fs::remove_file(dir.path().join("calls.log"));
             let old_path = std::env::var_os("PATH");
             std::env::set_var("PATH", dir.path());
             Self {

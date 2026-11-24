@@ -233,9 +233,39 @@ assert!(Endpoint::in_container_relay(0).is_err());
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
 pub(super) enum ServeEnd {
     Halted(super::HaltReason),
     Failed(String),
+}
+
+#[cfg(unix)]
+pub(super) fn refusal_text(error: &RpcError) -> Option<&'static str> {
+    match error {
+        RpcError::LineTooLong { .. } | RpcError::TotalTooLong { .. } => Some("request too large"),
+        RpcError::NotUtf8 => Some("bad request: not valid UTF-8"),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn bad_request(message: &str) -> String {
+    let response = super::BrokerResponse {
+        ok: false,
+        output: serde_json::json!(message),
+        kind: Some(super::ToolErrorKind::BadRequest),
+        halt: false,
+    };
+    serde_json::to_string(&response).expect("broker responses are plain JSON")
+}
+
+#[cfg(unix)]
+async fn reply_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    text: &str,
+    wait: Duration,
+) -> Result<(), RpcError> {
+    write_reply(writer, text, MAX_REPLY_BYTES, wait).await
 }
 
 #[cfg(unix)]
@@ -253,13 +283,7 @@ where
         Ok(None) => Ok(None),
         Ok(Some(line)) => {
             let (reply, halt) = broker.handle_line_with_halt(&line).await;
-            let written = write_reply(
-                &mut write_half,
-                &reply,
-                MAX_REPLY_BYTES,
-                limits.read_timeout,
-            )
-            .await;
+            let written = reply_line(&mut write_half, &reply, limits.read_timeout).await;
             match (written, halt) {
                 (_, Some(reason)) => Ok(Some(reason)),
                 (Ok(()), None) => Ok(None),
@@ -267,30 +291,38 @@ where
             }
         }
         Err(error) => {
-            let message = match error {
-                RpcError::LineTooLong { .. } | RpcError::TotalTooLong { .. } => {
-                    Some("request too large")
-                }
-                RpcError::NotUtf8 => Some("bad request: not valid UTF-8"),
-                _ => None,
-            };
-            if let Some(message) = message {
-                let reply = serde_json::to_string(&super::BrokerResponse {
-                    ok: false,
-                    output: serde_json::json!(message),
-                    kind: Some(super::ToolErrorKind::BadRequest),
-                    halt: false,
-                })
-                .expect("broker responses are plain JSON");
-                let _ = write_reply(
-                    &mut write_half,
-                    &reply,
-                    MAX_REPLY_BYTES,
-                    limits.read_timeout,
-                )
-                .await;
+            if let Some(message) = refusal_text(&error) {
+                let text = bad_request(message);
+                let _ = reply_line(&mut write_half, &text, limits.read_timeout).await;
             }
             Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn accept_failed(error: std::io::Error) -> ServeEnd {
+    ServeEnd::Failed(format!("broker socket accept failed: {error}"))
+}
+
+#[cfg(unix)]
+pub(super) async fn serve_with<S, F, Fut>(
+    mut accept: F,
+    broker: &super::broker::ArmedBroker,
+    limits: ReadLimits,
+) -> ServeEnd
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<S>>,
+{
+    loop {
+        let stream = match accept().await {
+            Ok(stream) => stream,
+            Err(error) => return accept_failed(error),
+        };
+        if let Ok(Some(reason)) = serve_connection(stream, broker, limits).await {
+            return ServeEnd::Halted(reason);
         }
     }
 }
@@ -301,13 +333,6 @@ pub(super) async fn serve_listener(
     broker: std::sync::Arc<super::broker::ArmedBroker>,
     limits: ReadLimits,
 ) -> ServeEnd {
-    loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(error) => return ServeEnd::Failed(format!("broker socket accept failed: {error}")),
-        };
-        if let Ok(Some(reason)) = serve_connection(stream, &broker, limits).await {
-            return ServeEnd::Halted(reason);
-        }
-    }
+    let accept = || async { listener.accept().await.map(|(stream, _)| stream) };
+    serve_with(accept, &broker, limits).await
 }
