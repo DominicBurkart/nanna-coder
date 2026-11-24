@@ -309,6 +309,10 @@ impl TaskWorkspace {
         &self.protected
     }
 
+    pub(crate) fn container_handle(&self) -> Option<&Arc<ContainerHandle>> {
+        self.container_handle.as_ref()
+    }
+
     pub async fn create_with_container(
         source_repo: &Path,
         task_id: &str,
@@ -3712,6 +3716,64 @@ mod tests {
             let config_dir = config_dir.to_string_lossy().into_owned();
             assert!(args.iter().all(|a| !a.contains(&config_dir)), "{args:?}");
         }
+        ws.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_the_verifier_declaration_is_mounted_read_only_into_the_dev_container() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
+        let source = TempDir::new().unwrap();
+        init_git_repo(source.path());
+        std::fs::create_dir_all(source.path().join(".nanna")).unwrap();
+        std::fs::write(
+            source.path().join(".nanna/verify.toml"),
+            "[[check]]\nname = \"a\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        git_cmd(source.path()).args(["add", "."]).output().unwrap();
+        git_cmd(source.path())
+            .args(["commit", "-m", "declare"])
+            .output()
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+
+        let mut ws = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &unique_id("ws-verify-ro"),
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Disabled,
+            None,
+            move |config: ContainerConfig| async move {
+                *sink.lock().unwrap() = Some(config);
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = seen.lock().unwrap().clone().unwrap();
+        let root = ws.workspace_path.clone();
+        assert!(root.join(".nanna/verify.toml").is_file());
+        let wanted = ReadOnlyMount::new(root.join(".nanna"), "/workspace/.nanna");
+        assert!(config.read_only_mounts.contains(&wanted));
+        let args = config.run_args(&ContainerRuntime::Podman, "mock-image:latest");
+        let flag = wanted.run_arg();
+        assert!(flag.ends_with(":/workspace/.nanna:ro"), "{flag}");
+        let writable = args
+            .iter()
+            .position(|a| a.ends_with(":/workspace:z"))
+            .unwrap();
+        let read_only = args.iter().position(|a| *a == flag).unwrap();
+        assert!(read_only > writable, "{args:?}");
+        assert!(args.contains(&"--network=none".to_string()), "{args:?}");
         ws.cleanup().unwrap();
     }
 
