@@ -13,7 +13,7 @@
 13 executor.rs '            format!("--memory={}m", limits.memory_mb),' -> '            format!("--memory={}m", limi': KILLED
 14 executor.rs '            format!("--pids-limit={}", limits.pids),' -> '            format!("--pids-limit={}", l': KILLED
 15 executor.rs '        super::route::off_runtime(|| {\n            super::ro' -> '        let _ = &self.name;': KILLED
-16 executor.rs '        drop(guard);\n        outcome' -> '        std::mem::forget(guard);\n       ': KILLED
+16 executor.rs '        drop(guard);\n        drop(socket_guard);' -> '        std::mem::forget(guard);\n       ': KILLED
 17 executor.rs '["rm", "-f", "--volumes", name]' -> '["rm", "--volumes", name]': KILLED
 18 executor.rs '_ = tokio::time::sleep_until(deadline) => {' -> '_ = std::future::pending::<()>() => {': KILLED
 19 executor.rs 'let deadline = Instant::now() + launch.deadline();' -> 'let deadline = Instant::now() + launch.d': KILLED
@@ -67,7 +67,7 @@
 67 executor.rs 'is_dir && owner == effective && mode & 0o077 == 0' -> 'is_dir && mode & 0o077 == 0': KILLED
 68 executor.rs 'is_dir && owner == effective && mode & 0o077 == 0' -> 'is_dir && owner == effective': KILLED
 69 executor.rs 'is_dir && owner == effective && mode & 0o077 == 0' -> 'is_dir && owner == effective && mode & 0': KILLED
-70 executor.rs 'Ok(ContainerRuntime::Podman) => ContainerRuntime::Podman,' -> 'Ok(ContainerRuntime::Podman | ContainerR': KILLED
+70 executor.rs '            ContainerRuntime::Podman => ContainerRuntime::Po' -> '            ContainerRuntime::Podman | C': KILLED
 71 executor.rs 'std::fs::Permissions::from_mode(0o666)' -> 'std::fs::Permissions::from_mode(0o600)': KILLED
 72 executor.rs 'std::fs::Permissions::from_mode(0o666)' -> 'std::fs::Permissions::from_mode(0o777)': KILLED
 73 executor.rs '        .stderr(Stdio::null())\n        .kill_on_drop(true);' -> '        .stderr(Stdio::null())\n        .': KILLED
@@ -83,8 +83,21 @@
 83 executor.rs '                super::route::REMOVE_LIMIT,' -> '                std::time::Duration::fro': KILLED
 84 rpc.rs 'tokio::time::timeout(self.limits.read_timeout, self.inner.re' -> 'tokio::time::timeout(self.limits.read_ti': KILLED
 85 rpc.rs '    tokio::time::timeout(timeout, async {' -> '    tokio::time::timeout(timeout * 2, as': KILLED
-86 rpc.rs '                MAX_REPLY_BYTES,\n                limits.read' -> '                MAX_REPLY_BYTES,\n       ': KILLED
-87 rpc.rs '                    MAX_REPLY_BYTES,\n                    lim' -> '                    MAX_REPLY_BYTES,\n   ': KILLED
+86 rpc.rs 'let written = reply_line(&mut write_half, &reply, limits.rea' -> 'let written = reply_line(&mut write_half': KILLED
+87 rpc.rs 'let _ = reply_line(&mut write_half, &text, limits.read_timeo' -> 'let _ = reply_line(&mut write_half, &tex': KILLED
 88 rpc.rs 'pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_se' -> 'pub const REQUEST_READ_TIMEOUT: Duration': KILLED
 89 route.rs 'pub(super) const REMOVE_LIMIT: Duration = Duration::from_sec' -> 'pub(super) const REMOVE_LIMIT: Duration ': KILLED
 90 route.rs 'bounded_status(runtime.command(), &args, REMOVE_LIMIT);' -> 'bounded_status(runtime.command(), &args,': KILLED
+91 executor.rs "!name.is_empty() && !name.starts_with('-') && name.chars().a" -> "!name.starts_with('-') && name.chars().a": KILLED
+92 executor.rs "!name.is_empty() && !name.starts_with('-') && name.chars().a" -> '!name.is_empty() && name.chars().all(is_': KILLED
+93 executor.rs "!name.is_empty() && !name.starts_with('-') && name.chars().a" -> "!name.is_empty() && !name.starts_with('-": KILLED
+94 executor.rs 'Self(format!("launch plan refused: {error}"))' -> 'Self(format!("refused: {error}"))': KILLED
+95 executor.rs 'Self(format!("broker refused: {error}"))' -> 'Self(format!("refused: {error}"))': KILLED
+96 executor.rs 'Self(format!("runtime detection failed: {error}"))' -> 'Self(format!("failed: {error}"))': KILLED
+97 executor.rs '.expect("podman start has a piped stdin")' -> '.expect("")': SURVIVED
+98 rpc.rs 'RpcError::NotUtf8 => Some("bad request: not valid UTF-8"),' -> 'RpcError::NotUtf8 => None,': KILLED
+99 rpc.rs 'RpcError::LineTooLong { .. } | RpcError::TotalTooLong { .. }' -> 'RpcError::LineTooLong { .. } => Some("re': KILLED
+100 rpc.rs '        halt: false,\n    };\n    serde_json::to_string(&respo' -> '        halt: true,\n    };\n    serde_jso': KILLED
+101 rpc.rs '        kind: Some(super::ToolErrorKind::BadRequest),\n      ' -> '        kind: Some(super::ToolErrorKind:': KILLED
+102 rpc.rs 'ServeEnd::Failed(format!("broker socket accept failed: {erro' -> 'ServeEnd::Failed(format!("accept failed:': KILLED
+103 executor.rs 'match tokio::task::spawn_blocking(detect_runtime).await? {' -> 'match Ok::<_, tokio::task::JoinError>(de': KILLED

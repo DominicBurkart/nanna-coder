@@ -1,7 +1,7 @@
 Reading executor-slice3-results.txt. The file is written by executor-slice3-mutants.py and is not edited; a full re-run on the committed tree reproduces it.
 
-All 90 mutants over executor.rs, rpc.rs and route.rs are KILLED. A KILLED (hang) row means the mutated build made a test hang and the runner's 900 s limit ended it; the hang is the kill. There is no survivor and no COMPILE ERROR row.
+All mutants over executor.rs, rpc.rs and route.rs are KILLED except row 97. A KILLED (hang) row means the mutated build made a test hang and the runner's 900 s limit ended it; the hang is the kill. There is no COMPILE ERROR row.
 
-Two earlier survivors were wrong to call equivalent and are now killed: the action audit pass-through (a gated run_command call reaches the broker with the default policy, and the audit of that call is asserted on the outcome) and the socket directory owner check (the decision is the pure is_private function with a truth table).
+Row 97 survives and is equivalent. It changes only the message of the expect() on the piped stdin of `podman start`. The branch it guards runs only if take() returns None, and take() is called once on a child spawned with Stdio::piped(), so the branch cannot execute; a different panic message on an unreachable branch cannot change any behaviour a test can observe.
 
-The prompt-write deadline is killed through send_lines over a tiny duplex that never reads, with a virtual clock.
+Earlier tables wrongly called two survivors equivalent and they are now killed: the action audit pass-through (a gated run_command call reaches the broker with the default policy, and the audit of that call is asserted on the outcome) and the socket directory owner check (the decision is the pure is_private function with a truth table). The prompt-write deadline is killed by a runtime that never reads a 300 kB prompt. Runtime detection staying off the async thread is killed by a slow `--version` against a concurrent ticker on a current-thread runtime.
