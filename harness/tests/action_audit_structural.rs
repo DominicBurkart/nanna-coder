@@ -676,7 +676,7 @@ fn action_gates_are_built_only_at_the_pinned_production_sites() {
             "task.rs: action_policy_gate_routed: ActionGate::new",
             "task.rs: action_policy_gate_routed: action_policy_gate_routed",
             "task.rs: default_action_gate: ActionGate::new",
-            "task.rs: model_facing_registry: with_action_gate",
+            "task.rs: with_model_facing_layers: with_action_gate",
             "task.rs: with_action_gate: with_action_gate",
             "task.rs: with_action_policy: action_policy_gate",
             "task.rs: with_action_policy: with_action_gate",
