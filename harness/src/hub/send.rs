@@ -167,7 +167,7 @@ pub(super) fn scope_of(rec: &SessionRecord) -> RecipientScope {
         max_effect: rec.max_effect,
         tools: rec.tools.clone(),
         write_paths: rec.write_paths.clone(),
-        read_paths: None,
+        read_paths: rec.read_paths.for_recipient(),
     }
 }
 
@@ -591,7 +591,7 @@ mod tests {
     use crate::hub::message::{MessageKind, MessageReach};
     use crate::hub::oracle::{GitObjectOracle, GitRunner};
     use crate::hub::registry::SessionRegistry;
-    use crate::hub::session::SessionStatus;
+    use crate::hub::session::{ReadScope, SessionStatus};
     use crate::hub::store::{
         HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, Retention,
         StoreError,
@@ -1047,6 +1047,83 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct ReadsSeen {
+        seen: Mutex<Vec<Option<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl MessageAuditor for ReadsSeen {
+        fn name(&self) -> &str {
+            "reads-seen"
+        }
+
+        async fn review_outbound(
+            &self,
+            r: &OutboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            for scope in r.recipients {
+                self.seen.lock().unwrap().push(scope.read_paths.clone());
+            }
+            Ok(MessageVerdict::Deliver)
+        }
+
+        async fn review_inbound(
+            &self,
+            _r: &InboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            Ok(MessageVerdict::Deliver)
+        }
+    }
+
+    #[test]
+    fn a_recipient_reads_unknown_and_unrestricted_as_unrestricted_and_a_list_as_itself() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let mut record = world.sessions.get(b.session().clone()).unwrap().unwrap();
+        record.read_paths = ReadScope::Unknown;
+        assert_eq!(scope_of(&record).read_paths, None);
+        record.read_paths = ReadScope::Unrestricted;
+        assert_eq!(scope_of(&record).read_paths, None);
+        record.read_paths = ReadScope::Paths(vec!["docs/**".into()]);
+        assert_eq!(
+            scope_of(&record).read_paths,
+            Some(vec!["docs/**".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_outbound_review_sees_each_recipients_recorded_read_scope() {
+        let listed = ReadScope::Paths(vec!["docs/**".into()]);
+        let rows = [
+            (ReadScope::Unknown, None),
+            (ReadScope::Unrestricted, None),
+            (listed, Some(vec!["docs/**".to_string()])),
+        ];
+        for (scope, expected) in rows {
+            let world = World::memory();
+            let a = world.bind("a", None, MessageReach::Root);
+            let b = world.bind("b", None, MessageReach::Root);
+            world
+                .sessions
+                .update(
+                    b.session().clone(),
+                    Box::new(move |mut record| {
+                        record.read_paths = scope;
+                        Some(record)
+                    }),
+                )
+                .unwrap();
+            let spy = Arc::new(ReadsSeen::default());
+            let shared: Arc<dyn MessageAuditor> = spy.clone();
+            let hub = world.hub_with(Arc::new(shared), HubLimits::default());
+            hub.review_send(&a, &req(&b, "x")).await.unwrap();
+            hub.review_note(&a, "all good").await.unwrap();
+            assert_eq!(spy.name(), "reads-seen");
+            assert_eq!(*spy.seen.lock().unwrap(), vec![expected.clone(), expected]);
         }
     }
 

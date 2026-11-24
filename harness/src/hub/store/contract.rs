@@ -43,6 +43,7 @@ pub(super) fn session(
         max_effect: crate::effects::EffectClass::Workspace,
         tools: vec!["read_file".into()],
         write_paths: vec!["src".into()],
+        read_paths: crate::hub::session::ReadScope::Unrestricted,
         subtask: "subtask".into(),
         note: None,
         result_summary: None,

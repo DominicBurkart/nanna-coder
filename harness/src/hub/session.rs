@@ -85,7 +85,7 @@ pub enum SessionKind {
 /// use chrono::Utc;
 /// use harness::effects::EffectClass;
 /// use harness::hub::lineage::{Lineage, RootId, SessionId};
-/// use harness::hub::session::{SessionKind, SessionRecord, SessionStatus};
+/// use harness::hub::session::{ReadScope, SessionKind, SessionRecord, SessionStatus};
 /// use harness::identity::DevLoop;
 /// use harness::task::TaskId;
 /// use uuid::Uuid;
@@ -101,6 +101,7 @@ pub enum SessionKind {
 ///     max_effect: EffectClass::Workspace,
 ///     tools: vec!["read_file".into()],
 ///     write_paths: vec!["src".into()],
+///     read_paths: ReadScope::Unrestricted,
 ///     subtask: "fix the bug".into(),
 ///     note: None,
 ///     result_summary: None,
@@ -125,6 +126,8 @@ pub struct SessionRecord {
     pub max_effect: EffectClass,
     pub tools: Vec<String>,
     pub write_paths: Vec<String>,
+    #[serde(default, deserialize_with = "lenient_read_scope")]
+    pub read_paths: ReadScope,
     pub subtask: String,
     #[serde(default, deserialize_with = "lenient_note")]
     pub note: Option<Summary>,
@@ -134,6 +137,100 @@ pub struct SessionRecord {
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// What a session may read, recorded when it is registered from its audited identity card.
+///
+/// `Unknown` is the explicit serde default: a record written before read paths were recorded, or
+/// one whose stored value is unreadable, loads as `Unknown`. It is never read as `Unrestricted`.
+/// The privilege comparison in section 8.2 fails closed in both directions: a sender whose scope
+/// is `Unknown` has no read authority at all, and a recipient whose scope is `Unknown` is treated
+/// as able to read everything. `Debug` prints the number of paths and never a path.
+///
+/// ```
+/// use harness::hub::session::ReadScope;
+///
+/// assert_eq!(ReadScope::default(), ReadScope::Unknown);
+/// let listed = ["docs/**".to_string()];
+/// assert_eq!(ReadScope::of_card(None), ReadScope::Unrestricted);
+/// assert_eq!(ReadScope::of_card(Some(&listed)), ReadScope::Paths(listed.to_vec()));
+/// assert_eq!(ReadScope::Unknown.for_sender(), Some(Vec::new()));
+/// assert_eq!(ReadScope::Unknown.for_recipient(), None);
+/// assert_eq!(format!("{:?}", ReadScope::Paths(listed.to_vec())), "Paths(1)");
+/// ```
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadScope {
+    #[default]
+    Unknown,
+    Unrestricted,
+    Paths(Vec<String>),
+}
+
+impl ReadScope {
+    /// The scope an audited card declares: no `scope.read_paths` means unrestricted reads.
+    ///
+    /// ```
+    /// use harness::hub::session::ReadScope;
+    ///
+    /// assert_eq!(ReadScope::of_card(None), ReadScope::Unrestricted);
+    /// assert_eq!(ReadScope::of_card(Some(&[])), ReadScope::Paths(Vec::new()));
+    /// ```
+    pub fn of_card(read_paths: Option<&[String]>) -> Self {
+        read_paths.map_or(ReadScope::Unrestricted, |paths| {
+            ReadScope::Paths(paths.to_vec())
+        })
+    }
+
+    /// The read set as the sender side of the privilege comparison: `None` covers any recipient,
+    /// `Unknown` is the empty set (no authority).
+    ///
+    /// ```
+    /// use harness::hub::session::ReadScope;
+    ///
+    /// assert_eq!(ReadScope::Unrestricted.for_sender(), None);
+    /// assert_eq!(ReadScope::Unknown.for_sender(), Some(Vec::new()));
+    /// ```
+    pub fn for_sender(&self) -> Option<Vec<String>> {
+        match self {
+            ReadScope::Unknown => Some(Vec::new()),
+            ReadScope::Unrestricted => None,
+            ReadScope::Paths(paths) => Some(paths.clone()),
+        }
+    }
+
+    /// The read set as the recipient side of the privilege comparison: `None` means it may read
+    /// anything, which is how `Unknown` counts.
+    ///
+    /// ```
+    /// use harness::hub::session::ReadScope;
+    ///
+    /// assert_eq!(ReadScope::Unknown.for_recipient(), None);
+    /// assert_eq!(ReadScope::Paths(vec!["a".into()]).for_recipient(), Some(vec!["a".to_string()]));
+    /// ```
+    pub fn for_recipient(&self) -> Option<Vec<String>> {
+        match self {
+            ReadScope::Unknown | ReadScope::Unrestricted => None,
+            ReadScope::Paths(paths) => Some(paths.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadScope::Unknown => f.write_str("Unknown"),
+            ReadScope::Unrestricted => f.write_str("Unrestricted"),
+            ReadScope::Paths(paths) => write!(f, "Paths({})", paths.len()),
+        }
+    }
+}
+
+pub(crate) fn lenient_read_scope<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ReadScope, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(ReadScope::deserialize(raw).unwrap_or_default())
 }
 
 pub(crate) fn lenient_note<'de, D: Deserializer<'de>>(
@@ -169,6 +266,7 @@ mod tests {
     use super::*;
     use crate::hub::lineage::RootId;
     use crate::task::TaskId;
+    use proptest::prelude::*;
 
     fn record() -> SessionRecord {
         let now = Utc::now();
@@ -182,6 +280,7 @@ mod tests {
             max_effect: EffectClass::Workspace,
             tools: vec!["tool-SECRET".into()],
             write_paths: vec!["path-SECRET".into()],
+            read_paths: ReadScope::Paths(vec!["read-SECRET".into()]),
             subtask: "subtask-SECRET".into(),
             note: Some(Summary::compose("coder", "running", "note-SECRET")),
             result_summary: Some("result-SECRET".into()),
@@ -278,5 +377,228 @@ mod tests {
             serde_json::to_string(&SessionKind::Librarian).unwrap(),
             "\"librarian\""
         );
+    }
+    fn paths(list: &[&str]) -> ReadScope {
+        ReadScope::Paths(list.iter().map(|path| path.to_string()).collect())
+    }
+
+    fn all_states() -> Vec<ReadScope> {
+        vec![
+            ReadScope::Unknown,
+            ReadScope::Unrestricted,
+            paths(&[]),
+            paths(&["a"]),
+            paths(&["a", "b"]),
+            paths(&["b"]),
+        ]
+    }
+
+    fn scope_with(read_paths: Option<Vec<String>>) -> crate::action_auditor::RecipientScope {
+        crate::action_auditor::RecipientScope {
+            session: SessionId::from_task(TaskId("x".into())),
+            identity: "x".into(),
+            max_effect: EffectClass::None,
+            tools: Vec::new(),
+            write_paths: Vec::new(),
+            read_paths,
+        }
+    }
+
+    fn asymmetric(sender: &ReadScope, recipient: &ReadScope) -> bool {
+        crate::action_auditor::is_privilege_asymmetric(
+            &scope_with(recipient.for_recipient()),
+            &scope_with(sender.for_sender()),
+        )
+    }
+
+    #[test]
+    fn the_explicit_default_of_a_read_scope_is_unknown_never_unrestricted() {
+        assert_eq!(ReadScope::default(), ReadScope::Unknown);
+    }
+
+    #[test]
+    fn a_record_written_before_read_paths_existed_loads_as_unknown() {
+        let mut legacy = serde_json::to_value(record()).unwrap();
+        legacy.as_object_mut().unwrap().remove("read_paths");
+        assert!(legacy.get("read_paths").is_none());
+        let loaded: SessionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.read_paths, ReadScope::Unknown);
+        assert_eq!(loaded.identity, record().identity);
+    }
+
+    #[test]
+    fn every_read_scope_round_trips_through_a_record_in_snake_case() {
+        for scope in all_states() {
+            let mut original = record();
+            original.read_paths = scope;
+            let json = serde_json::to_string(&original).unwrap();
+            let back: SessionRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, original);
+        }
+        assert_eq!(
+            serde_json::to_string(&ReadScope::Unknown).unwrap(),
+            "\"unknown\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReadScope::Unrestricted).unwrap(),
+            "\"unrestricted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&paths(&["a"])).unwrap(),
+            "{\"paths\":[\"a\"]}"
+        );
+    }
+
+    #[test]
+    fn a_garbled_read_scope_loads_as_unknown_and_keeps_the_rest_of_the_record() {
+        let garbled = [
+            "1",
+            "null",
+            "\"everything\"",
+            "\"Unrestricted\"",
+            "[]",
+            "{}",
+            "{\"paths\":\"src\"}",
+            "{\"paths\":[1]}",
+            "{\"other\":[]}",
+            "{\"paths\":[\"a\"],\"extra\":true}",
+        ];
+        for raw in garbled {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value["read_paths"] = serde_json::from_str(raw).unwrap();
+            let loaded: SessionRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(loaded.read_paths, ReadScope::Unknown, "{raw}");
+            assert_eq!(loaded.identity, record().identity, "{raw}");
+        }
+    }
+
+    #[test]
+    fn debug_of_a_read_scope_prints_counts_and_never_a_path() {
+        assert_eq!(format!("{:?}", ReadScope::Unknown), "Unknown");
+        assert_eq!(format!("{:?}", ReadScope::Unrestricted), "Unrestricted");
+        let shown = format!("{:?}", paths(&["read-SECRET", "other-SECRET"]));
+        assert_eq!(shown, "Paths(2)");
+    }
+
+    #[test]
+    fn a_card_without_read_paths_is_unrestricted_and_one_with_them_is_exactly_those() {
+        assert_eq!(ReadScope::of_card(None), ReadScope::Unrestricted);
+        assert_eq!(ReadScope::of_card(Some(&[])), paths(&[]));
+        let listed = ["docs/**".to_string(), "src/**".to_string()];
+        assert_eq!(
+            ReadScope::of_card(Some(&listed)),
+            paths(&["docs/**", "src/**"])
+        );
+    }
+
+    #[test]
+    fn a_sender_reads_unknown_as_no_authority_and_a_recipient_reads_it_as_unrestricted() {
+        let own = |list: &[&str]| Some(list.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        assert_eq!(ReadScope::Unknown.for_sender(), own(&[]));
+        assert_eq!(ReadScope::Unrestricted.for_sender(), None);
+        assert_eq!(paths(&["a", "b"]).for_sender(), own(&["a", "b"]));
+        assert_eq!(ReadScope::Unknown.for_recipient(), None);
+        assert_eq!(ReadScope::Unrestricted.for_recipient(), None);
+        assert_eq!(paths(&["a", "b"]).for_recipient(), own(&["a", "b"]));
+    }
+
+    #[test]
+    fn the_privilege_table_over_every_sender_and_recipient_state() {
+        let rows: Vec<(ReadScope, Vec<(ReadScope, bool)>)> = vec![
+            (
+                ReadScope::Unknown,
+                vec![
+                    (ReadScope::Unknown, true),
+                    (ReadScope::Unrestricted, true),
+                    (paths(&[]), false),
+                    (paths(&["a"]), true),
+                    (paths(&["a", "b"]), true),
+                ],
+            ),
+            (
+                ReadScope::Unrestricted,
+                vec![
+                    (ReadScope::Unknown, false),
+                    (ReadScope::Unrestricted, false),
+                    (paths(&[]), false),
+                    (paths(&["a"]), false),
+                    (paths(&["a", "b"]), false),
+                ],
+            ),
+            (
+                paths(&["a"]),
+                vec![
+                    (ReadScope::Unknown, true),
+                    (ReadScope::Unrestricted, true),
+                    (paths(&[]), false),
+                    (paths(&["a"]), false),
+                    (paths(&["b"]), true),
+                    (paths(&["a", "b"]), true),
+                ],
+            ),
+            (
+                paths(&[]),
+                vec![
+                    (ReadScope::Unknown, true),
+                    (ReadScope::Unrestricted, true),
+                    (paths(&[]), false),
+                    (paths(&["a"]), true),
+                ],
+            ),
+        ];
+        for (sender, recipients) in rows {
+            for (recipient, expected) in recipients {
+                assert_eq!(
+                    asymmetric(&sender, &recipient),
+                    expected,
+                    "sender {sender:?} recipient {recipient:?}"
+                );
+            }
+        }
+    }
+
+    fn scope_strategy() -> impl Strategy<Value = ReadScope> {
+        let alphabet = proptest::sample::select(vec!["a", "b", "c", "d"]);
+        let to_scope = |items: Vec<&str>| paths(&items);
+        let listed = proptest::collection::vec(alphabet, 0..4).prop_map(to_scope);
+        prop_oneof![
+            Just(ReadScope::Unknown),
+            Just(ReadScope::Unrestricted),
+            listed
+        ]
+    }
+
+    fn authority_of(sender: &ReadScope) -> (bool, std::collections::HashSet<String>) {
+        match sender {
+            ReadScope::Unknown => (false, Default::default()),
+            ReadScope::Unrestricted => (true, Default::default()),
+            ReadScope::Paths(list) => (false, list.iter().cloned().collect()),
+        }
+    }
+
+    fn reach_of(recipient: &ReadScope) -> (bool, std::collections::HashSet<String>) {
+        match recipient {
+            ReadScope::Paths(list) => (false, list.iter().cloned().collect()),
+            _ => (true, Default::default()),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn the_decision_equals_a_set_model_of_what_each_side_may_read(
+            sender in scope_strategy(),
+            recipient in scope_strategy(),
+        ) {
+            let (sender_all, sender_set) = authority_of(&sender);
+            let (recipient_all, recipient_set) = reach_of(&recipient);
+            let covered = sender_all || (!recipient_all && recipient_set.is_subset(&sender_set));
+            prop_assert_eq!(asymmetric(&sender, &recipient), !covered);
+        }
+
+        #[test]
+        fn a_read_scope_always_survives_a_json_round_trip(scope in scope_strategy()) {
+            let json = serde_json::to_string(&scope).unwrap();
+            prop_assert_eq!(serde_json::from_str::<ReadScope>(&json).unwrap(), scope);
+        }
     }
 }

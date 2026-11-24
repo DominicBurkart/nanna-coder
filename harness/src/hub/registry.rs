@@ -1,5 +1,5 @@
 use super::lineage::{Lineage, SessionBinding, SessionId};
-use super::session::{SessionKind, SessionRecord, SessionStatus};
+use super::session::{ReadScope, SessionKind, SessionRecord, SessionStatus};
 use super::store::{ActiveSession, SessionStore, StoreError};
 use super::summary::Summary;
 use crate::action_auditor::{is_credential_path, IdentifierOracle, NullOracle, RuleMessageAuditor};
@@ -149,6 +149,7 @@ impl SessionRegistry {
                 .map(|pattern| pattern.as_str().to_string())
                 .collect(),
             write_paths: card.scope.paths.clone(),
+            read_paths: ReadScope::of_card(card.scope.read_paths.as_deref()),
             subtask: self.vet_bounded(subtask),
             note: None,
             result_summary: None,
@@ -645,6 +646,63 @@ mod tests {
         assert_eq!((record.created_at, record.last_activity), (at(5), at(5)));
         assert_eq!(record.ended_at, None);
         assert!(registry.tracks(&sid("t1")));
+    }
+
+    fn binding_reading(name: &str, read_paths: Option<Vec<String>>) -> SessionBinding {
+        let mut card = crate::identity::example();
+        card.scope.read_paths = read_paths;
+        SessionBinding::from_audited(
+            &card,
+            TaskId(name.to_string()),
+            Lineage::root_child(RootId::mcp(Uuid::from_u128(1))),
+        )
+    }
+
+    fn listed(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn register_records_the_read_paths_of_the_audited_card() {
+        let rows = [
+            (None, ReadScope::Unrestricted),
+            (Some(listed(&[])), ReadScope::Paths(listed(&[]))),
+            (
+                Some(listed(&["docs/**", "src/**"])),
+                ReadScope::Paths(listed(&["docs/**", "src/**"])),
+            ),
+        ];
+        for (card_reads, expected) in rows {
+            let (store, registry) = registry();
+            let bound = binding_reading("t1", card_reads.clone());
+            registry.register(&bound, "go", at(0)).unwrap();
+            assert_eq!(stored(&store, "t1").read_paths, expected, "{card_reads:?}");
+        }
+    }
+
+    #[test]
+    fn reregister_records_the_card_read_paths_over_a_legacy_unknown_record() {
+        let (store, registry) = registry();
+        let bound = binding_reading("t1", Some(listed(&["docs/**"])));
+        registry.register(&bound, "go", at(0)).unwrap();
+        store
+            .update(
+                sid("t1"),
+                Box::new(|mut record| {
+                    record.read_paths = ReadScope::Unknown;
+                    Some(record)
+                }),
+            )
+            .unwrap();
+        assert_eq!(stored(&store, "t1").read_paths, ReadScope::Unknown);
+        registry.reregister(&bound, "go", at(1)).unwrap();
+        assert_eq!(
+            stored(&store, "t1").read_paths,
+            ReadScope::Paths(listed(&["docs/**"]))
+        );
+        let fresh = binding_reading("t2", None);
+        registry.reregister(&fresh, "go", at(2)).unwrap();
+        assert_eq!(stored(&store, "t2").read_paths, ReadScope::Unrestricted);
     }
 
     #[test]
