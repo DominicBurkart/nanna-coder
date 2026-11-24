@@ -358,7 +358,13 @@ impl ToolRegistry {
                         return Err(ToolError::ActionDenied(denied));
                     }
                 }
-                tool.execute(args).await
+                let result = tool.execute(args).await;
+                if let Err(ToolError::ActionDenied(denied)) = &result {
+                    if denied.is_escalation() {
+                        self.escalate_denial(name, denied).await;
+                    }
+                }
+                result
             }
             (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
                 identity: identity.clone(),
@@ -492,6 +498,7 @@ impl ToolRegistry {
 
     fn inspects_content(&self, name: &str) -> bool {
         name == crate::action_auditor::RUN_COMMAND_TOOL
+            || name == crate::verify::VERIFIER_TOOL
             || crate::action_auditor::is_message_tool(name)
     }
 

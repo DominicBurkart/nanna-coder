@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-bare-uuid"
+description = "a bare uuid with no context word, nobody vouches"
+
+[input]
+subject = "status update"
+body = "{{uuid#bare}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "null-oracle", "adversarial"]

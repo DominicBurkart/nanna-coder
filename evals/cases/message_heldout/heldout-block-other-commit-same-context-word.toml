@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-other-commit-same-context-word"
+description = "one commit id is vouched, a second one after the same word is not"
+
+[input]
+subject = "status update"
+body = "commit {{git_sha#ok}} is the base, commit {{git_sha#other}} is the fix"
+window = []
+vouch = ["git_sha#ok"]
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "oracle", "context-word", "other-token", "adversarial"]

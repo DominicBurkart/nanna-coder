@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
+use super::mailbox;
 use crate::auditor::Allowed;
 use crate::identity::AgentIdentity;
 use crate::task::TaskId;
@@ -17,7 +18,13 @@ const MCP_PREFIX: &str = "mcp-";
 const PLAN_PREFIX: &str = "plan-";
 const BACKLOG_PREFIX: &str = "backlog-";
 
-/// A spawned subagent's id. Same value as its [`TaskId`].
+/// A spawned subagent's id. Same value as its [`TaskId`] for every task id that does not start
+/// with `@`.
+///
+/// `@` is reserved: [`SessionId::from_task`] prefixes a task id that starts with it, so no task
+/// id can equal the id of a root mailbox (see [`crate::hub::mailbox`]). Serde, `Display` and
+/// `FromStr` use one form and refuse any `@` text that is neither a canonical mailbox id nor an
+/// escaped task id.
 ///
 /// ```
 /// use harness::hub::lineage::SessionId;
@@ -27,15 +34,38 @@ const BACKLOG_PREFIX: &str = "backlog-";
 /// let session = SessionId::from_task(task.clone());
 /// assert_eq!(session.task_id(), &task);
 /// assert_eq!(session.to_string(), "t-1");
+/// assert_eq!("t-1".parse::<SessionId>(), Ok(session));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct SessionId(TaskId);
+
+/// Text that is not the form of a task id or of a root mailbox id.
+///
+/// ```
+/// use harness::hub::lineage::SessionId;
+///
+/// let refused = "@forged".parse::<SessionId>();
+/// assert!(refused.is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a session id")]
+pub struct SessionIdError;
 
 impl SessionId {
     pub fn from_task(task: TaskId) -> Self {
-        Self(task)
+        Self(TaskId(mailbox::escape_task(task.0)))
     }
 
+    pub(super) fn from_mailbox(text: String) -> Self {
+        Self(TaskId(text))
+    }
+
+    pub(super) fn text(&self) -> &str {
+        &(self.0).0
+    }
+
+    /// The task id this session was built from. For an id that starts with `@` this is the
+    /// escaped form, not the original.
     pub fn task_id(&self) -> &TaskId {
         &self.0
     }
@@ -43,7 +73,34 @@ impl SessionId {
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&(self.0).0)
+        f.write_str(self.text())
+    }
+}
+
+impl std::fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match mailbox::is_mailbox(self) {
+            true => f.write_str("SessionId(Mailbox)"),
+            false => f.debug_tuple("SessionId").field(&self.0).finish(),
+        }
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = SessionIdError;
+
+    fn from_str(raw: &str) -> Result<Self, SessionIdError> {
+        match mailbox::wire_is_valid(raw) {
+            true => Ok(Self(TaskId(raw.to_string()))),
+            false => Err(SessionIdError),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -256,10 +313,14 @@ pub struct SessionBinding {
 impl SessionBinding {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_proof(allowed: &Allowed, task: TaskId, lineage: Lineage) -> Self {
+        Self::from_audited(allowed.identity(), task, lineage)
+    }
+
+    pub(crate) fn from_audited(identity: &AgentIdentity, task: TaskId, lineage: Lineage) -> Self {
         Self {
             session: SessionId::from_task(task),
             lineage,
-            identity: Arc::new(allowed.identity().clone()),
+            identity: Arc::new(identity.clone()),
         }
     }
 

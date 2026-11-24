@@ -1,11 +1,21 @@
 #[cfg(test)]
 #[macro_use]
 mod contract;
+mod activity;
+mod activity_write;
 mod engine;
 mod journal;
 mod messages;
 mod sessions;
 
+pub use activity::{
+    activity_path_from, ActivityEntry, ActivityStore, Direction, InMemoryActivityStore,
+    JsonlActivityStore, ACTIVITY_PATH_ENV, ACTIVITY_PER_SESSION_MAX, ACTIVITY_TOTAL_BYTES_MAX,
+    ENTRY_OVERHEAD,
+};
+pub use activity_write::{
+    ArgsSummary, MAX_ARGS_CHARS, MAX_SUBJECT_CHARS, MAX_TOOL_CHARS, MAX_TURN_BYTES,
+};
 pub use journal::HubLock;
 pub use messages::{InMemoryMessageStore, JsonlMessageStore};
 pub use sessions::{InMemorySessionStore, JsonlSessionStore};
@@ -13,6 +23,7 @@ pub use sessions::{InMemorySessionStore, JsonlSessionStore};
 use super::lineage::{RootId, SessionId};
 use super::message::{DeliveryState, MessageId, Recipient, Seq, StoredMessage};
 use super::session::{SessionRecord, SessionStatus};
+use super::summary::Summary;
 use chrono::{DateTime, Duration, Utc};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -77,6 +88,30 @@ impl Default for Retention {
     }
 }
 
+/// The part of a non-terminal session record that the orphan sweep reads: no agent-authored
+/// text, so it is cheap to copy and safe to log.
+///
+/// ```
+/// use chrono::Utc;
+/// use harness::hub::lineage::SessionId;
+/// use harness::hub::session::SessionStatus;
+/// use harness::hub::store::ActiveSession;
+///
+/// let listed = ActiveSession {
+///     id: SessionId::from_task(harness::task::TaskId("t".into())),
+///     status: SessionStatus::Running,
+///     last_activity: Utc::now(),
+/// };
+/// assert!(listed.status.is_active());
+/// assert!(format!("{listed:?}").contains("Running"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSession {
+    pub id: SessionId,
+    pub status: SessionStatus,
+    pub last_activity: DateTime<Utc>,
+}
+
 /// Storage for [`SessionRecord`]s. `prune` removes a whole root once every
 /// session in it is terminal and the root's latest `last_activity` is older
 /// than `completed_session_ttl`; it returns the number of sessions removed.
@@ -107,6 +142,21 @@ pub trait SessionStore: Send + Sync {
     /// assert!(InMemorySessionStore::new().get(id).unwrap().is_none());
     /// ```
     fn get(&self, id: SessionId) -> Result<Option<SessionRecord>, StoreError>;
+    /// Replace the record with this id by what `change` returns for it, reading and writing under
+    /// one hold of the store's lock, so no other writer can run between the two. `change` returning
+    /// `None` leaves the record as it was. Unknown id: `NotFound`.
+    ///
+    /// ```
+    /// use harness::hub::store::{InMemorySessionStore, SessionStore, StoreError};
+    /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("x".into()));
+    /// let store = InMemorySessionStore::new();
+    /// assert!(matches!(store.update(id, Box::new(|_| None)), Err(StoreError::NotFound)));
+    /// ```
+    fn update(
+        &self,
+        id: SessionId,
+        change: Box<dyn FnOnce(SessionRecord) -> Option<SessionRecord> + '_>,
+    ) -> Result<(), StoreError>;
     /// Every session in `root`, ordered by `created_at` then id.
     ///
     /// ```
@@ -136,10 +186,11 @@ pub trait SessionStore: Send + Sync {
     /// ```
     /// use harness::hub::store::{InMemorySessionStore, SessionStore, StoreError};
     /// let id = harness::hub::lineage::SessionId::from_task(harness::task::TaskId("x".into()));
-    /// let result = InMemorySessionStore::new().set_note(id, "n".into());
+    /// let note = harness::hub::summary::Summary::compose("a", "running", "n");
+    /// let result = InMemorySessionStore::new().set_note(id, note);
     /// assert!(matches!(result, Err(StoreError::NotFound)));
     /// ```
-    fn set_note(&self, id: SessionId, note: String) -> Result<(), StoreError>;
+    fn set_note(&self, id: SessionId, note: Summary) -> Result<(), StoreError>;
     /// Remove expired roots; returns the number of sessions removed.
     ///
     /// ```
@@ -148,6 +199,14 @@ pub trait SessionStore: Send + Sync {
     /// assert_eq!(removed.unwrap(), 0);
     /// ```
     fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError>;
+    /// Every record that is not terminal (`Pending`, `Running` or `WaitingOnMessages`), ordered
+    /// by id, as `(id, status, last_activity)`. A read failure is an error, never an empty list.
+    ///
+    /// ```
+    /// use harness::hub::store::{InMemorySessionStore, SessionStore};
+    /// assert!(InMemorySessionStore::new().active().unwrap().is_empty());
+    /// ```
+    fn active(&self) -> Result<Vec<ActiveSession>, StoreError>;
 }
 
 /// Storage for [`StoredMessage`]s. The store assigns `seq` on `append`

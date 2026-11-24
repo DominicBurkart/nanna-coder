@@ -118,6 +118,11 @@ enum Commands {
         /// (falls back to NANNA_PLANNER_MODEL; without either the tool is off)
         #[arg(long)]
         planner_model: Option<String>,
+        #[arg(
+            long,
+            help = "Run audited tasks on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_BROKER_DIR); off unless given"
+        )]
+        pi_route: bool,
     },
     /// Delegate a coding task through the MCP Tasks protocol.
     ///
@@ -151,6 +156,11 @@ enum Commands {
         /// Name of the agent identity the task runs under
         #[arg(short, long)]
         identity: String,
+        #[arg(
+            long,
+            help = "Run the task on the pi executor (needs NANNA_PI_IMAGE and NANNA_PI_BROKER_DIR); off unless given"
+        )]
+        pi_route: bool,
     },
     /// Pull open GitHub issues into the persistent task queue
     ///
@@ -555,12 +565,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             audit_model,
             max_iterations,
             planner_model,
+            pi_route,
         } => {
             let from_env = std::env::var("NANNA_PLANNER_MODEL").ok();
             let planner = planner_model
                 .or(from_env)
                 .filter(|name| !name.trim().is_empty());
-            run_mcp_server(model, audit_model, max_iterations, planner).await?;
+            run_mcp_server(model, audit_model, max_iterations, planner, pi_route).await?;
         }
         Commands::Delegate {
             description,
@@ -571,6 +582,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations,
             ttl_ms,
             identity,
+            pi_route,
         } => {
             run_delegate(
                 &description,
@@ -580,6 +592,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_iterations,
                 ttl_ms,
                 &identity,
+                pi_route,
             )
             .await?;
         }
@@ -1871,27 +1884,31 @@ async fn build_mcp_task_manager_with_budget(
         spawn_escalation_hook(&plane),
         Some((provider.clone(), model.to_string())),
     )?;
-    let action_gate = TaskManager::action_policy_gate(
+    let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
+    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, provider.clone(), model);
+    let action_gate = TaskManager::action_policy_gate_routed(
         Arc::clone(&leases),
         harness::task::action_windows_from(&|key| std::env::var_os(key)),
         Some((provider.clone(), model.to_string())),
         harness::action_auditor::ActionAuditLog::file(
             queue_path.with_file_name("action_audit.jsonl"),
         ),
+        hub.router_weak(),
     );
-    Ok(TaskManager::restore_with_escalations(
-        DEFAULT_MAX_CONCURRENT_TASKS,
-        Box::new(HybridPolicy::default()),
-        Box::new(JsonlQueueStore::open(queue_path)?),
-        leases,
-        provider,
-        catalog,
-        plane,
-        action_gate,
-        &spawn_gate,
-    )
-    .await?
-    .with_durable_budget(budget_path))
+    Ok(hub
+        .restore(harness::task::RestoreParts {
+            max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
+            policy: Box::new(HybridPolicy::default()),
+            store: Box::new(JsonlQueueStore::open(queue_path)?),
+            leases,
+            provider,
+            identities: catalog,
+            escalations: plane,
+            action_gate,
+            spawn_gate: &spawn_gate,
+        })
+        .await?
+        .with_durable_budget(budget_path))
 }
 
 fn build_delegate_task_manager(
@@ -1908,6 +1925,60 @@ fn build_delegate_task_manager(
         model.map(|name| (provider, name.to_string())),
         harness::action_auditor::ActionAuditLog::in_memory(),
     )
+}
+
+fn pi_route_from_env(
+    enabled: bool,
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    pi_route_logged(enabled, &|key| std::env::var_os(key))
+}
+
+fn pi_route_logged(
+    enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    pi_route_with(enabled, lookup, &warn_notice)
+}
+
+const PI_ROUTE_INERT_NOTICE: &str =
+    "the pi route is on but inert: until a pi image and a model path exist, every task fails closed";
+
+fn warn_notice(message: &str) {
+    warn!("{message}");
+}
+
+#[cfg(unix)]
+fn pi_executor(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::PodmanPiExecutor::from_lookup(lookup)?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn pi_executor(
+    _lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    warn!(
+        "the pi route is on and this platform has no pi executor: every audited task fails closed"
+    );
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::UnwiredPiExecutor,
+    ))
+}
+
+fn pi_route_with(
+    enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    notify: &dyn Fn(&str),
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let route = harness::harness_adapter::PiRoute::from_lookup(lookup, pi_executor(lookup)?)?;
+    notify(PI_ROUTE_INERT_NOTICE);
+    Ok(Some(route))
 }
 
 const TELEMETRY_FILE: &str = "telemetry.jsonl";
@@ -2074,6 +2145,7 @@ async fn run_mcp_server(
     audit_model: Option<String>,
     max_iterations: usize,
     planner_model: Option<String>,
+    pi_route: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::NannaMcpServer;
     use std::sync::Arc;
@@ -2101,7 +2173,8 @@ async fn run_mcp_server(
             plane.clone(),
             &catalog,
         )
-        .await?,
+        .await?
+        .with_pi_route(pi_route_from_env(pi_route)?),
     );
 
     let telemetry = export_action_audit(
@@ -2150,6 +2223,7 @@ async fn run_mcp_server(
 /// in-process server as a client over an in-memory duplex. This dogfoods the
 /// exact wire protocol external orchestrators use, without spawning a child
 /// process.
+#[allow(clippy::too_many_arguments)]
 async fn run_delegate(
     description: &str,
     repo_path: &std::path::Path,
@@ -2158,6 +2232,7 @@ async fn run_delegate(
     max_iterations: usize,
     ttl_ms: Option<u64>,
     identity: &str,
+    pi_route: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use harness::mcp::client::NannaMcpClient;
     use harness::mcp::NannaMcpServer;
@@ -2174,11 +2249,10 @@ async fn run_delegate(
     .await?;
     let queue_path = resolve_queue_path(None)?;
     let plane = resolve_escalation_plane(&queue_path)?;
-    let task_manager = Arc::new(build_delegate_task_manager(
-        provider.clone(),
-        Some(auditor_name.as_str()),
-        plane.clone(),
-    ));
+    let task_manager = Arc::new(
+        build_delegate_task_manager(provider.clone(), Some(auditor_name.as_str()), plane.clone())
+            .with_pi_route(pi_route_from_env(pi_route)?),
+    );
     let telemetry = export_action_audit(
         &task_manager.action_gate(),
         queue_path.with_file_name(DELEGATE_TELEMETRY_FILE),
@@ -3771,6 +3845,165 @@ mod tests {
     }
 
     #[test]
+    fn the_pi_route_is_off_unless_the_flag_is_passed() {
+        let serve = |extra: &[&str]| {
+            let mut args = vec!["nanna", "mcp-serve"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::McpServe { pi_route, .. } => pi_route,
+                _ => panic!("not mcp-serve"),
+            }
+        };
+        let delegate = |extra: &[&str]| {
+            let mut args = vec![
+                "nanna",
+                "delegate",
+                "-d",
+                "task",
+                "-r",
+                "/tmp/x",
+                "-i",
+                "rust-implementer",
+            ];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Delegate { pi_route, .. } => pi_route,
+                _ => panic!("not delegate"),
+            }
+        };
+        assert!(!serve(&[]));
+        assert!(serve(&["--pi-route"]));
+        assert!(!delegate(&[]));
+        assert!(delegate(&["--pi-route"]));
+    }
+
+    #[test]
+    fn the_pi_route_needs_the_flag_and_host_configuration() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        assert!(pi_route_with(false, &configured, &|_| {})
+            .unwrap()
+            .is_none());
+        assert!(pi_route_with(false, &|_| None, &|_| {}).unwrap().is_none());
+        assert!(pi_route_with(true, &configured, &|_| {}).unwrap().is_some());
+        assert!(pi_route_with(true, &|_| None, &|_| {}).is_err());
+    }
+
+    #[test]
+    fn an_enabled_pi_route_announces_that_it_is_inert_and_a_disabled_one_is_silent() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let heard = std::cell::RefCell::new(Vec::new());
+        let notify = |message: &str| heard.borrow_mut().push(message.to_string());
+        assert!(pi_route_with(false, &configured, &notify)
+            .unwrap()
+            .is_none());
+        assert!(heard.borrow().is_empty());
+        assert!(pi_route_with(true, &configured, &notify).unwrap().is_some());
+        let heard = heard.borrow();
+        assert_eq!(heard.len(), 1);
+        assert!(heard[0].contains("inert"), "{}", heard[0]);
+        assert!(heard[0].contains("fails closed"), "{}", heard[0]);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_logged_pi_route_writes_the_inert_notice_at_warn_level() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(pi_route_logged(false, &configured).unwrap().is_none());
+            assert!(captured.0.lock().unwrap().is_empty());
+            assert!(pi_route_logged(true, &configured).unwrap().is_some());
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("inert"), "{text}");
+        assert!(text.contains("fails closed"), "{text}");
+        assert!(pi_route_from_env(false).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enabled_pi_route_runs_pi_in_a_container_with_no_network_by_default() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let route = pi_route_with(true, &configured, &|_| {}).unwrap().unwrap();
+        let shown = format!("{:?}", route.executor());
+        assert!(shown.contains("PodmanPiExecutor"), "{shown}");
+        assert!(shown.contains("None"), "{shown}");
+        let named = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("model-net")),
+            other => configured(other),
+        };
+        let route = pi_route_with(true, &named, &|_| {}).unwrap().unwrap();
+        assert!(format!("{:?}", route.executor()).contains("model-net"));
+        let reserved = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("host")),
+            other => configured(other),
+        };
+        assert!(pi_route_with(true, &reserved, &|_| {}).is_err());
+    }
+
+    #[test]
     fn the_cli_registry_refuses_a_bad_policy_and_accepts_a_solo_one() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
@@ -3841,6 +4074,13 @@ mod tests {
             without.action_gate().auditor_name(),
             RULE_ACTION_AUDITOR_NAME
         );
+    }
+
+    #[test]
+    fn the_delegate_task_manager_has_no_message_hub() {
+        let manager =
+            build_delegate_task_manager(offline_provider(), Some("delegate-model"), quiet_plane());
+        assert!(manager.hub().is_none());
     }
     use harness::eval::swebench_results::{
         SweBenchInstanceResult, SweBenchRunConfig, SweBenchRunResult, TokenUsage,

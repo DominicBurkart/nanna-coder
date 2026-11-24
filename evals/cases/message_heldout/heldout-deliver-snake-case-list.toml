@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-snake-case-list"
+description = "several snake_case function names"
+
+[input]
+subject = "status update"
+body = "Renamed load_session_records_from_journal and prune_expired_message_rows, nothing else changed."
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "near-miss"]

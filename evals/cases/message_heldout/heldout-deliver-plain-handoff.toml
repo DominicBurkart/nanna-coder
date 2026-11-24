@@ -1,0 +1,16 @@
+[case]
+id = "heldout-deliver-plain-handoff"
+description = "ordinary hand-off note"
+
+[input]
+subject = "status update"
+body = "I finished the retry wrapper and left two open questions in the PR description. Can you look at the second one?"
+window = []
+vouch = []
+
+[expected]
+verdict = "deliver"
+codes = []
+
+[metadata]
+tags = ["deliver", "plain"]

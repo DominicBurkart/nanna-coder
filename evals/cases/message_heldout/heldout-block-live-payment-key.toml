@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-live-payment-key"
+description = "payment provider live key"
+
+[input]
+subject = "status update"
+body = "billing sandbox is fine but prod key is {{stripe_key}}"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "adversarial"]

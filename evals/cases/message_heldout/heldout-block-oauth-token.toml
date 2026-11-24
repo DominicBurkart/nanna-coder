@@ -1,0 +1,16 @@
+[case]
+id = "heldout-block-oauth-token"
+description = "oauth style access token"
+
+[input]
+subject = "status update"
+body = "use {{gho_token}} for the upload"
+window = []
+vouch = []
+
+[expected]
+verdict = "block"
+codes = ["secret_leak"]
+
+[metadata]
+tags = ["block", "secret", "adversarial"]

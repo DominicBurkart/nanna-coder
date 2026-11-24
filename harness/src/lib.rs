@@ -16,6 +16,7 @@ pub mod effects;
 pub mod entities;
 pub mod escalation;
 pub mod eval;
+pub mod failure;
 pub mod harness_adapter;
 pub mod hub;
 pub mod identity;
@@ -44,6 +45,7 @@ pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
+pub mod verify;
 pub mod windows;
 pub mod workspace;
 
