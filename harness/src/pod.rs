@@ -1024,6 +1024,22 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "without serial lock `nanna_test_bring_up_cmd_env`")]
+    fn bring_up_command_refuses_an_unserialised_caller() {
+        let _ = bring_up_command(Path::new("/nonexistent/nanna-pod-lock-guard"));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "without serial lock `nanna_test_bring_up_cmd_env`")]
+    async fn ensure_running_inner_refuses_an_unserialised_caller() {
+        let cfg = EnsureConfig {
+            probe_url: start_ok_http_server().await,
+            ..EnsureConfig::default()
+        };
+        let _ = ensure_running_inner(&cfg, false).await;
+    }
+
+    #[test]
+    #[should_panic(expected = "without serial lock `nanna_test_bring_up_cmd_env`")]
     fn inheriting_the_locks_from_an_unserialised_test_panics_at_the_spawn_site() {
         drop(inherit_serial_env_locks(async {}));
     }
