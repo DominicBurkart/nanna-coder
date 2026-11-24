@@ -3,6 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
+#[path = "support/test_module_files.rs"]
+mod test_module_files;
+use test_module_files::{
+    cfg_test_file_modules, is_exact_test_file_module, path_attribute_files, skipped_files,
+};
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -107,21 +113,29 @@ fn scan_source(file: &str, source: &str) -> Idents {
     scan
 }
 
+fn production_from(sources: Vec<(String, String)>) -> Vec<Idents> {
+    let skipped = skipped_files(&sources).unwrap_or_else(|reason| panic!("{reason}"));
+    sources
+        .iter()
+        .filter(|(file, _)| !skipped.contains(file))
+        .map(|(file, source)| scan_source(file, source))
+        .collect()
+}
+
 fn production() -> Vec<Idents> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&root, &mut files);
-    files
-        .into_iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            scan_source(&relative, &fs::read_to_string(&path).unwrap())
-        })
-        .collect()
+    production_from(
+        files
+            .into_iter()
+            .map(|path| {
+                let text = path.strip_prefix(&root).unwrap().to_string_lossy();
+                let relative = text.replace('\\', "/");
+                (relative, fs::read_to_string(&path).unwrap())
+            })
+            .collect(),
+    )
 }
 
 fn mentions(name: &str) -> BTreeMap<String, usize> {
@@ -171,7 +185,11 @@ fn no_production_use_renames_anything_to_hide_a_noop_hook_or_a_workspace_constru
 fn only_the_task_runner_constructs_task_workspaces_and_it_installs_a_hook_each_time() {
     assert_eq!(
         mentions("TaskWorkspace"),
-        pinned(&[("task.rs", 5), ("workspace.rs", 3)]),
+        pinned(&[
+            ("harness_adapter/binding.rs", 3),
+            ("task.rs", 5),
+            ("workspace.rs", 3)
+        ]),
         "a new production path names TaskWorkspace; a workspace built without with_audit_hook silently gets NoopAuditHook"
     );
     assert_eq!(
@@ -205,4 +223,146 @@ fn the_scanner_sees_raw_identifiers_macros_aliases_and_renames_but_not_cfg_test_
         "#[cfg(test)] mod t { fn f() { let _ = NoopAuditHook; } } #[cfg(test)] fn h() { NoopAuditHook; } struct S; #[cfg(test)] impl S { fn k(&self) { NoopAuditHook; } }",
     );
     assert!(!hidden.found.contains_key("x.rs: NoopAuditHook"));
+}
+
+#[test]
+fn only_exact_cfg_test_file_modules_are_skipped_and_every_other_file_stays_scanned() {
+    let sources: Vec<(String, String)> = [
+        ("lib.rs", "#[cfg(test)] mod z;"),
+        ("z.rs", "fn f() { TaskWorkspace; }"),
+        (
+            "a/mod.rs",
+            "fn helper() {} #[cfg(test)] mod t; #[cfg(not(test))] mod u; mod v; #[cfg(test)] mod inline { } #[cfg(test)] mod t2; #[cfg(not(test))] mod t2; #[cfg(test)] mod t3; mod t3; #[cfg(any(test, unix))] mod ya; #[cfg(unix)] mod yb; #[cfg(feature = \"x\")] mod yc; #[cfg(all(test, unix))] mod yd;",
+        ),
+        ("a/t.rs", "fn f() { TaskWorkspace; }"),
+        ("a/u.rs", "fn f() { TaskWorkspace; }"),
+        ("a/v.rs", "fn f() { TaskWorkspace; }"),
+        ("a/inline.rs", "fn f() { TaskWorkspace; }"),
+        ("a/t2.rs", "fn f() { TaskWorkspace; }"),
+        ("a/t3.rs", "fn f() { TaskWorkspace; }"),
+        ("a/ya.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yb.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yc.rs", "fn f() { TaskWorkspace; }"),
+        ("a/yd.rs", "fn f() { TaskWorkspace; }"),
+        ("b.rs", "#[cfg(test)] mod x;"),
+        ("b/x/mod.rs", "fn f() { TaskWorkspace; }"),
+        ("c.rs", "fn f() { TaskWorkspace; }"),
+    ]
+    .iter()
+    .map(|(file, source)| (file.to_string(), source.to_string()))
+    .collect();
+    let scanned: BTreeSet<String> = production_from(sources)
+        .into_iter()
+        .flat_map(|scan| scan.found)
+        .filter_map(|(entry, _)| entry.strip_suffix(": TaskWorkspace").map(str::to_string))
+        .collect();
+    let expected: BTreeSet<String> = [
+        "a/inline.rs",
+        "a/t2.rs",
+        "a/t3.rs",
+        "a/u.rs",
+        "a/v.rs",
+        "a/ya.rs",
+        "a/yb.rs",
+        "a/yc.rs",
+        "a/yd.rs",
+        "c.rs",
+    ]
+    .iter()
+    .map(|file| file.to_string())
+    .collect();
+    assert_eq!(scanned, expected);
+}
+
+#[test]
+fn the_cfg_test_match_is_exact() {
+    assert!(cfg_test_file_modules("a/mod.rs", "#[cfg(any(test, unix))] mod ya;").is_empty());
+    assert_eq!(
+        cfg_test_file_modules("a/mod.rs", "#[cfg(test)] mod t;"),
+        vec!["a/t.rs".to_string(), "a/t/mod.rs".to_string()]
+    );
+}
+
+#[test]
+fn a_module_name_declared_both_as_test_and_otherwise_is_never_skipped() {
+    let source = "#[cfg(test)] mod t; #[cfg(not(test))] mod t;";
+    assert!(cfg_test_file_modules("a/mod.rs", source).is_empty());
+    let unconditional = "#[cfg(test)] mod t; mod t;";
+    assert!(cfg_test_file_modules("a/mod.rs", unconditional).is_empty());
+    let inline_twin = "#[cfg(test)] mod t; mod t { }";
+    assert!(cfg_test_file_modules("a/mod.rs", inline_twin).is_empty());
+}
+
+#[test]
+fn an_inline_test_module_never_skips_a_file_of_the_same_name() {
+    assert!(cfg_test_file_modules("a/mod.rs", "#[cfg(test)] mod inline { }").is_empty());
+    assert!(is_exact_test_file_module(
+        &syn::parse_str("#[cfg(test)] mod m;").unwrap()
+    ));
+    assert!(!is_exact_test_file_module(
+        &syn::parse_str("#[cfg(test)] mod m { }").unwrap()
+    ));
+}
+
+fn sources(files: &[(&str, &str)]) -> Vec<(String, String)> {
+    files
+        .iter()
+        .map(|(file, source)| (file.to_string(), source.to_string()))
+        .collect()
+}
+
+#[test]
+fn any_path_attribute_anywhere_makes_the_guard_refuse_to_skip_and_names_the_file() {
+    let evasions = [
+        ("dotdot", "#[path = \"../a/x.rs\"] mod y;"),
+        ("unnormalised", "#[path = \"s/../x.rs\"] mod y;"),
+        (
+            "cfg_attr_not_test",
+            "#[cfg_attr(not(test), path = \"x.rs\")] mod y;",
+        ),
+        ("cfg_attr_unix", "#[cfg_attr(unix, path = \"x.rs\")] mod y;"),
+        (
+            "nested_cfg_attr",
+            "#[cfg_attr(unix, cfg_attr(unix, path = \"x.rs\"))] mod y;",
+        ),
+        ("inline_module", "mod inner { #[path = \"z.rs\"] mod q; }"),
+        ("other_file", "#[path = \"a/x.rs\"] mod y;"),
+        (
+            "macro_body",
+            "macro_rules! m { () => { #[path = \"x.rs\"] mod y; } }",
+        ),
+        ("plain", "#[path = \"x.rs\"] mod y;"),
+    ];
+    for (label, carrier) in evasions {
+        let files = sources(&[
+            ("a/mod.rs", "#[cfg(test)] mod x;"),
+            ("a/x.rs", "fn f() { TaskWorkspace; }"),
+            ("carrier.rs", carrier),
+        ]);
+        assert_eq!(
+            path_attribute_files(&files),
+            vec!["carrier.rs".to_string()],
+            "{label}"
+        );
+        let reason = skipped_files(&files).unwrap_err();
+        assert!(reason.contains("carrier.rs"), "{label}: {reason}");
+    }
+}
+
+#[test]
+fn attributes_that_merely_mention_a_path_do_not_trip_the_refusal() {
+    let files = sources(&[
+        ("a/mod.rs", "#[cfg(test)] mod x; #[cfg_attr(test, derive(Debug))] struct S; #[cfg(feature = \"path\")] fn g() {} #[doc = \"path\"] fn h() { let path = 1; let _ = (path == 1, path); }"),
+        ("a/x.rs", "fn f() { TaskWorkspace; }"),
+    ]);
+    assert!(path_attribute_files(&files).is_empty());
+    let skipped = skipped_files(&files).unwrap();
+    assert!(skipped.contains("a/x.rs"));
+}
+
+#[test]
+#[should_panic(expected = "cannot reason about module files")]
+fn the_scan_itself_fails_when_a_path_attribute_exists() {
+    let files = sources(&[("a.rs", "#[path = \"b.rs\"] mod m;"), ("b.rs", "")]);
+    let _ = production_from(files);
 }

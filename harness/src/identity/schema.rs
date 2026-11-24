@@ -430,7 +430,7 @@ impl Validator<'_> {
         self.within_host("limits.sandbox", &raw.limits.sandbox, &host.sandbox)?;
         let source = self.file.to_path_buf();
 
-        Ok(AgentIdentity {
+        let identity = AgentIdentity {
             identity: IdentitySection {
                 name: raw.identity.name,
                 description: raw.identity.description,
@@ -448,7 +448,11 @@ impl Validator<'_> {
             },
             limits: raw.limits,
             source,
-        })
+        };
+        match crate::verify::ceiling_violation(&identity) {
+            Some(reason) => Err(self.invalid("scope.max_effect", reason)),
+            None => Ok(identity),
+        }
     }
 }
 

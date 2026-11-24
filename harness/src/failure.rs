@@ -56,14 +56,19 @@ impl FailureKind {
         match error_type {
             "MaxIterationsExceeded" => FailureKind::MaxIterations,
             "StateError" => FailureKind::StateError,
-            "TaskCheckFailed" => FailureKind::TaskCheckFailed,
+            "TaskCheckFailed" | "VerificationFailed" => FailureKind::TaskCheckFailed,
             "ProtectedPathViolation" => FailureKind::ProtectedPathViolation,
             "ScopeError" => FailureKind::ScopeError,
             "LineageInconsistent" => FailureKind::SpawnRefused,
             "IdentityUnavailable" => FailureKind::IdentityUnavailable,
             "NoProvider" => FailureKind::ModelUnavailable,
-            "ContainerSetupFailed" | "SidecarSetupFailed" => FailureKind::ContainerSetupFailed,
-            "WorkspaceCreationFailed" => FailureKind::WorkspaceSetupFailed,
+            "ContainerSetupFailed"
+            | "SidecarSetupFailed"
+            | "VerifierRequiresContainer"
+            | "VerifierExecFailed" => FailureKind::ContainerSetupFailed,
+            "WorkspaceCreationFailed" | "VerifierChecksInvalid" => {
+                FailureKind::WorkspaceSetupFailed
+            }
             "ImpactError" => FailureKind::ImpactError,
             "QueuePersistFailed" | "SessionRegistryFailed" | "RestoreSessionRegistryFailed" => {
                 FailureKind::QueueError
@@ -98,6 +103,13 @@ mod tests {
         ("NoProvider", FailureKind::ModelUnavailable),
         ("ContainerSetupFailed", FailureKind::ContainerSetupFailed),
         ("SidecarSetupFailed", FailureKind::ContainerSetupFailed),
+        ("VerificationFailed", FailureKind::TaskCheckFailed),
+        (
+            "VerifierRequiresContainer",
+            FailureKind::ContainerSetupFailed,
+        ),
+        ("VerifierExecFailed", FailureKind::ContainerSetupFailed),
+        ("VerifierChecksInvalid", FailureKind::WorkspaceSetupFailed),
         ("WorkspaceCreationFailed", FailureKind::WorkspaceSetupFailed),
         ("ImpactError", FailureKind::ImpactError),
         ("QueuePersistFailed", FailureKind::QueueError),
@@ -165,8 +177,8 @@ mod tests {
             .filter(|kind| !reachable.contains(kind))
             .collect();
         let expected: HashSet<FailureKind> = [
-            FailureKind::InvalidRequest,
             FailureKind::Cancelled,
+            FailureKind::InvalidRequest,
             FailureKind::Unclassified,
         ]
         .into_iter()
