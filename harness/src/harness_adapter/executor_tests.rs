@@ -84,15 +84,8 @@ impl Rig {
         let registry = self.registry.take().unwrap();
         let bound = BoundWorkspace::for_test(registry, &self.identity, &self.repo, &self.agent);
         let progress = Arc::clone(&self.progress);
-        PiLaunch::new(
-            task,
-            name,
-            &self.agent,
-            bound,
-            &self.route,
-            progress,
-            deadline,
-        )
+        let (agent, route) = (&self.agent, &self.route);
+        PiLaunch::new(task, name, agent, bound, route, progress, deadline)
     }
 }
 
@@ -1514,7 +1507,7 @@ async fn an_accept_failure_ends_serving_as_a_failure() {
 
 #[tokio::test]
 async fn a_start_that_cannot_be_spawned_is_reported() {
-    let body = "echo \"$@\" >> \"${0%/*}/calls.log\"\ncase \"$1\" in cp) /bin/cat > /dev/null; /bin/rm -f \"$0\";; esac";
+    let body = "echo \"$@\" >> \"${0%/*}/calls.log\"\ncase \"$1\" in cp) while read -r _line; do :; done; printf '#!/nonexistent/interpreter\\n' > \"$0\"; exit 0;; esac";
     let fake = FakePodman::install_isolated_async("podman", body).await;
     let root = private_root();
     let mut rig = rig(two_tools());
