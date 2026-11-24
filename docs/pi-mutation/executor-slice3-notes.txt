@@ -1,7 +1,7 @@
-Survivors of executor-slice3-mutants.py and why they stay. The results file is written by the runner and is not edited.
+Reading executor-slice3-results.txt. The file is written by executor-slice3-mutants.py and is not edited; a full re-run on the committed tree reproduces it.
 
-21 executor.rs, the deadline on the prompt write: equivalent against the fake. The prompt line is the audited subtask and fits the pipe buffer, so the write never blocks; killing the mutant needs a runtime that stops reading stdin and a prompt larger than the pipe buffer.
+All 90 mutants over executor.rs, rpc.rs and route.rs are KILLED. A KILLED (hang) row means the mutated build made a test hang and the runner's 900 s limit ended it; the hang is the kill. There is no survivor and no COMPILE ERROR row.
 
-33 executor.rs, the action audit is dropped from the outcome: equivalent today. The executor serves with BrokerPolicy::default(), whose ceiling is Workspace, and the action gate reviews Repository and above, so no gated call can reach the executor and the audit is always empty on this route. The pass-through from ArmedBroker::action_audit is covered by the slice 1 broker tests; it becomes reachable, and needs an executor-level test, when a wider policy is configured.
+Two earlier survivors were wrong to call equivalent and are now killed: the action audit pass-through (a gated run_command call reaches the broker with the default policy, and the audit of that call is asserted on the outcome) and the socket directory owner check (the decision is the pure is_private function with a truth table).
 
-34 executor.rs, the owner check of the socket directory: not killable unprivileged. It needs a 0700 directory owned by another user, which a test cannot create without root.
+The prompt-write deadline is killed through send_lines over a tiny duplex that never reads, with a virtual clock.
