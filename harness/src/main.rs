@@ -1930,21 +1930,54 @@ fn build_delegate_task_manager(
 fn pi_route_from_env(
     enabled: bool,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
-    Ok(pi_route_with(enabled, &|key| std::env::var_os(key))?)
+    pi_route_logged(enabled, &|key| std::env::var_os(key))
+}
+
+fn pi_route_logged(
+    enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
+    pi_route_with(enabled, lookup, &warn_notice)
+}
+
+const PI_ROUTE_INERT_NOTICE: &str =
+    "the pi route is on but inert: until a pi image and a model path exist, every task fails closed";
+
+fn warn_notice(message: &str) {
+    warn!("{message}");
+}
+
+#[cfg(unix)]
+fn pi_executor(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::PodmanPiExecutor::from_lookup(lookup)?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn pi_executor(
+    _lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
+    warn!(
+        "the pi route is on and this platform has no pi executor: every audited task fails closed"
+    );
+    Ok(std::sync::Arc::new(
+        harness::harness_adapter::UnwiredPiExecutor,
+    ))
 }
 
 fn pi_route_with(
     enabled: bool,
     lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Result<Option<harness::harness_adapter::PiRoute>, harness::harness_adapter::PiRouteError> {
+    notify: &dyn Fn(&str),
+) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
     if !enabled {
         return Ok(None);
     }
-    let route = harness::harness_adapter::PiRoute::from_lookup(
-        lookup,
-        std::sync::Arc::new(harness::harness_adapter::UnwiredPiExecutor),
-    )?;
-    warn!("the pi route is on and its executor is not wired: every audited task fails closed");
+    let route = harness::harness_adapter::PiRoute::from_lookup(lookup, pi_executor(lookup)?)?;
+    notify(PI_ROUTE_INERT_NOTICE);
     Ok(Some(route))
 }
 
@@ -3856,10 +3889,118 @@ mod tests {
             }
             _ => None,
         };
-        assert!(pi_route_with(false, &configured).unwrap().is_none());
-        assert!(pi_route_with(false, &|_| None).unwrap().is_none());
-        assert!(pi_route_with(true, &configured).unwrap().is_some());
-        assert!(pi_route_with(true, &|_| None).is_err());
+        assert!(pi_route_with(false, &configured, &|_| {})
+            .unwrap()
+            .is_none());
+        assert!(pi_route_with(false, &|_| None, &|_| {}).unwrap().is_none());
+        assert!(pi_route_with(true, &configured, &|_| {}).unwrap().is_some());
+        assert!(pi_route_with(true, &|_| None, &|_| {}).is_err());
+    }
+
+    #[test]
+    fn an_enabled_pi_route_announces_that_it_is_inert_and_a_disabled_one_is_silent() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let heard = std::cell::RefCell::new(Vec::new());
+        let notify = |message: &str| heard.borrow_mut().push(message.to_string());
+        assert!(pi_route_with(false, &configured, &notify)
+            .unwrap()
+            .is_none());
+        assert!(heard.borrow().is_empty());
+        assert!(pi_route_with(true, &configured, &notify).unwrap().is_some());
+        let heard = heard.borrow();
+        assert_eq!(heard.len(), 1);
+        assert!(heard[0].contains("inert"), "{}", heard[0]);
+        assert!(heard[0].contains("fails closed"), "{}", heard[0]);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_logged_pi_route_writes_the_inert_notice_at_warn_level() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(pi_route_logged(false, &configured).unwrap().is_none());
+            assert!(captured.0.lock().unwrap().is_empty());
+            assert!(pi_route_logged(true, &configured).unwrap().is_some());
+        });
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("inert"), "{text}");
+        assert!(text.contains("fails closed"), "{text}");
+        assert!(pi_route_from_env(false).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enabled_pi_route_runs_pi_in_a_container_with_no_network_by_default() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let route = pi_route_with(true, &configured, &|_| {}).unwrap().unwrap();
+        let shown = format!("{:?}", route.executor());
+        assert!(shown.contains("PodmanPiExecutor"), "{shown}");
+        assert!(shown.contains("None"), "{shown}");
+        let named = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("model-net")),
+            other => configured(other),
+        };
+        let route = pi_route_with(true, &named, &|_| {}).unwrap().unwrap();
+        assert!(format!("{:?}", route.executor()).contains("model-net"));
+        let reserved = |key: &str| match key {
+            harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("host")),
+            other => configured(other),
+        };
+        assert!(pi_route_with(true, &reserved, &|_| {}).is_err());
     }
 
     #[test]

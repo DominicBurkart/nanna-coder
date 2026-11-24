@@ -67,15 +67,21 @@
 mod binding;
 #[cfg(test)]
 mod binding_tests;
-#[cfg_attr(not(test), expect(dead_code))]
 mod broker;
 #[cfg(test)]
 mod broker_tests;
 mod checked;
+#[cfg(unix)]
+mod executor;
+#[cfg(all(test, unix))]
+mod executor_tests;
 mod isolation;
 mod pi;
 mod pi_extension;
 mod route;
+mod rpc;
+#[cfg(test)]
+mod rpc_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
@@ -90,12 +96,18 @@ pub use broker::{
     MAX_REQUEST_BYTES,
 };
 pub use checked::{launch_plan, CheckedPlan, HarnessAdapter, PlanError};
+#[cfg(unix)]
+pub use executor::{PiNetwork, PiNetworkError, PodmanPiExecutor, PI_NETWORK_ENV};
 pub use isolation::{IsolationPolicy, IsolationViolation, BROKER_SOCKET_CONTAINER_PATH};
 pub use pi::PiAdapter;
 pub(crate) use route::{pi_container_name, PiContainerGuard};
 pub use route::{
     PiExecutor, PiLaunch, PiLimits, PiRoute, PiRouteError, PiRunOutcome, UnwiredPiExecutor,
     PI_BROKER_DIR_ENV, PI_IMAGE_ENV,
+};
+pub use rpc::{
+    write_reply, LineReader, ReadLimits, RpcError, MAX_REPLY_BYTES, MAX_RPC_LINE_BYTES,
+    MAX_RPC_TOTAL_BYTES, RELAY_HOST, REQUEST_READ_TIMEOUT,
 };
 
 use crate::auditor::Allowed;

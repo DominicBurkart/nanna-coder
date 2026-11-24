@@ -291,18 +291,52 @@ impl PiContainerGuard {
     }
 }
 
+pub(super) const REMOVE_LIMIT: Duration = Duration::from_secs(10);
+
+pub(super) fn off_runtime<F: FnOnce()>(work: F) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+pub(super) fn bounded_status(command: &str, args: &[String], limit: Duration) {
+    let Ok(mut child) = std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if started.elapsed() < limit => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
 impl Drop for PiContainerGuard {
     fn drop(&mut self) {
-        let runtime = crate::container::detect_runtime();
-        if !runtime.is_available() {
-            return;
-        }
-        let _ = std::process::Command::new(runtime.command())
-            .args(["rm", "-f", &self.name])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        off_runtime(|| {
+            let runtime = crate::container::detect_runtime();
+            if runtime.is_available() {
+                let args = ["rm", "-f", self.name.as_str()].map(String::from);
+                bounded_status(runtime.command(), &args, REMOVE_LIMIT);
+            }
+        });
     }
 }
 
@@ -464,6 +498,96 @@ mod tests {
         let guard = PiContainerGuard::arm("nanna-pi-t-1");
         assert_eq!(guard.name(), "nanna-pi-t-1");
         std::mem::forget(guard);
+    }
+
+    const SLOW_RM: &str = "case \"$1\" in rm) sleep 1;; esac";
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_removal_does_not_stall_a_multi_thread_runtime() {
+        let fake = FakePodman::install_scripted_async(SLOW_RM).await;
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async {
+            drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        })
+        .await
+        .unwrap();
+        let after = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        ticker.abort();
+        assert!(fake.calls().contains(&"rm -f nanna-pi-t-1".to_string()));
+        assert!(after >= before + 10, "ticker advanced {before} -> {after}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_removal_completes_inline_on_a_current_thread_runtime() {
+        let fake = FakePodman::install_scripted_async(SLOW_RM).await;
+        let started = std::time::Instant::now();
+        drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(fake.calls().contains(&"rm -f nanna-pi-t-1".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_that_hangs_is_killed_at_the_limit() {
+        let started = std::time::Instant::now();
+        bounded_status(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            Duration::from_millis(200),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_removal_limit_is_ten_seconds() {
+        assert_eq!(REMOVE_LIMIT, Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_guard_gives_a_hung_removal_the_removal_limit_and_then_kills_it() {
+        let fake =
+            FakePodman::install_scripted_async("case \"$1\" in rm) exec sleep 60;; esac").await;
+        let started = std::time::Instant::now();
+        drop(PiContainerGuard::arm("nanna-pi-t-1"));
+        let elapsed = started.elapsed();
+        assert!(fake.calls().contains(&"rm -f nanna-pi-t-1".to_string()));
+        assert!(elapsed >= Duration::from_secs(9), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_that_finishes_returns_before_the_limit() {
+        let started = std::time::Instant::now();
+        bounded_status(
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            Duration::from_secs(20),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_missing_removal_command_returns_at_once() {
+        bounded_status(
+            "/nonexistent/nanna-pi-test-command",
+            &[],
+            Duration::from_secs(20),
+        );
     }
 
     #[cfg(unix)]

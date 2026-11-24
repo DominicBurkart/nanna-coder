@@ -705,6 +705,7 @@ impl Broker {
         self.core.registry.installed_layers()
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn served(&self) -> Vec<&str> {
         self.core.served.iter().map(String::as_str).collect()
     }
@@ -759,6 +760,7 @@ impl ArmedBroker {
         self.core.halted.load(Ordering::SeqCst)
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn task_id(&self) -> &TaskId {
         &self.core.task_id
     }
@@ -832,23 +834,36 @@ impl ArmedBroker {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn handle_line(&self, line: &str) -> String {
+        self.handle_line_with_halt(line).await.0
+    }
+
+    pub(crate) async fn handle_line_with_halt(&self, line: &str) -> (String, Option<HaltReason>) {
         let bad = |message: String| BrokerResponse {
             ok: false,
             output: json!(clip(&message, MAX_MESSAGE_BYTES)),
             kind: Some(ToolErrorKind::BadRequest),
             halt: false,
         };
+        let mut halt = None;
         let response = if line.len() > MAX_REQUEST_BYTES {
             bad("request too large".to_string())
         } else {
             match serde_json::from_str::<BrokerRequest>(line) {
-                Ok(request) => self.handle(request).await.to_response(),
+                Ok(request) => {
+                    let outcome = self.handle(request).await;
+                    let response = outcome.to_response();
+                    if let BrokerOutcome::Halt(reason) = outcome {
+                        halt = Some(reason);
+                    }
+                    response
+                }
                 Err(error) => bad(format!("bad request: {error}")),
             }
         };
         let text = serde_json::to_string(&response).expect("broker responses are plain JSON");
-        wire_text(&text)
+        (wire_text(&text), halt)
     }
 }
 

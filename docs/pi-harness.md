@@ -1,9 +1,12 @@
 # Pi as nanna's internal harness
 
-**Status: planned.** The interface layer (`harness_adapter`) exists, and so do
-the host-side `binding` and `broker` modules of slice 1, which nothing calls. No
-socket server, executor or runner switch is written, nothing launches pi yet,
-and `assign_task` still runs the in-house loop. This document describes the
+**Status: planned, default off.** The interface layer (`harness_adapter`)
+exists, with the host-side `binding` and `broker` modules (slice 1), the
+`TaskRunner` pi route (slice 2) and `PodmanPiExecutor` with its bounded rpc
+framing (slice 3). The route is off unless `mcp-serve` or `delegate` is started
+with `--pi-route`, so `assign_task` still runs the in-house loop. The executor
+is tested against a fake `podman` only: nothing has run real pi in a real
+container yet (slice 5). This document describes the
 target and what is and is not built. Tracking: #924 (merge criteria), #922
 (eval runner and prompt paths), #923 (`tasks/result` wire shape); #921 (the
 action-gate halt and widening the broker policy) is closed.
@@ -215,12 +218,16 @@ Implemented: broker-socket, gateway, capability, env (exact name and value),
 file-path, image, scope, limits and audited-repository checks in
 `IsolationPolicy`; image, model-name and broker-socket-path validation in
 `resolve`; `Allowed`-bound prompt and repository; fail-closed `Unsupported`;
-handshake comparison (called by `Broker::arm`, which nothing calls yet).
+handshake comparison (called by `Broker::arm`, which the executor calls before it serves).
 
-Not implemented yet, all executor work: non-root user, read-only root
-filesystem, dropped Linux capabilities, `no-new-privileges`, and network
-enforcement (the plan states the allowed endpoint; nothing enforces it until
-the executor runs the container on an internal network). `container::NetworkPolicy::for_ceiling` (landed with #669) governs the dev
+Implemented in `PodmanPiExecutor` and covered by an exact-argv test against a
+fake `podman` (not yet run against real podman): non-root user, read-only root
+filesystem, dropped Linux capabilities, `no-new-privileges`, no pull, memory and
+pids limits, no network by default (`--network=none`; a named operator-provisioned
+network is opt-in through `NANNA_PI_NETWORK`, reserved names refused, and nanna
+cannot verify that the named network reaches only the model gateway). The broker
+socket is the only bind mount; the workspace is never mounted.
+`container::NetworkPolicy::for_ceiling` (landed with #669) governs the dev
 container where broker-run tools execute and is unchanged. The agent container
 is separate: its plan is always exactly the model gateway at every ceiling
 (tested), so there is one rule per container and nothing ceiling-derived to
@@ -254,16 +261,17 @@ defence in depth, a separate change that needs the protected-path reviewer).
 
 Not yet done (in order):
 
-1. The socket server that reads broker lines from the container and calls
-   `ArmedBroker::handle_line`, and the `TaskRunner` method that builds the
-   layers and the bound registry in one step (requires
-   `BoundIdentity::Audited`; keep the `BoundIdentity` through task start, which
-   `run` flattens today).
-2. Executor trait plus a container executor (hardening above) with a fake for
-   tests; RPC event parsing (`agent_settled`, tool events) into the existing
-   `TaskResult`/`FailureDiagnostics`, keeping `tasks/result` JSON unchanged for
-   the bridge fixtures (golden-JSON test); lease release on every exit
-   path. Blocked on the real-pi integration test below.
+1. Done in slice 3, not verified against real podman: the socket server
+   (`rpc`, LF-only bounded reads) and the executor (create, `cp` of the plan
+   files into a volume, `start --attach`, arm after the runtime's tool list is
+   verified, deadline, halt and model failures as `StateError`, container
+   removed on every exit). Not verified: volume copy-up and ownership under
+   `--user 65534`, `podman cp -` into a volume, SELinux on the socket connect,
+   non-root and read-only-root behaviour of pi, and how pi reaches a model
+   gateway from a container without a network (the relay is not designed).
+   Budget, cost and `token_usage` parity with the in-house loop is a known gap.
+2. The golden `tasks/result` shape test against the bridge fixtures and the
+   real-pi `NANNA_PI_BIN` integration test (slices 5 and 6).
 3. Packaging: pi 1.2.0 as a pinned flake input (`github:earendil-works/pi`) with
    a lock hash and `npm install --ignore-scripts`, built into the agent image
    only; CI gets pi from that same pinned input. Upstream changed organisations
