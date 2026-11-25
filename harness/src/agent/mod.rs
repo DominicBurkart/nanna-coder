@@ -17,9 +17,13 @@ pub mod eval;
 pub mod eval_case;
 pub mod project_detect;
 pub mod project_prompt;
+pub mod prompt;
 pub mod prompts;
 pub mod rag;
 pub mod report;
+pub mod swe_loop;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
@@ -48,7 +52,7 @@ const COMPLETION_TEMPERATURE: f32 = 0.2;
 const DECISION_TEMPERATURE: f32 = 0.3;
 const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
 const MAX_TOOL_ITERATIONS: usize = 10;
-const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
+const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "replace"];
 const DEFAULT_MAX_NO_PROGRESS_NUDGES: usize = 2;
 const MAX_NO_PROGRESS_MESSAGE_CHARS: usize = 500;
 
@@ -1457,88 +1461,16 @@ pub trait AgentComponent: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        plain_response, scoped_write_registry, tool_call_response, MockProvider,
+    };
     use super::*;
     use crate::entities::git::types::GitRepository;
     use crate::entities::{EntityQuery, EntityStore, InMemoryEntityStore};
     use crate::tools::{EchoTool, ToolRegistry};
-    use model::provider::{ModelError, ModelResult};
     use model::types::{
-        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ModelInfo, ToolCall, Usage,
+        ChatResponse, Choice, FinishReason, FunctionCall, MessageRole, ToolCall, Usage,
     };
-    use std::sync::Mutex;
-
-    struct MockProvider {
-        responses: Mutex<Vec<ChatResponse>>,
-    }
-
-    impl MockProvider {
-        fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
-            Arc::new(Self {
-                responses: Mutex::new(responses),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for MockProvider {
-        async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
-            let mut responses = self.responses.lock().unwrap();
-            if responses.is_empty() {
-                return Err(ModelError::Unknown {
-                    message: "No more responses".to_string(),
-                });
-            }
-            Ok(responses.remove(0))
-        }
-
-        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
-            Ok(vec![])
-        }
-
-        async fn health_check(&self) -> ModelResult<()> {
-            Ok(())
-        }
-
-        fn provider_name(&self) -> &'static str {
-            "mock"
-        }
-    }
-
-    fn plain_response(content: &str) -> ChatResponse {
-        ChatResponse {
-            choices: vec![Choice {
-                message: ChatMessage {
-                    role: MessageRole::Assistant,
-                    content: Some(content.to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                finish_reason: Some(FinishReason::Stop),
-            }],
-            usage: None,
-        }
-    }
-
-    fn tool_call_response(tool_name: &str, args: serde_json::Value) -> ChatResponse {
-        ChatResponse {
-            choices: vec![Choice {
-                message: ChatMessage {
-                    role: MessageRole::Assistant,
-                    content: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "call_0".to_string(),
-                        function: FunctionCall {
-                            name: tool_name.to_string(),
-                            arguments: args,
-                        },
-                    }]),
-                    tool_call_id: None,
-                },
-                finish_reason: Some(FinishReason::ToolCalls),
-            }],
-            usage: None,
-        }
-    }
 
     /// Wrap tool-loop responses with the state machine responses needed for
     /// EnrichingEntities → PlanningEntityModification → PerformingEntityModification →
@@ -1552,13 +1484,6 @@ mod tests {
                                           // UpdatingEntities: no LLM call
         responses.push(plain_response("COMPLETE - task done")); // CheckingTaskCompletion
         responses
-    }
-
-    fn scoped_write_registry(root: &std::path::Path) -> ToolRegistry {
-        let mut identity = crate::identity::example();
-        identity.scope.max_effect = crate::effects::EffectClass::Workspace;
-        identity.scope.tools = vec!["write_file".parse().unwrap()];
-        crate::tools::create_tool_registry_for(root, &identity).unwrap()
     }
 
     #[tokio::test]
