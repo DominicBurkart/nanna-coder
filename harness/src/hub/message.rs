@@ -1,4 +1,5 @@
 use super::lineage::{RootId, SessionId};
+use super::notice::Notices;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -149,13 +150,16 @@ impl fmt::Debug for SendRequest {
 /// ```
 /// use harness::hub::message::SendReceipt;
 ///
-/// let receipt = SendReceipt { ids: vec![], recipients: 0 };
+/// let receipt = SendReceipt { ids: vec![], recipients: 0, notices: Default::default() };
 /// assert_eq!(receipt.recipients, receipt.ids.len());
+/// assert!(receipt.notices.is_empty());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SendReceipt {
     pub ids: Vec<MessageId>,
     pub recipients: usize,
+    #[serde(skip_serializing_if = "Notices::is_empty")]
+    pub notices: Notices,
 }
 
 /// How far a session's identity card lets it message: `None` forbids

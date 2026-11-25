@@ -1,9 +1,11 @@
+pub mod doorbell;
 pub mod error;
 pub mod index;
 pub mod limits;
 pub mod lineage;
 pub mod mailbox;
 pub mod message;
+pub mod notice;
 pub mod oracle;
 pub mod query;
 pub mod reach;
