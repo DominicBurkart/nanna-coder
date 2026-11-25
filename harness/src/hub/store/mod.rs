@@ -21,7 +21,7 @@ pub use messages::{InMemoryMessageStore, JsonlMessageStore};
 pub use sessions::{InMemorySessionStore, JsonlSessionStore};
 
 use super::lineage::{RootId, SessionId};
-use super::message::{DeliveryState, MessageId, Recipient, Seq, StoredMessage};
+use super::message::{DeliveryState, MessageId, Recipient, Release, Seq, StoredMessage};
 use super::session::{SessionRecord, SessionStatus};
 use super::summary::Summary;
 use chrono::{DateTime, Duration, Utc};
@@ -44,6 +44,7 @@ pub const MESSAGES_PATH_ENV: &str = "NANNA_MESSAGES_PATH";
 /// assert_eq!(StoreError::Locked.to_string(), "hub state locked by another nanna process");
 /// assert_eq!(StoreError::NotFound.to_string(), "no such record");
 /// assert_eq!(StoreError::Duplicate.to_string(), "record already exists");
+/// assert_eq!(StoreError::Conflict.to_string(), "record is not in the expected state");
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -57,6 +58,8 @@ pub enum StoreError {
     NotFound,
     #[error("record already exists")]
     Duplicate,
+    #[error("record is not in the expected state")]
+    Conflict,
 }
 
 /// How long finished state is kept. Quarantined messages are never pruned:
@@ -302,6 +305,41 @@ pub trait MessageStore: Send + Sync {
     /// assert!(matches!(result, Err(StoreError::NotFound)));
     /// ```
     fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError>;
+    /// Every `Quarantined` message of every root in ascending `Seq` order, and nothing else. The
+    /// records carry the stored (already redacted) text and the reason codes of the hold; a read
+    /// failure is an error, never an empty list.
+    ///
+    /// ```
+    /// use harness::hub::store::{InMemoryMessageStore, MessageStore};
+    /// assert!(InMemoryMessageStore::new().quarantined().unwrap().is_empty());
+    /// ```
+    fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError>;
+    /// Move the message from `from` to `to` only if it is in `from` now, deciding and writing in
+    /// one commit under the store's single lock, so of two writers racing for the same message
+    /// exactly one wins and a writer holding a stale view never overwrites a newer state. Returns
+    /// the record as written. A message in another state: `Conflict`; unknown id: `NotFound`.
+    /// `release` is the only way a release marker reaches a record, and it is accepted only for
+    /// `Quarantined` to `Pending`; any other combination is `Conflict` and changes nothing. A
+    /// transition without `release` keeps the marker the record already has.
+    ///
+    /// ```
+    /// use harness::hub::message::{DeliveryState, MessageId};
+    /// use harness::hub::store::{InMemoryMessageStore, MessageStore, StoreError};
+    /// let result = InMemoryMessageStore::new().transition(
+    ///     MessageId::new(),
+    ///     DeliveryState::Quarantined,
+    ///     DeliveryState::Expired,
+    ///     None,
+    /// );
+    /// assert!(matches!(result, Err(StoreError::NotFound)));
+    /// ```
+    fn transition(
+        &self,
+        id: MessageId,
+        from: DeliveryState,
+        to: DeliveryState,
+        release: Option<Release>,
+    ) -> Result<StoredMessage, StoreError>;
     /// Remove expired messages; returns how many.
     ///
     /// ```
@@ -421,6 +459,10 @@ mod tests {
         );
         assert_eq!(StoreError::NotFound.to_string(), "no such record");
         assert_eq!(StoreError::Duplicate.to_string(), "record already exists");
+        assert_eq!(
+            StoreError::Conflict.to_string(),
+            "record is not in the expected state"
+        );
         let io = StoreError::from(io::Error::other("disk"));
         assert_eq!(io.to_string(), "io: disk");
     }

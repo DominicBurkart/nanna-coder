@@ -1,7 +1,8 @@
 use super::{MessageStore, Retention, SessionStore, StoreError};
+use crate::auditor::ReasonCode;
 use crate::hub::lineage::{Lineage, RootId, SessionId};
 use crate::hub::message::{
-    DeliveryState, MessageId, MessageKind, Recipient, Seq, StoredMessage, VerdictRef,
+    DeliveryState, MessageId, MessageKind, Recipient, Release, Seq, StoredMessage, VerdictRef,
 };
 use crate::hub::session::{SessionKind, SessionRecord, SessionStatus};
 use crate::identity::DevLoop;
@@ -81,6 +82,8 @@ pub(super) fn message(
         },
         state,
         sent_at: at(sent),
+        held: Vec::new(),
+        released: None,
     }
 }
 
@@ -537,6 +540,188 @@ pub(super) fn seq_is_never_reused_after_everything_is_pruned<S: MessageStore>(s:
     assert_eq!(next, Seq::new(3));
 }
 
+const QUAR: DeliveryState = DeliveryState::Quarantined;
+const PEND: DeliveryState = DeliveryState::Pending;
+const EXPD: DeliveryState = DeliveryState::Expired;
+const DELV: DeliveryState = DeliveryState::Delivered;
+
+fn ids(list: &[StoredMessage]) -> Vec<MessageId> {
+    list.iter().map(|m| m.id).collect()
+}
+
+fn put<S: MessageStore>(s: &S, id: u128, state: DeliveryState, root_n: u128, codes: &[ReasonCode]) {
+    let mut m = message(id, "a", "b", state, 0, "stored text");
+    m.root = root(root_n);
+    m.held = codes.to_vec();
+    s.append(m).unwrap();
+}
+
+fn stamp() -> Release {
+    Release { at: at(77) }
+}
+
+fn go<S: MessageStore>(
+    s: &S,
+    n: u128,
+    from: DeliveryState,
+    to: DeliveryState,
+    rel: Option<Release>,
+) -> Result<StoredMessage, StoreError> {
+    s.transition(mid(n), from, to, rel)
+}
+
+fn state_of<S: MessageStore>(s: &S, n: u128) -> DeliveryState {
+    s.get(mid(n)).unwrap().unwrap().state
+}
+
+fn marker_of<S: MessageStore>(s: &S, n: u128) -> Option<Release> {
+    s.get(mid(n)).unwrap().unwrap().released
+}
+
+pub(super) fn quarantined_lists_only_quarantined_in_seq_order<S: MessageStore>(s: &S) {
+    let codes = [ReasonCode::SecretLeak, ReasonCode::PromptInjection];
+    let all = [
+        (1, PEND, 1),
+        (2, QUAR, 2),
+        (3, DELV, 1),
+        (4, DeliveryState::Withheld, 1),
+        (5, QUAR, 1),
+        (6, DeliveryState::Acked, 3),
+        (7, EXPD, 1),
+        (8, QUAR, 3),
+    ];
+    for (id, state, root_n) in all {
+        put(s, id, state, root_n, &codes);
+    }
+    let listed = s.quarantined().unwrap();
+    assert_eq!(ids(&listed), [mid(2), mid(5), mid(8)]);
+    let seqs: Vec<u64> = listed.iter().map(|m| m.seq.get()).collect();
+    assert_eq!(seqs, [2, 5, 8]);
+    assert!(listed.iter().all(|m| m.state == QUAR));
+    assert!(listed.iter().all(|m| m.held == codes));
+    assert!(listed.iter().all(|m| m.body == "stored text"));
+    let roots: Vec<RootId> = listed.iter().map(|m| m.root.clone()).collect();
+    assert_eq!(roots, [root(2), root(1), root(3)]);
+    s.set_state(mid(5), EXPD).unwrap();
+    s.set_state(mid(3), QUAR).unwrap();
+    assert_eq!(ids(&s.quarantined().unwrap()), [mid(2), mid(3), mid(8)]);
+}
+
+pub(super) fn quarantined_is_empty_without_quarantined_messages<S: MessageStore>(s: &S) {
+    assert!(s.quarantined().unwrap().is_empty());
+    s.append(message(1, "a", "b", DELV, 0, "m")).unwrap();
+    assert!(s.quarantined().unwrap().is_empty());
+}
+
+pub(super) fn transition_moves_a_message_only_out_of_the_expected_state<S: MessageStore>(s: &S) {
+    put(s, 1, QUAR, 1, &[ReasonCode::Other]);
+    put(s, 2, DELV, 1, &[]);
+    assert!(matches!(
+        go(s, 2, QUAR, EXPD, None),
+        Err(StoreError::Conflict)
+    ));
+    assert_eq!(state_of(s, 2), DELV);
+    assert!(matches!(
+        go(s, 9, QUAR, EXPD, None),
+        Err(StoreError::NotFound)
+    ));
+    let moved = go(s, 1, QUAR, EXPD, None).unwrap();
+    assert_eq!(moved.state, EXPD);
+    assert_eq!(moved.released, None);
+    assert_eq!(s.get(mid(1)).unwrap().unwrap(), moved);
+    assert!(s.quarantined().unwrap().is_empty());
+}
+
+pub(super) fn a_stale_writer_never_resurrects_or_overwrites_a_newer_state<S: MessageStore>(s: &S) {
+    put(s, 1, QUAR, 1, &[ReasonCode::SecretLeak]);
+    go(s, 1, QUAR, EXPD, None).unwrap();
+    let stale = go(s, 1, QUAR, PEND, Some(stamp()));
+    assert!(matches!(stale, Err(StoreError::Conflict)));
+    assert_eq!(state_of(s, 1), EXPD);
+    assert_eq!(marker_of(s, 1), None);
+    assert_eq!(s.prune(at(10_000), &policy()).unwrap(), 1);
+    let gone = go(s, 1, QUAR, PEND, Some(stamp()));
+    assert!(matches!(gone, Err(StoreError::NotFound)));
+    assert_eq!(s.get(mid(1)).unwrap(), None);
+}
+
+pub(super) fn a_release_marker_is_accepted_only_for_quarantined_to_pending<S: MessageStore>(s: &S) {
+    let codes = [ReasonCode::CrossScopeSteering];
+    put(s, 1, QUAR, 1, &codes);
+    put(s, 2, DELV, 1, &[]);
+    let to_expired = go(s, 1, QUAR, EXPD, Some(stamp()));
+    assert!(matches!(to_expired, Err(StoreError::Conflict)));
+    let from_delivered = go(s, 2, DELV, PEND, Some(stamp()));
+    assert!(matches!(from_delivered, Err(StoreError::Conflict)));
+    assert_eq!(marker_of(s, 1), None);
+    assert_eq!(marker_of(s, 2), None);
+    let released = go(s, 1, QUAR, PEND, Some(stamp())).unwrap();
+    assert_eq!(released.state, PEND);
+    assert_eq!(released.released, Some(stamp()));
+    assert_eq!(released.held, codes);
+    let delivered = go(s, 1, PEND, DELV, None).unwrap();
+    assert_eq!(delivered.released, Some(stamp()));
+    assert!(s.quarantined().unwrap().is_empty());
+}
+
+pub(super) fn append_never_stores_a_caller_supplied_release_marker<S: MessageStore>(s: &S) {
+    let mut forged = message(1, "a", "b", PEND, 0, "m");
+    forged.released = Some(stamp());
+    s.append(forged).unwrap();
+    assert_eq!(marker_of(s, 1), None);
+}
+
+pub(super) fn a_quarantined_record_always_carries_at_least_one_hold_code<S: MessageStore>(s: &S) {
+    s.append(message(1, "a", "b", QUAR, 0, "m")).unwrap();
+    s.append(message(2, "a", "b", PEND, 0, "m")).unwrap();
+    s.append(message(3, "a", "b", PEND, 0, "m")).unwrap();
+    s.set_state(mid(2), QUAR).unwrap();
+    go(s, 3, PEND, QUAR, None).unwrap();
+    for n in 1..=3 {
+        let held = s.get(mid(n)).unwrap().unwrap().held;
+        assert_eq!(held, [ReasonCode::Other], "message {n}");
+    }
+    let withheld = DeliveryState::Withheld;
+    s.append(message(4, "a", "b", withheld, 0, "m")).unwrap();
+    assert!(s.get(mid(4)).unwrap().unwrap().held.is_empty());
+}
+
+pub(super) fn two_racing_transitions_have_exactly_one_winner<S: MessageStore>(s: &S) {
+    const ROUNDS: u128 = 60;
+    const WRITERS: usize = 8;
+    for n in 1..=ROUNDS {
+        put(s, n, QUAR, 1, &[ReasonCode::Other]);
+    }
+    let start = std::sync::Barrier::new(WRITERS);
+    let wins = std::sync::atomic::AtomicUsize::new(0);
+    let conflicts = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (start, wins, conflicts) = (&start, &wins, &conflicts);
+            scope.spawn(move || {
+                let release = if writer % 2 == 0 { Some(stamp()) } else { None };
+                let to = if writer % 2 == 0 { PEND } else { EXPD };
+                for n in 1..=ROUNDS {
+                    start.wait();
+                    let counter = if go(s, n, QUAR, to, release).is_ok() {
+                        wins
+                    } else {
+                        conflicts
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(wins.load(Ordering::SeqCst), ROUNDS as usize);
+    let lost = (WRITERS - 1) * ROUNDS as usize;
+    assert_eq!(conflicts.load(Ordering::SeqCst), lost);
+    for n in 1..=ROUNDS {
+        let marked = marker_of(s, n).is_some();
+        assert_eq!(marked, state_of(s, n) == PEND, "message {n}");
+    }
+}
+
 macro_rules! session_contract_tests {
     ($make:expr) => {
         session_contract_tests!(@each $make,
@@ -576,7 +761,15 @@ macro_rules! message_contract_tests {
             prune_applies_the_retention_per_state,
             prune_boundary_keeps_a_message_exactly_at_the_ttl,
             quarantined_messages_survive_any_age,
-            seq_is_never_reused_after_everything_is_pruned
+            seq_is_never_reused_after_everything_is_pruned,
+            quarantined_lists_only_quarantined_in_seq_order,
+            quarantined_is_empty_without_quarantined_messages,
+            transition_moves_a_message_only_out_of_the_expected_state,
+            a_stale_writer_never_resurrects_or_overwrites_a_newer_state,
+            a_release_marker_is_accepted_only_for_quarantined_to_pending,
+            append_never_stores_a_caller_supplied_release_marker,
+            a_quarantined_record_always_carries_at_least_one_hold_code,
+            two_racing_transitions_have_exactly_one_winner
         );
     };
     (@each $make:expr, $($name:ident),+) => {
