@@ -744,6 +744,8 @@ mod tests {
             call_id: "c".to_string(),
             result: String::new(),
             effect: Some(EffectRecord::new(class)),
+            seq: 0,
+            outcome: None,
         }
     }
 

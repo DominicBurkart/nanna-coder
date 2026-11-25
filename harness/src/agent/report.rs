@@ -118,6 +118,8 @@ mod tests {
                 call_id: "call-1".to_string(),
                 result: "fn main(){}".to_string(),
                 effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
+                seq: 0,
+                outcome: None,
             }],
             conversation_snapshot: vec![ChatMessage::user("hi")],
             denials: vec![],

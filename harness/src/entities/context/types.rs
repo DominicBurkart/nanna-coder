@@ -21,6 +21,12 @@ pub struct ToolCallRecord {
     /// effect classification.
     #[serde(default)]
     pub effect: Option<EffectRecord>,
+    /// Position of the call in the run, assigned by the harness at dispatch.
+    #[serde(default)]
+    pub seq: u64,
+    /// Structured result of the call when the tool reports one.
+    #[serde(default)]
+    pub outcome: Option<crate::tool_contract::ToolOutcome>,
 }
 
 /// Project context entity — persists the history of a completed agent run
@@ -89,6 +95,48 @@ mod tests {
     use model::types::{ChatMessage, MessageRole};
 
     #[test]
+    fn a_record_saved_before_outcomes_existed_still_loads() {
+        let legacy = serde_json::json!({
+            "tool_name": "echo",
+            "arguments": {"message": "hi"},
+            "call_id": "call_0",
+            "result": "hi"
+        });
+
+        let record: ToolCallRecord = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(record.seq, 0);
+        assert!(record.outcome.is_none());
+    }
+
+    #[test]
+    fn a_record_keeps_its_sequence_number_and_outcome() {
+        let record = ToolCallRecord {
+            tool_name: "replace".to_string(),
+            arguments: serde_json::json!({}),
+            call_id: "call_0".to_string(),
+            result: String::new(),
+            effect: None,
+            seq: 7,
+            outcome: Some(crate::tool_contract::ToolOutcome::failure(
+                crate::tool_contract::ErrorCode::NoMatch,
+                "old text not found",
+            )),
+        };
+
+        let wire = serde_json::to_value(&record).unwrap();
+        let back: ToolCallRecord = serde_json::from_value(wire).unwrap();
+
+        assert_eq!(back.seq, 7);
+        let outcome = back.outcome.unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.error_code,
+            Some(crate::tool_contract::ErrorCode::NoMatch)
+        );
+    }
+
+    #[test]
     fn test_context_entity_full_round_trip() {
         let tool_call = ToolCallRecord {
             tool_name: "echo".to_string(),
@@ -96,6 +144,8 @@ mod tests {
             call_id: "call_0".to_string(),
             result: "echoed: hello".to_string(),
             effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
+            seq: 0,
+            outcome: None,
         };
 
         let entity = ContextEntity::new(
@@ -134,6 +184,8 @@ mod tests {
             call_id: "call_1".to_string(),
             result: "3".to_string(),
             effect: Some(EffectRecord::new(crate::effects::EffectClass::None)),
+            seq: 0,
+            outcome: None,
         };
 
         let json = serde_json::to_string(&record).unwrap();

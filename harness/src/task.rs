@@ -2815,6 +2815,8 @@ max_concurrent = 1
             call_id: "call_1".to_string(),
             result: "fn main() {}".to_string(),
             effect: Some(crate::effects::EffectRecord::new(EffectClass::None)),
+            seq: 0,
+            outcome: None,
         };
         let diag = FailureDiagnostics {
             changes: None,
@@ -2846,6 +2848,8 @@ max_concurrent = 1
             call_id: format!("call_{name}"),
             result: String::new(),
             effect: class.map(crate::effects::EffectRecord::new),
+            seq: 0,
+            outcome: None,
         }
     }
 

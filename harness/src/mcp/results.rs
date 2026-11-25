@@ -667,6 +667,8 @@ mod tests {
             call_id: format!("c{n}"),
             result: "ok".to_string(),
             effect: None,
+            seq: 0,
+            outcome: None,
         };
         TaskResult {
             changes: None,
