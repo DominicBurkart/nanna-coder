@@ -41,6 +41,7 @@ pub mod protected;
 pub mod qa;
 pub mod result_store;
 pub mod rollout;
+pub mod sandbox_lease;
 pub mod sandbox_tools;
 pub mod scheduler;
 pub mod scope;
