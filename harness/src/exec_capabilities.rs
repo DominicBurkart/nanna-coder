@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::AgentIdentity;
+use crate::plugins::types::{Stack, VerbSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -146,25 +147,49 @@ pub fn mount_is_read_only(path: &Path) -> bool {
 }
 
 pub fn refusal(spec: &CapabilitySpec, workspace_root: &Path, env: &Environment) -> Option<String> {
-    if let Tier::Heavy { sandbox_image } = spec.tier {
+    refuse(
+        &Needs {
+            name: spec.name,
+            tier: spec.tier,
+            workspace_signal: spec.workspace_signal,
+            toolchain: spec.toolchain.to_vec(),
+            offline_cargo_home: spec.offline_cargo_home,
+            isolation: spec.isolation,
+        },
+        workspace_root,
+        env,
+    )
+}
+
+struct Needs<'a> {
+    name: &'a str,
+    tier: Tier,
+    workspace_signal: Option<&'a str>,
+    toolchain: Vec<&'a str>,
+    offline_cargo_home: bool,
+    isolation: Isolation,
+}
+
+fn refuse(needs: &Needs<'_>, workspace_root: &Path, env: &Environment) -> Option<String> {
+    if let Tier::Heavy { sandbox_image } = needs.tier {
         return Some(format!(
             "capability {} needs the dedicated sandbox image {sandbox_image}, which the default harness image does not carry",
-            spec.name
+            needs.name
         ));
     }
-    if let Some(signal) = spec.workspace_signal {
+    if let Some(signal) = needs.workspace_signal {
         if !workspace_root.join(signal).exists() {
             return Some(format!("the workspace has no {signal}"));
         }
     }
-    for program in spec.toolchain {
+    for program in &needs.toolchain {
         if env.find_program(program).is_none() {
             return Some(format!(
                 "toolchain program {program} is not in the harness image"
             ));
         }
     }
-    if spec.offline_cargo_home {
+    if needs.offline_cargo_home {
         if !env.offline {
             return Some("CARGO_NET_OFFLINE=true is not set for the harness".to_string());
         }
@@ -182,7 +207,7 @@ pub fn refusal(spec: &CapabilitySpec, workspace_root: &Path, env: &Environment) 
             Some(_) => {}
         }
     }
-    match spec.isolation {
+    match needs.isolation {
         Isolation::OfflinePrivateNamespaces => {
             if !env.is_root {
                 return Some(
@@ -196,6 +221,145 @@ pub fn refusal(spec: &CapabilitySpec, workspace_root: &Path, env: &Environment) 
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackCapability {
+    pub name: String,
+    pub tools: Vec<String>,
+    pub toolchain: Vec<String>,
+    pub workspace_signal: Option<String>,
+    pub offline_cargo_home: bool,
+    pub isolation: Isolation,
+    pub tier: Tier,
+}
+
+fn is_cargo_stack(stack: &Stack) -> bool {
+    stack.build_system == "cargo" || stack.package_manager == "cargo"
+}
+
+pub fn tool_names(stack: &Stack, verb: &str) -> Vec<String> {
+    let mut names = vec![verb.to_string()];
+    if is_cargo_stack(stack) {
+        names.push(format!("cargo_{verb}"));
+    }
+    names
+}
+
+pub fn verb_for_tool<'a>(stack: &'a Stack, tool: &str) -> Option<(&'a str, &'a VerbSpec)> {
+    stack
+        .verbs
+        .iter()
+        .find(|(verb, _)| tool_names(stack, verb).iter().any(|name| name == tool))
+        .map(|(verb, spec)| (verb.as_str(), spec))
+}
+
+pub fn capability_for_stack(stack: &Stack) -> StackCapability {
+    let mut toolchain: Vec<String> = Vec::new();
+    if is_cargo_stack(stack) {
+        toolchain.extend(["cargo", "rustc", "cc"].map(String::from));
+    }
+    for verb in stack.verbs.values() {
+        if let Some(program) = verb.argv.first() {
+            if !toolchain.contains(program) {
+                toolchain.push(program.clone());
+            }
+        }
+    }
+    StackCapability {
+        name: stack.build_system.clone(),
+        tools: stack
+            .verbs
+            .keys()
+            .flat_map(|verb| tool_names(stack, verb))
+            .collect(),
+        toolchain,
+        workspace_signal: stack.detect.first().cloned(),
+        offline_cargo_home: is_cargo_stack(stack),
+        isolation: Isolation::OfflinePrivateNamespaces,
+        tier: Tier::Light,
+    }
+}
+
+pub fn stack_refusal(
+    capability: &StackCapability,
+    workspace_root: &Path,
+    env: &Environment,
+) -> Option<String> {
+    refuse(
+        &Needs {
+            name: &capability.name,
+            tier: capability.tier,
+            workspace_signal: capability.workspace_signal.as_deref(),
+            toolchain: capability.toolchain.iter().map(String::as_str).collect(),
+            offline_cargo_home: capability.offline_cargo_home,
+            isolation: capability.isolation,
+        },
+        workspace_root,
+        env,
+    )
+}
+
+#[derive(Debug, Default)]
+pub struct StackPlan {
+    pub granted: Vec<String>,
+    pub unavailable: Vec<ToolsUnavailable>,
+}
+
+pub fn plan_for_stack(
+    identity: &AgentIdentity,
+    stack: &Stack,
+    workspace_root: &Path,
+    env: &Environment,
+    allow_network: bool,
+) -> StackPlan {
+    let mut plan = StackPlan::default();
+    let capability = capability_for_stack(stack);
+    let requested = |verb: &str| -> Vec<String> {
+        tool_names(stack, verb)
+            .into_iter()
+            .filter(|name| {
+                identity
+                    .scope
+                    .tools
+                    .iter()
+                    .any(|pattern| pattern.as_str() == name)
+            })
+            .collect()
+    };
+    let wanted: Vec<(&VerbSpec, Vec<String>)> = stack
+        .verbs
+        .iter()
+        .map(|(verb, spec)| (spec, requested(verb)))
+        .filter(|(_, names)| !names.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return plan;
+    }
+    if let Some(reason) = stack_refusal(&capability, workspace_root, env) {
+        plan.unavailable.push(ToolsUnavailable {
+            capability: capability.name,
+            tools: wanted.iter().flat_map(|(_, names)| names.clone()).collect(),
+            reason,
+        });
+        return plan;
+    }
+    let mut blocked = Vec::new();
+    for (spec, names) in wanted {
+        if spec.network && !allow_network {
+            blocked.extend(names);
+        } else {
+            plan.granted.extend(names);
+        }
+    }
+    if !blocked.is_empty() {
+        plan.unavailable.push(ToolsUnavailable {
+            capability: capability.name,
+            tools: blocked,
+            reason: "the verb needs network access and the host does not allow network".to_string(),
+        });
+    }
+    plan
 }
 
 pub fn requested_tools<'a>(
@@ -398,5 +562,210 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(!mount_is_read_only(dir.path()));
         assert!(!mount_is_read_only(Path::new("/definitely/not/here")));
+    }
+
+    const RUST_STACK: &str = r#"
+[stack]
+language = "rust"
+package_manager = "cargo"
+build_system = "cargo"
+detect = ["Cargo.toml"]
+source_globs = ["**/*.rs"]
+
+[stack.verbs.check]
+argv = ["cargo", "check", "--message-format=json", "{{package}}"]
+effect = "workspace"
+diagnostics = "cargo_json"
+
+[stack.verbs.check.params.package]
+kind = "string"
+
+[stack.verbs.test]
+argv = ["cargo", "test"]
+effect = "workspace"
+
+[stack.verbs.build]
+argv = ["cargo", "build"]
+effect = "workspace"
+"#;
+
+    const GO_STACK: &str = r#"
+[stack]
+language = "go"
+package_manager = "go"
+build_system = "go"
+detect = ["go.mod"]
+source_globs = ["**/*.go"]
+
+[stack.verbs.check]
+argv = ["go", "vet", "./..."]
+effect = "workspace"
+
+[stack.verbs.fetch]
+argv = ["go", "mod", "download"]
+effect = "workspace"
+network = true
+"#;
+
+    fn stack(src: &str) -> crate::plugins::types::Stack {
+        toml::from_str::<crate::plugins::types::StackFile>(src)
+            .unwrap()
+            .stack
+    }
+
+    fn go_fixture() -> Fixture {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let path = bin.path().join("go");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("go.mod"), "module x\n").unwrap();
+        Fixture { bin, home, repo }
+    }
+
+    fn go_environment(f: &Fixture) -> Environment {
+        Environment {
+            cargo_home: None,
+            cargo_home_read_only: false,
+            offline: false,
+            ..ready_environment(f.bin.path(), f.home.path())
+        }
+    }
+
+    #[test]
+    fn verb_names_are_bare_and_cargo_prefixed_only_for_cargo_stacks() {
+        let rust = stack(RUST_STACK);
+        assert_eq!(tool_names(&rust, "check"), vec!["check", "cargo_check"]);
+        let go = stack(GO_STACK);
+        assert_eq!(tool_names(&go, "check"), vec!["check"]);
+    }
+
+    #[test]
+    fn a_tool_name_resolves_back_to_its_verb() {
+        let rust = stack(RUST_STACK);
+        for name in ["check", "cargo_check"] {
+            assert_eq!(verb_for_tool(&rust, name).unwrap().0, "check", "{name}");
+        }
+        assert!(verb_for_tool(&rust, "cargo_ghost").is_none());
+        assert!(verb_for_tool(&rust, "read_file").is_none());
+        let go = stack(GO_STACK);
+        assert!(verb_for_tool(&go, "cargo_check").is_none());
+        assert_eq!(verb_for_tool(&go, "check").unwrap().0, "check");
+    }
+
+    #[test]
+    fn a_cargo_stack_keeps_the_legacy_tool_names_and_the_exact_name_rule() {
+        let f = fixture();
+        let env = ready_environment(f.bin.path(), f.home.path());
+        let rust = stack(RUST_STACK);
+        let granted = plan_for_stack(
+            &identity_with("\"read_file\", \"cargo_check\", \"cargo_test\""),
+            &rust,
+            f.repo.path(),
+            &env,
+            false,
+        );
+        assert_eq!(granted.granted, vec!["cargo_check", "cargo_test"]);
+        let bare = plan_for_stack(
+            &identity_with("\"check\", \"build\""),
+            &rust,
+            f.repo.path(),
+            &env,
+            false,
+        );
+        assert_eq!(bare.granted, vec!["build", "check"]);
+        for tools in ["\"cargo_*\"", "\"*\"", "\"che*\"", "\"read_file\""] {
+            let plan = plan_for_stack(&identity_with(tools), &rust, f.repo.path(), &env, false);
+            assert!(plan.granted.is_empty(), "{tools}");
+            assert!(plan.unavailable.is_empty(), "{tools}");
+        }
+    }
+
+    #[test]
+    fn a_cargo_stack_still_refuses_on_every_cargo_prerequisite() {
+        let f = fixture();
+        let rust = stack(RUST_STACK);
+        let identity = identity_with("\"cargo_check\"");
+        type Break = Box<dyn Fn(&mut Environment)>;
+        let cases: Vec<(&str, Break)> = vec![
+            ("CARGO_NET_OFFLINE", Box::new(|e| e.offline = false)),
+            ("CARGO_HOME is not set", Box::new(|e| e.cargo_home = None)),
+            ("read-only", Box::new(|e| e.cargo_home_read_only = false)),
+            ("not root", Box::new(|e| e.is_root = false)),
+            (
+                "isolation is unavailable",
+                Box::new(|e| e.isolation = Err("denied".to_string())),
+            ),
+            ("toolchain program cargo", Box::new(|e| e.path_dirs.clear())),
+        ];
+        for (needle, break_it) in cases {
+            let mut env = ready_environment(f.bin.path(), f.home.path());
+            break_it(&mut env);
+            let plan = plan_for_stack(&identity, &rust, f.repo.path(), &env, false);
+            assert!(plan.granted.is_empty(), "{needle}");
+            assert_eq!(plan.unavailable.len(), 1, "{needle}");
+            assert!(plan.unavailable[0].reason.contains(needle), "{needle}");
+            assert_eq!(plan.unavailable[0].tools, vec!["cargo_check"]);
+        }
+    }
+
+    #[test]
+    fn a_go_stack_needs_no_cargo_environment() {
+        let f = go_fixture();
+        let go = stack(GO_STACK);
+        let env = go_environment(&f);
+        let plan = plan_for_stack(&identity_with("\"check\""), &go, f.repo.path(), &env, false);
+        assert_eq!(plan.granted, vec!["check"]);
+        assert!(plan.unavailable.is_empty());
+    }
+
+    #[test]
+    fn a_go_stack_refuses_without_its_toolchain_or_workspace_signal() {
+        let f = go_fixture();
+        let go = stack(GO_STACK);
+        let identity = identity_with("\"check\"");
+        let mut env = go_environment(&f);
+        env.path_dirs.clear();
+        let plan = plan_for_stack(&identity, &go, f.repo.path(), &env, false);
+        assert!(plan.unavailable[0].reason.contains("toolchain program go"));
+        let env = go_environment(&f);
+        let empty = tempfile::tempdir().unwrap();
+        let plan = plan_for_stack(&identity, &go, empty.path(), &env, false);
+        assert!(plan.unavailable[0].reason.contains("go.mod"));
+    }
+
+    #[test]
+    fn network_verbs_need_the_caller_to_allow_network() {
+        let f = go_fixture();
+        let go = stack(GO_STACK);
+        let env = go_environment(&f);
+        let identity = identity_with("\"check\", \"fetch\"");
+        let denied = plan_for_stack(&identity, &go, f.repo.path(), &env, false);
+        assert_eq!(denied.granted, vec!["check"]);
+        assert_eq!(denied.unavailable.len(), 1);
+        assert_eq!(denied.unavailable[0].tools, vec!["fetch"]);
+        assert!(denied.unavailable[0].reason.contains("network"));
+        let allowed = plan_for_stack(&identity, &go, f.repo.path(), &env, true);
+        assert_eq!(allowed.granted, vec!["check", "fetch"]);
+        assert!(allowed.unavailable.is_empty());
+    }
+
+    #[test]
+    fn stack_capabilities_name_tools_uniquely_and_derive_the_toolchain() {
+        let rust = capability_for_stack(&stack(RUST_STACK));
+        assert_eq!(rust.tools.len(), 6);
+        let unique: std::collections::HashSet<&String> = rust.tools.iter().collect();
+        assert_eq!(unique.len(), rust.tools.len());
+        for program in ["cargo", "rustc", "cc"] {
+            assert!(rust.toolchain.iter().any(|p| p == program), "{program}");
+        }
+        assert!(rust.offline_cargo_home);
+        assert_eq!(rust.workspace_signal.as_deref(), Some("Cargo.toml"));
+        let go = capability_for_stack(&stack(GO_STACK));
+        assert_eq!(go.toolchain, vec!["go"]);
+        assert!(!go.offline_cargo_home);
+        assert_eq!(go.workspace_signal.as_deref(), Some("go.mod"));
     }
 }
