@@ -490,6 +490,8 @@ mod tests {
 
     fn sample_result() -> TaskResult {
         TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: "did the thing".to_string(),

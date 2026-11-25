@@ -385,6 +385,9 @@ pub fn compact_result(inputs: &ResultInputs<'_>) -> Value {
                     },
                 });
                 build_common(&mut value);
+                if let Some(audit) = &result.effects_audit {
+                    merge(&mut value, json!({ "effects_audit": audit.summary() }));
+                }
                 value
             });
             json!({
@@ -734,6 +737,8 @@ mod tests {
             outcome: None,
         };
         TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: format!("{}\u{0001}", "summary \u{0001}\"".repeat(20_000)),
@@ -880,6 +885,28 @@ mod tests {
             .await,
         );
         assert_eq!(view["no_changes"], false);
+    }
+
+    #[tokio::test]
+    async fn the_compact_view_carries_the_effects_audit_summary_only_when_present() {
+        use crate::effects_audit::{EffectsAudit, Finding, FindingSeverity, Verdict};
+        let server = server();
+        let plain = finished(&server, completed(big_result()), None).await;
+        let view = body(&fetch(&server, "get_task_result", json!({"task_id": plain.0})).await);
+        assert!(view.get("effects_audit").is_none());
+        let mut audited = big_result();
+        audited.effects_audit = Some(EffectsAudit {
+            verdict: Verdict::Flag,
+            findings: vec![Finding {
+                code: "unclaimed_change".to_string(),
+                severity: FindingSeverity::Flag,
+                detail: "b.rs".to_string(),
+            }],
+        });
+        let id = finished(&server, completed(audited), None).await;
+        let view = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
+        assert_eq!(view["effects_audit"]["verdict"], "flag");
+        assert_eq!(view["effects_audit"]["codes"], json!(["unclaimed_change"]));
     }
 
     #[test]

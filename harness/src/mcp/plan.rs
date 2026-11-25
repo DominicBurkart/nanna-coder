@@ -1311,6 +1311,8 @@ mod tests {
 
     fn finished_result() -> crate::task::TaskResult {
         crate::task::TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: "done".to_string(),
