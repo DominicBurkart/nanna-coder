@@ -71,6 +71,29 @@ fn changes_tool_definition() -> Value {
     })
 }
 
+fn audit_fix(code: &str) -> Option<(bool, &'static str)> {
+    match code {
+        "claimed_unverified" => Some((true, "State the exact file path and use replace.")),
+        "no_changes" => Some((
+            true,
+            "Name the file, the function and the exact change; the agent must edit with replace or write_file before finishing.",
+        )),
+        "destructive_rewrite" => Some((
+            true,
+            "Use replace for targeted edits instead of overwriting a whole file with write_file.",
+        )),
+        "build_regressed" => Some((
+            true,
+            "The edit broke a build that passed before; ask for a smaller change and keep the build green.",
+        )),
+        "out_of_scope_write" => Some((
+            false,
+            "The agent wrote outside its allowed paths; narrow the task or use an identity whose write scope covers them.",
+        )),
+        _ => None,
+    }
+}
+
 pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, String) {
     let lower = message.to_lowercase();
     let spawn_refusal = |lower: &str| -> (String, bool, String) {
@@ -148,6 +171,15 @@ pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, Strin
             false,
             "Raise max_iterations or split the task into smaller ones.".to_string(),
         ),
+        "WallClockExceeded" => (
+            "wall_clock_exceeded".to_string(),
+            true,
+            "The agent ran past its wall-clock limit. Submit a smaller, more specific task, or use an identity with a higher max_wall_clock_secs.".to_string(),
+        ),
+        code if audit_fix(code).is_some() => {
+            let (retryable, fix) = audit_fix(code).unwrap_or((false, ""));
+            (code.to_string(), retryable, fix.to_string())
+        }
         "NoProgress" => (
             "no_progress".to_string(),
             true,
@@ -589,6 +621,37 @@ mod tests {
         assert_eq!((c.as_str(), retryable), ("no_progress", true));
         assert!(fix.contains("name the file"), "{fix}");
         assert_eq!(code("SomethingNew", "x").0, "SomethingNew");
+    }
+
+    #[test]
+    fn a_wall_clock_overrun_has_its_own_retryable_reason_code() {
+        let (code, retryable, fix) = classify_failure(
+            "WallClockExceeded",
+            "Agent exceeded its wall-clock limit of 600s",
+        );
+        assert_eq!(code, "wall_clock_exceeded");
+        assert!(retryable);
+        assert!(fix.contains("max_wall_clock_secs"), "{fix}");
+    }
+
+    #[test]
+    fn blocking_audit_codes_map_to_reason_codes_with_fix_hints() {
+        let (code, retryable, fix) = classify_failure("claimed_unverified", "no changes");
+        assert_eq!((code.as_str(), retryable), ("claimed_unverified", true));
+        assert_eq!(fix, "State the exact file path and use replace.");
+        for code in [
+            "no_changes",
+            "destructive_rewrite",
+            "build_regressed",
+            "out_of_scope_write",
+        ] {
+            let (mapped, _, fix) = classify_failure(code, "x");
+            assert_eq!(mapped, code);
+            assert_ne!(fix, "Read the message for the cause.", "{code}");
+        }
+        assert!(!classify_failure("out_of_scope_write", "x").1);
+        assert!(classify_failure("destructive_rewrite", "x").1);
+        assert!(classify_failure("build_regressed", "x").1);
     }
 
     use crate::changes::{CapturedFile, ChangeCapture, ChangeStatus};
