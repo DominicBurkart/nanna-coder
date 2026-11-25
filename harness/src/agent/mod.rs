@@ -313,7 +313,7 @@ fn extract_tool_calls_from_history(
                         call_id: tc.id.clone(),
                         result: String::new(),
                         effect,
-                        seq: 0,
+                        seq: records.len() as u64,
                         outcome: None,
                     });
                 }
