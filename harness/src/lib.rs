@@ -14,6 +14,7 @@ pub mod ci_tools;
 pub mod container;
 pub mod deploy;
 pub mod effects;
+pub mod effects_audit;
 pub mod entities;
 pub mod escalation;
 pub mod eval;
