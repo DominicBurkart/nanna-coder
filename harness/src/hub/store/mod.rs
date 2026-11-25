@@ -459,10 +459,8 @@ mod tests {
         );
         assert_eq!(StoreError::NotFound.to_string(), "no such record");
         assert_eq!(StoreError::Duplicate.to_string(), "record already exists");
-        assert_eq!(
-            StoreError::Conflict.to_string(),
-            "record is not in the expected state"
-        );
+        let conflict = StoreError::Conflict.to_string();
+        assert_eq!(conflict, "record is not in the expected state");
         let io = StoreError::from(io::Error::other("disk"));
         assert_eq!(io.to_string(), "io: disk");
     }

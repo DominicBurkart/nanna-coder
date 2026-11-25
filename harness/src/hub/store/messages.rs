@@ -147,8 +147,8 @@ impl MessageTable {
     ) -> Result<StoredMessage, StoreError> {
         let seq = self.seq_of.get(&id).ok_or(StoreError::NotFound)?;
         let found = self.by_seq.get(seq).ok_or(StoreError::NotFound)?;
-        let marker_allowed = release.is_none()
-            || (from == DeliveryState::Quarantined && to == DeliveryState::Pending);
+        let release_pair = from == DeliveryState::Quarantined && to == DeliveryState::Pending;
+        let marker_allowed = release.is_none() || release_pair;
         if found.state != from || !marker_allowed {
             return Err(StoreError::Conflict);
         }
@@ -650,9 +650,8 @@ mod tests {
     #[test]
     fn a_legacy_quarantined_record_loads_held_and_is_not_deliverable() {
         let fixture = Fixture::new();
-        let pending = LEGACY_QUARANTINED
-            .replace("000000000001\",\"seq\":1", "000000000002\",\"seq\":2")
-            .replace("\"quarantined\"", "\"pending\"");
+        let renumbered = LEGACY_QUARANTINED.replace("0001\",\"seq\":1", "0002\",\"seq\":2");
+        let pending = renumbered.replace("\"quarantined\"", "\"pending\"");
         let journal = format!("{LEGACY_QUARANTINED}\n{pending}\n");
         assert!(!journal.contains("held") && !journal.contains("released"));
         std::fs::write(fixture.path("messages.jsonl"), journal).unwrap();
@@ -665,7 +664,8 @@ mod tests {
         let waiting: Vec<MessageId> = inbox.iter().map(|m| m.id).collect();
         assert_eq!(waiting, [mid(2)]);
         assert_eq!(store.unread(sid("b")).unwrap(), 1);
-        let held: Vec<MessageId> = store.quarantined().unwrap().iter().map(|m| m.id).collect();
+        let listed = store.quarantined().unwrap();
+        let held: Vec<MessageId> = listed.iter().map(|m| m.id).collect();
         assert_eq!(held, [mid(1)]);
         assert!(store.get(mid(2)).unwrap().unwrap().held.is_empty());
         drop(store);
@@ -683,8 +683,9 @@ mod tests {
         store.append(parked).unwrap();
         let release = Release { at: at(5) };
         let (quarantined, pending) = (DeliveryState::Quarantined, DeliveryState::Pending);
+        let marker = Some(release);
         store
-            .transition(mid(1), quarantined, pending, Some(release))
+            .transition(mid(1), quarantined, pending, marker)
             .unwrap();
         assert!(file_text(&fixture).contains(r#""op":"transition""#));
         drop(store);
@@ -715,20 +716,16 @@ mod tests {
     fn a_journal_transition_that_cannot_apply_is_corrupt() {
         let fixture = Fixture::new();
         let store = open(&fixture).unwrap();
-        store
-            .append(message(1, "a", "b", DeliveryState::Pending, 0, "m"))
-            .unwrap();
+        let pending = message(1, "a", "b", DeliveryState::Pending, 0, "m");
+        store.append(pending).unwrap();
         drop(store);
         let good = file_text(&fixture);
-        let first = good
-            .lines()
-            .find(|l| l.contains(r#""op":"append""#))
-            .unwrap();
+        let mut appends = good.lines().filter(|l| l.contains(r#""op":"append""#));
+        let first = appends.next().unwrap();
+        let tail = r#""to":"expired","release":null}"#;
         let transition = |n: u128, from: &str| {
-            format!(
-                r#"{{"op":"transition","id":"{}","from":"{from}","to":"expired","release":null}}"#,
-                mid(n).as_uuid()
-            )
+            let id = mid(n).as_uuid();
+            format!(r#"{{"op":"transition","id":"{id}","from":"{from}",{tail}"#)
         };
         let wrong_state = format!("{first}\n{}\n", transition(1, "quarantined"));
         std::fs::write(fixture.path("messages.jsonl"), wrong_state).unwrap();
@@ -739,10 +736,8 @@ mod tests {
         let fine = format!("{first}\n{}\n", transition(1, "pending"));
         std::fs::write(fixture.path("messages.jsonl"), fine).unwrap();
         let reopened = open(&fixture).unwrap();
-        assert_eq!(
-            reopened.get(mid(1)).unwrap().unwrap().state,
-            DeliveryState::Expired
-        );
+        let state = reopened.get(mid(1)).unwrap().unwrap().state;
+        assert_eq!(state, DeliveryState::Expired);
     }
 
     #[test]
@@ -767,36 +762,22 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum HoldOp {
-        Put {
-            id: u8,
-            state: u8,
-        },
-        SetState {
-            id: u8,
-            state: u8,
-        },
-        Move {
-            id: u8,
-            from: u8,
-            to: u8,
-            release: bool,
-        },
+        Put { id: u8, state: u8 },
+        SetState { id: u8, state: u8 },
+        Move(u8, u8, u8, bool),
         Prune,
         Reopen,
+    }
+
+    fn to_move(parts: (u8, u8, u8, bool)) -> HoldOp {
+        HoldOp::Move(parts.0, parts.1, parts.2, parts.3)
     }
 
     fn hold_strategy() -> impl Strategy<Value = HoldOp> {
         prop_oneof![
             (0u8..6, 0u8..6).prop_map(|(id, state)| HoldOp::Put { id, state }),
             (0u8..6, 0u8..6).prop_map(|(id, state)| HoldOp::SetState { id, state }),
-            (0u8..6, 0u8..6, 0u8..6, any::<bool>()).prop_map(|(id, from, to, release)| {
-                HoldOp::Move {
-                    id,
-                    from,
-                    to,
-                    release,
-                }
-            }),
+            Strategy::prop_map((0u8..6, 0u8..6, 0u8..6, any::<bool>()), to_move),
             Just(HoldOp::Prune),
             Just(HoldOp::Reopen),
         ]
@@ -810,8 +791,8 @@ mod tests {
     }
 
     fn allowed(from: DeliveryState, to: DeliveryState, release: bool) -> bool {
-        let release_pair = from == DeliveryState::Quarantined && to == DeliveryState::Pending;
-        !release || release_pair
+        let marked_moves = [(DeliveryState::Quarantined, DeliveryState::Pending)];
+        !release || marked_moves.contains(&(from, to))
     }
 
     fn run_holds(
@@ -824,39 +805,39 @@ mod tests {
         for op in ops {
             match op {
                 HoldOp::Put { id, state } => {
-                    let record = message(u128::from(*id), "a", "b", state_of(*state), 0, "m");
-                    if store.append(record).is_ok() {
+                    let state = state_of(*state);
+                    let record = message(u128::from(*id), "a", "b", state, 0, "m");
+                    let result = store.append(record);
+                    if model.iter().any(|e| e.id == *id) {
+                        assert!(matches!(result, Err(StoreError::Duplicate)));
+                    } else {
+                        assert_eq!(result.unwrap().get(), counter);
                         model.push(Seen {
                             id: *id,
                             seq: counter,
-                            state: state_of(*state),
+                            state,
                             marked: false,
                         });
                         counter += 1;
                     }
                 }
                 HoldOp::SetState { id, state } => {
-                    let result = store.set_state(mid(u128::from(*id)), state_of(*state));
-                    if let Some(entry) = model.iter_mut().find(|e| e.id == *id) {
-                        result.unwrap();
-                        entry.state = state_of(*state);
+                    let state = state_of(*state);
+                    let result = store.set_state(mid(u128::from(*id)), state);
+                    match model.iter_mut().find(|e| e.id == *id) {
+                        None => assert!(matches!(result, Err(StoreError::NotFound))),
+                        Some(entry) => {
+                            result.unwrap();
+                            entry.state = state;
+                        }
                     }
                 }
-                HoldOp::Move {
-                    id,
-                    from,
-                    to,
-                    release,
-                } => {
-                    let marker = if *release {
-                        Some(Release { at: at(9) })
-                    } else {
-                        None
-                    };
+                HoldOp::Move(id, from, to, release) => {
+                    let stamp = Release { at: at(9) };
+                    let marker = if *release { Some(stamp) } else { None };
                     let (from, to) = (state_of(*from), state_of(*to));
                     let result = store.transition(mid(u128::from(*id)), from, to, marker);
-                    let entry = model.iter_mut().find(|e| e.id == *id);
-                    match entry {
+                    match model.iter_mut().find(|e| e.id == *id) {
                         None => assert!(matches!(result, Err(StoreError::NotFound))),
                         Some(entry) if entry.state == from && allowed(from, to, *release) => {
                             result.unwrap();
@@ -881,12 +862,12 @@ mod tests {
             }
             expected.sort();
             let listed = store.quarantined().unwrap();
-            let got: Vec<(u64, u8)> = listed
-                .iter()
-                .map(|m| (m.seq.get(), m.id.as_uuid().as_u128() as u8))
-                .collect();
+            let mut got: Vec<(u64, u8)> = Vec::new();
+            for found in &listed {
+                got.push((found.seq.get(), found.id.as_uuid().as_u128() as u8));
+                assert!(!found.held.is_empty());
+            }
             assert_eq!(got, expected);
-            assert!(listed.iter().all(|m| !m.held.is_empty()));
             for entry in &model {
                 let found = store.get(mid(u128::from(entry.id))).unwrap().unwrap();
                 assert_eq!(found.state, entry.state);

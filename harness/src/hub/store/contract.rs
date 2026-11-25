@@ -616,15 +616,11 @@ pub(super) fn quarantined_is_empty_without_quarantined_messages<S: MessageStore>
 pub(super) fn transition_moves_a_message_only_out_of_the_expected_state<S: MessageStore>(s: &S) {
     put(s, 1, QUAR, 1, &[ReasonCode::Other]);
     put(s, 2, DELV, 1, &[]);
-    assert!(matches!(
-        go(s, 2, QUAR, EXPD, None),
-        Err(StoreError::Conflict)
-    ));
+    let wrong = go(s, 2, QUAR, EXPD, None);
+    assert!(matches!(wrong, Err(StoreError::Conflict)));
     assert_eq!(state_of(s, 2), DELV);
-    assert!(matches!(
-        go(s, 9, QUAR, EXPD, None),
-        Err(StoreError::NotFound)
-    ));
+    let unknown = go(s, 9, QUAR, EXPD, None);
+    assert!(matches!(unknown, Err(StoreError::NotFound)));
     let moved = go(s, 1, QUAR, EXPD, None).unwrap();
     assert_eq!(moved.state, EXPD);
     assert_eq!(moved.released, None);

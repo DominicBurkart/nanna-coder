@@ -1711,12 +1711,8 @@ mod tests {
             appends: AtomicUsize::new(0),
         };
         assert!(store.quarantined().unwrap().is_empty());
-        let result = store.transition(
-            MessageId::new(),
-            DeliveryState::Quarantined,
-            DeliveryState::Expired,
-            None,
-        );
+        let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        let result = store.transition(MessageId::new(), quarantined, expired, None);
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 

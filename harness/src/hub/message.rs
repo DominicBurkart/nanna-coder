@@ -478,10 +478,8 @@ mod tests {
         message.held = vec![ReasonCode::SecretLeak, ReasonCode::CrossScopeSteering];
         message.released = Some(Release { at: Utc::now() });
         let json = serde_json::to_value(&message).unwrap();
-        assert_eq!(
-            json["held"],
-            serde_json::json!(["secret_leak", "cross_scope_steering"])
-        );
+        let codes = serde_json::json!(["secret_leak", "cross_scope_steering"]);
+        assert_eq!(json["held"], codes);
         let back: StoredMessage = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, message);
         let mut old = json;
