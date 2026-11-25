@@ -68,8 +68,7 @@ the repository effect class; the pull-request tools it lists are the ones on
 nanna main. `pr-shepherd` has no `github_pr_promote`: nanna-coder has no
 solo gate, and only the maintainer marks its pull requests ready. `docs-writer` is limited to markdown by using `docs/**/*.md`
 instead of `docs/**`, so the yaml, python and evidence files under `docs/` are
-not writable. `AGENTS.md` is not in its write paths because it is a protected
-file. Because every card restricts paths, none receives `run_command`.
+not writable. `AGENTS.md` is not in its write paths. Because every card restricts paths, none receives `run_command`.
 Tool names are exact because the narrowing check compares strings, so
 `cargo_*` in a base would not cover `cargo_check` in an override.
 

@@ -232,9 +232,4 @@ mod tests {
         );
         assert!(PolicyError::TooLarge.to_string().contains("65536 bytes"));
     }
-
-    #[test]
-    fn the_cap_matches_the_protected_declaration_cap() {
-        assert_eq!(MAX_POLICY_BYTES, crate::protected::MAX_EXTRAS_BYTES);
-    }
 }

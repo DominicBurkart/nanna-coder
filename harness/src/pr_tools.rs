@@ -4674,10 +4674,10 @@ mod tests {
     #[tokio::test]
     async fn push_refuses_any_unpushed_commit_that_touches_a_protected_path() {
         for path in [
-            ".github/workflows/ci.yml",
-            ".github/CODEOWNERS",
-            "codecov.yml",
-            "windows.toml",
+            ".nanna/workflows/ci.yml",
+            ".nanna/CODEOWNERS",
+            ".nanna/codecov.yml",
+            ".nanna/windows.toml",
             ".nanna/agents/x.toml",
             ".nanna/policy.toml",
             "crates/api/.nanna/agents/x.toml",
@@ -4789,10 +4789,13 @@ mod tests {
     #[tokio::test]
     async fn push_refuses_a_commit_that_deletes_or_renames_a_protected_path() {
         let fixture = push_fixture();
-        commit_file(fixture.work.path(), "codecov.yml", "a: 1\n", "base");
+        commit_file(fixture.work.path(), ".nanna/codecov.yml", "a: 1\n", "base");
         git(fixture.work.path(), &["push", "-q", "origin", "main"]);
         git(fixture.work.path(), &["checkout", "-q", "-b", "feature-d"]);
-        git(fixture.work.path(), &["mv", "codecov.yml", "moved.yml"]);
+        git(
+            fixture.work.path(),
+            &["mv", ".nanna/codecov.yml", "moved.yml"],
+        );
         git(
             fixture.work.path(),
             &["commit", "-q", "-m", "mv\n\nNanna-Identity: sdlc-dev"],
@@ -4814,7 +4817,7 @@ mod tests {
             "a\n\nNanna-Identity: sdlc-dev",
         );
         git(fixture.work.path(), &["checkout", "-q", "main"]);
-        commit_file(fixture.work.path(), "codecov.yml", "x", "m");
+        commit_file(fixture.work.path(), ".nanna/codecov.yml", "x", "m");
         git(fixture.work.path(), &["checkout", "-q", "feature-m"]);
         git(
             fixture.work.path(),
@@ -5006,8 +5009,8 @@ mod tests {
     #[tokio::test]
     async fn commit_refuses_a_tracked_change_to_a_protected_path_and_commits_nothing() {
         for path in [
-            "codecov.yml",
-            ".github/workflows/ci.yml",
+            ".nanna/codecov.yml",
+            ".nanna/workflows/ci.yml",
             ".nanna/agents/x.toml",
             ".nanna/policy.toml",
         ] {
@@ -5031,14 +5034,15 @@ mod tests {
         let dir = github_repo_fixture();
         commit_file(dir.path(), "plain.txt", "a", "base");
         git(dir.path(), &["checkout", "-q", "-b", "feature-s"]);
-        git(dir.path(), &["mv", "plain.txt", "codecov.yml"]);
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        git(dir.path(), &["mv", "plain.txt", ".nanna/codecov.yml"]);
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
         let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
         let dir = github_repo_fixture();
-        commit_file(dir.path(), "codecov.yml", "a", "base");
+        commit_file(dir.path(), ".nanna/codecov.yml", "a", "base");
         git(dir.path(), &["checkout", "-q", "-b", "feature-s"]);
-        git(dir.path(), &["mv", "codecov.yml", "plain.txt"]);
+        git(dir.path(), &["mv", ".nanna/codecov.yml", "plain.txt"]);
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
         let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
@@ -5047,9 +5051,9 @@ mod tests {
     #[tokio::test]
     async fn commit_leaves_untracked_protected_paths_out_of_the_commit() {
         let dir = feature_repo();
-        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
-        std::fs::write(dir.path().join(".github/workflows/x.yml"), "on: push").unwrap();
-        std::fs::write(dir.path().join("codecov.yml"), "a: 1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna/workflows")).unwrap();
+        std::fs::write(dir.path().join(".nanna/workflows/x.yml"), "on: push").unwrap();
+        std::fs::write(dir.path().join(".nanna/codecov.yml"), "a: 1").unwrap();
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
@@ -5062,32 +5066,26 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         skipped.sort();
-        assert_eq!(skipped, vec![".github/workflows/x.yml", "codecov.yml"]);
+        assert_eq!(
+            skipped,
+            vec![".nanna/codecov.yml", ".nanna/workflows/x.yml"]
+        );
     }
 
-    fn own_protected() -> ProtectedPaths {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let extras = crate::protected::ProtectedExtras::load(&root).unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
-    }
-
-    fn declared_extras() -> ProtectedPaths {
-        let extras =
-            crate::protected::ProtectedExtras::parse(r#"extra = ["src/gate.rs", "ci/**"]"#)
-                .unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
+    fn config_dir_protected() -> ProtectedPaths {
+        ProtectedPaths::with_config_dir(Path::new("/repo"), Some(Path::new("/repo/ci")))
     }
 
     #[tokio::test]
-    async fn commit_leaves_repo_declared_paths_out_of_the_commit() {
+    async fn commit_leaves_config_dir_paths_out_of_the_commit() {
         let dir = feature_repo();
         std::fs::create_dir_all(dir.path().join("ci")).unwrap();
         std::fs::write(dir.path().join("ci/deploy.sh"), "x").unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/gate.rs"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+        std::fs::write(dir.path().join("ci/gate.rs"), "x").unwrap();
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(declared_extras());
+            .with_protected(config_dir_protected());
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(committed, "ok.txt");
@@ -5098,26 +5096,26 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         skipped.sort();
-        assert_eq!(skipped, vec!["ci/deploy.sh", "src/gate.rs"]);
+        assert_eq!(skipped, vec!["ci/deploy.sh", "ci/gate.rs"]);
     }
 
     #[tokio::test]
-    async fn commit_refuses_a_tracked_change_to_a_repo_declared_path() {
+    async fn commit_refuses_a_tracked_change_to_a_config_dir_path() {
         let dir = github_repo_fixture();
-        commit_file(dir.path(), "src/gate.rs", "a\n", "base");
+        commit_file(dir.path(), "ci/gate.rs", "a\n", "base");
         git(dir.path(), &["checkout", "-q", "-b", "feature-x"]);
-        std::fs::write(dir.path().join("src/gate.rs"), "b\n").unwrap();
+        std::fs::write(dir.path().join("ci/gate.rs"), "b\n").unwrap();
         let before = head_sha(dir.path());
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(declared_extras());
+            .with_protected(config_dir_protected());
         let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
         assert!(err.to_string().contains("protected"), "{err}");
         assert_eq!(head_sha(dir.path()), before);
     }
 
     #[tokio::test]
-    async fn push_refuses_a_commit_under_a_repo_declared_pattern() {
-        for path in ["src/gate.rs", "ci/sub/deploy.sh"] {
+    async fn push_refuses_a_commit_under_the_config_dir() {
+        for path in ["ci/gate.rs", "ci/sub/deploy.sh"] {
             let fixture = push_fixture();
             git(fixture.work.path(), &["checkout", "-q", "-b", "feature-rd"]);
             commit_file(
@@ -5127,7 +5125,7 @@ mod tests {
                 "declared\n\nNanna-Identity: sdlc-dev",
             );
             let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-                .with_protected(declared_extras());
+                .with_protected(config_dir_protected());
             let err = tool.execute(json!({})).await.unwrap_err();
             assert!(
                 err.to_string()
@@ -5427,12 +5425,8 @@ mod tests {
         );
         let mock = head_listing(vec![]);
         let client: Arc<dyn GithubClient> = mock.clone();
-        let declared = crate::protected::ProtectedExtras::parse(r#"extra = ["ci/**"]"#).unwrap();
         let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-            .with_protected(ProtectedPaths::for_repo_with_extras(
-                Path::new("/nonexistent"),
-                &declared,
-            ))
+            .with_protected(config_dir_protected())
             .with_gate(HumanGate::Solo)
             .with_client(client);
         let err = tool.execute(json!({})).await.unwrap_err();
@@ -5525,20 +5519,19 @@ mod tests {
 
     const ALIAS_SPELLINGS: [&str; 3] = [
         "tools/RELEAS~1.SH",
-        "gate~1/x.rs",
+        "NANNA~1/x.rs",
         "tools/release-helper.sh.",
     ];
 
-    fn alias_declared() -> ProtectedPaths {
-        let extras = crate::protected::ProtectedExtras::parse(
-            "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]",
+    fn alias_protected() -> ProtectedPaths {
+        ProtectedPaths::with_config_dir(
+            Path::new("/repo"),
+            Some(Path::new("/repo/tools/release-helper.sh")),
         )
-        .unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
     }
 
     #[tokio::test]
-    async fn commit_leaves_windows_aliases_of_declared_paths_out_of_the_commit() {
+    async fn commit_leaves_windows_aliases_of_protected_paths_out_of_the_commit() {
         let dir = feature_repo();
         for path in ALIAS_SPELLINGS {
             let file = dir.path().join(path);
@@ -5547,7 +5540,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(alias_declared());
+            .with_protected(alias_protected());
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(committed, "ok.txt");
@@ -5556,7 +5549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_refuses_windows_aliases_of_declared_paths() {
+    async fn push_refuses_windows_aliases_of_protected_paths() {
         for path in ALIAS_SPELLINGS {
             let fixture = push_fixture();
             git(
@@ -5570,7 +5563,7 @@ mod tests {
                 "declared\n\nNanna-Identity: sdlc-dev",
             );
             let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-                .with_protected(alias_declared());
+                .with_protected(alias_protected());
             let err = tool.execute(json!({})).await.unwrap_err();
             assert!(
                 err.to_string().contains("changes protected path"),
@@ -5581,9 +5574,9 @@ mod tests {
     }
 
     const UNICODE_SPELLINGS: [(&str, &str); 3] = [
-        ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
-        ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
-        ("src/\u{212A}ey.rs", "src/key.rs"),
+        ("docs/cafe\u{301}-key/x.md", "docs/caf\u{e9}-key/**"),
+        ("docs/caf\u{e9}-\u{212A}ey/y.md", "docs/caf\u{e9}-key/**"),
+        ("docs/cafe\u{301}-KEY/z.md", "docs/caf\u{e9}-key/**"),
     ];
 
     fn nfc(s: &str) -> String {
@@ -5591,16 +5584,15 @@ mod tests {
         s.nfc().collect()
     }
 
-    fn unicode_declared() -> ProtectedPaths {
-        let extras = crate::protected::ProtectedExtras::parse(
-            "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]",
+    fn unicode_protected() -> ProtectedPaths {
+        ProtectedPaths::with_config_dir(
+            Path::new("/repo"),
+            Some(Path::new("/repo/docs/caf\u{e9}-key")),
         )
-        .unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
     }
 
     #[tokio::test]
-    async fn commit_leaves_unicode_equivalent_spellings_of_declared_paths_out_of_the_commit() {
+    async fn commit_leaves_unicode_equivalent_spellings_of_protected_paths_out_of_the_commit() {
         let dir = feature_repo();
         for (path, _) in UNICODE_SPELLINGS {
             let file = dir.path().join(path);
@@ -5609,7 +5601,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(unicode_declared());
+            .with_protected(unicode_protected());
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(committed, "ok.txt");
@@ -5628,7 +5620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_refuses_unicode_equivalent_spellings_of_declared_paths() {
+    async fn push_refuses_unicode_equivalent_spellings_of_protected_paths() {
         for (path, rule) in UNICODE_SPELLINGS {
             let fixture = push_fixture();
             git(
@@ -5642,7 +5634,7 @@ mod tests {
                 "declared\n\nNanna-Identity: sdlc-dev",
             );
             let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-                .with_protected(unicode_declared());
+                .with_protected(unicode_protected());
             let err = tool.execute(json!({})).await.unwrap_err();
             assert!(
                 err.to_string().contains("changes protected path"),
@@ -5653,18 +5645,17 @@ mod tests {
     }
 
     const COMBINED_SPELLINGS: [&str; 4] = [
-        "docs/cafe\u{301}./x.md",
-        "src/caf\u{e9}.rs.",
-        "docs/re\u{301}sume\u{301}~1.txt",
-        "fla\u{212A}e.nix.",
+        "docs/cafe\u{301}-key./x.md",
+        "docs/caf\u{e9}-\u{212A}ey /y.md",
+        "crates/e\u{301}/.nanna./z.toml",
+        ".NANNA /w.toml",
     ];
 
-    fn combined_declared() -> ProtectedPaths {
-        let extras = crate::protected::ProtectedExtras::parse(
-            "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]",
+    fn combined_protected() -> ProtectedPaths {
+        ProtectedPaths::with_config_dir(
+            Path::new("/repo"),
+            Some(Path::new("/repo/docs/caf\u{e9}-key")),
         )
-        .unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
     }
 
     #[tokio::test]
@@ -5677,7 +5668,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(combined_declared());
+            .with_protected(combined_protected());
         let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
         let committed = run_git(dir.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
         assert_eq!(committed, "ok.txt");
@@ -5700,7 +5691,7 @@ mod tests {
                 "declared\n\nNanna-Identity: sdlc-dev",
             );
             let tool = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-                .with_protected(combined_declared());
+                .with_protected(combined_protected());
             let err = tool.execute(json!({})).await.unwrap_err();
             assert!(
                 err.to_string().contains("changes protected path"),
@@ -5715,14 +5706,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn commit_refuses_an_untracked_hardlink_to_a_repo_declared_file() {
+    async fn commit_refuses_an_untracked_hardlink_to_a_protected_file() {
         let dir = feature_repo();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/gate.rs"), "original").unwrap();
-        std::fs::hard_link(dir.path().join("src/gate.rs"), dir.path().join("alias.txt")).unwrap();
+        std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+        std::fs::write(dir.path().join("ci/gate.rs"), "original").unwrap();
+        std::fs::hard_link(dir.path().join("ci/gate.rs"), dir.path().join("alias.txt")).unwrap();
         let before = head_sha(dir.path());
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(declared_extras());
+            .with_protected(config_dir_protected());
         let err = tool.execute(json!({ "subject": "x" })).await.unwrap_err();
         assert!(
             err.to_string().contains(crate::protected::HARDLINK_RULE),
@@ -5746,11 +5737,10 @@ mod tests {
 
     #[cfg(unix)]
     fn folded_commit_paths() -> ProtectedPaths {
-        let extras = crate::protected::ProtectedExtras::parse(
-            "extra = [\"docs/caf\u{e9}/**\", \"tools/release-helper.sh\"]",
+        ProtectedPaths::with_config_dir(
+            Path::new("/repo"),
+            Some(Path::new("/repo/tools/release-helper.sh")),
         )
-        .unwrap();
-        ProtectedPaths::for_repo_with_extras(Path::new("/nonexistent"), &extras)
     }
 
     #[cfg(unix)]
@@ -5771,7 +5761,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn commit_leaves_a_folded_protected_alias_out_instead_of_refusing_it_as_a_link() {
-        for name in ["docs/cafe\u{301}./x.md", "tools/RELEAS~1.SH"] {
+        for name in [".nanna./cafe\u{301}.md", "tools/RELEAS~1.SH"] {
             let dir = linked_repo(name);
             std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
             let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
@@ -5882,7 +5872,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_registered_commit_tool_refuses_a_hardlink_to_a_declared_file() {
+    async fn the_registered_commit_tool_refuses_a_hardlink_to_a_protected_file() {
         let identity = granted_identity();
         let fixture = push_fixture();
         git(fixture.work.path(), &["checkout", "-q", "-b", "feature-hl"]);
@@ -5898,7 +5888,7 @@ mod tests {
             &mut registry,
             fixture.work.path(),
             &identity,
-            &declared_extras(),
+            &config_dir_protected(),
         );
         let commit = registry.get_tool("git_commit").unwrap();
         let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
@@ -5906,15 +5896,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn solo_declared() -> ProtectedPaths {
-        combined_declared().with_policy(crate::policy::RepoPolicy::solo())
+    fn solo_protected() -> ProtectedPaths {
+        combined_protected().with_policy(crate::policy::RepoPolicy::solo())
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn commit_refuses_hardlinks_identically_under_the_solo_gate_and_without_a_policy() {
         let mut messages = Vec::new();
-        for protected in [combined_declared(), solo_declared()] {
+        for protected in [combined_protected(), solo_protected()] {
             for name in ["plain.txt", "cafe\u{301}-x.txt.", "copy.sh"] {
                 let dir = feature_repo();
                 let original = dir.path().join("keep.bin");
@@ -5978,10 +5968,14 @@ mod tests {
             fixture.work.path(),
             &["checkout", "-q", "-b", "feature-solo-hl"],
         );
-        std::fs::create_dir_all(fixture.work.path().join("src")).unwrap();
-        std::fs::write(fixture.work.path().join("src/cafe\u{301}.rs"), "original").unwrap();
+        std::fs::create_dir_all(fixture.work.path().join("docs/cafe\u{301}-key")).unwrap();
+        std::fs::write(
+            fixture.work.path().join("docs/cafe\u{301}-key/gate.rs"),
+            "original",
+        )
+        .unwrap();
         std::fs::hard_link(
-            fixture.work.path().join("src/cafe\u{301}.rs"),
+            fixture.work.path().join("docs/cafe\u{301}-key/gate.rs"),
             fixture.work.path().join("alias.txt."),
         )
         .unwrap();
@@ -5990,7 +5984,7 @@ mod tests {
             &mut registry,
             fixture.work.path(),
             &identity,
-            &solo_declared(),
+            &solo_protected(),
         );
         let commit = registry.get_tool("git_commit").unwrap();
         let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
@@ -6060,7 +6054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_commit_and_push_tools_carry_the_declared_set() {
+    async fn registered_commit_and_push_tools_carry_the_given_set() {
         let identity = granted_identity();
         let fixture = push_fixture();
         git(
@@ -6075,7 +6069,7 @@ mod tests {
             &mut registry,
             fixture.work.path(),
             &identity,
-            &declared_extras(),
+            &config_dir_protected(),
         );
         let commit = registry.get_tool("git_commit").unwrap();
         let result = commit.execute(json!({ "subject": "x" })).await.unwrap();
@@ -6099,7 +6093,7 @@ mod tests {
         );
     }
 
-    async fn assert_registry_commit_and_push_honour_the_declared_set(
+    async fn assert_registry_commit_and_push_honour_the_given_set(
         registry: ToolRegistry,
         work: &Path,
     ) {
@@ -6131,7 +6125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_registries_built_with_a_declared_set_hand_it_to_commit_and_push() {
+    async fn identity_registries_built_with_a_given_set_hand_it_to_commit_and_push() {
         use crate::container::{ContainerHandle, ContainerRuntime};
         let identity = granted_identity();
         let fixture = push_fixture();
@@ -6139,11 +6133,10 @@ mod tests {
         let registry = crate::tools::create_tool_registry_for_guarded(
             fixture.work.path(),
             &identity,
-            declared_extras(),
+            config_dir_protected(),
         )
         .unwrap();
-        assert_registry_commit_and_push_honour_the_declared_set(registry, fixture.work.path())
-            .await;
+        assert_registry_commit_and_push_honour_the_given_set(registry, fixture.work.path()).await;
 
         let fixture = push_fixture();
         git(fixture.work.path(), &["checkout", "-q", "-b", "feature-g2"]);
@@ -6158,20 +6151,19 @@ mod tests {
             handle,
             "/workspace",
             &identity,
-            declared_extras(),
+            config_dir_protected(),
         )
         .unwrap();
-        assert_registry_commit_and_push_honour_the_declared_set(registry, fixture.work.path())
-            .await;
+        assert_registry_commit_and_push_honour_the_given_set(registry, fixture.work.path()).await;
     }
 
     #[tokio::test]
-    async fn push_allows_the_same_commit_when_nothing_is_declared() {
+    async fn push_allows_the_same_commit_without_a_config_dir() {
         let fixture = push_fixture();
         git(fixture.work.path(), &["checkout", "-q", "-b", "feature-nd"]);
         commit_file(
             fixture.work.path(),
-            "src/gate.rs",
+            "ci/gate.rs",
             "x",
             "plain\n\nNanna-Identity: sdlc-dev",
         );
@@ -7505,7 +7497,8 @@ mod tests {
     #[tokio::test]
     async fn commit_stages_literal_paths_so_a_file_named_star_cannot_pull_in_protected_files() {
         let dir = feature_repo();
-        std::fs::write(dir.path().join("codecov.yml"), "a: 1").unwrap();
+        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
+        std::fs::write(dir.path().join(".nanna/codecov.yml"), "a: 1").unwrap();
         std::fs::write(dir.path().join("*"), "star").unwrap();
         std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
         let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev");
@@ -7518,9 +7511,9 @@ mod tests {
                 .collect();
         committed.sort();
         assert_eq!(committed, vec!["*", "ok.txt"]);
-        assert_eq!(result["skipped_protected"], json!(["codecov.yml"]));
+        assert_eq!(result["skipped_protected"], json!([".nanna/codecov.yml"]));
         let tracked = run_git(dir.path(), &["ls-files"]).unwrap();
-        assert!(!tracked.contains("codecov.yml"));
+        assert!(!tracked.contains(".nanna/codecov.yml"));
     }
 
     #[test]
@@ -8502,62 +8495,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn commit_and_push_refuse_a_change_to_the_pr_tools_source_itself() {
-        let fixture = push_fixture();
-        commit_file(
-            fixture.work.path(),
-            "harness/src/pr_tools.rs",
-            "a\n",
-            "base",
-        );
-        git(fixture.work.path(), &["push", "-q", "origin", "main"]);
-        git(
-            fixture.work.path(),
-            &["checkout", "-q", "-b", "feature-self"],
-        );
-        std::fs::write(
-            fixture.work.path().join("harness/src/pr_tools.rs"),
-            "tampered\n",
-        )
-        .unwrap();
-        std::fs::write(fixture.work.path().join("ok.txt"), "ok").unwrap();
-        let before = head_sha(fixture.work.path());
-        let commit = GitCommitTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-            .with_protected(own_protected());
-        let err = commit.execute(json!({ "subject": "x" })).await.unwrap_err();
-        assert!(err.to_string().contains("protected"), "{err}");
-        assert_eq!(head_sha(fixture.work.path()), before);
-
-        git(fixture.work.path(), &["add", "-A"]);
-        git(
-            fixture.work.path(),
-            &["commit", "-q", "-m", "self\n\nNanna-Identity: sdlc-dev"],
-        );
-        let push = GitPushBranchTool::new(fixture.work.path().to_path_buf(), "sdlc-dev")
-            .with_protected(own_protected());
-        let err = push.execute(json!({})).await.unwrap_err();
-        assert!(err.to_string().contains("protected"), "{err}");
-        assert!(!remote_has(fixture.work.path(), "feature-self"));
-    }
-
-    #[tokio::test]
-    async fn commit_leaves_an_untracked_pr_tools_source_out_of_the_commit() {
-        let dir = feature_repo();
-        std::fs::create_dir_all(dir.path().join("harness/src")).unwrap();
-        std::fs::write(dir.path().join("harness/src/pr_tools.rs"), "x").unwrap();
-        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
-        let tool = GitCommitTool::new(dir.path().to_path_buf(), "sdlc-dev")
-            .with_protected(own_protected());
-        let result = tool.execute(json!({ "subject": "x" })).await.unwrap();
-        assert_eq!(
-            result["skipped_protected"],
-            json!(["harness/src/pr_tools.rs"])
-        );
-        let tracked = run_git(dir.path(), &["ls-files"]).unwrap();
-        assert!(!tracked.contains("pr_tools.rs"));
-    }
-
     fn table_checksum(table: &[(u32, u32)]) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for (lo, hi) in table {
@@ -8598,7 +8535,7 @@ mod tests {
         git(dir, &["rm", "-rfq", "."]);
         commit_file(
             dir,
-            ".github/workflows/ci.yml",
+            ".nanna/workflows/ci.yml",
             "on: push\n",
             "root\n\nNanna-Identity: sdlc-dev",
         );

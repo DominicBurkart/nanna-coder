@@ -28,7 +28,18 @@ const FREE_CONSTRUCTORS: [&str; 4] = [
     "create_container_tool_registry_for",
 ];
 
-const SHIPPED_ONLY_SITES: [(&str, &str, &str); 13] = [
+const SHIPPED_ONLY_SITES: [(&str, &str, &str); 16] = [
+    (
+        "src/tools.rs",
+        "create_tool_registry_in_checkout",
+        "ProtectedPaths::for_repo",
+    ),
+    ("src/workspace.rs", "create", "ProtectedPaths::for_repo"),
+    (
+        "src/workspace.rs",
+        "create_with_container_using",
+        "ProtectedPaths::for_repo",
+    ),
     ("src/tools.rs", "scoped", "ProtectedPaths::for_repo"),
     (
         "src/tools.rs",
@@ -453,7 +464,6 @@ fn test_only_code_and_guarded_variants_are_not_flagged() {
         "#[cfg(test)] mod tests { fn t() { create_tool_registry(r); } }",
         "#[cfg(test)] fn t() { ProtectedPaths::for_repo(r); }",
         "fn ok() { create_tool_registry_guarded(r, p); create_tool_registry_in_checkout(r); }",
-        "fn ok() { ProtectedPaths::for_repo_with_extras(r, e); ProtectedPaths::with_extras(r, None, e); }",
         "fn ok() { WriteFileTool::guarded(r, None, p); }",
     ] {
         assert!(unguarded_sites("src/ok.rs", source).is_empty(), "{source}");
@@ -565,9 +575,7 @@ fn qualified_path_calls_are_flagged() {
     ] {
         assert_eq!(found(source).len(), 1, "{source}");
     }
-    assert!(
-        found("fn f() { <Vec<u8>>::new(); <ProtectedPaths>::with_extras(r, c, e); }").is_empty()
-    );
+    assert!(found("fn f() { <Vec<u8>>::new(); <ProtectedPaths>::check(r); }").is_empty());
 }
 
 #[test]
@@ -633,7 +641,7 @@ fn self_calls_inside_an_impl_of_a_guarded_type_are_flagged() {
     }
     for source in [
         "impl Other { fn x() { Self::for_repo(r); } }",
-        "impl ProtectedPaths { fn x() { Self::with_extras(r, c, e); } }",
+        "impl ProtectedPaths { fn x() { Self::check(r); } }",
         "fn x() { Self::for_repo(r); }",
         "impl<T> Tr for Vec<T> { fn x() { Self::new(); } }",
         "impl (A, B) { fn x() { Self::new(); } }",

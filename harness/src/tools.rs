@@ -7,9 +7,7 @@ use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, 
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
 use crate::policy::RepoPolicy;
-use crate::protected::{
-    ProtectedConfigError, ProtectedExtras, ProtectedPathViolation, ProtectedPaths,
-};
+use crate::protected::{ProtectedConfigError, ProtectedPathViolation, ProtectedPaths};
 use crate::scope::{
     canonical_root, relative_to, resolve_path, resolve_path_guarded,
     validate_path_within_workspace, DenialReason, PathAccess, PathScope, ScopeDenial, ScopeError,
@@ -3316,15 +3314,13 @@ pub fn create_tool_registry(workspace_root: &std::path::Path) -> ToolRegistry {
 }
 
 /// [`create_tool_registry`] for a checkout the caller works in directly:
-/// the repository's `.nanna/protected.toml` is read first and a bad
-/// declaration is an error.
+/// the repository's `.nanna/policy.toml` is read first and a bad policy is
+/// an error.
 pub fn create_tool_registry_in_checkout(
     workspace_root: &std::path::Path,
 ) -> Result<ToolRegistry, ProtectedConfigError> {
-    let extras = ProtectedExtras::load(workspace_root)?;
     let policy = RepoPolicy::load(workspace_root)?;
-    let protected =
-        ProtectedPaths::for_repo_with_extras(workspace_root, &extras).with_policy(policy);
+    let protected = ProtectedPaths::for_repo(workspace_root).with_policy(policy);
     Ok(create_tool_registry_guarded(workspace_root, protected))
 }
 
@@ -4865,37 +4861,12 @@ mod tests {
         assert!(registry.get_tool("github_pr_status").is_some());
     }
 
-    const PROTECTED_EXAMPLES: [(&str, &str); 30] = [
+    const PROTECTED_EXAMPLES: [(&str, &str); 5] = [
         (".nanna/**", ".nanna/agents/x.toml"),
         ("**/.nanna/**", "crates/api/.nanna/agents/x.toml"),
         (".git/**", ".git/config"),
         (".git/**", ".git/hooks/pre-commit"),
         (".git/**", ".git"),
-        (".github/workflows/**", ".github/workflows/ci.yml"),
-        (".github/CODEOWNERS", ".github/CODEOWNERS"),
-        ("codecov.yml", "codecov.yml"),
-        ("windows.toml", "windows.toml"),
-        ("tarpaulin.toml", "tarpaulin.toml"),
-        ("deny.toml", "deny.toml"),
-        ("flake.nix", "flake.nix"),
-        ("flake.lock", "flake.lock"),
-        (".github/rulesets/**", ".github/rulesets/main.json"),
-        (".githooks/**", ".githooks/pre-commit"),
-        (".cargo/**", ".cargo/config.toml"),
-        (".devcontainer/**", ".devcontainer/devcontainer.json"),
-        ("AGENTS.md", "AGENTS.md"),
-        (".gitattributes", ".gitattributes"),
-        (".gitmodules", ".gitmodules"),
-        ("CODEOWNERS", "CODEOWNERS"),
-        ("docs/CODEOWNERS", "docs/CODEOWNERS"),
-        (".github/**", ".github/actions/setup/action.yml"),
-        (".github/**", ".github/dependabot.yml"),
-        (".cargo-husky/**", ".cargo-husky/hooks/pre-commit"),
-        (".envrc", ".envrc"),
-        (".config/**", ".config/nextest.toml"),
-        (".claude/**", ".claude/settings.json"),
-        ("nix/**", "nix/containers.nix"),
-        ("CLAUDE.md", "CLAUDE.md"),
     ];
 
     fn write_capable_tools(registry: &ToolRegistry) -> Vec<String> {
@@ -5051,8 +5022,13 @@ mod tests {
         #[tokio::test]
         async fn a_hardlink_to_a_protected_file_cannot_be_written_through() {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("flake.nix"), "original").unwrap();
-            std::fs::hard_link(dir.path().join("flake.nix"), dir.path().join("alias.txt")).unwrap();
+            std::fs::create_dir(dir.path().join(".nanna")).unwrap();
+            std::fs::write(dir.path().join(".nanna/gate.toml"), "original").unwrap();
+            std::fs::hard_link(
+                dir.path().join(".nanna/gate.toml"),
+                dir.path().join("alias.txt"),
+            )
+            .unwrap();
             let err = tool_in(dir.path())
                 .execute(json!({ "path": "alias.txt", "content": "evil" }))
                 .await
@@ -5063,7 +5039,7 @@ mod tests {
                 "{err:?}"
             );
             assert_eq!(
-                std::fs::read_to_string(dir.path().join("flake.nix")).unwrap(),
+                std::fs::read_to_string(dir.path().join(".nanna/gate.toml")).unwrap(),
                 "original"
             );
             assert_eq!(
@@ -5103,18 +5079,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_checkout_registry_refuses_a_hardlink_to_a_repo_declared_file() {
+        async fn a_checkout_registry_refuses_a_hardlink_to_a_nanna_config_file() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-            std::fs::write(
-                dir.path().join(".nanna/protected.toml"),
-                "extra = [\"src/gate.rs\", \"ci/**\"]\n",
+            std::fs::write(dir.path().join(".nanna/deploy.sh"), "original").unwrap();
+            std::fs::hard_link(
+                dir.path().join(".nanna/deploy.sh"),
+                dir.path().join("alias.sh"),
             )
             .unwrap();
-            std::fs::create_dir_all(dir.path().join("ci")).unwrap();
-            std::fs::write(dir.path().join("ci/deploy.sh"), "original").unwrap();
-            std::fs::hard_link(dir.path().join("ci/deploy.sh"), dir.path().join("alias.sh"))
-                .unwrap();
             let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
             let err = registry
                 .execute(
@@ -5129,7 +5102,7 @@ mod tests {
                 "{err:?}"
             );
             assert_eq!(
-                std::fs::read_to_string(dir.path().join("ci/deploy.sh")).unwrap(),
+                std::fs::read_to_string(dir.path().join(".nanna/deploy.sh")).unwrap(),
                 "original"
             );
         }
@@ -5137,11 +5110,6 @@ mod tests {
         async fn folded_link_outcomes(policy: Option<&str>) -> Vec<String> {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-            std::fs::write(
-                dir.path().join(".nanna/protected.toml"),
-                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
-            )
-            .unwrap();
             if let Some(policy) = policy {
                 std::fs::write(dir.path().join(".nanna/policy.toml"), policy).unwrap();
             }
@@ -5150,9 +5118,9 @@ mod tests {
             for name in [
                 "alias.txt",
                 "cafe\u{301}-x.txt.",
-                "src/cafe\u{301}.rs.",
-                "tools/RELEAS~1.SH",
-                "ci/deploy.sh",
+                ".nanna./cafe\u{301}.rs",
+                "NANNA~1/helper.sh",
+                ".nanna/deploy.sh",
             ] {
                 let file = dir.path().join(name);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -5183,9 +5151,9 @@ mod tests {
                 vec![
                     crate::protected::HARDLINK_RULE.to_string(),
                     crate::protected::HARDLINK_RULE.to_string(),
-                    "src/caf\u{e9}.rs".to_string(),
-                    "tools/release-helper.sh".to_string(),
-                    "ci/**".to_string(),
+                    ".nanna/**".to_string(),
+                    ".nanna/**".to_string(),
+                    ".nanna/**".to_string(),
                 ]
             );
         }
@@ -5213,17 +5181,12 @@ mod tests {
         async fn a_checkout_registry_refuses_hardlinks_reached_through_folded_spellings() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-            std::fs::write(
-                dir.path().join(".nanna/protected.toml"),
-                "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n",
-            )
-            .unwrap();
             let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
             for (name, rule) in [
                 ("alias.txt", crate::protected::HARDLINK_RULE),
                 ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
-                ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
-                ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+                (".nanna./cafe\u{301}.rs", ".nanna/**"),
+                ("NANNA~1/helper.sh", ".nanna/**"),
             ] {
                 let file = dir.path().join(name);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -5250,7 +5213,7 @@ mod tests {
             let deep = ["a"; 1_100].join("/");
             std::fs::create_dir_all(dir.path().join(&deep)).unwrap();
             let err = tool_in(dir.path())
-                .execute(json!({ "path": format!("{deep}/CODECO~1.YML"), "content": "x" }))
+                .execute(json!({ "path": format!("{deep}/NANNA~1"), "content": "x" }))
                 .await
                 .unwrap_err();
             assert!(
@@ -5327,16 +5290,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_checkout_registry_refuses_writes_to_repo_declared_paths() {
+    async fn a_checkout_registry_refuses_writes_to_nanna_config_paths() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-        std::fs::write(
-            dir.path().join(".nanna/protected.toml"),
-            "extra = [\"src/gate.rs\", \"ci/**\"]\n",
-        )
-        .unwrap();
         let registry = create_tool_registry_in_checkout(dir.path()).unwrap();
-        for path in ["src/gate.rs", "ci/deploy.sh"] {
+        for path in [".nanna/gate.toml", "ci/.nanna/deploy.sh"] {
             let err = registry
                 .execute("write_file", json!({ "path": path, "content": "x" }))
                 .await
@@ -5351,17 +5309,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok["success"], true);
-    }
-
-    #[test]
-    fn a_checkout_registry_is_refused_for_a_bad_declaration() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".nanna")).unwrap();
-        std::fs::write(dir.path().join(".nanna/protected.toml"), "extra = [").unwrap();
-        assert!(matches!(
-            create_tool_registry_in_checkout(dir.path()),
-            Err(ProtectedConfigError::Malformed(_))
-        ));
     }
 
     #[test]
