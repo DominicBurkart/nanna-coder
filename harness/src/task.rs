@@ -2268,6 +2268,7 @@ impl TaskRunner {
             ),
             model_name: queued.model.clone(),
             max_inactivity: *self.inactivity.read().unwrap(),
+            context_budget_chars: Some(crate::agent::context_budget_chars_from_env(&queued.model)),
             ..Default::default()
         };
         let context = AgentContext {
@@ -3662,6 +3663,84 @@ max_concurrent = 1
         fn provider_name(&self) -> &'static str {
             "recording"
         }
+    }
+
+    #[tokio::test]
+    async fn test_submit_fits_the_history_to_the_models_window() {
+        struct HistoryProvider {
+            inner: Arc<MockProvider>,
+            masked: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for HistoryProvider {
+            async fn chat(
+                &self,
+                request: model::types::ChatRequest,
+            ) -> model::provider::ModelResult<model::types::ChatResponse> {
+                if request.messages.iter().any(|message| {
+                    message
+                        .content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("removed to save context"))
+                }) {
+                    self.masked.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.inner.chat(request).await
+            }
+
+            async fn list_models(
+                &self,
+            ) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+                self.inner.list_models().await
+            }
+
+            async fn health_check(&self) -> model::provider::ModelResult<()> {
+                self.inner.health_check().await
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "history"
+            }
+        }
+
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let rows = format!("{}\n", "x".repeat(20)).repeat(500);
+        std::fs::write(repo_dir.path().join("big.txt"), rows).unwrap();
+        init_test_git_repo(repo_dir.path());
+        let read = || {
+            super::identity_tests::tool_call_response(
+                "read_file",
+                serde_json::json!({"path": "big.txt"}),
+            )
+        };
+        let mut script: Vec<_> = (0..9).map(|_| read()).collect();
+        script.push(stop_response("CANNOT: nothing to change."));
+        let provider = Arc::new(HistoryProvider {
+            inner: MockProvider::new(wrap_with_state_machine_responses(script)),
+            masked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider.clone(),
+            )
+            .await;
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        while !matches!(
+            manager.poll(&task_id).await.unwrap().status,
+            TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+        ) {
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(provider.masked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     async fn system_prompt_received_by_the_agent(repo: &std::path::Path) -> String {

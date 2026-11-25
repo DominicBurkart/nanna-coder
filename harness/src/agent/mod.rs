@@ -15,6 +15,7 @@
 pub mod agents_md;
 pub mod eval;
 pub mod eval_case;
+mod history_fit;
 pub mod project_detect;
 pub mod project_prompt;
 pub mod prompts;
@@ -22,6 +23,7 @@ pub mod rag;
 pub mod report;
 mod tool_output;
 
+pub use history_fit::{context_budget_chars_from, context_budget_chars_from_env};
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
 use crate::action_auditor::{ActionAuditLogEntry, ActionDenied};
@@ -38,7 +40,8 @@ use thiserror::Error;
 
 use model::provider::ModelProvider;
 use model::types::{
-    ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, ToolCall, Usage,
+    ChatMessage, ChatRequest, ChatResponse, FinishReason, MessageRole, ToolCall, ToolDefinition,
+    Usage,
 };
 
 const MAX_LLM_RESPONSE_LENGTH: usize = 2000;
@@ -230,6 +233,7 @@ pub struct AgentConfig {
     pub model_name: String,
     pub max_no_progress_nudges: usize,
     pub max_inactivity: Option<std::time::Duration>,
+    pub context_budget_chars: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -241,6 +245,7 @@ impl Default for AgentConfig {
             model_name: DEFAULT_MODEL.to_string(),
             max_no_progress_nudges: DEFAULT_MAX_NO_PROGRESS_NUDGES,
             max_inactivity: None,
+            context_budget_chars: None,
         }
     }
 }
@@ -374,6 +379,15 @@ fn extract_result_summary(history: &[ChatMessage]) -> String {
         .to_string()
 }
 
+fn log_context_estimate(estimated_chars: usize, response: &ChatResponse) {
+    tracing::info!(
+        estimated_chars,
+        estimated_tokens = estimated_chars / history_fit::CHARS_PER_TOKEN,
+        prompt_tokens = response.usage.as_ref().map(|usage| usage.prompt_tokens),
+        "context estimate"
+    );
+}
+
 /// Agent control loop.
 ///
 /// Generic over the backing entity store so that downstream callers can plug
@@ -393,6 +407,7 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
     progress_counter: Option<Arc<AtomicUsize>>,
     state_history: Vec<AgentState>,
     progress: ProgressGuard,
+    history_fit: history_fit::HistoryFit,
 }
 
 #[derive(Debug)]
@@ -453,6 +468,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             progress_counter: None,
             state_history: Vec::new(),
             progress: ProgressGuard::default(),
+            history_fit: history_fit::HistoryFit::default(),
         }
     }
 
@@ -720,6 +736,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
         // Initialize conversation history from context
         self.conversation_history.clear();
+        self.history_fit = history_fit::HistoryFit::default();
         if !self.config.system_prompt.is_empty() {
             let sp = self.config.system_prompt.clone();
             self.conversation_history.push(ChatMessage::system(&sp));
@@ -1242,6 +1259,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
     /// counts and token usage without the planning/completion-check overhead.
     pub async fn run_tool_loop(&mut self, context: AgentContext) -> AgentResult<AgentRunResult> {
         self.conversation_history.clear();
+        self.history_fit = history_fit::HistoryFit::default();
 
         if !self.config.system_prompt.is_empty() {
             let sp = self.config.system_prompt.clone();
@@ -1267,7 +1285,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
         while self.iterations < self.config.max_iterations {
             let model_name = self.config.model_name.clone();
-            let messages = self.conversation_history.clone();
+            let (messages, estimated_chars) = self.history_for_request(&tool_defs);
             let request = ChatRequest::new(&model_name, messages).with_tools(tool_defs.clone());
 
             let provider = match self.llm_provider.clone() {
@@ -1278,6 +1296,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let response = provider.chat(request).await.map_err(|e| {
                 self.enrich_error(bare_state_error(format!("LLM call failed: {}", e)))
             })?;
+
+            log_context_estimate(estimated_chars, &response);
 
             if response.choices.is_empty() {
                 return Err(self.enrich_error(bare_state_error("Empty response from model")));
@@ -1358,6 +1378,27 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         }
     }
 
+    fn history_for_request(&mut self, tool_defs: &[ToolDefinition]) -> (Vec<ChatMessage>, usize) {
+        let schema_chars = serde_json::to_string(tool_defs).map_or(0, |text| text.chars().count());
+        match self.config.context_budget_chars {
+            Some(budget) => {
+                let fitted = self.history_fit.fit(
+                    &self.conversation_history,
+                    budget.saturating_sub(schema_chars),
+                );
+                (fitted.messages, fitted.chars + schema_chars)
+            }
+            None => {
+                let chars: usize = self
+                    .conversation_history
+                    .iter()
+                    .map(history_fit::message_chars)
+                    .sum();
+                (self.conversation_history.clone(), chars + schema_chars)
+            }
+        }
+    }
+
     /// Dispatch every tool call in `tool_calls` in order. A `Block` is fed
     /// back to the model as a tool-response error so the agent can adapt;
     /// an `Escalate` (the action auditor's own verdict, or the registry's
@@ -1406,6 +1447,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         let tool_defs = self.tool_registry.as_ref().unwrap().get_definitions();
 
         // Add plan context if available, rather than resetting the conversation
+        self.history_fit.pin_plan(self.conversation_history.len());
         if let Some(plan) = &self.plan_cache {
             self.conversation_history.push(ChatMessage::user(format!(
                 "Execute the following plan using the available tools: {}",
@@ -1417,14 +1459,15 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         }
 
         for _ in 0..MAX_TOOL_ITERATIONS {
-            let request =
-                ChatRequest::new(&self.config.model_name, self.conversation_history.clone())
-                    .with_tools(tool_defs.clone())
-                    .with_temperature(COMPLETION_TEMPERATURE);
+            let (messages, estimated_chars) = self.history_for_request(&tool_defs);
+            let request = ChatRequest::new(&self.config.model_name, messages)
+                .with_tools(tool_defs.clone())
+                .with_temperature(COMPLETION_TEMPERATURE);
 
             let response = self
                 .call_llm_with_retry(provider, request, "perform")
                 .await?;
+            log_context_estimate(estimated_chars, &response);
 
             if response.choices.is_empty() {
                 break;
