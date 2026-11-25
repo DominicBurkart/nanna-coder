@@ -176,19 +176,21 @@ fn no_production_code_builds_a_notice_or_a_notice_list_with_a_struct_literal() {
 
 fn struct_fields(text: &str, name: &str) -> (Vec<(String, String)>, Vec<String>) {
     let file = syn::parse_file(text).unwrap();
+    let mut fields = Vec::new();
+    let mut derives: Vec<String> = Vec::new();
+    let mut seen = 0;
     for item in file.items {
         if let syn::Item::Struct(found) = item {
             if found.ident == name {
-                let mut fields = Vec::new();
+                seen += 1;
                 for field in found.fields.iter() {
                     let ident = field.ident.as_ref().unwrap().to_string();
-                    let kind = match &field.ty {
-                        syn::Type::Path(ty) => names(&ty.path),
-                        _ => "?".to_string(),
-                    };
+                    let mut kind = "?".to_string();
+                    if let syn::Type::Path(ty) = &field.ty {
+                        kind = names(&ty.path);
+                    }
                     fields.push((ident, kind));
                 }
-                let mut derives: Vec<String> = Vec::new();
                 for attr in found.attrs.iter().filter(|a| a.path().is_ident("derive")) {
                     let collect = |meta: syn::meta::ParseNestedMeta| {
                         derives.push(names(&meta.path));
@@ -196,11 +198,11 @@ fn struct_fields(text: &str, name: &str) -> (Vec<(String, String)>, Vec<String>)
                     };
                     attr.parse_nested_meta(collect).unwrap();
                 }
-                return (fields, derives);
             }
         }
     }
-    panic!("struct {name} not found");
+    assert_eq!(seen, 1, "struct {name} not found");
+    (fields, derives)
 }
 
 #[test]
@@ -223,10 +225,8 @@ fn a_sender_notice_has_no_free_text_field_and_cannot_be_deserialized() {
     let deserializable = derives.iter().any(|d| d.ends_with("Deserialize"));
     assert!(!deserializable, "{derives:?}");
     assert!(text.contains("codes: Vec<ReasonCode>"));
-    assert!(
-        text.contains("\n    rendered: String,"),
-        "rendered must stay private"
-    );
+    let private = text.contains("\n    rendered: String,");
+    assert!(private, "rendered must stay private");
 }
 
 #[test]
@@ -248,10 +248,11 @@ fn the_doorbell_text_has_one_integer_hole_one_parameter_and_one_source() {
     let mut functions = Vec::new();
     let mut templates = Vec::new();
     for item in &file.items {
-        match item {
-            syn::Item::Fn(function) => functions.push(function),
-            syn::Item::Const(constant) => templates.push(constant),
-            _ => {}
+        if let syn::Item::Fn(function) = item {
+            functions.push(function);
+        }
+        if let syn::Item::Const(constant) = item {
+            templates.push(constant);
         }
     }
     assert_eq!(functions.len(), 1);
@@ -259,25 +260,26 @@ fn the_doorbell_text_has_one_integer_hole_one_parameter_and_one_source() {
     let function = functions[0];
     assert_eq!(function.sig.ident, "doorbell_text");
     assert_eq!(function.sig.inputs.len(), 1);
-    let syn::FnArg::Typed(argument) = &function.sig.inputs[0] else {
-        panic!("doorbell_text must not take self");
-    };
-    assert!(matches!(&*argument.ty, syn::Type::Path(ty) if names(&ty.path) == "usize"));
-    let syn::Expr::Lit(literal) = &*templates[0].expr else {
-        panic!("the template must be a literal");
-    };
-    let syn::Lit::Str(template) = &literal.lit else {
-        panic!("the template must be a string");
-    };
-    let template = template.value();
+    let mut argument_type = String::new();
+    if let syn::FnArg::Typed(argument) = &function.sig.inputs[0] {
+        if let syn::Type::Path(ty) = &*argument.ty {
+            argument_type = names(&ty.path);
+        }
+    }
+    assert_eq!(argument_type, "usize", "doorbell_text takes one usize");
+    let mut template = String::new();
+    if let syn::Expr::Lit(literal) = &*templates[0].expr {
+        if let syn::Lit::Str(text) = &literal.lit {
+            template = text.value();
+        }
+    }
+    assert!(!template.is_empty(), "template is a string literal");
     assert_eq!(template.matches("{}").count(), 1, "{template}");
     assert_eq!(template.matches('{').count(), 1, "{template}");
     assert_eq!(template.matches('}').count(), 1, "{template}");
     let production = text.split("#[cfg(test)]").next().unwrap();
-    assert!(
-        !production.contains("format!"),
-        "the doorbell must not format"
-    );
+    let formats = production.contains("format!");
+    assert!(!formats, "the doorbell must not format");
     let defined = files_containing("fn doorbell_text(");
     assert_eq!(defined, ["hub/doorbell.rs"]);
 }
