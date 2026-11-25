@@ -2667,7 +2667,14 @@ mod tests {
     const ALIAS_SPELLINGS: [(&str, &str); 3] = [
         ("NANNA~1/x.rs", ".nanna/**"),
         (".nanna./x.sh", ".nanna/**"),
-        ("sub/.nanna /x.sh", "**/.nanna/**"),
+        (
+            if cfg!(windows) {
+                "sub/.nanna./x.sh"
+            } else {
+                "sub/.nanna /x.sh"
+            },
+            "**/.nanna/**",
+        ),
     ];
 
     #[test]
@@ -2735,7 +2742,14 @@ mod tests {
     const COMBINED_SPELLINGS: [(&str, &str); 4] = [
         ("crates/cafe\u{301}/.nanna./x.md", "**/.nanna/**"),
         ("crates/caf\u{e9}/NANNA~1/x.rs", "**/.nanna/**"),
-        ("docs/re\u{301}sume\u{301}/.nanna /x.txt", "**/.nanna/**"),
+        (
+            if cfg!(windows) {
+                "docs/re\u{301}sume\u{301}/.nanna./x.txt"
+            } else {
+                "docs/re\u{301}sume\u{301}/.nanna /x.txt"
+            },
+            "**/.nanna/**",
+        ),
         (".NANNA./re\u{301}sume\u{301}.nix", ".nanna/**"),
     ];
 
