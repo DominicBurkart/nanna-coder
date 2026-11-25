@@ -20,6 +20,7 @@ pub mod project_prompt;
 pub mod prompts;
 pub mod rag;
 pub mod report;
+mod tool_output;
 
 pub use report::{AgentRunReport, TokenUsageDto, ToolCallSummary, SCHEMA_VERSION};
 
@@ -1379,10 +1380,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let outcome = registry.execute(&name, args).await;
             self.note_tool_call(&name, outcome.is_ok());
             let escalated = is_escalation(&outcome);
-            let response_content = match outcome {
-                Ok(v) => v.to_string(),
-                Err(e) => format!("Error: {}", e),
-            };
+            let response_content = tool_output::render(&name, &outcome);
             self.conversation_history
                 .push(ChatMessage::tool_response(call_id, response_content));
             if escalated {
@@ -1455,10 +1453,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     self.note_tool_call(&tc.function.name, result.is_ok());
                     let escalated = is_escalation(&result);
 
-                    let content = match result {
-                        Ok(val) => val.to_string(),
-                        Err(e) => format!("Error: {}", e),
-                    };
+                    let content = tool_output::render(&tc.function.name, &result);
 
                     self.conversation_history
                         .push(ChatMessage::tool_response(tc.id.clone(), content));
@@ -3740,6 +3735,44 @@ mod tests {
         let result = agent.run(progress_context()).await.unwrap();
         assert!(result.task_completed);
         assert!(nudge_messages(&agent).is_empty());
+    }
+
+    async fn tool_messages_after_a_large_read(state_machine: bool) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), "row\n".repeat(5_000)).unwrap();
+        let read = tool_call_response("read_file", serde_json::json!({"path": "big.txt"}));
+        let calls = vec![read, plain_response("Looks fine.")];
+        let responses = if state_machine {
+            wrap_with_state_machine_responses(calls)
+        } else {
+            calls
+        };
+        let mut agent = progress_agent(responses, read_only_registry(dir.path()), 2);
+        let result = if state_machine {
+            agent.run(progress_context()).await
+        } else {
+            agent.run_tool_loop(progress_context()).await
+        };
+        assert!(result.is_ok(), "{result:?}");
+        agent
+            .conversation_history
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .filter_map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn both_dispatch_paths_bound_tool_results() {
+        for state_machine in [false, true] {
+            let messages = tool_messages_after_a_large_read(state_machine).await;
+            assert_eq!(messages.len(), 1);
+            assert!(
+                messages[0].contains("call read_file with start_line=201"),
+                "state_machine={state_machine}: {} chars",
+                messages[0].len()
+            );
+        }
     }
 
     fn repo_tool_only_registry(root: &std::path::Path) -> ToolRegistry {
