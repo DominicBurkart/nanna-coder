@@ -31,6 +31,7 @@ pub mod observability;
 pub mod onboarding;
 pub mod plan_dispatch;
 pub mod planner;
+pub mod plugins;
 pub mod pod;
 pub mod policy;
 pub mod pr_binding;
