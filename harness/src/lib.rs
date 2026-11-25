@@ -13,6 +13,7 @@ pub mod ci_policy;
 pub mod ci_tools;
 pub mod container;
 pub mod deploy;
+pub mod diagnostics;
 pub mod effects;
 pub mod entities;
 pub mod escalation;
