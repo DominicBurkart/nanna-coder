@@ -576,7 +576,7 @@ impl AutoChecker {
         })
     }
 
-    pub fn with_cap_secs(mut self, secs: u64) -> Self {
+    pub fn with_auto_check_secs(mut self, secs: u64) -> Self {
         if let Some(spec) = Arc::get_mut(&mut self.spec) {
             spec.cap = Duration::from_secs(secs);
         }
@@ -1110,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn a_check_over_the_cap_is_killed_and_reported_as_timed_out() {
         let rig = rig();
-        let checker = checker(&rig, "sleep 30").with_cap_secs(1);
+        let checker = checker(&rig, "sleep 30").with_auto_check_secs(1);
         let started = std::time::Instant::now();
         let feedback = checker.after_edits(&touched(&["src/a.rs"])).await.unwrap();
         assert_eq!(feedback.text, "build: check timed out (1s)");
