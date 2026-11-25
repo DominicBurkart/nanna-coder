@@ -348,6 +348,19 @@ pub fn lock_flags(argv: &[String], had_lock: bool) -> Vec<String> {
         .collect()
 }
 
+fn retry_busy<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut retries = 0;
+    loop {
+        match attempt() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && retries < 40 => {
+                retries += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn own_dir(path: &Path, uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
@@ -480,10 +493,12 @@ impl SandboxedExec {
     }
 
     pub fn kill_uid(&self, uid: u32) {
-        let _ = Command::new(&self.config.helper)
-            .args(["kill-uid", &uid.to_string()])
-            .env_clear()
-            .status();
+        let _ = retry_busy(|| {
+            Command::new(&self.config.helper)
+                .args(["kill-uid", &uid.to_string()])
+                .env_clear()
+                .status()
+        });
     }
 
     pub fn run(&self, request: &ExecRequest) -> std::io::Result<Outcome> {
@@ -541,7 +556,7 @@ impl SandboxedExec {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        let mut child = command.spawn()?;
+        let mut child = retry_busy(|| command.spawn())?;
         let out = drain(child.stdout.take().expect("piped stdout"));
         let err = drain(child.stderr.take().expect("piped stderr"));
         let deadline = Instant::now() + request.timeout.unwrap_or(self.config.timeout);
@@ -804,6 +819,27 @@ exit 2
 
     fn request(parts: &[&str]) -> ExecRequest {
         ExecRequest::new(strings(parts))
+    }
+
+    #[test]
+    fn a_busy_executable_is_retried_and_other_errors_are_not() {
+        let mut calls = 0;
+        let result = retry_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+        let mut other_calls = 0;
+        let result: std::io::Result<()> = retry_busy(|| {
+            other_calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert!(result.is_err());
+        assert_eq!(other_calls, 1);
     }
 
     #[test]

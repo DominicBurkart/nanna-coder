@@ -46,6 +46,7 @@ pub mod sandbox_tools;
 pub mod scheduler;
 pub mod scope;
 pub mod sidecar;
+pub mod stack_exec;
 pub mod task;
 pub mod telemetry;
 #[cfg(test)]
