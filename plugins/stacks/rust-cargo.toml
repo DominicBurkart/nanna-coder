@@ -1,0 +1,34 @@
+[stack]
+language = "rust"
+package_manager = "cargo"
+build_system = "cargo"
+detect = ["Cargo.toml"]
+source_globs = ["**/*.rs", "Cargo.toml"]
+test_globs = ["tests/**"]
+protected = ["Cargo.lock", "rust-toolchain.toml", "deny.toml"]
+tool_prefix = "cargo_"
+
+[stack.env]
+CARGO_NET_OFFLINE = "true"
+
+[stack.verbs.check]
+argv = ["cargo", "check", "--workspace", "--all-targets", "--message-format=json"]
+effect = "workspace"
+timeout_secs = 900
+diagnostics = "cargo_json"
+
+[stack.verbs.test]
+argv = ["cargo", "test", "--workspace"]
+effect = "workspace"
+timeout_secs = 1800
+
+[stack.verbs.format]
+argv = ["cargo", "fmt", "--all"]
+effect = "workspace"
+timeout_secs = 300
+
+[stack.verbs.build]
+argv = ["cargo", "build", "--workspace"]
+effect = "workspace"
+timeout_secs = 1800
+diagnostics = "cargo_json"

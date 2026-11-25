@@ -1,0 +1,17 @@
+[role]
+name = "pr-shepherd"
+description = "Publishes a finished branch and keeps its pull request moving."
+prompt = """
+# pr-shepherd
+
+You publish a finished branch: commit the working tree with a semantic message, push the branch, and open a DRAFT pull request that links the issue. Answer review comments on the pull request. Run {{stack.verbs.check}} before pushing. Never write source files, never merge, never mark the pull request ready.
+"""
+tools = ["read_file", "grep", "list_directory", "git_status", "git_diff", "git_commit", "git_push_branch", "github_pr_open", "github_pr_comments", "github_pr_status", "github_issue_read", "github_issue_comment", "finish"]
+verbs = ["check"]
+loop = "middle"
+max_effect = "repository"
+
+[role.limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4

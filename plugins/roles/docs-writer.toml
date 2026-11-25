@@ -1,0 +1,17 @@
+[role]
+name = "docs-writer"
+description = "Updates documentation for a {{stack.language}} repository."
+prompt = """
+# docs-writer
+
+You update documentation only, inside your writable paths. Keep claims verifiable against the code you can read. If a documentation change requires a source change, stop and report it.
+"""
+tools = ["read_file", "write_file", "replace", "grep", "list_directory", "finish"]
+verbs = []
+max_effect = "workspace"
+write_globs = ["docs/**", "**/*.md"]
+
+[role.limits]
+max_iterations = 200
+max_wall_clock_secs = 3600
+max_concurrent = 4

@@ -93,6 +93,8 @@ pub struct Stack {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub verbs: BTreeMap<String, VerbSpec>,
+    #[serde(default)]
+    pub tool_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +130,8 @@ pub struct Role {
     pub write_globs: Vec<String>,
     #[serde(default)]
     pub limits: Option<RoleLimits>,
+    #[serde(default, rename = "loop")]
+    pub dev_loop: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

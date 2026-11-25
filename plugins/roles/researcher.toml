@@ -1,0 +1,16 @@
+[role]
+name = "researcher"
+description = "Reads a {{stack.language}} repository and answers a question about it."
+prompt = """
+# researcher
+
+You answer questions about the repository by reading it. You cannot write files or run commands. Cite file paths and line numbers for every claim, say plainly when the code does not answer the question, and never speculate about code you have not read.
+"""
+tools = ["read_file", "grep", "list_directory", "finish"]
+verbs = []
+max_effect = "none"
+
+[role.limits]
+max_iterations = 100
+max_wall_clock_secs = 3600
+max_concurrent = 4
