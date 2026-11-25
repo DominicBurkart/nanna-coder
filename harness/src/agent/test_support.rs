@@ -11,19 +11,26 @@ pub(crate) use scripted::ScriptedTool;
 
 pub(crate) struct MockProvider {
     responses: Mutex<Vec<ChatResponse>>,
+    requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl MockProvider {
+    pub(crate) fn requests(&self) -> Vec<ChatRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
     pub(crate) fn new(responses: Vec<ChatResponse>) -> Arc<Self> {
         Arc::new(Self {
             responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
         })
     }
 }
 
 #[async_trait]
 impl ModelProvider for MockProvider {
-    async fn chat(&self, _request: ChatRequest) -> ModelResult<ChatResponse> {
+    async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+        self.requests.lock().unwrap().push(request);
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
             return Err(ModelError::Unknown {

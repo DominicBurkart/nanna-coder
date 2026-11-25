@@ -10,6 +10,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_MAX_RESULTS: u32 = 50;
+const MAX_LINE_CHARS: usize = 200;
+const MAX_OUTPUT_CHARS: usize = 8_000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -44,11 +46,13 @@ struct Search<'a> {
     glob: Option<&'a glob::Pattern>,
     limit: usize,
     matches: Vec<String>,
+    used: usize,
+    overflowed: bool,
 }
 
 impl Search<'_> {
     fn full(&self) -> bool {
-        self.matches.len() > self.limit
+        self.overflowed || self.matches.len() > self.limit
     }
 
     fn readable(&self, relative: &Path) -> bool {
@@ -89,7 +93,14 @@ impl Search<'_> {
                 return;
             }
             if self.regex.is_match(line) {
-                self.matches.push(format!("{shown}:{}:{line}", index + 1));
+                let entry = format!("{shown}:{}:{}", index + 1, cut(line));
+                let length = entry.chars().count();
+                if self.used + length > MAX_OUTPUT_CHARS {
+                    self.overflowed = true;
+                    return;
+                }
+                self.used += length;
+                self.matches.push(entry);
             }
         }
     }
@@ -120,6 +131,13 @@ impl Search<'_> {
     }
 }
 
+fn cut(line: &str) -> String {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        Some((byte, _)) => format!("{}…", &line[..byte]),
+        None => line.to_string(),
+    }
+}
+
 #[async_trait]
 impl TypedTool for GrepTool {
     type Args = GrepArgs;
@@ -129,7 +147,7 @@ impl TypedTool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a regular expression. Returns lines as path:line:text, skipping dot directories, target and node_modules."
+        "Search file contents with a regular expression. Returns lines as path:line:text, skipping dot directories, target and node_modules. Long lines are cut and output stops at 8000 characters with truncated true; narrow the pattern or path to see more."
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -175,6 +193,8 @@ impl TypedTool for GrepTool {
             glob: glob.as_ref(),
             limit: limit as usize,
             matches: Vec::new(),
+            used: 0,
+            overflowed: false,
         };
         if target.is_dir() {
             search.visit_dir(&target);
@@ -191,7 +211,7 @@ impl TypedTool for GrepTool {
                 Err(error) => return error_outcome(error, &self.root, path_arg),
             }
         }
-        let truncated = search.matches.len() > search.limit;
+        let truncated = search.overflowed || search.matches.len() > search.limit;
         search.matches.truncate(search.limit);
         ToolOutcome::success(json!({
             "matches": search.matches,
@@ -377,6 +397,43 @@ mod tests {
 
         assert_eq!(matches(&result).len(), 2);
         assert_eq!(result["data"]["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn a_long_matching_line_is_cut() {
+        let dir = TempDir::new().unwrap();
+        put(&dir, "min.js", &format!("hit{}\n", "é".repeat(5_000)));
+
+        let result = run(&tool(&dir, None), json!({"pattern": "hit"})).await;
+
+        let line = result["data"]["matches"][0].as_str().unwrap();
+        assert!(line.chars().count() <= MAX_LINE_CHARS + "min.js:1:".len() + 1);
+        assert!(line.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn the_output_stays_under_the_character_cap_whatever_max_results_asks() {
+        let dir = TempDir::new().unwrap();
+        put(
+            &dir,
+            "a.txt",
+            &format!("hit{}\n", "x".repeat(150)).repeat(1_000),
+        );
+
+        let result = run(
+            &tool(&dir, None),
+            json!({"pattern": "hit", "max_results": 1_000}),
+        )
+        .await;
+
+        let total: usize = result["data"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap().chars().count())
+            .sum();
+        assert!(total <= MAX_OUTPUT_CHARS);
+        assert_eq!(result["data"]["truncated"], true);
     }
 
     #[tokio::test]

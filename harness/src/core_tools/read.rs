@@ -19,6 +19,9 @@ pub struct ReadFileArgs {
     pub end_line: Option<u32>,
 }
 
+const DEFAULT_WINDOW_LINES: usize = 200;
+const MAX_CONTENT_CHARS: usize = 12_000;
+
 pub struct ReadFileTool {
     root: PathBuf,
     scope: Option<PathScope>,
@@ -39,7 +42,7 @@ impl TypedTool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a text file. The content is the raw file text with no line-number gutter; pass it to replace exactly as returned. Use start_line and end_line to read a range."
+        "Read a text file. The content is the raw file text with no line-number gutter; pass it to replace exactly as returned. Returns at most 200 lines unless end_line is given, and never more than 12000 characters; when truncated is true, call again with start_line set to next_start_line, or use grep to find the lines you need."
     }
 
     fn effect_class(&self) -> EffectClass {
@@ -99,20 +102,63 @@ impl TypedTool for ReadFileTool {
                 );
             }
         }
-        let end = args.end_line.map_or(total, |end| (end as usize).min(total));
-        let selected = if total == 0 {
-            String::new()
+        let wanted_end = args.end_line.map_or_else(
+            || total.min(start.saturating_add(DEFAULT_WINDOW_LINES - 1)),
+            |end| (end as usize).min(total),
+        );
+        let window = if total == 0 {
+            Window::default()
         } else {
-            lines[start - 1..end].join("\n")
+            window(&lines, start, wanted_end)
         };
-        ToolOutcome::success(json!({
+        let truncated = window.line_cut || window.end < args.end_line.map_or(total, |_| wanted_end);
+        let mut data = json!({
             "path": args.path,
             "total_lines": total,
             "start_line": start,
-            "end_line": end,
-            "content": selected,
-        }))
+            "end_line": window.end,
+            "content": window.content,
+            "truncated": truncated,
+        });
+        if window.line_cut {
+            data["line_cut"] = json!(true);
+        }
+        if truncated && window.end < total {
+            data["next_start_line"] = json!(window.end + 1);
+        }
+        ToolOutcome::success(data)
     }
+}
+
+#[derive(Default)]
+struct Window {
+    content: String,
+    end: usize,
+    line_cut: bool,
+}
+
+fn window(lines: &[&str], start: usize, end: usize) -> Window {
+    let mut taken = Window::default();
+    let mut used = 0;
+    for (index, line) in lines.iter().enumerate().take(end).skip(start - 1) {
+        let separator = usize::from(index >= start);
+        let length = line.chars().count();
+        if used + separator + length > MAX_CONTENT_CHARS {
+            if index < start {
+                taken.content = line.chars().take(MAX_CONTENT_CHARS).collect();
+                taken.end = index + 1;
+                taken.line_cut = true;
+            }
+            break;
+        }
+        if separator == 1 {
+            taken.content.push('\n');
+        }
+        taken.content.push_str(line);
+        used += separator + length;
+        taken.end = index + 1;
+    }
+    taken
 }
 
 #[cfg(test)]
@@ -130,6 +176,70 @@ mod tests {
 
     async fn run(tool: &Typed<ReadFileTool>, args: Value) -> Value {
         tool.execute(args).await.unwrap()
+    }
+
+    fn numbered_lines(count: usize, width: usize) -> String {
+        (1..=count)
+            .map(|line| format!("{line:0>width$}\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_long_file_returns_a_default_window_and_says_where_to_continue() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("long.rs"), numbered_lines(980, 8)).unwrap();
+
+        let result = run(&tool(&dir, None), json!({"path": "long.rs"})).await;
+
+        assert_eq!(result["data"]["total_lines"], 980);
+        assert_eq!(result["data"]["start_line"], 1);
+        assert_eq!(result["data"]["end_line"], 200);
+        assert_eq!(result["data"]["truncated"], true);
+        assert_eq!(result["data"]["next_start_line"], 201);
+    }
+
+    #[tokio::test]
+    async fn a_requested_range_is_still_held_to_the_character_cap() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("wide.rs"), numbered_lines(300, 200)).unwrap();
+
+        let result = run(
+            &tool(&dir, None),
+            json!({"path": "wide.rs", "start_line": 10, "end_line": 300}),
+        )
+        .await;
+
+        let content = result["data"]["content"].as_str().unwrap();
+        let end = result["data"]["end_line"].as_u64().unwrap();
+        assert!(content.chars().count() <= MAX_CONTENT_CHARS);
+        assert!(end < 300);
+        assert_eq!(result["data"]["truncated"], true);
+        assert_eq!(result["data"]["next_start_line"], end + 1);
+        assert!(content.ends_with(&format!("{end:0>200}")));
+    }
+
+    #[tokio::test]
+    async fn a_single_oversized_line_is_cut_and_flagged() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("min.js"), "é".repeat(50_000)).unwrap();
+
+        let result = run(&tool(&dir, None), json!({"path": "min.js"})).await;
+
+        let content = result["data"]["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), MAX_CONTENT_CHARS);
+        assert_eq!(result["data"]["truncated"], true);
+        assert_eq!(result["data"]["line_cut"], true);
+    }
+
+    #[tokio::test]
+    async fn a_short_file_is_not_flagged_as_truncated() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+
+        let result = run(&tool(&dir, None), json!({"path": "a.txt"})).await;
+
+        assert_eq!(result["data"]["truncated"], false);
+        assert!(result["data"].get("next_start_line").is_none());
     }
 
     #[tokio::test]

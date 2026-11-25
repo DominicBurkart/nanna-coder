@@ -1,5 +1,6 @@
 use super::{is_refusal, DEFAULT_MODEL, FILE_EDIT_TOOLS};
 use crate::action_auditor::ActionDenied;
+use crate::agent::context_window::{fit_context, DEFAULT_CONTEXT_CHARS};
 use crate::effects::EffectRecord;
 use crate::entities::context::types::ToolCallRecord;
 use crate::tool_contract::{EditObserver, ErrorCode, FinishClaim, FinishSlot, ToolOutcome};
@@ -51,12 +52,14 @@ pub fn no_progress_classification(elapsed: Duration, window: Duration) -> String
 pub struct LoopLimits {
     pub max_iterations: usize,
     pub max_inactivity: Option<Duration>,
+    pub max_context_chars: usize,
 }
 
 impl Default for LoopLimits {
     fn default() -> Self {
         Self {
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_context_chars: DEFAULT_CONTEXT_CHARS,
             max_inactivity: resolve_inactivity(
                 None,
                 std::env::var(MAX_INACTIVITY_ENV).ok().as_deref(),
@@ -266,8 +269,8 @@ impl SweLoop {
             if clock.expired() {
                 break clock.inactive();
             }
-            let request = ChatRequest::new(&self.model_name, conversation.clone())
-                .with_tools(tool_defs.clone());
+            let sent = fit_context(&conversation, self.limits.max_context_chars);
+            let request = ChatRequest::new(&self.model_name, sent).with_tools(tool_defs.clone());
             let response = match clock.bound(self.provider.chat(request)).await {
                 Some(result) => result.map_err(|error| SweError::Model(error.to_string()))?,
                 None => break clock.inactive(),
@@ -500,6 +503,7 @@ mod tests {
     fn limits() -> LoopLimits {
         LoopLimits {
             max_iterations: 20,
+            max_context_chars: DEFAULT_CONTEXT_CHARS,
             max_inactivity: None,
         }
     }
@@ -861,6 +865,7 @@ mod tests {
             slot(),
             LoopLimits {
                 max_iterations: 5,
+                max_context_chars: DEFAULT_CONTEXT_CHARS,
                 max_inactivity: Some(window),
             },
         );
@@ -880,6 +885,7 @@ mod tests {
     fn windowed(window: u64) -> LoopLimits {
         LoopLimits {
             max_iterations: 20,
+            max_context_chars: DEFAULT_CONTEXT_CHARS,
             max_inactivity: Some(Duration::from_secs(window)),
         }
     }
@@ -993,6 +999,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_system_prompt_and_task_survive_a_huge_tool_result() {
+        let finish = slot();
+        let registry = scripted_registry(vec![
+            ScriptedTool::new(
+                "read_file",
+                EffectClass::None,
+                vec![ok_outcome(json!({"content": "x".repeat(117_000)}))],
+            ),
+            finish_tool(&finish),
+        ]);
+        let provider = MockProvider::new(vec![
+            tool_call_response("read_file", json!({"path": "a"})),
+            tool_call_response("finish", json!({})),
+        ]);
+        let mut swe = SweLoop::new(
+            provider.clone(),
+            registry,
+            "SYSTEM RULES",
+            finish,
+            LoopLimits {
+                max_context_chars: 4_000,
+                ..limits()
+            },
+        );
+
+        let run = swe.run("THE TASK").await.unwrap();
+
+        let sent = &provider.requests()[1].messages;
+        assert_eq!(sent[0].content.as_deref(), Some("SYSTEM RULES"));
+        assert_eq!(sent[1].content.as_deref(), Some("THE TASK"));
+        assert!(crate::agent::context_window::conversation_chars(sent) <= 4_000);
+        let recorded = run.conversation[3].content.as_deref().unwrap();
+        assert!(recorded.len() > 100_000);
+    }
+
+    #[tokio::test]
     async fn max_iterations_ends_the_loop() {
         let registry = scripted_registry(vec![read_tool()]);
         let provider = MockProvider::new(vec![
@@ -1007,6 +1049,7 @@ mod tests {
             slot(),
             LoopLimits {
                 max_iterations: 2,
+                max_context_chars: DEFAULT_CONTEXT_CHARS,
                 max_inactivity: None,
             },
         );

@@ -10,14 +10,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_MAX_ENTRIES: u32 = 500;
+const MAX_ENTRIES: u32 = 200;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListDirectoryArgs {
     #[schemars(description = "Directory to list, relative to the workspace root (default \".\")")]
     pub path: Option<String>,
-    #[schemars(description = "Maximum entries to return (default 500)")]
+    #[schemars(description = "Maximum entries to return (default and ceiling 200)")]
     pub max_entries: Option<u32>,
 }
 
@@ -50,7 +50,7 @@ impl TypedTool for ListDirectoryTool {
 
     async fn run(&self, args: ListDirectoryArgs) -> ToolOutcome {
         let path_arg = args.path.as_deref().unwrap_or(".");
-        let limit = args.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+        let limit = args.max_entries.unwrap_or(MAX_ENTRIES).min(MAX_ENTRIES);
         if limit == 0 {
             return ToolOutcome::failure(ErrorCode::InvalidArgs, "max_entries must be at least 1");
         }
@@ -193,6 +193,22 @@ mod tests {
         assert_eq!(names(&result), [pair("a", "file"), pair("b", "file")]);
         assert_eq!(result["data"]["truncated"], true);
         assert_eq!(result["data"]["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_large_directory_is_held_to_two_hundred_entries_whatever_is_asked() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..300 {
+            put(&dir, &format!("f{index:03}"), "");
+        }
+
+        for args in [json!({}), json!({"max_entries": 10_000})] {
+            let result = run(&tool(&dir, None), args).await;
+
+            assert_eq!(names(&result).len(), 200);
+            assert_eq!(result["data"]["total"], 300);
+            assert_eq!(result["data"]["truncated"], true);
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@
 //! 9. Decision → **Plan Entity Modification** (loop)
 
 pub mod agents_md;
+pub mod context_window;
 pub mod eval;
 pub mod eval_case;
 pub mod project_detect;
