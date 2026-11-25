@@ -77,6 +77,7 @@ const TOOL_TABLE: &[(&str, Solo)] = &[
     ("SqlxMigrateTool", Solo::Local),
     ("StubTool", Solo::Local),
     ("TrunkBuildTool", Solo::Local),
+    ("Typed", Solo::Local),
     ("WriteFileTool", Solo::Local),
 ];
 
