@@ -35,6 +35,7 @@ pub mod planner;
 pub mod plugins;
 pub mod pod;
 pub mod policy;
+pub mod post_run;
 pub mod pr_binding;
 pub mod pr_tools;
 pub mod protected;
