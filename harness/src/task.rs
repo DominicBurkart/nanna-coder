@@ -417,6 +417,7 @@ struct TaskRunner {
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
+    inactivity: std::sync::RwLock<Option<std::time::Duration>>,
     escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
     sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
@@ -950,6 +951,7 @@ impl TaskManager {
             intake: Mutex::new(()),
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
+            inactivity: std::sync::RwLock::new(None),
             escalator: std::sync::RwLock::new(None),
             sink,
             cost_accountant: std::sync::RwLock::new(cost_accountant),
@@ -991,6 +993,11 @@ impl TaskManager {
     /// acquires is released with the rest of a task's leases only when it
     /// shares the same store this manager's [`TaskManager::cancel`] and
     /// terminal-transition handling release from.
+    pub fn with_inactivity_window(self, window: Option<std::time::Duration>) -> Self {
+        *self.runner.inactivity.write().unwrap() = window;
+        self
+    }
+
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
         self
@@ -2260,6 +2267,7 @@ impl TaskRunner {
                 ),
             ),
             model_name: queued.model.clone(),
+            max_inactivity: *self.inactivity.read().unwrap(),
             ..Default::default()
         };
         let context = AgentContext {
@@ -3428,6 +3436,15 @@ max_concurrent = 1
                 .with_max_level(tracing::Level::TRACE)
                 .try_init();
         });
+    }
+
+    #[tokio::test]
+    async fn test_the_inactivity_window_is_off_until_a_manager_sets_it() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        assert_eq!(*manager.runner.inactivity.read().unwrap(), None);
+        let window = std::time::Duration::from_secs(2700);
+        let manager = manager.with_inactivity_window(Some(window));
+        assert_eq!(*manager.runner.inactivity.read().unwrap(), Some(window));
     }
 
     #[test]

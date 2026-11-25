@@ -228,6 +228,7 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub model_name: String,
     pub max_no_progress_nudges: usize,
+    pub max_inactivity: Option<std::time::Duration>,
 }
 
 impl Default for AgentConfig {
@@ -238,6 +239,39 @@ impl Default for AgentConfig {
             system_prompt: String::new(),
             model_name: DEFAULT_MODEL.to_string(),
             max_no_progress_nudges: DEFAULT_MAX_NO_PROGRESS_NUDGES,
+            max_inactivity: None,
+        }
+    }
+}
+
+pub const INACTIVITY_ENV: &str = "NANNA_MAX_INACTIVITY_SECS";
+pub const DEFAULT_INACTIVITY_SECS: u64 = 2700;
+const MAX_INACTIVITY_SECS: u64 = 86_400;
+
+pub fn inactivity_window_from(value: Option<&str>) -> Result<Option<std::time::Duration>, String> {
+    let Some(raw) = value else {
+        return Ok(Some(std::time::Duration::from_secs(
+            DEFAULT_INACTIVITY_SECS,
+        )));
+    };
+    let secs: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{INACTIVITY_ENV} must be a whole number of seconds, got `{raw}`"))?;
+    if secs > MAX_INACTIVITY_SECS {
+        return Err(format!(
+            "{INACTIVITY_ENV} must be between 0 and {MAX_INACTIVITY_SECS} seconds, got {secs}"
+        ));
+    }
+    Ok((secs > 0).then(|| std::time::Duration::from_secs(secs)))
+}
+
+pub fn inactivity_window_from_env() -> Option<std::time::Duration> {
+    match inactivity_window_from(std::env::var(INACTIVITY_ENV).ok().as_deref()) {
+        Ok(window) => window,
+        Err(e) => {
+            tracing::error!(error = %e, "ignoring invalid inactivity setting; using the default");
+            Some(std::time::Duration::from_secs(DEFAULT_INACTIVITY_SECS))
         }
     }
 }
@@ -360,11 +394,23 @@ pub struct AgentLoop<S: EntityStore + Send = InMemoryEntityStore> {
     progress: ProgressGuard,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ProgressGuard {
     write_calls: usize,
     nudges: usize,
     refused: bool,
+    last_progress: tokio::time::Instant,
+}
+
+impl Default for ProgressGuard {
+    fn default() -> Self {
+        Self {
+            write_calls: 0,
+            nudges: 0,
+            refused: false,
+            last_progress: tokio::time::Instant::now(),
+        }
+    }
 }
 
 enum StopVerdict {
@@ -540,6 +586,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 .is_some_and(|class| class > crate::effects::EffectClass::None);
         if writes {
             self.progress.write_calls += 1;
+            self.progress.last_progress = tokio::time::Instant::now();
         }
     }
 
@@ -561,7 +608,11 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             self.progress.refused = true;
             return StopVerdict::Accept;
         }
-        if self.progress.nudges < self.config.max_no_progress_nudges {
+        let may_nudge = match self.config.max_inactivity {
+            Some(window) => self.progress.last_progress.elapsed() < window,
+            None => self.progress.nudges < self.config.max_no_progress_nudges,
+        };
+        if may_nudge {
             self.progress.nudges += 1;
             let nudge = self.nudge_text();
             self.conversation_history.push(ChatMessage::user(nudge));
@@ -3711,6 +3762,80 @@ mod tests {
         let result = agent.run_tool_loop(progress_context()).await.unwrap();
         assert!(result.task_completed);
         assert!(nudge_messages(&agent).is_empty());
+    }
+
+    fn windowed_agent(dir: &std::path::Path, window_secs: u64) -> AgentLoop {
+        let mut agent = progress_agent(vec![], write_capable_registry(dir), 2);
+        agent.config.max_inactivity = Some(std::time::Duration::from_secs(window_secs));
+        agent.reset_progress();
+        agent
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_window_nudges_past_the_stop_count_while_it_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = windowed_agent(dir.path(), 2700);
+        for _ in 0..5 {
+            assert!(matches!(
+                agent.judge_stop("I will do it."),
+                StopVerdict::Nudge
+            ));
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_window_gives_up_once_it_has_elapsed_without_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = windowed_agent(dir.path(), 2700);
+        assert!(matches!(agent.judge_stop("Working."), StopVerdict::Nudge));
+        tokio::time::advance(std::time::Duration::from_secs(2701)).await;
+        assert!(matches!(
+            agent.judge_stop("Still working."),
+            StopVerdict::GiveUp
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_edit_restarts_the_inactivity_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = windowed_agent(dir.path(), 2700);
+        tokio::time::advance(std::time::Duration::from_secs(2000)).await;
+        agent.note_tool_call("write_file", true);
+        tokio::time::advance(std::time::Duration::from_secs(2000)).await;
+        assert!(!agent.is_guarded());
+        let mut unedited = windowed_agent(dir.path(), 2700);
+        tokio::time::advance(std::time::Duration::from_secs(2000)).await;
+        unedited.note_tool_call("write_file", false);
+        tokio::time::advance(std::time::Duration::from_secs(2000)).await;
+        assert!(matches!(unedited.judge_stop("Done."), StopVerdict::GiveUp));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_accepted_inside_the_inactivity_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = windowed_agent(dir.path(), 2700);
+        assert!(matches!(
+            agent.judge_stop("CANNOT: the file does not exist."),
+            StopVerdict::Accept
+        ));
+    }
+
+    #[test]
+    fn inactivity_window_defaults_to_forty_five_minutes_and_zero_disables() {
+        assert_eq!(
+            inactivity_window_from(None),
+            Ok(Some(std::time::Duration::from_secs(2700)))
+        );
+        assert_eq!(inactivity_window_from(Some("0")), Ok(None));
+        assert_eq!(
+            inactivity_window_from(Some("600")),
+            Ok(Some(std::time::Duration::from_secs(600)))
+        );
+        let err = inactivity_window_from(Some("soon")).unwrap_err();
+        assert!(err.contains("NANNA_MAX_INACTIVITY_SECS"), "{err}");
+        let err = inactivity_window_from(Some("999999")).unwrap_err();
+        assert!(err.contains("NANNA_MAX_INACTIVITY_SECS"), "{err}");
     }
 
     fn failing_edit_call() -> ChatResponse {
