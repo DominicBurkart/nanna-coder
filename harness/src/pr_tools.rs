@@ -5612,9 +5612,12 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(skipped.len(), UNICODE_SPELLINGS.len());
-        let mut folded: Vec<String> = skipped.iter().map(|p| nfc(p)).collect();
+        let mut folded: Vec<String> = skipped.iter().map(|p| nfc(p).to_lowercase()).collect();
         folded.sort();
-        let mut expected: Vec<String> = UNICODE_SPELLINGS.iter().map(|(p, _)| nfc(p)).collect();
+        let mut expected: Vec<String> = UNICODE_SPELLINGS
+            .iter()
+            .map(|(p, _)| nfc(p).to_lowercase())
+            .collect();
         expected.sort();
         assert_eq!(folded, expected);
     }
@@ -5646,9 +5649,17 @@ mod tests {
 
     const COMBINED_SPELLINGS: [&str; 4] = [
         "docs/cafe\u{301}-key./x.md",
-        "docs/caf\u{e9}-\u{212A}ey /y.md",
+        if cfg!(windows) {
+            "docs/caf\u{e9}-\u{212A}ey./y.md"
+        } else {
+            "docs/caf\u{e9}-\u{212A}ey /y.md"
+        },
         "crates/e\u{301}/.nanna./z.toml",
-        ".NANNA /w.toml",
+        if cfg!(windows) {
+            ".NANNA./w.toml"
+        } else {
+            ".NANNA /w.toml"
+        },
     ];
 
     fn combined_protected() -> ProtectedPaths {
