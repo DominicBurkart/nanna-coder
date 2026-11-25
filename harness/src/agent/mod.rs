@@ -51,7 +51,7 @@ const PLANNING_TEMPERATURE: f32 = 0.7;
 const COMPLETION_TEMPERATURE: f32 = 0.2;
 const DECISION_TEMPERATURE: f32 = 0.3;
 const DEFAULT_MODEL: &str = "qwen2.5:0.5b";
-const MAX_TOOL_ITERATIONS: usize = 10;
+const MAX_TURNS_WITHOUT_EDIT: usize = 32;
 const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
 const DEFAULT_MAX_NO_PROGRESS_NUDGES: usize = 2;
 const MAX_NO_PROGRESS_MESSAGE_CHARS: usize = 500;
@@ -90,7 +90,7 @@ pub enum AgentError {
         conversation_snapshot: Vec<ChatMessage>,
         last_agent_state: AgentState,
     },
-    #[error("Agent made no progress: it stopped {nudges} time(s) after being prompted without changing any files. Last message: {last_message}")]
+    #[error("Agent made no progress: it changed no files before it gave up, after {nudges} reminder(s). Last message: {last_message}")]
     NoProgress {
         nudges: usize,
         last_message: String,
@@ -416,6 +416,8 @@ struct ProgressGuard {
     nudges: usize,
     refused: bool,
     last_progress: tokio::time::Instant,
+    turns_since_edit: usize,
+    cut_off: bool,
 }
 
 impl Default for ProgressGuard {
@@ -425,6 +427,8 @@ impl Default for ProgressGuard {
             nudges: 0,
             refused: false,
             last_progress: tokio::time::Instant::now(),
+            turns_since_edit: 0,
+            cut_off: false,
         }
     }
 }
@@ -593,6 +597,29 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.progress = ProgressGuard::default();
     }
 
+    fn start_perform_pass(&mut self) {
+        if std::mem::take(&mut self.progress.cut_off) {
+            self.progress.turns_since_edit = 0;
+            self.progress.last_progress = tokio::time::Instant::now();
+        }
+    }
+
+    fn cutoff_reached(&self) -> bool {
+        self.progress.turns_since_edit >= MAX_TURNS_WITHOUT_EDIT
+            || self
+                .config
+                .max_inactivity
+                .is_some_and(|window| self.progress.last_progress.elapsed() >= window)
+    }
+
+    fn require_an_edit(&self) -> AgentResult<()> {
+        if self.is_guarded() {
+            let last = extract_result_summary(&self.conversation_history);
+            return Err(self.no_progress_error(&last));
+        }
+        Ok(())
+    }
+
     fn note_tool_call(&mut self, name: &str, succeeded: bool) {
         let writes = succeeded
             && FILE_EDIT_TOOLS.contains(&name)
@@ -603,6 +630,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 .is_some_and(|class| class > crate::effects::EffectClass::None);
         if writes {
             self.progress.write_calls += 1;
+            self.progress.turns_since_edit = 0;
             self.progress.last_progress = tokio::time::Instant::now();
         }
     }
@@ -1458,7 +1486,14 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 .push(ChatMessage::user(&context.user_prompt));
         }
 
-        for _ in 0..MAX_TOOL_ITERATIONS {
+        self.start_perform_pass();
+        loop {
+            if self.cutoff_reached() {
+                self.require_an_edit()?;
+                self.progress.cut_off = true;
+                break;
+            }
+
             let (messages, estimated_chars) = self.history_for_request(&tool_defs);
             let request = ChatRequest::new(&self.config.model_name, messages)
                 .with_tools(tool_defs.clone())
@@ -1470,8 +1505,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             log_context_estimate(estimated_chars, &response);
 
             if response.choices.is_empty() {
+                self.require_an_edit()?;
                 break;
             }
+            self.progress.turns_since_edit += 1;
 
             let choice = response.choices.into_iter().next().unwrap();
 
@@ -1518,11 +1555,6 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                     StopVerdict::GiveUp => return Err(self.no_progress_error(&stop_text)),
                 }
             }
-        }
-
-        if self.is_guarded() {
-            let last = extract_result_summary(&self.conversation_history);
-            return Err(self.no_progress_error(&last));
         }
 
         self.performed_actions += 1;
@@ -2008,7 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_perform_entity_modification_with_tools_max_iterations() {
-        let responses: Vec<ChatResponse> = (0..MAX_TOOL_ITERATIONS + 5)
+        let responses: Vec<ChatResponse> = (0..40)
             .map(|_| tool_call_response("echo", serde_json::json!({"message": "loop"})))
             .collect();
 
@@ -2041,6 +2073,15 @@ mod tests {
             "Should stop after max iterations without error"
         );
         assert_eq!(agent.performed_actions, 1, "Should count as one action");
+        assert_eq!(tool_message_count(&agent), 32);
+    }
+
+    fn tool_message_count(agent: &AgentLoop) -> usize {
+        agent
+            .conversation_history()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count()
     }
 
     #[test]
@@ -4009,11 +4050,174 @@ mod tests {
     async fn state_machine_fails_when_the_inner_budget_runs_out_without_a_write() {
         let dir = tempfile::tempdir().unwrap();
         let mut responses = vec![plain_response("Plan: execute the task")];
-        responses.extend((0..12).map(|i| plain_response(&format!("I will do it {i}"))));
+        responses.extend((0..40).map(|i| plain_response(&format!("I will do it {i}"))));
         responses.push(plain_response("COMPLETE"));
         let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 50);
         let err = agent.run(progress_context()).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::NoProgress { nudges: 32, .. }),
+            "{err:?}"
+        );
+    }
+
+    fn read_call() -> ChatResponse {
+        tool_call_response("read_file", serde_json::json!({"path": "a.txt"}))
+    }
+
+    fn reads(count: usize) -> Vec<ChatResponse> {
+        (0..count).map(|_| read_call()).collect()
+    }
+
+    fn cutoff_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        dir
+    }
+
+    fn planned(parts: Vec<Vec<ChatResponse>>) -> Vec<ChatResponse> {
+        let mut responses = vec![plain_response("Plan: execute the task")];
+        responses.extend(parts.into_iter().flatten());
+        responses
+    }
+
+    #[tokio::test]
+    async fn inner_loop_allows_32_turns_without_an_edit() {
+        let dir = cutoff_dir();
+        let responses = planned(vec![
+            reads(31),
+            vec![
+                write_call(),
+                plain_response("done"),
+                plain_response("COMPLETE"),
+            ],
+        ]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let result = agent.run(progress_context()).await.unwrap();
+        assert_eq!(result.tool_calls_made.len(), 32);
+        assert_eq!(result.result_summary, "done");
+    }
+
+    #[tokio::test]
+    async fn an_edit_resets_the_turn_count() {
+        let dir = cutoff_dir();
+        let responses = planned(vec![
+            reads(20),
+            vec![write_call()],
+            reads(20),
+            vec![plain_response("done"), plain_response("COMPLETE")],
+        ]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let result = agent.run(progress_context()).await.unwrap();
+        assert_eq!(result.tool_calls_made.len(), 41);
+        assert_eq!(result.result_summary, "done");
+    }
+
+    #[tokio::test]
+    async fn the_cutoff_after_an_edit_proceeds_to_completion() {
+        let dir = cutoff_dir();
+        let responses = planned(vec![
+            vec![write_call()],
+            reads(32),
+            vec![plain_response("COMPLETE")],
+        ]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.tool_calls_made.len(), 33);
+    }
+
+    #[tokio::test]
+    async fn the_cutoff_without_an_edit_is_no_progress() {
+        for window in [None, Some(std::time::Duration::from_secs(2700))] {
+            let dir = cutoff_dir();
+            let responses = planned(vec![reads(40), vec![plain_response("COMPLETE")]]);
+            let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+            agent.config.max_inactivity = window;
+            let err = agent.run(progress_context()).await.unwrap_err();
+            assert!(
+                matches!(err, AgentError::NoProgress { nudges: 0, .. }),
+                "{err:?}"
+            );
+            assert_eq!(err.diagnostics().0.len(), 32, "{window:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pass_after_a_cutoff_starts_with_a_fresh_count() {
+        let dir = cutoff_dir();
+        let responses = planned(vec![
+            vec![write_call()],
+            reads(32),
+            vec![
+                plain_response("INCOMPLETE"),
+                plain_response("PROCEED"),
+                plain_response("Plan: verify"),
+            ],
+            reads(3),
+            vec![plain_response("done"), plain_response("COMPLETE")],
+        ]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let result = agent.run(progress_context()).await.unwrap();
+        assert_eq!(result.tool_calls_made.len(), 36);
+        assert_eq!(result.result_summary, "done");
+    }
+
+    struct SlowProvider(Arc<MockProvider>);
+
+    #[async_trait]
+    impl ModelProvider for SlowProvider {
+        async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            self.0.chat(request).await
+        }
+
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "slow"
+        }
+    }
+
+    fn slow_agent(root: &std::path::Path, responses: Vec<ChatResponse>) -> AgentLoop {
+        let config = AgentConfig {
+            max_inactivity: Some(std::time::Duration::from_secs(2700)),
+            ..Default::default()
+        };
+        AgentLoop::with_tools(
+            config,
+            InMemoryEntityStore::new(),
+            Arc::new(SlowProvider(MockProvider::new(responses))),
+            write_capable_registry(root),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_inactivity_window_ends_the_pass_before_32_turns() {
+        let dir = cutoff_dir();
+        let mut agent = slow_agent(dir.path(), planned(vec![reads(8)]));
+        let err = agent.run(progress_context()).await.unwrap_err();
         assert!(matches!(err, AgentError::NoProgress { .. }), "{err:?}");
+        assert_eq!(err.diagnostics().0.len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_inactivity_window_runs_from_the_last_edit_and_then_completes() {
+        let dir = cutoff_dir();
+        let responses = planned(vec![
+            vec![write_call()],
+            reads(5),
+            vec![plain_response("COMPLETE")],
+        ]);
+        let mut agent = slow_agent(dir.path(), responses);
+        let result = agent.run(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(result.tool_calls_made.len(), 6);
     }
 
     #[tokio::test]
