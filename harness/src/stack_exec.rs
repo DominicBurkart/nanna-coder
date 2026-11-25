@@ -357,6 +357,10 @@ impl TypedTool for VerbTool {
         self.verb.effect
     }
 
+    fn parameters_schema(&self) -> Value {
+        self.args_schema()
+    }
+
     async fn run(&self, args: VerbArgs) -> ToolOutcome {
         let params = match params_from_args(&args.0) {
             Ok(params) => params,
@@ -959,6 +963,7 @@ mod tests {
             protected: Vec::new(),
             env: BTreeMap::new(),
             verbs: BTreeMap::new(),
+            tool_prefix: None,
         }
     }
 
@@ -1163,6 +1168,25 @@ mod tests {
             ExecTarget::Ephemeral(Arc::new(exec(rig))),
             Vec::new(),
         ))
+    }
+
+    #[test]
+    fn a_verb_tool_advertises_its_own_parameters_to_the_model() {
+        let rig = rig();
+        let v = verb(
+            &["/bin/echo", "{{msg}}"],
+            vec![("msg", param(ParamKind::String, true))],
+        );
+        let tool = echo_tool(&rig, v);
+
+        let schema = tool
+            .definition()
+            .function
+            .raw_parameters
+            .expect("raw schema");
+
+        assert_eq!(schema["properties"]["msg"]["type"], "string");
+        assert_eq!(schema["required"], serde_json::json!(["msg"]));
     }
 
     #[tokio::test]

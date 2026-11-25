@@ -96,6 +96,9 @@ pub trait TypedTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn effect_class(&self) -> EffectClass;
+    fn parameters_schema(&self) -> Value {
+        schema_for_args::<Self::Args>()
+    }
     async fn run(&self, args: Self::Args) -> ToolOutcome;
 }
 
@@ -124,7 +127,7 @@ impl<T: TypedTool> Tool for Typed<T> {
             function: FunctionDefinition {
                 name: self.0.name().to_string(),
                 description: self.0.description().to_string(),
-                raw_parameters: Some(schema_for_args::<T::Args>()),
+                raw_parameters: Some(self.0.parameters_schema()),
                 parameters: ModelSchema {
                     schema_type: SchemaType::Object,
                     properties: None,
@@ -383,6 +386,51 @@ mod tests {
         assert!(schema.get("title").is_none());
         assert_eq!(definition.function.name, "echo_typed");
         assert_eq!(definition.function.description, "Echo text back.");
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct DynamicArgs {}
+
+    struct DynamicTool;
+
+    #[async_trait]
+    impl TypedTool for DynamicTool {
+        type Args = DynamicArgs;
+
+        fn name(&self) -> &str {
+            "check"
+        }
+
+        fn description(&self) -> &str {
+            "Run the stack check."
+        }
+
+        fn effect_class(&self) -> EffectClass {
+            EffectClass::Workspace
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"package": {"type": "string"}},
+                "required": []
+            })
+        }
+
+        async fn run(&self, _args: DynamicArgs) -> ToolOutcome {
+            ToolOutcome::success(json!({}))
+        }
+    }
+
+    #[test]
+    fn a_typed_tool_can_supply_its_own_parameter_schema() {
+        let definition = Typed(DynamicTool).definition();
+
+        let schema = definition.function.raw_parameters.expect("raw schema");
+
+        assert_eq!(schema["properties"]["package"]["type"], "string");
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[tokio::test]
