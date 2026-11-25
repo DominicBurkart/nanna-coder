@@ -4,6 +4,7 @@ use std::time::Duration;
 pub const DEFAULT_NUM_CTX: u32 = 16_384;
 pub const MIN_NUM_CTX: u32 = 2_048;
 pub const MAX_NUM_CTX: u32 = 131_072;
+pub const GEMMA4_E4B_MIN_NUM_CTX: u32 = 65_536;
 pub const MIN_MODEL_TIMEOUT_SECS: u64 = 10;
 pub const MAX_MODEL_TIMEOUT_SECS: u64 = 7_200;
 
@@ -39,6 +40,22 @@ impl OllamaConfig {
     pub fn with_num_ctx(mut self, num_ctx: u32) -> Self {
         self.num_ctx = num_ctx;
         self
+    }
+
+    pub fn num_ctx_for(&self, model: &str) -> u32 {
+        let name = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        let is_gemma4_e4b = name
+            .strip_prefix("gemma4:e4b")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'));
+        if is_gemma4_e4b {
+            self.num_ctx.max(GEMMA4_E4B_MIN_NUM_CTX)
+        } else {
+            self.num_ctx
+        }
     }
 
     pub fn num_ctx_from_env(value: Option<&str>) -> Result<Option<u32>, String> {
@@ -289,6 +306,46 @@ mod tests {
         })
         .unwrap_err()
         .contains("NANNA_NUM_CTX"));
+    }
+
+    #[test]
+    fn gemma4_e4b_never_gets_a_window_below_65536() {
+        let configured = |num_ctx| OllamaConfig::default().with_num_ctx(num_ctx);
+        for name in [
+            "gemma4:e4b",
+            "Gemma4:E4B",
+            "gemma4:e4b-it-q4_K_M",
+            "registry.ollama.ai/library/gemma4:e4b",
+        ] {
+            assert_eq!(OllamaConfig::default().num_ctx_for(name), 65_536, "{name}");
+            assert_eq!(configured(8_192).num_ctx_for(name), 65_536, "{name}");
+            assert_eq!(configured(131_072).num_ctx_for(name), 131_072, "{name}");
+        }
+        let overridden =
+            OllamaConfig::from_lookup(|key| (key == "NANNA_NUM_CTX").then(|| "8192".to_string()))
+                .unwrap();
+        assert_eq!(overridden.num_ctx_for("gemma4:e4b"), 65_536);
+    }
+
+    #[test]
+    fn other_models_keep_the_configured_window() {
+        for name in [
+            "gemma4:26b",
+            "gemma4:e4bx",
+            "my-gemma4:e4b",
+            "gemma4",
+            "qwen2.5:0.5b",
+            "",
+        ] {
+            assert_eq!(OllamaConfig::default().num_ctx_for(name), 16_384, "{name}");
+            assert_eq!(
+                OllamaConfig::default()
+                    .with_num_ctx(8_192)
+                    .num_ctx_for(name),
+                8_192,
+                "{name}"
+            );
+        }
     }
 
     #[test]
