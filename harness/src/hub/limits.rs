@@ -9,7 +9,8 @@ pub const SENDER_WINDOW_SECS: i64 = 600;
 /// The longest span the per-root rate limit counts over.
 pub const ROOT_WINDOW_SECS: i64 = 3600;
 
-/// The hub's size, rate and fan-out limits.
+/// The hub's size, rate and fan-out limits. `session_idle_secs` caps the time one session may spend
+/// blocked inside `msg_recv`, summed over every call since the hub started.
 ///
 /// ```
 /// use harness::hub::limits::HubLimits;
@@ -18,6 +19,7 @@ pub const ROOT_WINDOW_SECS: i64 = 3600;
 /// assert_eq!(limits.body_max, 8192);
 /// assert_eq!(limits.per_sender_per_10m, 30);
 /// assert_eq!(limits.per_root_per_hour, 2000);
+/// assert_eq!(limits.session_idle_secs, 1800);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubLimits {
@@ -28,6 +30,7 @@ pub struct HubLimits {
     pub per_root_per_hour: u32,
     pub fanout_max: usize,
     pub thread_depth_max: u8,
+    pub session_idle_secs: u32,
 }
 
 impl Default for HubLimits {
@@ -40,6 +43,7 @@ impl Default for HubLimits {
             per_root_per_hour: 2000,
             fanout_max: 20,
             thread_depth_max: 32,
+            session_idle_secs: 1800,
         }
     }
 }
