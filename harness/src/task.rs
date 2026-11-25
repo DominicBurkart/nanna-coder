@@ -153,6 +153,10 @@ pub struct TaskResult {
     pub changes: Option<crate::changes::ChangeCapture>,
     #[serde(default)]
     pub tools_unavailable: Vec<crate::exec_capabilities::ToolsUnavailable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects_audit: Option<crate::effects_audit::EffectsAudit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_run: Option<crate::post_run::PostRunReport>,
 }
 
 impl TaskResult {
@@ -172,7 +176,7 @@ impl TaskResult {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "result_summary": self.result_summary,
             "changes_patch": self.changes_patch,
             "format_patch": self.format_patch,
@@ -187,7 +191,16 @@ impl TaskResult {
             "blast_radius": self.blast_radius,
             "qa_summary": self.qa_summary.to_json(),
             "budget": self.budget.to_json(),
-        })
+        });
+        if let Some(object) = value.as_object_mut() {
+            if let Some(audit) = &self.effects_audit {
+                object.insert("effects_audit".to_string(), serde_json::json!(audit));
+            }
+            if let Some(post_run) = &self.post_run {
+                object.insert("post_run".to_string(), serde_json::json!(post_run));
+            }
+        }
+        value
     }
 }
 
@@ -2316,6 +2329,8 @@ impl TaskRunner {
             Ok(result) => {
                 let files_modified = parse_modified_files(changes_patch.as_deref());
                 let task_result = TaskResult {
+                    effects_audit: None,
+                    post_run: None,
                     result_summary: result.result_summary,
                     changes_patch,
                     format_patch,
@@ -2720,6 +2735,8 @@ max_concurrent = 1
     #[test]
     fn test_task_result_to_json() {
         let result = TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: "Done".to_string(),
@@ -2855,6 +2872,8 @@ max_concurrent = 1
 
     fn result_with_calls(tool_calls_made: Vec<ToolCallRecord>) -> TaskResult {
         TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: "done".to_string(),
@@ -9535,6 +9554,8 @@ mod result_persistence {
 
     fn result() -> TaskResult {
         TaskResult {
+            effects_audit: None,
+            post_run: None,
             result_summary: "all done".to_string(),
             changes: None,
             tools_unavailable: vec![],
@@ -9550,6 +9571,51 @@ mod result_persistence {
             qa_summary: Default::default(),
             budget: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_result_persisted_before_the_audit_fields_existed_still_loads() {
+        let mut value = serde_json::to_value(result()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("effects_audit");
+        object.remove("post_run");
+        let back: TaskResult = serde_json::from_value(value).unwrap();
+        assert!(back.effects_audit.is_none());
+        assert!(back.post_run.is_none());
+    }
+
+    #[test]
+    fn absent_audit_fields_are_not_serialised() {
+        let value = serde_json::to_value(result()).unwrap();
+        assert!(value.get("effects_audit").is_none());
+        assert!(value.get("post_run").is_none());
+        assert!(result().to_json().get("effects_audit").is_none());
+    }
+
+    #[test]
+    fn audit_and_post_run_round_trip_and_show_in_to_json() {
+        use crate::effects_audit::{EffectsAudit, Finding, FindingSeverity, Verdict};
+        use crate::post_run::{FmtReport, PostRunReport};
+        let mut with = result();
+        with.effects_audit = Some(EffectsAudit {
+            verdict: Verdict::Flag,
+            findings: vec![Finding {
+                code: "unclaimed_change".to_string(),
+                severity: FindingSeverity::Flag,
+                detail: "b.rs".to_string(),
+            }],
+        });
+        with.post_run = Some(PostRunReport {
+            fmt: FmtReport::default(),
+            build: crate::tool_contract::BuildState::Pass,
+        });
+        let wire = serde_json::to_string(&with).unwrap();
+        let back: TaskResult = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.effects_audit, with.effects_audit);
+        assert_eq!(back.post_run, with.post_run);
+        let json = with.to_json();
+        assert_eq!(json["effects_audit"]["verdict"], "flag");
+        assert_eq!(json["post_run"]["build"]["state"], "pass");
     }
 
     fn cancelled() -> TaskStatus {

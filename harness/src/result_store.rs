@@ -952,6 +952,8 @@ mod tests {
         TaskStatus::Completed {
             finished_at: Utc::now(),
             result: crate::task::TaskResult {
+                effects_audit: None,
+                post_run: None,
                 result_summary: "done".into(),
                 changes_patch: None,
                 format_patch: None,

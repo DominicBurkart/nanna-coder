@@ -759,6 +759,8 @@ mod tests {
 
     fn result(files: &[&str], effect: Option<EffectClass>) -> TaskResult {
         TaskResult {
+            effects_audit: None,
+            post_run: None,
             changes: None,
             tools_unavailable: vec![],
             result_summary: "done".to_string(),
