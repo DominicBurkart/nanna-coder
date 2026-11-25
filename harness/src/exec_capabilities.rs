@@ -259,13 +259,6 @@ pub fn capability_for_stack(stack: &Stack) -> StackCapability {
     if is_cargo_stack(stack) {
         toolchain.extend(["cargo", "rustc", "cc"].map(String::from));
     }
-    for verb in stack.verbs.values() {
-        if let Some(program) = verb.argv.first() {
-            if !toolchain.contains(program) {
-                toolchain.push(program.clone());
-            }
-        }
-    }
     StackCapability {
         name: stack.build_system.clone(),
         tools: stack
@@ -346,7 +339,17 @@ pub fn plan_for_stack(
     }
     let mut blocked = Vec::new();
     for (spec, names) in wanted {
-        if spec.network && !allow_network {
+        let missing = spec
+            .argv
+            .first()
+            .filter(|program| env.find_program(program).is_none());
+        if let Some(program) = missing {
+            plan.unavailable.push(ToolsUnavailable {
+                capability: capability.name.clone(),
+                tools: names,
+                reason: format!("toolchain program {program} is not in the harness image"),
+            });
+        } else if spec.network && !allow_network {
             blocked.extend(names);
         } else {
             plan.granted.extend(names);
@@ -587,6 +590,10 @@ effect = "workspace"
 [stack.verbs.build]
 argv = ["cargo", "build"]
 effect = "workspace"
+
+[stack.verbs.format]
+argv = ["rustfmt", "--check"]
+effect = "workspace"
 "#;
 
     const GO_STACK: &str = r#"
@@ -737,6 +744,26 @@ network = true
     }
 
     #[test]
+    fn a_missing_verb_program_refuses_only_the_verbs_that_need_it() {
+        let f = fixture();
+        let env = ready_environment(f.bin.path(), f.home.path());
+        let rust = stack(RUST_STACK);
+        let plan = plan_for_stack(
+            &identity_with("\"cargo_check\", \"format\""),
+            &rust,
+            f.repo.path(),
+            &env,
+            false,
+        );
+        assert_eq!(plan.granted, vec!["cargo_check"]);
+        assert_eq!(plan.unavailable.len(), 1);
+        assert_eq!(plan.unavailable[0].tools, vec!["format"]);
+        assert!(plan.unavailable[0]
+            .reason
+            .contains("toolchain program rustfmt"));
+    }
+
+    #[test]
     fn network_verbs_need_the_caller_to_allow_network() {
         let f = go_fixture();
         let go = stack(GO_STACK);
@@ -755,7 +782,7 @@ network = true
     #[test]
     fn stack_capabilities_name_tools_uniquely_and_derive_the_toolchain() {
         let rust = capability_for_stack(&stack(RUST_STACK));
-        assert_eq!(rust.tools.len(), 6);
+        assert_eq!(rust.tools.len(), 8);
         let unique: std::collections::HashSet<&String> = rust.tools.iter().collect();
         assert_eq!(unique.len(), rust.tools.len());
         for program in ["cargo", "rustc", "cc"] {
@@ -764,7 +791,7 @@ network = true
         assert!(rust.offline_cargo_home);
         assert_eq!(rust.workspace_signal.as_deref(), Some("Cargo.toml"));
         let go = capability_for_stack(&stack(GO_STACK));
-        assert_eq!(go.toolchain, vec!["go"]);
+        assert!(go.toolchain.is_empty());
         assert!(!go.offline_cargo_home);
         assert_eq!(go.workspace_signal.as_deref(), Some("go.mod"));
     }
