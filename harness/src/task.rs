@@ -7929,6 +7929,28 @@ mod repo_override_tests {
         wait_for(manager, &id, |status| status.is_terminal()).await
     }
 
+    async fn submit_hinted_refused(
+        manager: &TaskManager,
+        repo: &Path,
+        hint: Option<&str>,
+        paths: &[&str],
+    ) -> Task {
+        let mut calls: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": path, "content": "x"}),
+                )
+            })
+            .collect();
+        calls.push(stop_response("CANNOT: those paths are outside my scope."));
+        let provider = MockProvider::new(wrap_with_state_machine_responses(calls));
+        let hinted = queued(repo).with_identity_hint(hint.map(str::to_string));
+        let id = manager.submit_task(hinted, provider).await;
+        wait_for(manager, &id, |status| status.is_terminal()).await
+    }
+
     #[tokio::test]
     async fn test_a_hinted_task_resolves_to_the_catalog_card_narrowed_by_its_repo() {
         let repo = repo_with_origin();
@@ -8178,7 +8200,7 @@ mod repo_override_tests {
         install_override(repo.path(), "rust-implementer.toml", NARROWING);
         let widened = NARROWING.replace(r#"paths = ["api/**"]"#, r#"paths = ["**"]"#);
         let manager = manager().await;
-        let task = submit_hinted(
+        let task = submit_hinted_refused(
             &manager,
             repo.path(),
             Some("rust-implementer"),
@@ -9172,10 +9194,10 @@ mod impact_tests {
         let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
         let (_, task) = run(
             repo.path(),
-            vec![tool_call_response(
-                "write_file",
-                serde_json::json!({"path": 5, "content": "x"}),
-            )],
+            vec![
+                tool_call_response("write_file", serde_json::json!({"path": 5, "content": "x"})),
+                stop_response("CANNOT: the write arguments were rejected."),
+            ],
         )
         .await;
         let (error_type, error) = failure(&task);

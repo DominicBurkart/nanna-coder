@@ -530,8 +530,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         self.progress = ProgressGuard::default();
     }
 
-    fn note_tool_call(&mut self, name: &str) {
-        let writes = FILE_EDIT_TOOLS.contains(&name)
+    fn note_tool_call(&mut self, name: &str, succeeded: bool) {
+        let writes = succeeded
+            && FILE_EDIT_TOOLS.contains(&name)
             && self
                 .tool_registry
                 .as_ref()
@@ -1320,12 +1321,12 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             let name = tool_call.function.name.clone();
             let args = tool_call.function.arguments.clone();
             let call_id = tool_call.id.clone();
-            self.note_tool_call(&name);
             let registry = match self.tool_registry.as_ref() {
                 Some(r) => r,
                 None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
             };
             let outcome = registry.execute(&name, args).await;
+            self.note_tool_call(&name, outcome.is_ok());
             let escalated = is_escalation(&outcome);
             let response_content = match outcome {
                 Ok(v) => v.to_string(),
@@ -1394,13 +1395,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 self.conversation_history.push(choice.message.clone());
 
                 for tc in &tool_calls {
-                    self.note_tool_call(&tc.function.name);
                     let result = self
                         .tool_registry
                         .as_ref()
                         .unwrap()
                         .execute(&tc.function.name, tc.function.arguments.clone())
                         .await;
+                    self.note_tool_call(&tc.function.name, result.is_ok());
                     let escalated = is_escalation(&result);
 
                     let content = match result {
@@ -1568,7 +1569,7 @@ mod tests {
                 serde_json::json!({"path": "Cargo.toml", "content": "x"}),
             ),
             tool_call_response("github_pr_status", serde_json::json!({})),
-            plain_response("Gave up."),
+            plain_response("CANNOT: the manifest is outside my scope."),
         ]);
         let config = AgentConfig {
             max_iterations: 5,
@@ -1742,7 +1743,7 @@ mod tests {
                 "write_file",
                 serde_json::json!({"path": "docs/x.md", "content": "x"}),
             ),
-            plain_response("Done."),
+            plain_response("CANNOT: docs are outside my scope."),
         ]));
         let config = AgentConfig {
             max_iterations: 20,
@@ -3710,6 +3711,74 @@ mod tests {
         let result = agent.run_tool_loop(progress_context()).await.unwrap();
         assert!(result.task_completed);
         assert!(nudge_messages(&agent).is_empty());
+    }
+
+    fn failing_edit_call() -> ChatResponse {
+        tool_call_response(
+            "edit_file",
+            serde_json::json!({"path": "t.txt", "old_string": "missing", "new_string": "beta"}),
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_loop_a_failed_edit_does_not_count_as_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut agent = progress_agent(
+            vec![
+                failing_edit_call(),
+                plain_response("I have updated the file."),
+                edit_call(),
+                plain_response("done"),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert!(result.task_completed);
+        assert_eq!(nudge_messages(&agent).len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.txt")).unwrap(),
+            "beta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_loop_gives_up_when_every_edit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut agent = progress_agent(
+            vec![
+                failing_edit_call(),
+                plain_response("I have updated the file."),
+                failing_edit_call(),
+                plain_response("Updated."),
+                plain_response("Really updated."),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        assert!(matches!(err, AgentError::NoProgress { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn state_machine_a_failed_edit_does_not_count_as_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut agent = progress_agent(
+            vec![
+                plain_response("Plan: edit the file"),
+                failing_edit_call(),
+                plain_response("I have updated the file."),
+                plain_response("Updated."),
+                plain_response("Really updated."),
+            ],
+            write_capable_registry(dir.path()),
+            2,
+        );
+        let err = agent.run(progress_context()).await.unwrap_err();
+        assert!(matches!(err, AgentError::NoProgress { .. }), "{err:?}");
     }
 
     #[tokio::test]
