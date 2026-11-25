@@ -291,45 +291,42 @@ fn extract_tool_calls_from_history(
     history: &[ChatMessage],
     registry: Option<&ToolRegistry>,
 ) -> Vec<ToolCallRecord> {
-    use std::collections::HashMap;
-
-    let mut call_args: HashMap<String, (String, serde_json::Value)> = HashMap::new();
-    let mut call_results: HashMap<String, String> = HashMap::new();
+    let mut records: Vec<ToolCallRecord> = Vec::new();
+    let mut unanswered: Vec<usize> = Vec::new();
 
     for msg in history {
         if msg.role == MessageRole::Assistant {
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
-                    call_args.insert(
-                        tc.id.clone(),
-                        (tc.function.name.clone(), tc.function.arguments.clone()),
-                    );
+                    let tool_name = tc.function.name.clone();
+                    let effect = registry
+                        .and_then(|r| r.effect_class_of(&tool_name))
+                        .map(EffectRecord::new);
+                    unanswered.push(records.len());
+                    records.push(ToolCallRecord {
+                        tool_name,
+                        arguments: tc.function.arguments.clone(),
+                        call_id: tc.id.clone(),
+                        result: String::new(),
+                        effect,
+                    });
                 }
             }
         }
         if msg.role == MessageRole::Tool {
             if let (Some(call_id), Some(content)) = (&msg.tool_call_id, &msg.content) {
-                call_results.insert(call_id.clone(), content.clone());
+                let pending = unanswered
+                    .iter()
+                    .position(|&i| records[i].call_id == *call_id);
+                if let Some(pos) = pending {
+                    let idx = unanswered.remove(pos);
+                    records[idx].result = content.clone();
+                }
             }
         }
     }
 
-    call_args
-        .into_iter()
-        .map(|(call_id, (tool_name, arguments))| {
-            let result = call_results.get(&call_id).cloned().unwrap_or_default();
-            let effect = registry
-                .and_then(|r| r.effect_class_of(&tool_name))
-                .map(EffectRecord::new);
-            ToolCallRecord {
-                tool_name,
-                arguments,
-                call_id,
-                result,
-                effect,
-            }
-        })
-        .collect()
+    records
 }
 
 fn extract_result_summary(history: &[ChatMessage]) -> String {
@@ -2669,6 +2666,36 @@ mod tests {
         assert_eq!(records[1].call_id, "call_b");
         assert_eq!(records[1].tool_name, "calc");
         assert_eq!(records[1].result, "4");
+    }
+
+    #[test]
+    fn extract_tool_calls_keeps_calls_that_reuse_an_id_across_turns() {
+        let history = vec![
+            ChatMessage::user("edit twice"),
+            assistant_tool_calls(vec![(
+                "call_0",
+                "read_file",
+                serde_json::json!({"path": "a"}),
+            )]),
+            ChatMessage::tool_response("call_0", "first result"),
+            assistant_tool_calls(vec![(
+                "call_0",
+                "write_file",
+                serde_json::json!({"path": "b"}),
+            )]),
+            ChatMessage::tool_response("call_0", "second result"),
+            assistant_tool_calls(vec![("call_0", "cargo_check", serde_json::json!({}))]),
+        ];
+
+        let records = extract_tool_calls_from_history(&history, None);
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].tool_name, "read_file");
+        assert_eq!(records[0].result, "first result");
+        assert_eq!(records[1].tool_name, "write_file");
+        assert_eq!(records[1].result, "second result");
+        assert_eq!(records[2].tool_name, "cargo_check");
+        assert_eq!(records[2].result, "");
     }
 
     /// A tool call without a matching response (model crashed or response
