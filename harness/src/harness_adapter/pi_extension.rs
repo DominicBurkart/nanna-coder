@@ -54,6 +54,7 @@ export default function (pi: any) {
       name: capability.name,
       label: capability.name,
       description: capability.description,
+      raw_parameters: None,
       parameters: capability.parameters,
       async execute(_id: string, params: unknown) {
         const reply = await call(capability.name, params);

@@ -4598,6 +4598,7 @@ mod identity_tests {
                 function: model::types::FunctionDefinition {
                     name: "deploy_prod".to_string(),
                     description: "deploys".to_string(),
+                    raw_parameters: None,
                     parameters: model::types::JsonSchema {
                         schema_type: model::types::SchemaType::Object,
                         properties: None,

@@ -92,11 +92,27 @@ pub struct ToolDefinition {
     pub function: FunctionDefinition,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
     pub parameters: JsonSchema,
+    #[serde(skip)]
+    pub raw_parameters: Option<serde_json::Value>,
+}
+
+impl Serialize for FunctionDefinition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("FunctionDefinition", 3)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("description", &self.description)?;
+        match &self.raw_parameters {
+            Some(raw) => state.serialize_field("parameters", raw)?,
+            None => state.serialize_field("parameters", &self.parameters)?,
+        }
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +220,64 @@ pub struct ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_object_schema() -> JsonSchema {
+        JsonSchema {
+            schema_type: SchemaType::Object,
+            properties: None,
+            required: None,
+        }
+    }
+
+    #[test]
+    fn raw_parameters_replace_the_typed_schema_on_the_wire() {
+        let definition = FunctionDefinition {
+            name: "replace".to_string(),
+            description: "Replace text".to_string(),
+            parameters: empty_object_schema(),
+            raw_parameters: Some(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            })),
+        };
+
+        let wire = serde_json::to_value(&definition).unwrap();
+
+        assert_eq!(wire["parameters"]["additionalProperties"], false);
+        assert_eq!(wire["parameters"]["required"][0], "path");
+        assert_eq!(wire["parameters"]["properties"]["path"]["type"], "string");
+        assert!(wire.get("raw_parameters").is_none());
+    }
+
+    #[test]
+    fn typed_parameters_serialise_unchanged_without_raw_parameters() {
+        let definition = FunctionDefinition {
+            name: "echo".to_string(),
+            description: "Echo".to_string(),
+            parameters: empty_object_schema(),
+            raw_parameters: None,
+        };
+
+        let wire = serde_json::to_value(&definition).unwrap();
+
+        assert_eq!(wire["parameters"]["type"], "object");
+        assert!(wire.get("raw_parameters").is_none());
+    }
+
+    #[test]
+    fn a_function_definition_round_trips_without_raw_parameters() {
+        let wire = serde_json::json!({
+            "name": "echo",
+            "description": "Echo",
+            "parameters": {"type": "object", "properties": null, "required": null}
+        });
+
+        let definition: FunctionDefinition = serde_json::from_value(wire).unwrap();
+
+        assert!(definition.raw_parameters.is_none());
+    }
 
     #[test]
     fn test_message_constructors() {

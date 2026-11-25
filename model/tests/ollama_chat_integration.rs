@@ -119,6 +119,7 @@ async fn test_chat_with_tool_definitions() {
         function: FunctionDefinition {
             name: "get_weather".to_string(),
             description: "Get the current weather in a given location".to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some(properties),
@@ -256,6 +257,7 @@ async fn test_ollama_tool_calling_roundtrip() {
         function: FunctionDefinition {
             name: "get_weather".to_string(),
             description: "Get current weather for a city".to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some(properties),

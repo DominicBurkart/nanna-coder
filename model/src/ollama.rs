@@ -1191,6 +1191,7 @@ mod tests {
             function: FunctionDefinition {
                 name: "get_weather".to_string(),
                 description: "Get the weather for a location".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some(props),

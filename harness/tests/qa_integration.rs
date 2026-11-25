@@ -465,6 +465,7 @@ impl harness::tools::Tool for StubTool {
             function: model::types::FunctionDefinition {
                 name: self.name.to_string(),
                 description: "stub".to_string(),
+                raw_parameters: None,
                 parameters: model::types::JsonSchema {
                     schema_type: model::types::SchemaType::Object,
                     properties: None,

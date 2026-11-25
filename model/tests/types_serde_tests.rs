@@ -126,6 +126,7 @@ fn chat_request_with_tools_sets_auto_choice() {
         function: FunctionDefinition {
             name: "calc".into(),
             description: "Calculator".into(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: None,

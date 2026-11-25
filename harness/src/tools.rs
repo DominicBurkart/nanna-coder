@@ -365,7 +365,10 @@ impl ToolRegistry {
     }
 
     pub fn get_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        let mut definitions: Vec<ToolDefinition> =
+            self.tools.values().map(|tool| tool.definition()).collect();
+        definitions.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        definitions
     }
 
     /// Dispatch `name(args)`. Checks run in a fixed order, each before the
@@ -739,6 +742,7 @@ impl Tool for EchoTool {
             function: FunctionDefinition {
                 name: "echo".to_string(),
                 description: "Echo back the provided message".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -803,6 +807,7 @@ impl Tool for CalculatorTool {
             function: FunctionDefinition {
                 name: "calculate".to_string(),
                 description: "Perform basic arithmetic calculations".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -931,6 +936,7 @@ impl Tool for ReadFileTool {
                 description:
                     "Read the contents of a file. Returns the file content with line numbers."
                         .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -1065,6 +1071,7 @@ impl Tool for WriteFileTool {
             function: FunctionDefinition {
                 name: "write_file".to_string(),
                 description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -1146,7 +1153,7 @@ const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const EDIT_HINT_LINE_CHARS: usize = 80;
 const EDIT_HINT_MAX_LINES: usize = 5;
 
-fn resolve_write_target(
+pub(crate) fn resolve_write_target(
     scope: Option<&PathScope>,
     protected: &ProtectedPaths,
     tool: &str,
@@ -1163,7 +1170,7 @@ fn resolve_write_target(
     )
 }
 
-fn reject_hardlinked(file: &std::fs::File, path: &Path) -> ToolResult<()> {
+pub(crate) fn reject_hardlinked(file: &std::fs::File, path: &Path) -> ToolResult<()> {
     if crate::protected::is_hardlinked(&file.metadata()?) {
         return Err(ToolError::ProtectedPath(
             crate::protected::hardlink_violation(path),
@@ -1185,19 +1192,19 @@ fn too_large(path: &str) -> ToolError {
     ))
 }
 
-fn uses_crlf(content: &str) -> bool {
+pub(crate) fn uses_crlf(content: &str) -> bool {
     content.contains("\r\n") && !content.replace("\r\n", "").contains('\n')
 }
 
-fn to_crlf(text: &str) -> String {
+pub(crate) fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-fn line_of(content: &str, byte: usize) -> usize {
+pub(crate) fn line_of(content: &str, byte: usize) -> usize {
     content[..byte].matches('\n').count() + 1
 }
 
-fn line_list(lines: &[usize]) -> String {
+pub(crate) fn line_list(lines: &[usize]) -> String {
     lines
         .iter()
         .map(|n| format!("line {n}"))
@@ -1327,6 +1334,7 @@ impl Tool for EditFileTool {
             function: FunctionDefinition {
                 name: "edit_file".to_string(),
                 description: "Replace an exact piece of text in an existing file. Call read_file first and copy old_string exactly, including indentation. Use write_file only to create a new file.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some(props),
@@ -1556,6 +1564,7 @@ impl Tool for ListDirTool {
             function: FunctionDefinition {
                 name: "list_directory".to_string(),
                 description: "List files and directories in a path.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -1764,6 +1773,7 @@ impl Tool for SearchTool {
                 name: "search".to_string(),
                 description: "Search for a pattern in files. Returns matching lines with context."
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -1873,6 +1883,7 @@ impl Tool for GitStatusTool {
             function: FunctionDefinition {
                 name: "git_status".to_string(),
                 description: "Get the current git repository status including branch, staged files, and modified files.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some(HashMap::new()),
@@ -1929,6 +1940,7 @@ impl Tool for GitDiffTool {
                 name: "git_diff".to_string(),
                 description: "Show git diff for files. Can show staged or unstaged changes."
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2035,6 +2047,7 @@ impl Tool for RunCommandTool {
             function: FunctionDefinition {
                 name: "run_command".to_string(),
                 description: "Run a shell command in the dev container workspace.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2234,6 +2247,7 @@ fn cargo_build_definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "cargo_build".to_string(),
             description: "Build the cargo project inside the dev container.".to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some({
@@ -2269,6 +2283,7 @@ fn cargo_test_definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "cargo_test".to_string(),
             description: "Run cargo tests inside the dev container.".to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some({
@@ -2304,6 +2319,7 @@ fn cargo_check_definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "cargo_check".to_string(),
             description: "Run cargo check (type and borrow checking without compilation) inside the dev container.".to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some({
@@ -2563,6 +2579,7 @@ impl Tool for CargoBenchTool {
             function: FunctionDefinition {
                 name: "cargo_bench".to_string(),
                 description: "Run cargo benchmarks inside the dev container.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2637,6 +2654,7 @@ impl Tool for CargoRunTool {
             function: FunctionDefinition {
                 name: "cargo_run".to_string(),
                 description: "Run a cargo binary inside the dev container.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2730,6 +2748,7 @@ impl Tool for CargoDenyTool {
                               or {\"check\": \"advisories\"} to run one category. \
                               Returns { stdout, stderr, success, command }."
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2797,6 +2816,7 @@ impl Tool for CargoAuditTool {
                               Example: call with {} to audit all dependencies. \
                               Returns { stdout, stderr, success, command }."
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some(HashMap::new()),
@@ -2847,6 +2867,7 @@ impl Tool for TrunkBuildTool {
                     .map(|c| c.description)
                     .unwrap_or_default()
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -2927,6 +2948,7 @@ impl Tool for SqlxMigrateTool {
                     .map(|c| c.description)
                     .unwrap_or_default()
                     .to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -3684,6 +3706,7 @@ impl Tool for GitHubPrStatusTool {
             function: FunctionDefinition {
                 name: "github_pr_status".to_string(),
                 description: "Get GitHub PR status. L0: compact single-line status. L1: detailed expansion of a specific field.".to_string(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some({
@@ -3972,6 +3995,23 @@ pub fn create_container_tool_registry_for_guarded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_definitions_are_listed_in_name_order() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool::new(PathBuf::from("."))));
+        registry.register(Box::new(EchoTool::new()));
+        registry.register(Box::new(ReadFileTool::new(PathBuf::from("."))));
+        registry.register(Box::new(CalculatorTool::new()));
+
+        let names: Vec<String> = registry
+            .get_definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+
+        assert_eq!(names, ["calculate", "echo", "read_file", "write_file"]);
+    }
     use crate::scope::DenialReason;
     use proptest::prelude::*;
 
@@ -3996,6 +4036,7 @@ mod tests {
                 function: FunctionDefinition {
                     name: self.name.clone(),
                     description: String::new(),
+                    raw_parameters: None,
                     parameters: JsonSchema {
                         schema_type: SchemaType::Object,
                         properties: None,

@@ -1866,6 +1866,7 @@ pub(crate) fn definition(name: &str, description: &str, parameters: JsonSchema) 
         function: FunctionDefinition {
             name: name.to_string(),
             description: description.to_string(),
+            raw_parameters: None,
             parameters,
         },
     }

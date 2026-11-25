@@ -22,6 +22,7 @@ impl Tool for StubTool {
             function: FunctionDefinition {
                 name: self.name.clone(),
                 description: self.description.clone(),
+                raw_parameters: None,
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: None,

@@ -229,6 +229,7 @@ fn definition(
         function: FunctionDefinition {
             name: name.to_string(),
             description: description.to_string(),
+            raw_parameters: None,
             parameters: JsonSchema {
                 schema_type: SchemaType::Object,
                 properties: Some(properties),
