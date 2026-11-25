@@ -100,6 +100,43 @@ fn build_task_system_prompt(
     }
 }
 
+fn task_prompt_preamble(identity: Option<&AgentIdentity>, tool_names: &[&str]) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(identity) = identity {
+        match identity.system_prompt_text() {
+            Ok(text) if !text.trim().is_empty() => sections.push(text.trim().to_string()),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                error = %e,
+                "Failed to read the identity prompt for task; continuing without it"
+            ),
+        }
+    }
+    let mut names: Vec<&str> = tool_names.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    sections.push(format!(
+        "Tools you may call: {}. Never call a tool that is not listed; an unknown name is an error.\n\
+         File paths are relative to the repository root, which is your working directory. \
+         If you are unsure of a path, call list_directory on `.` first.\n\
+         read_file output prefixes each line with its line number. Those numbers are not part of the file: \
+         never copy them into old_string or content.\n\
+         Change one thing at a time and read the tool result: an `Error:` result means the change did not happen. \
+         When the task is done, reply with a short summary of what you changed. \
+         If it cannot be done, reply with one sentence starting with `CANNOT:` that says why.",
+        names.join(", ")
+    ));
+    sections.join("\n\n")
+}
+
+fn compose_task_system_prompt(preamble: &str, base: &str) -> String {
+    if preamble.is_empty() {
+        base.to_string()
+    } else {
+        format!("{preamble}\n\n{base}")
+    }
+}
+
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
@@ -2212,12 +2249,15 @@ impl TaskRunner {
         let agent_config = AgentConfig {
             max_iterations: effective_max_iterations(queued.max_iterations, identity.as_ref()),
             verbose: false,
-            system_prompt: build_task_system_prompt(
-                &workspace.workspace_path,
-                workspace
-                    .sidecar_env()
-                    .iter()
-                    .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+            system_prompt: compose_task_system_prompt(
+                &task_prompt_preamble(identity.as_ref(), &tool_registry.list_tools()),
+                &build_task_system_prompt(
+                    &workspace.workspace_path,
+                    workspace
+                        .sidecar_env()
+                        .iter()
+                        .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+                ),
             ),
             model_name: queued.model.clone(),
             ..Default::default()
@@ -3391,6 +3431,50 @@ max_concurrent = 1
     }
 
     #[test]
+    fn test_task_prompt_preamble_carries_the_card_prompt_tools_and_path_rules() {
+        let mut identity = crate::identity::example();
+        identity.identity.system_prompt =
+            crate::identity::SystemPrompt::Inline("Implement Rust changes carefully.".to_string());
+        let card_prompt = identity.system_prompt_text().unwrap();
+        let preamble = task_prompt_preamble(
+            Some(&identity),
+            &["write_file", "read_file", "edit_file", "list_directory"],
+        );
+        assert!(preamble.contains(card_prompt.trim()), "{preamble}");
+        assert!(
+            preamble.contains("edit_file, list_directory, read_file, write_file"),
+            "{preamble}"
+        );
+        assert!(
+            preamble.contains("relative to the repository root"),
+            "{preamble}"
+        );
+        assert!(preamble.contains("line number"), "{preamble}");
+        assert!(preamble.contains("CANNOT:"), "{preamble}");
+        assert!(
+            preamble.contains("Never call a tool that is not listed"),
+            "{preamble}"
+        );
+    }
+
+    #[test]
+    fn test_task_prompt_preamble_without_an_identity_still_lists_tools_and_paths() {
+        let preamble = task_prompt_preamble(None, &["read_file"]);
+        assert!(preamble.contains("read_file"), "{preamble}");
+        assert!(
+            preamble.contains("relative to the repository root"),
+            "{preamble}"
+        );
+    }
+
+    #[test]
+    fn test_compose_task_system_prompt_puts_the_preamble_first() {
+        let composed = compose_task_system_prompt("PRE", "BASE");
+        assert_eq!(composed, "PRE\n\nBASE");
+        assert_eq!(compose_task_system_prompt("", "BASE"), "BASE");
+    }
+
+    #[test]
     fn test_build_task_system_prompt_no_guidance_returns_default() {
         ensure_tracing_subscriber();
         let dir = tempfile::tempdir().unwrap();
@@ -3611,7 +3695,7 @@ max_concurrent = 1
         copy_dir(&fullstack_fixture(), repo_dir.path());
         init_test_git_repo(repo_dir.path());
         let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
-        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("This repository is a full-stack Rust workspace."));
         assert!(prompt.contains("The `api` crate"));
         assert!(prompt.contains("so `DATABASE_URL` is not set"));
@@ -3628,7 +3712,8 @@ max_concurrent = 1
         .unwrap();
         init_test_git_repo(repo_dir.path());
         let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
-        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+        assert!(prompt.ends_with(DEFAULT_TASK_SYSTEM_PROMPT), "{prompt}");
+        assert!(!prompt.contains("full-stack"), "{prompt}");
     }
 
     #[tokio::test]
