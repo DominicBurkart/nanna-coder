@@ -1,0 +1,18 @@
+[stack]
+language = "nix"
+package_manager = "nix"
+build_system = "nix"
+detect = ["flake.nix"]
+source_globs = ["**/*.nix"]
+test_globs = []
+protected = ["flake.lock"]
+
+[stack.verbs.build]
+argv = ["nix", "build"]
+effect = "workspace"
+timeout_secs = 1800
+
+[stack.verbs.check]
+argv = ["nix", "flake", "check"]
+effect = "workspace"
+timeout_secs = 1800

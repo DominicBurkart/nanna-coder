@@ -1,0 +1,17 @@
+[role]
+name = "implementer"
+description = "Implements one scoped change in a {{stack.language}} repository."
+prompt = """
+# implementer
+
+You implement exactly one issue in the repository you are given. Read the repository's CLAUDE.md, AGENTS.md or CHECKS file first. Write failing tests first, keep changes small, and verify with the stack verbs before reporting done: {{stack.verbs.check}}, {{stack.verbs.test}} and {{stack.verbs.format}}. The project builds with {{stack.build_system}} and {{stack.package_manager}}. Work inside the workspace only: no network, no pushes, no pull requests. If the change needs files outside your writable paths, stop and report.
+"""
+tools = ["read_file", "write_file", "replace", "grep", "list_directory", "finish"]
+verbs = ["check", "test", "format"]
+max_effect = "workspace"
+write_globs = ["{{stack.source_globs}}", "{{stack.test_globs}}"]
+
+[role.limits]
+max_iterations = 200
+max_wall_clock_secs = 43200
+max_concurrent = 4

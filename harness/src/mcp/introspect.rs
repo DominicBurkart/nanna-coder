@@ -48,8 +48,11 @@ pub fn is_introspection_tool(name: &str) -> bool {
 }
 
 fn card(identity: &AgentIdentity) -> Value {
+    let (source, plugin_version) = crate::plugins::load::provenance_of(identity);
     json!({
         "name": identity.name(),
+        "source": source.as_str(),
+        "plugin_version": plugin_version,
         "role": role(identity.name()),
         "assignable": resolve::is_assignable(identity.name()),
         "description": identity.identity.description,

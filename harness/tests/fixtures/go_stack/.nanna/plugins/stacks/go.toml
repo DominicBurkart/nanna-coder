@@ -1,0 +1,32 @@
+[stack]
+language = "go"
+package_manager = "go modules"
+build_system = "go"
+detect = ["go.mod"]
+source_globs = ["**/*.go", "go.mod"]
+test_globs = ["**/*_test.go"]
+protected = ["go.sum"]
+
+[stack.env]
+GOFLAGS = "-mod=readonly"
+GOPROXY = "off"
+
+[stack.verbs.check]
+argv = ["go", "vet", "./..."]
+effect = "workspace"
+timeout_secs = 600
+
+[stack.verbs.test]
+argv = ["go", "test", "./..."]
+effect = "workspace"
+timeout_secs = 900
+
+[stack.verbs.format]
+argv = ["gofmt", "-l", "-w", "{{files}}"]
+effect = "workspace"
+timeout_secs = 120
+
+[stack.verbs.format.params.files]
+kind = "path_list"
+description = "Go files to format"
+required = true

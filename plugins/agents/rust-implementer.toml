@@ -1,0 +1,4 @@
+[agent]
+name = "rust-implementer"
+role = "implementer"
+stack = "rust-cargo"

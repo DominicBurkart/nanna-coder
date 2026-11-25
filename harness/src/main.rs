@@ -352,6 +352,29 @@ enum AgentsAction {
         #[arg(long)]
         repo: Option<std::path::PathBuf>,
     },
+    /// Render a curated or repo-local agent: capabilities and system prompt
+    Render {
+        /// Agent name
+        name: String,
+        /// Repository whose .nanna/plugins/ are layered on the curated plugins.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        /// Repository identifier the rendered scope is limited to.
+        #[arg(long = "scope-repo")]
+        scope_repo: Vec<String>,
+    },
+    /// Validate curated, host and repo plugins together under the host policy
+    Check {
+        /// Catalog directory. Defaults to the host catalog directory.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Repository whose .nanna/plugins/ and .nanna/agents/ are layered on top.
+        #[arg(long)]
+        repo: Option<std::path::PathBuf>,
+        /// Repository identifier curated agents are scoped to.
+        #[arg(long = "scope-repo")]
+        scope_repo: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -542,6 +565,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => catalog,
             };
             print!("{}", catalog.map_err(|e| e.to_string())?.render_table());
+        }
+        Commands::Agents {
+            action:
+                AgentsAction::Render {
+                    name,
+                    repo,
+                    scope_repo,
+                },
+        } => {
+            let text =
+                harness::plugins::load::describe_rendered(repo.as_deref(), &name, &scope_repo)
+                    .map_err(|e| e.to_string())?;
+            print!("{text}");
+        }
+        Commands::Agents {
+            action:
+                AgentsAction::Check {
+                    dir,
+                    repo,
+                    scope_repo,
+                },
+        } => {
+            let host = match dir.or_else(IdentityCatalog::default_global_dir) {
+                Some(dir) if dir.is_dir() => {
+                    Some(IdentityCatalog::load(dir).map_err(|e| e.to_string())?)
+                }
+                _ => None,
+            };
+            let policy =
+                harness::plugins::policy::load_default_policy().map_err(|e| e.to_string())?;
+            let layered = harness::plugins::load::build_catalog(
+                host,
+                repo.as_deref(),
+                &scope_repo,
+                None,
+                &policy,
+            )
+            .map_err(|e| e.to_string())?;
+            print!("{}", layered.render_table());
+            println!("ok: {} agents", layered.len());
         }
         Commands::DefaultModel { model, catalog } => {
             run_default_model(model, catalog).await?;

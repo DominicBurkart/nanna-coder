@@ -1,0 +1,4 @@
+[agent]
+name = "go-implementer"
+role = "implementer"
+stack = "go"
