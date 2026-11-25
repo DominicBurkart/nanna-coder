@@ -191,6 +191,26 @@ impl BuildState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishClaim {
+    pub summary: String,
+    pub files_changed: Vec<String>,
+}
+
+pub type FinishSlot = std::sync::Arc<std::sync::Mutex<Option<FinishClaim>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditFeedback {
+    pub text: String,
+    pub build: BuildState,
+    pub improved: bool,
+}
+
+#[async_trait]
+pub trait EditObserver: Send + Sync {
+    async fn after_edits(&self, touched: &[String]) -> Option<EditFeedback>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +424,44 @@ mod tests {
 
         assert_eq!(Tool::name(&typed), "echo_typed");
         assert_eq!(typed.effect_class(), EffectClass::None);
+    }
+
+    #[test]
+    fn a_finish_slot_starts_empty_and_holds_the_claim() {
+        let slot = FinishSlot::default();
+        assert!(slot.lock().unwrap().is_none());
+
+        *slot.lock().unwrap() = Some(FinishClaim {
+            summary: "added the attribute".to_string(),
+            files_changed: vec!["src/main.rs".to_string()],
+        });
+
+        let claim = slot.lock().unwrap().clone().unwrap();
+        assert_eq!(claim.files_changed, ["src/main.rs"]);
+    }
+
+    struct FixedObserver;
+
+    #[async_trait]
+    impl EditObserver for FixedObserver {
+        async fn after_edits(&self, touched: &[String]) -> Option<EditFeedback> {
+            Some(EditFeedback {
+                text: format!("build: pass ({} file)", touched.len()),
+                build: BuildState::Pass,
+                improved: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_edit_observer_reports_text_state_and_whether_the_build_improved() {
+        let observer: Box<dyn EditObserver> = Box::new(FixedObserver);
+
+        let feedback = observer.after_edits(&["a.rs".to_string()]).await.unwrap();
+
+        assert_eq!(feedback.text, "build: pass (1 file)");
+        assert!(feedback.build.is_passing());
+        assert!(feedback.improved);
     }
 
     #[test]
