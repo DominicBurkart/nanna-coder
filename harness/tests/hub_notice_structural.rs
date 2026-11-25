@@ -139,10 +139,12 @@ fn production_sites() -> Vec<String> {
 #[test]
 fn a_sender_notice_is_built_in_exactly_one_place_the_inbound_block_path() {
     let sites = production_sites();
-    let builds: Vec<&String> = sites
-        .iter()
-        .filter(|s| s.contains("SenderNotice::new"))
-        .collect();
+    let mut builds: Vec<&String> = Vec::new();
+    for site in &sites {
+        if site.contains("SenderNotice::new") {
+            builds.push(site);
+        }
+    }
     assert_eq!(
         builds,
         ["hub/recv.rs: retire: SenderNotice::new"],
