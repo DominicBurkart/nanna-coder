@@ -1040,10 +1040,21 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
             let enrichment_summary = self.plan_cache.as_deref().unwrap_or("No enrichment data");
 
-            let prompt_text = prompts::PlanningPrompt::build(
+            let editors = self.write_tool_names();
+            let mut readers = self.read_tool_names();
+            readers.sort();
+            let mut others =
+                self.tool_names_where(|class| class > crate::effects::EffectClass::None);
+            others.retain(|name| !editors.contains(name));
+            others.sort();
+
+            let prompt_text = prompts::PlanningPrompt::build_with_tools(
                 &context.user_prompt,
                 entity_count,
                 enrichment_summary,
+                &editors,
+                &readers,
+                &others,
             );
 
             let request = ChatRequest::new(
@@ -3857,6 +3868,64 @@ mod tests {
                 messages[0].len()
             );
         }
+    }
+
+    struct FirstRequest(Mutex<Option<ChatRequest>>);
+
+    #[async_trait]
+    impl ModelProvider for FirstRequest {
+        async fn chat(&self, request: ChatRequest) -> ModelResult<ChatResponse> {
+            self.0.lock().unwrap().get_or_insert(request);
+            Ok(plain_response("COMPLETE"))
+        }
+
+        async fn list_models(&self) -> ModelResult<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> ModelResult<()> {
+            Ok(())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "first-request"
+        }
+    }
+
+    #[tokio::test]
+    async fn the_planning_request_names_the_registered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FirstRequest(Mutex::new(None)));
+        let mut agent = AgentLoop::with_tools(
+            AgentConfig::default(),
+            InMemoryEntityStore::new(),
+            provider.clone(),
+            crate::tools::create_tool_registry(dir.path()),
+        );
+        agent
+            .plan_entity_modification(&progress_context())
+            .await
+            .unwrap();
+        let request = provider.0.lock().unwrap().take().unwrap();
+        let prompt = request.messages[0].content.clone().unwrap();
+        assert!(
+            prompt.contains("FILE EDIT TOOLS: edit_file, write_file\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "READ TOOLS: calculate, echo, git_diff, git_status, list_directory, read_file, search\n"
+            ),
+            "{prompt}"
+        );
+        let others = prompt
+            .lines()
+            .find(|line| line.starts_with("OTHER TOOLS: "))
+            .unwrap();
+        assert!(others.contains("github_pr_status"), "{others}");
+        assert!(!others.contains("write_file"), "{others}");
+        assert!(prompt.ends_with("Use only these tool names."), "{prompt}");
+        assert!(!prompt.contains("file_write"), "{prompt}");
     }
 
     fn repo_tool_only_registry(root: &std::path::Path) -> ToolRegistry {
