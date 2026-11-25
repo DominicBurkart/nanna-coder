@@ -4,6 +4,7 @@ use super::lineage::{SessionBinding, SessionId};
 use super::message::{
     DeliveryState, MessageId, Recipient, SendReceipt, SendRequest, Seq, StoredMessage, VerdictRef,
 };
+use super::notice::NoticeTable;
 use super::reach::resolve;
 use super::registry::{RegistryError, SessionRegistry};
 use super::session::SessionRecord;
@@ -74,6 +75,7 @@ pub struct MessageHub {
     pub(super) registry: Arc<SessionRegistry>,
     pub(super) waiters: Waiters,
     pub(super) cursors: CursorTable,
+    pub(super) notices: NoticeTable,
 }
 
 impl std::fmt::Debug for MessageHub {
@@ -200,6 +202,7 @@ impl MessageHub {
             registry,
             waiters: Waiters::default(),
             cursors: CursorTable::new(),
+            notices: NoticeTable::default(),
         }
     }
 
@@ -566,9 +569,11 @@ impl MessageHub {
                     .map(|rec| self.record(sender, &req, rec, &draft))
                     .collect();
                 let ids = self.append_all(stored)?;
+                let notices = self.notices.take(sender.session());
                 Ok(SendReceipt {
                     recipients: ids.len(),
                     ids,
+                    notices,
                 })
             }
         }
