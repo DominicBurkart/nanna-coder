@@ -1600,7 +1600,7 @@ start)
   read -r prompt
   printf '%s\n' "$prompt" > "$d/prompt.txt"
   [ -f "$d/hang" ] && exec sleep 30
-  if [ -f "$d/closestdin" ]; then exec 0<&-; else cat <&0 >> "$d/stdin.jsonl" & fi
+  if [ -f "$d/closestdin" ]; then exec 0<&-; else exec 3<&0; cat <&3 >> "$d/stdin.jsonl" & fi
   for n in 1 2 3 4; do
     while [ ! -f "$d/go$n" ]; do sleep 0.02; done
     cat "$d/part$n.jsonl"
