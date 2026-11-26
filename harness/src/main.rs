@@ -1885,7 +1885,8 @@ async fn build_mcp_task_manager_with_budget(
         Some((provider.clone(), model.to_string())),
     )?;
     let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
-    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, provider.clone(), model);
+    let opening = harness::hub::runtime::HubOpen::new(provider.clone(), model, plane.clone());
+    let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, opening);
     let action_gate = TaskManager::action_policy_gate_routed(
         Arc::clone(&leases),
         harness::task::action_windows_from(&|key| std::env::var_os(key)),

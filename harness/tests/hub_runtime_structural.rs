@@ -195,7 +195,15 @@ const REGISTRY: Target = Target {
 };
 const RUNTIME: Target = Target {
     owner: "HubRuntime",
-    members: &["open", "open_with", "assemble"],
+    members: &["open", "open_with", "assemble", "assemble_with_sink"],
+};
+const SINK: Target = Target {
+    owner: "EscalationQuarantineSink",
+    members: &["new", "from_plane"],
+};
+const HUB: Target = Target {
+    owner: "MessageHub",
+    members: &["new", "with_sink", "with_quarantine_sink"],
 };
 const ROUTER: Target = Target {
     owner: "HubRouter",
@@ -229,7 +237,7 @@ fn sorted(mut items: Vec<String>) -> Vec<String> {
 fn exactly_one_session_registry_is_built_in_production_and_it_is_the_hub_runtimes() {
     assert_eq!(
         sorted(production(REGISTRY)),
-        set(&["hub/runtime.rs: assemble: SessionRegistry::new"]),
+        set(&["hub/runtime.rs: assemble_with_sink: SessionRegistry::new"]),
         "a SessionRegistry is built outside HubRuntime::assemble: the hub and the TaskManager must share one"
     );
 }
@@ -240,7 +248,7 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
         sorted(production(RUNTIME)),
         set(&[
             "hub/runtime.rs: open: HubRuntime::open_with",
-            "hub/runtime.rs: open_with: HubRuntime::assemble",
+            "hub/runtime.rs: open_with: HubRuntime::assemble_with_sink",
             "main.rs: build_mcp_task_manager_with_budget: HubRuntime::open",
         ]),
         "delegate and backlog-sync must stay hub-less; pin any new opener deliberately"
@@ -251,7 +259,7 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
 fn the_router_and_the_production_auditors_are_built_only_by_the_hub_runtime() {
     assert_eq!(
         sorted(production(ROUTER)),
-        set(&["hub/runtime.rs: assemble: HubRouter::new"])
+        set(&["hub/runtime.rs: assemble_with_sink: HubRouter::new"])
     );
     assert_eq!(
         sorted(production(AUDITORS)),
@@ -379,4 +387,127 @@ fn the_registry_scanner_rejects_a_second_site_a_rename_and_every_bypass() {
     assert!(found("#[cfg(test)] mod t { fn a() { SessionRegistry::new(s); } }").is_empty());
     assert!(found("#[cfg(test)] impl X { fn a() { SessionRegistry::new(s); } }").is_empty());
     assert!(found("impl X { #[cfg(test)] fn a() { SessionRegistry::new(s); } }").is_empty());
+}
+
+#[test]
+fn exactly_one_production_site_builds_the_escalation_quarantine_sink_in_open() {
+    assert_eq!(
+        sorted(production(SINK)),
+        set(&["hub/runtime.rs: open: EscalationQuarantineSink::from_plane"]),
+        "the production hub must be given the escalation sink in HubRuntime::open and nowhere else"
+    );
+}
+
+#[test]
+fn the_production_hub_is_built_with_a_sink_in_assemble_and_never_through_the_test_constructor() {
+    assert_eq!(
+        sorted(production(HUB)),
+        set(&["hub/runtime.rs: assemble_with_sink: MessageHub::with_sink"]),
+        "MessageHub::new is a test constructor; a production hub needs a sink"
+    );
+}
+
+struct Names {
+    hits: Vec<String>,
+}
+
+impl Names {
+    fn tokens(&mut self, stream: TokenStream) {
+        for token in stream {
+            match token {
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Ident(name) if name == "NoopQuarantineSink" => {
+                    self.hits.push(name.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Names {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_fn(self, node);
+        }
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_struct(self, node);
+        }
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_item_use(self, node);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if !is_cfg_test(&node.attrs) {
+            syn::visit::visit_impl_item_fn(self, node);
+        }
+    }
+
+    fn visit_ident(&mut self, node: &'ast syn::Ident) {
+        if node == "NoopQuarantineSink" {
+            self.hits.push(node.to_string());
+        }
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.tokens(node.tokens.clone());
+    }
+}
+
+fn noop_names(text: &str) -> Vec<String> {
+    let file = syn::parse_file(text).expect("source parses");
+    let mut names = Names { hits: Vec::new() };
+    names.visit_file(&file);
+    names.hits
+}
+
+#[test]
+fn the_noop_quarantine_sink_exists_only_in_test_code() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut found = Vec::new();
+    for path in &files {
+        let text = fs::read_to_string(path).unwrap();
+        if !noop_names(&text).is_empty() {
+            found.push(relative(path, &src));
+        }
+    }
+    assert!(files.len() > 50);
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "NoopQuarantineSink outside cfg(test)"
+    );
+}
+
+#[test]
+fn the_noop_scan_sees_a_production_use_and_ignores_a_test_only_one() {
+    let live = "fn make() { let _ = NoopQuarantineSink; }";
+    assert_eq!(noop_names(live).len(), 1);
+    let in_macro = "fn make() { build!(NoopQuarantineSink); }";
+    assert_eq!(noop_names(in_macro).len(), 1);
+    let gated = "#[cfg(test)] fn make() { let _ = NoopQuarantineSink; }";
+    assert!(noop_names(gated).is_empty());
+    let module = "#[cfg(test)] mod tests { struct NoopQuarantineSink; }";
+    assert!(noop_names(module).is_empty());
 }

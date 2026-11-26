@@ -1,13 +1,15 @@
 //! The production assembly of the message hub: the stores, the one session registry and the hub.
 
 use super::oracle::SystemGit;
+use super::quarantine_sink::EscalationQuarantineSink;
 use super::registry::SessionRegistry;
 use super::router::{BindingTable, HubRouter, ProductionAuditors};
-use super::send::{AuditorProvider, MessageHub};
+use super::send::{AuditorProvider, MessageHub, QuarantineSink};
 use super::store::{
     messages_path_from, sessions_path_from, HubLock, JsonlMessageStore, JsonlSessionStore,
     MessageStore, SessionStore, StoreError,
 };
+use crate::escalation::EscalationPlane;
 use crate::leases::{Clock, SystemClock};
 use crate::scheduler::QueueStoreError;
 use crate::task::{RestoreParts, TaskManager, RESTORE_AUDIT_DEADLINE};
@@ -48,6 +50,38 @@ impl HubPaths {
                 .unwrap_or_else(|| beside("sessions.jsonl")),
             messages: messages_path_from(messages_env, None)
                 .unwrap_or_else(|| beside("messages.jsonl")),
+        }
+    }
+}
+
+/// What the host gives [`HubRuntime::open`]: the model that audits messages and the escalation
+/// plane that reaches a human.
+///
+/// ```
+/// use harness::escalation::{EscalationLog, EscalationPlane};
+/// use harness::hub::runtime::HubOpen;
+/// use model::{OllamaConfig, OllamaProvider};
+/// use std::sync::Arc;
+///
+/// let provider = Arc::new(OllamaProvider::new(OllamaConfig::default()).unwrap());
+/// let log = Arc::new(EscalationLog::in_memory());
+/// let plane = EscalationPlane::from_lookup(log, &std::env::temp_dir(), &|_| None).unwrap();
+/// let open = HubOpen::new(provider, "m", plane);
+/// assert_eq!(open.model, "m");
+/// ```
+pub struct HubOpen {
+    pub provider: Arc<dyn ModelProvider>,
+    pub model: String,
+    pub plane: EscalationPlane,
+}
+
+impl HubOpen {
+    /// The parameters for one host process.
+    pub fn new(provider: Arc<dyn ModelProvider>, model: &str, plane: EscalationPlane) -> Self {
+        Self {
+            provider,
+            model: model.to_string(),
+            plane,
         }
     }
 }
@@ -136,12 +170,18 @@ impl HubRuntime {
         Self { parts: None }
     }
 
-    /// Open the journals at `paths` and build the hub, auditing messages with `model`.
+    /// Open the journals at `paths` and build the hub, auditing messages with the model in
+    /// `open` and reporting inbound quarantines to its escalation plane.
     ///
     /// Locked or unreadable stores give an unavailable runtime and a loud error log, so the
     /// host still starts without a hub.
-    pub fn open(paths: &HubPaths, provider: Arc<dyn ModelProvider>, model: &str) -> Self {
-        let model = model.to_string();
+    pub fn open(paths: &HubPaths, open: HubOpen) -> Self {
+        let HubOpen {
+            provider,
+            model,
+            plane,
+        } = open;
+        let sink: Arc<dyn QuarantineSink> = Arc::new(EscalationQuarantineSink::from_plane(&plane));
         let factory: AuditorFactory = Box::new(move |sessions, messages, table| {
             let (sessions, messages) = (Arc::clone(sessions), Arc::clone(messages));
             let table = Arc::clone(table);
@@ -155,17 +195,19 @@ impl HubRuntime {
             );
             Arc::new(auditors)
         });
-        HubRuntime::open_with(paths, factory, Arc::new(SystemClock))
+        HubRuntime::open_with(paths, factory, Arc::new(SystemClock), sink)
     }
 
     pub(crate) fn open_with(
         paths: &HubPaths,
         auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
+        sink: Arc<dyn QuarantineSink>,
     ) -> Self {
         match open_stores(paths) {
             Ok((sessions, messages, locks)) => {
-                let mut runtime = HubRuntime::assemble(sessions, messages, auditors, clock);
+                let mut runtime =
+                    HubRuntime::assemble_with_sink(sessions, messages, auditors, clock, sink);
                 if let Some(parts) = runtime.parts.as_mut() {
                     parts._locks = locks;
                 }
@@ -178,23 +220,36 @@ impl HubRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn assemble(
         sessions: Arc<dyn SessionStore>,
         messages: Arc<dyn MessageStore>,
         auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let sink: Arc<dyn QuarantineSink> = Arc::new(super::send::NoopQuarantineSink);
+        Self::assemble_with_sink(sessions, messages, auditors, clock, sink)
+    }
+
+    pub(crate) fn assemble_with_sink(
+        sessions: Arc<dyn SessionStore>,
+        messages: Arc<dyn MessageStore>,
+        auditors: AuditorFactory,
+        clock: Arc<dyn Clock>,
+        sink: Arc<dyn QuarantineSink>,
+    ) -> Self {
         let table = BindingTable::new();
         let auditors = auditors(&sessions, &messages, &table);
         let registry = Arc::new(SessionRegistry::new(Arc::clone(&sessions)));
         let started = clock.now();
-        let hub = MessageHub::new(
+        let hub = MessageHub::with_sink(
             sessions,
             messages,
             auditors,
             Arc::clone(&clock),
             Default::default(),
             Arc::clone(&registry),
+            sink,
         );
         Self {
             parts: Some(Parts {
@@ -268,6 +323,15 @@ pub(crate) mod tests {
         Arc::new(model::OllamaProvider::new(model::OllamaConfig::default()).unwrap())
     }
 
+    pub(crate) fn opening() -> HubOpen {
+        let sink = crate::test_support::escalation::CapturingSink::new(false);
+        HubOpen::new(
+            provider(),
+            "m",
+            crate::test_support::escalation::plane(&sink),
+        )
+    }
+
     pub(crate) fn constant_auditors(auditor: Arc<dyn MessageAuditor>) -> AuditorFactory {
         Box::new(move |_, _, _| Arc::new(auditor))
     }
@@ -306,7 +370,7 @@ pub(crate) mod tests {
     #[test]
     fn an_opened_runtime_has_one_registry_shared_with_the_hub() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = HubRuntime::open(&paths(dir.path()), provider(), "m");
+        let runtime = HubRuntime::open(&paths(dir.path()), opening());
         assert!(runtime.is_available());
         let (hub, registry) = (runtime.hub().unwrap(), runtime.registry().unwrap());
         assert!(Arc::ptr_eq(hub.registry(), &registry));
@@ -319,13 +383,13 @@ pub(crate) mod tests {
     #[test]
     fn stores_that_are_locked_give_a_runtime_without_a_hub() {
         let dir = tempfile::tempdir().unwrap();
-        let first = HubRuntime::open(&paths(dir.path()), provider(), "m");
+        let first = HubRuntime::open(&paths(dir.path()), opening());
         assert!(first.is_available());
-        let second = HubRuntime::open(&paths(dir.path()), provider(), "m");
+        let second = HubRuntime::open(&paths(dir.path()), opening());
         assert!(!second.is_available());
         assert!(second.hub().is_none() && second.registry().is_none());
         drop(first);
-        let third = HubRuntime::open(&paths(dir.path()), provider(), "m");
+        let third = HubRuntime::open(&paths(dir.path()), opening());
         assert!(third.is_available());
     }
 
@@ -336,18 +400,18 @@ pub(crate) mod tests {
             sessions: a.path().join("sessions.jsonl"),
             messages: b.path().join("messages.jsonl"),
         };
-        let first = HubRuntime::open(&split, provider(), "m");
+        let first = HubRuntime::open(&split, opening());
         assert!(first.is_available());
         let sessions_taken = HubPaths {
             sessions: a.path().join("sessions.jsonl"),
             messages: tempfile::tempdir().unwrap().path().join("m.jsonl"),
         };
-        assert!(!HubRuntime::open(&sessions_taken, provider(), "m").is_available());
+        assert!(!HubRuntime::open(&sessions_taken, opening()).is_available());
         let messages_taken = HubPaths {
             sessions: tempfile::tempdir().unwrap().path().join("s.jsonl"),
             messages: b.path().join("messages.jsonl"),
         };
-        assert!(!HubRuntime::open(&messages_taken, provider(), "m").is_available());
+        assert!(!HubRuntime::open(&messages_taken, opening()).is_available());
     }
 
     #[test]
@@ -359,7 +423,7 @@ pub(crate) mod tests {
             sessions: blocker.join("sessions.jsonl"),
             messages: blocker.join("messages.jsonl"),
         };
-        assert!(!HubRuntime::open(&under_a_file, provider(), "m").is_available());
+        assert!(!HubRuntime::open(&under_a_file, opening()).is_available());
         let bare = HubPaths {
             sessions: PathBuf::from("sessions.jsonl"),
             messages: PathBuf::from("messages.jsonl"),
@@ -414,6 +478,153 @@ pub(crate) mod tests {
             &manager.hub().unwrap(),
             &runtime.hub().unwrap()
         ));
+    }
+
+    mod inbound_quarantine {
+        use super::*;
+        use crate::escalation::{EscalationLog, EscalationPlane, RECORD_FILE_NAME};
+        use crate::hub::lineage::{Lineage, RootId, SessionBinding};
+        use crate::hub::message::VerdictRef;
+        use crate::hub::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
+        use crate::hub::recv::RecvRequest;
+        use crate::hub::session::SessionStatus;
+        use crate::test_support::escalation::{plane, CapturingSink};
+
+        const PLANTED: &str = "PLANTED-QUARANTINE-TOKEN-74";
+
+        struct World {
+            _dir: tempfile::TempDir,
+            runtime: HubRuntime,
+            recipient: SessionBinding,
+            id: MessageId,
+        }
+
+        fn binding(name: &str) -> SessionBinding {
+            let mut card = crate::identity::example();
+            card.scope.message_reach = crate::hub::message::MessageReach::Root;
+            let lineage = Lineage::root_child(RootId::mcp(uuid::Uuid::from_u128(7)));
+            SessionBinding::from_audited(&card, crate::task::TaskId(name.to_string()), lineage)
+        }
+
+        fn world(plane: EscalationPlane) -> World {
+            let dir = tempfile::tempdir().unwrap();
+            let open = HubOpen::new(provider(), "m", plane);
+            let runtime = HubRuntime::open(&paths(dir.path()), open);
+            let registry = runtime.registry().unwrap();
+            let (sender, recipient) = (binding("sender"), binding("recipient"));
+            for who in [&sender, &recipient] {
+                registry.register(who, "subtask", Utc::now()).unwrap();
+                let running = SessionStatus::Running;
+                registry
+                    .set_status(who.session(), running, Utc::now())
+                    .unwrap();
+            }
+            let message = StoredMessage {
+                id: MessageId::new(),
+                seq: Seq::new(0),
+                from: sender.session().clone(),
+                from_identity: sender.identity().name().to_string(),
+                to: recipient.session().clone(),
+                root: sender.lineage().root().clone(),
+                kind: MessageKind::Info,
+                subject: PLANTED.to_string(),
+                body: PLANTED.to_string(),
+                in_reply_to: None,
+                thread_depth: 0,
+                outbound_verdict: VerdictRef {
+                    log_id: "scripted".to_string(),
+                    content_hash: 1,
+                },
+                state: DeliveryState::Pending,
+                sent_at: Utc::now(),
+                held: Vec::new(),
+                released: None,
+            };
+            let id = message.id;
+            runtime.hub().unwrap().messages.append(message).unwrap();
+            World {
+                _dir: dir,
+                runtime,
+                recipient,
+                id,
+            }
+        }
+
+        async fn recv(world: &World) -> crate::hub::recv::RecvPage {
+            let hub = world.runtime.hub().unwrap();
+            let page = hub.recv(&world.recipient, RecvRequest::default()).await;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            page.unwrap()
+        }
+
+        #[tokio::test]
+        async fn an_inbound_quarantine_through_the_real_open_is_one_content_free_escalation() {
+            let (log, _guard) = crate::test_support::logs::capture();
+            let captured = CapturingSink::new(false);
+            let world = world(plane(&captured));
+            let page = recv(&world).await;
+            assert_eq!((page.withheld, page.messages.len()), (1, 0));
+            let seen = captured.escalations();
+            assert_eq!(seen.len(), 1);
+            let page = &seen[0];
+            assert_eq!(page.severity, crate::escalation::Severity::Blocked);
+            assert_eq!(page.source, crate::escalation::EscalationSource::Auditor);
+            let held = world.runtime.hub().unwrap().messages.quarantined().unwrap();
+            assert_eq!(held.len(), 1);
+            let held_id = held[0].id.as_uuid().to_string();
+            assert!(page.summary.contains(&held_id));
+            assert_ne!(held[0].id, world.id);
+            let shown = [
+                serde_json::to_string(page).unwrap(),
+                format!("{page:?}"),
+                page.title(),
+                page.body(),
+                log.text(),
+            ];
+            for text in shown {
+                assert!(!text.contains(PLANTED), "{text}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_local_record_of_an_inbound_quarantine_names_ids_and_no_text() {
+            let records = tempfile::tempdir().unwrap();
+            let log = Arc::new(EscalationLog::in_memory());
+            let plane = EscalationPlane::from_lookup(log, records.path(), &|_| None).unwrap();
+            let world = world(plane);
+            recv(&world).await;
+            let file = records.path().join(RECORD_FILE_NAME);
+            let record = std::fs::read_to_string(file).unwrap();
+            let held = world.runtime.hub().unwrap().messages.quarantined().unwrap();
+            assert!(
+                record.contains(&held[0].id.as_uuid().to_string()),
+                "{record}"
+            );
+            assert!(!record.contains(PLANTED), "{record}");
+        }
+
+        #[tokio::test]
+        async fn a_failing_escalation_leaves_the_recv_verdict_and_the_stored_state_unchanged() {
+            let working = world(plane(&CapturingSink::new(false)));
+            let broken = CapturingSink::new(true);
+            let failing = world(plane(&broken));
+            let (good, bad) = (recv(&working).await, recv(&failing).await);
+            assert_eq!(broken.escalations().len(), 1);
+            assert_eq!(good.withheld, bad.withheld);
+            assert_eq!(good.messages.len(), bad.messages.len());
+            assert_eq!(good.remaining, bad.remaining);
+            let states = |world: &World| {
+                let held = world.runtime.hub().unwrap().messages.quarantined();
+                held.unwrap()
+                    .iter()
+                    .map(|message| message.state)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(states(&working), states(&failing));
+            assert_eq!(states(&failing), vec![DeliveryState::Quarantined]);
+        }
     }
 
     mod orphan_sweep {

@@ -8,6 +8,7 @@ pub mod mailbox;
 pub mod message;
 pub mod notice;
 pub mod oracle;
+pub mod quarantine_sink;
 pub mod query;
 pub mod reach;
 pub mod recv;
