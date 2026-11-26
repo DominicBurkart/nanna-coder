@@ -98,21 +98,19 @@ impl<'ast> Visit<'ast> for Facts {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if self.skipped(&node.attrs) {
-            return;
+        if !self.skipped(&node.attrs) {
+            self.enter(&node.sig);
+            syn::visit::visit_item_fn(self, node);
+            self.open.pop();
         }
-        self.enter(&node.sig);
-        syn::visit::visit_item_fn(self, node);
-        self.open.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if self.skipped(&node.attrs) {
-            return;
+        if !self.skipped(&node.attrs) {
+            self.enter(&node.sig);
+            syn::visit::visit_impl_item_fn(self, node);
+            self.open.pop();
         }
-        self.enter(&node.sig);
-        syn::visit::visit_impl_item_fn(self, node);
-        self.open.pop();
     }
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
