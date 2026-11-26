@@ -1846,6 +1846,7 @@ async fn build_mcp_task_manager(
     lease_path: &std::path::Path,
     plane: harness::escalation::EscalationPlane,
     catalog: &IdentityCatalog,
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
     let budget_path = harness::budget::budget_path_from(
         std::env::var_os(harness::budget::BUDGET_PATH_ENV),
@@ -1859,10 +1860,12 @@ async fn build_mcp_task_manager(
         plane,
         budget_path,
         catalog,
+        bell,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_mcp_task_manager_with_budget(
     provider: std::sync::Arc<dyn model::ModelProvider>,
     model: &str,
@@ -1871,6 +1874,7 @@ async fn build_mcp_task_manager_with_budget(
     plane: harness::escalation::EscalationPlane,
     budget_path: Option<std::path::PathBuf>,
     catalog: &IdentityCatalog,
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<harness::task::TaskManager, Box<dyn std::error::Error>> {
     use harness::leases::JsonlLeaseStore;
     use harness::scheduler::{HybridPolicy, JsonlQueueStore};
@@ -1885,7 +1889,10 @@ async fn build_mcp_task_manager_with_budget(
         Some((provider.clone(), model.to_string())),
     )?;
     let hub_paths = harness::hub::runtime::HubPaths::resolve(queue_path);
-    let opening = harness::hub::runtime::HubOpen::new(provider.clone(), model, plane.clone());
+    let mut opening = harness::hub::runtime::HubOpen::new(provider.clone(), model, plane.clone());
+    if let Some(bell) = bell {
+        opening = opening.with_doorbell(bell);
+    }
     let hub = harness::hub::runtime::HubRuntime::open(&hub_paths, opening);
     let action_gate = TaskManager::action_policy_gate_routed(
         Arc::clone(&leases),
@@ -1928,17 +1935,23 @@ fn build_delegate_task_manager(
     )
 }
 
+fn pi_doorbell(enabled: bool) -> Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>> {
+    enabled.then(|| std::sync::Arc::new(harness::harness_adapter::PiSteerDoorbell::new()))
+}
+
 fn pi_route_from_env(
     enabled: bool,
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
-    pi_route_logged(enabled, &|key| std::env::var_os(key))
+    pi_route_logged(enabled, &|key| std::env::var_os(key), bell)
 }
 
 fn pi_route_logged(
     enabled: bool,
     lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
-    pi_route_with(enabled, lookup, &warn_notice)
+    pi_route_with(enabled, lookup, &warn_notice, bell)
 }
 
 const PI_ROUTE_INERT_NOTICE: &str =
@@ -1951,15 +1964,19 @@ fn warn_notice(message: &str) {
 #[cfg(unix)]
 fn pi_executor(
     lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
-    Ok(std::sync::Arc::new(
-        harness::harness_adapter::PodmanPiExecutor::from_lookup(lookup)?,
-    ))
+    let mut executor = harness::harness_adapter::PodmanPiExecutor::from_lookup(lookup)?;
+    if let Some(bell) = bell {
+        executor = executor.with_doorbells(bell);
+    }
+    Ok(std::sync::Arc::new(executor))
 }
 
 #[cfg(not(unix))]
 fn pi_executor(
     _lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    _bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<std::sync::Arc<dyn harness::harness_adapter::PiExecutor>, Box<dyn std::error::Error>> {
     warn!(
         "the pi route is on and this platform has no pi executor: every audited task fails closed"
@@ -1973,11 +1990,13 @@ fn pi_route_with(
     enabled: bool,
     lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     notify: &dyn Fn(&str),
+    bell: Option<std::sync::Arc<harness::harness_adapter::PiSteerDoorbell>>,
 ) -> Result<Option<harness::harness_adapter::PiRoute>, Box<dyn std::error::Error>> {
     if !enabled {
         return Ok(None);
     }
-    let route = harness::harness_adapter::PiRoute::from_lookup(lookup, pi_executor(lookup)?)?;
+    let executor = pi_executor(lookup, bell)?;
+    let route = harness::harness_adapter::PiRoute::from_lookup(lookup, executor)?;
     notify(PI_ROUTE_INERT_NOTICE);
     Ok(Some(route))
 }
@@ -2165,6 +2184,7 @@ async fn run_mcp_server(
     let catalog = load_identities();
     let escalation_path = resolve_escalation_path(&queue_path);
     let plane = resolve_escalation_plane(&queue_path)?;
+    let bell = pi_doorbell(pi_route);
     let task_manager = Arc::new(
         build_mcp_task_manager(
             provider.clone(),
@@ -2173,9 +2193,10 @@ async fn run_mcp_server(
             &lease_path,
             plane.clone(),
             &catalog,
+            bell.clone(),
         )
         .await?
-        .with_pi_route(pi_route_from_env(pi_route)?),
+        .with_pi_route(pi_route_from_env(pi_route, bell)?),
     );
 
     let telemetry = export_action_audit(
@@ -2252,7 +2273,7 @@ async fn run_delegate(
     let plane = resolve_escalation_plane(&queue_path)?;
     let task_manager = Arc::new(
         build_delegate_task_manager(provider.clone(), Some(auditor_name.as_str()), plane.clone())
-            .with_pi_route(pi_route_from_env(pi_route)?),
+            .with_pi_route(pi_route_from_env(pi_route, None)?),
     );
     let telemetry = export_action_audit(
         &task_manager.action_gate(),
@@ -3048,6 +3069,7 @@ mod tests {
                 harness::escalation::EscalationLog::in_memory(),
             )),
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3082,6 +3104,7 @@ mod tests {
                 harness::escalation::EscalationLog::in_memory(),
             )),
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3141,6 +3164,7 @@ mod tests {
             &dir.path().join("leases.jsonl"),
             harness::escalation::EscalationPlane::from(std::sync::Arc::clone(&log)),
             &catalog,
+            None,
         )
         .await
         .unwrap();
@@ -3172,6 +3196,7 @@ mod tests {
             &dir.path().join("leases.jsonl"),
             harness::escalation::EscalationPlane::from(std::sync::Arc::clone(&log)),
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3207,6 +3232,7 @@ mod tests {
             )),
             budget,
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap()
@@ -3244,6 +3270,7 @@ mod tests {
                 harness::escalation::EscalationLog::in_memory(),
             )),
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3485,6 +3512,7 @@ mod tests {
                 harness::escalation::EscalationLog::in_memory(),
             )),
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3674,6 +3702,7 @@ mod tests {
             &dir.path().join("leases.jsonl"),
             plane,
             &fixture_catalog(),
+            None,
         )
         .await
         .unwrap();
@@ -3890,12 +3919,16 @@ mod tests {
             }
             _ => None,
         };
-        assert!(pi_route_with(false, &configured, &|_| {})
+        assert!(pi_route_with(false, &configured, &|_| {}, None)
             .unwrap()
             .is_none());
-        assert!(pi_route_with(false, &|_| None, &|_| {}).unwrap().is_none());
-        assert!(pi_route_with(true, &configured, &|_| {}).unwrap().is_some());
-        assert!(pi_route_with(true, &|_| None, &|_| {}).is_err());
+        assert!(pi_route_with(false, &|_| None, &|_| {}, None)
+            .unwrap()
+            .is_none());
+        assert!(pi_route_with(true, &configured, &|_| {}, None)
+            .unwrap()
+            .is_some());
+        assert!(pi_route_with(true, &|_| None, &|_| {}, None).is_err());
     }
 
     #[test]
@@ -3912,11 +3945,13 @@ mod tests {
         };
         let heard = std::cell::RefCell::new(Vec::new());
         let notify = |message: &str| heard.borrow_mut().push(message.to_string());
-        assert!(pi_route_with(false, &configured, &notify)
+        assert!(pi_route_with(false, &configured, &notify, None)
             .unwrap()
             .is_none());
         assert!(heard.borrow().is_empty());
-        assert!(pi_route_with(true, &configured, &notify).unwrap().is_some());
+        assert!(pi_route_with(true, &configured, &notify, None)
+            .unwrap()
+            .is_some());
         let heard = heard.borrow();
         assert_eq!(heard.len(), 1);
         assert!(heard[0].contains("inert"), "{}", heard[0]);
@@ -3963,15 +3998,15 @@ mod tests {
             .with_ansi(false)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            assert!(pi_route_logged(false, &configured).unwrap().is_none());
+            assert!(pi_route_logged(false, &configured, None).unwrap().is_none());
             assert!(captured.0.lock().unwrap().is_empty());
-            assert!(pi_route_logged(true, &configured).unwrap().is_some());
+            assert!(pi_route_logged(true, &configured, None).unwrap().is_some());
         });
         let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(text.contains("WARN"), "{text}");
         assert!(text.contains("inert"), "{text}");
         assert!(text.contains("fails closed"), "{text}");
-        assert!(pi_route_from_env(false).unwrap().is_none());
+        assert!(pi_route_from_env(false, None).unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -3987,7 +4022,9 @@ mod tests {
             }
             _ => None,
         };
-        let route = pi_route_with(true, &configured, &|_| {}).unwrap().unwrap();
+        let route = pi_route_with(true, &configured, &|_| {}, None)
+            .unwrap()
+            .unwrap();
         let shown = format!("{:?}", route.executor());
         assert!(shown.contains("PodmanPiExecutor"), "{shown}");
         assert!(shown.contains("None"), "{shown}");
@@ -3995,13 +4032,63 @@ mod tests {
             harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("model-net")),
             other => configured(other),
         };
-        let route = pi_route_with(true, &named, &|_| {}).unwrap().unwrap();
+        let route = pi_route_with(true, &named, &|_| {}, None).unwrap().unwrap();
         assert!(format!("{:?}", route.executor()).contains("model-net"));
         let reserved = |key: &str| match key {
             harness::harness_adapter::PI_NETWORK_ENV => Some(std::ffi::OsString::from("host")),
             other => configured(other),
         };
-        assert!(pi_route_with(true, &reserved, &|_| {}).is_err());
+        assert!(pi_route_with(true, &reserved, &|_| {}, None).is_err());
+    }
+
+    #[test]
+    fn the_pi_doorbell_exists_only_when_the_pi_route_is_on() {
+        assert!(pi_doorbell(false).is_none());
+        let first = pi_doorbell(true).unwrap();
+        let second = pi_doorbell(true).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pi_executor_carries_the_doorbell_it_is_given_and_none_otherwise() {
+        let configured = |key: &str| match key {
+            harness::harness_adapter::PI_IMAGE_ENV => Some(std::ffi::OsString::from(format!(
+                "nanna-pi@sha256:{}",
+                "a".repeat(64)
+            ))),
+            harness::harness_adapter::PI_BROKER_DIR_ENV => {
+                Some(std::ffi::OsString::from("/run/user/1000/nanna/broker"))
+            }
+            _ => None,
+        };
+        let plain = pi_route_with(true, &configured, &|_| {}, None)
+            .unwrap()
+            .unwrap();
+        assert!(!format!("{:?}", plain.executor()).contains("PiSteerDoorbell"));
+        let belled = pi_route_with(true, &configured, &|_| {}, pi_doorbell(true));
+        assert!(format!("{:?}", belled.unwrap().unwrap().executor()).contains("PiSteerDoorbell"));
+    }
+
+    #[tokio::test]
+    async fn a_hub_built_with_a_doorbell_still_builds_the_manager_and_one_without_does_too() {
+        let dir = tempfile::tempdir().unwrap();
+        for bell in [None, pi_doorbell(true)] {
+            let manager = build_mcp_task_manager(
+                offline_provider(),
+                "reviewer-model",
+                &dir.path().join("queue.jsonl"),
+                &dir.path().join("leases.jsonl"),
+                harness::escalation::EscalationPlane::from(std::sync::Arc::new(
+                    harness::escalation::EscalationLog::in_memory(),
+                )),
+                &fixture_catalog(),
+                bell,
+            )
+            .await
+            .unwrap();
+            assert!(manager.hub().is_some());
+        }
     }
 
     #[test]

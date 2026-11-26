@@ -1,5 +1,6 @@
 use super::broker::{ArmedBroker, Broker, BrokerError};
 use super::rpc::{serve_listener, LineReader, ReadLimits, ServeEnd};
+use super::steer::{Coalescer, PiSteerDoorbell, SteerHandle};
 use super::{
     launch_plan, BrokerPolicy, CheckedPlan, PiAdapter, PiExecutor, PiLaunch, PiRunOutcome,
     PlanError, RingAuditSink, BROKER_SOCKET_CONTAINER_PATH,
@@ -7,6 +8,9 @@ use super::{
 use crate::agent::{AgentError, AgentRunResult, AgentState};
 use crate::container::{detect_runtime, ContainerRuntime};
 use crate::entities::context::types::ToolCallRecord;
+use crate::hub::doorbell::doorbell_text;
+use crate::hub::lineage::SessionId;
+use crate::task::TaskId;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -108,6 +112,7 @@ assert_eq!(format!("{isolated:?}"), format!("{:?}", PodmanPiExecutor::new(PiNetw
 pub struct PodmanPiExecutor {
     network: PiNetwork,
     socket_root: Option<PathBuf>,
+    doorbells: Option<Arc<PiSteerDoorbell>>,
 }
 
 impl PodmanPiExecutor {
@@ -121,7 +126,24 @@ impl PodmanPiExecutor {
         Self {
             network,
             socket_root: None,
+            doorbells: None,
         }
+    }
+
+    /// Register every run's session with `bell`, so a ring for that session steers the running
+    /// pi turn. Without it nothing is registered and a ring is a no-op.
+    ///
+    /// ```
+    /// use harness::harness_adapter::{PiSteerDoorbell, PodmanPiExecutor};
+    /// use std::sync::Arc;
+    ///
+    /// let bell = Arc::new(PiSteerDoorbell::new());
+    /// let executor = PodmanPiExecutor::isolated().with_doorbells(bell);
+    /// assert!(format!("{executor:?}").contains("PiSteerDoorbell"));
+    /// ```
+    pub fn with_doorbells(mut self, bell: Arc<PiSteerDoorbell>) -> Self {
+        self.doorbells = Some(bell);
+        self
     }
 
     #[doc = r#"Read the network from the environment: unset means none, set means a named network.
@@ -215,6 +237,17 @@ assert!(format!("{executor:?}").contains("sockets"));
         args.push(plan.image.clone());
         args.extend(plan.argv.iter().cloned());
         Ok(args)
+    }
+}
+
+pub(super) fn steer_line(count: usize) -> String {
+    serde_json::json!({"type": "steer", "message": doorbell_text(count)}).to_string()
+}
+
+async fn next_steer(steer: &mut Option<SteerHandle>) -> usize {
+    match steer.as_mut() {
+        Some(handle) => handle.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -784,10 +817,16 @@ impl PodmanPiExecutor {
             .map_err(|e| Refused(format!("broker socket {}: {e}", socket.display())))?;
         let guard = RemoveGuard::arm(&runtime, &name);
         let max_turns = agent.limits().max_iterations;
+        let session_id = SessionId::from_task(TaskId(launch_task_id));
+        let steer = self
+            .doorbells
+            .as_ref()
+            .map(|bell| bell.register(session_id));
         let session = Session {
             plan,
             tracker: Tracker::new(max_turns, progress),
             wall,
+            steer,
         };
         Ok(Started {
             session,
@@ -818,6 +857,7 @@ struct Session {
     plan: CheckedPlan,
     tracker: Tracker,
     wall: std::time::Duration,
+    steer: Option<SteerHandle>,
 }
 
 enum Ended {
@@ -873,10 +913,19 @@ impl Session {
         let mut unarmed = Some(broker);
         let mut serving: Option<Serving> = None;
         let mut armed: Option<Arc<ArmedBroker>> = None;
+        let mut steer = self.steer.take();
+        let mut coalescer = Coalescer::default();
+        let mut due: Option<usize> = None;
         let ended = loop {
             tokio::select! {
                 line = events.next_line() => match line {
-                    Ok(Some(line)) => match self.tracker.feed(&line) {
+                    Ok(Some(line)) => {
+                    let before = self.tracker.turns;
+                    let step = self.tracker.feed(&line);
+                    if self.tracker.turns != before {
+                        due = coalescer.turn_start();
+                    }
+                    match step {
                         Step::Continue => {}
                         Step::Settled => break Ended::Settled,
                         Step::Fail(message) => break Ended::Failed(message),
@@ -889,6 +938,7 @@ impl Session {
                                 Ok(ready) => {
                                     let ready = Arc::new(ready);
                                     armed = Some(Arc::clone(&ready));
+                                    due = coalescer.arm();
                                     serving = Some(Box::pin(serve_listener(
                                         listener,
                                         ready,
@@ -898,10 +948,14 @@ impl Session {
                                 Err(e) => break Ended::Failed(format!("lockdown not verified: {e}")),
                             }
                         }
-                    },
+                    }
+                    }
                     Ok(None) => break Ended::Failed("the runtime exited before the run settled".to_string()),
                     Err(e) => break Ended::Failed(format!("the runtime's event stream failed: {e}")),
                 },
+                count = next_steer(&mut steer) => {
+                    due = coalescer.on_ring(count);
+                }
                 end = async {
                     match serving.as_mut() {
                         Some(serving) => serving.await,
@@ -918,7 +972,14 @@ impl Session {
                     ));
                 }
             }
+            if let Some(count) = due.take() {
+                let line = [steer_line(count)];
+                if !send_lines(&mut stdin, &line, deadline).await {
+                    break Ended::Failed("writing the steer failed".to_string());
+                }
+            }
         };
+        drop(steer);
         drop(serving);
         drop(stdin);
         drop(child);
