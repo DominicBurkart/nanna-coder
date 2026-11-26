@@ -2,45 +2,68 @@ use super::lineage::SessionId;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// The most sessions whose idle time the hub tracks at once; a session beyond it gets no wait.
+/// The most sessions whose idle time the hub tracks at once; past it the least recently charged one is dropped.
 pub(super) const IDLE_SESSIONS_MAX: usize = 4096;
 
 #[derive(Debug, Default)]
+struct Ledger {
+    spent: HashMap<SessionId, (i64, u64)>,
+    stamp: u64,
+}
+
+impl Ledger {
+    fn oldest(&self) -> Option<SessionId> {
+        let found = self.spent.iter().min_by_key(|(_, entry)| entry.1);
+        found.map(|(key, _)| key.clone())
+    }
+
+    fn make_room(&mut self, session: &SessionId) {
+        let full = self.spent.len() >= IDLE_SESSIONS_MAX && !self.spent.contains_key(session);
+        let victim = if full { self.oldest() } else { None };
+        if let Some(key) = victim {
+            self.spent.remove(&key);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub(super) struct IdleBudget {
-    spent: Mutex<HashMap<SessionId, i64>>,
+    ledger: Mutex<Ledger>,
 }
 
 impl IdleBudget {
-    fn lock(&self) -> MutexGuard<'_, HashMap<SessionId, i64>> {
-        self.spent.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(super) fn charge(&self, session: &SessionId, millis: i64, cap_millis: i64) -> bool {
-        let mut spent = self.lock();
-        let room = spent.contains_key(session) || spent.len() < IDLE_SESSIONS_MAX;
-        let used = spent.get(session).copied().unwrap_or(0);
-        let fits = room && used.saturating_add(millis) <= cap_millis;
+        let mut ledger = self.lock();
+        let used = ledger.spent.get(session).map_or(0, |entry| entry.0);
+        let total = used.saturating_add(millis);
+        let fits = total <= cap_millis;
         if fits {
-            spent.insert(session.clone(), used.saturating_add(millis));
+            ledger.make_room(session);
+            ledger.stamp = ledger.stamp.saturating_add(1);
+            let stamp = ledger.stamp;
+            ledger.spent.insert(session.clone(), (total, stamp));
         }
         fits
     }
 
     pub(super) fn exhausted(&self, session: &SessionId, cap_millis: i64) -> bool {
-        let spent = self.lock();
-        let used = spent.get(session).copied();
-        let room = used.is_some() || spent.len() < IDLE_SESSIONS_MAX;
-        !room || used.unwrap_or(0) >= cap_millis
+        let ledger = self.lock();
+        let used = ledger.spent.get(session).map_or(0, |entry| entry.0);
+        used >= cap_millis
     }
 
     #[cfg(test)]
     pub(super) fn used(&self, session: &SessionId) -> i64 {
-        self.lock().get(session).copied().unwrap_or(0)
+        self.lock().spent.get(session).map_or(0, |entry| entry.0)
     }
 
     #[cfg(test)]
     pub(super) fn tracked(&self) -> usize {
-        self.lock().len()
+        self.lock().spent.len()
     }
 }
 
@@ -75,20 +98,55 @@ mod tests {
         assert!(budget.exhausted(&id("a"), 0));
     }
 
-    #[test]
-    fn a_full_map_gives_a_new_session_no_wait_and_keeps_serving_known_ones() {
-        let budget = IdleBudget::default();
+    fn filled(budget: &IdleBudget) {
         for n in 0..4096 {
             assert!(budget.charge(&id(&format!("s{n}")), 1000, 5000));
         }
         assert_eq!(budget.tracked(), 4096);
+    }
+
+    #[test]
+    fn a_full_map_still_gives_a_new_session_a_budget_by_dropping_the_least_recently_charged() {
+        let budget = IdleBudget::default();
+        filled(&budget);
         let late = id("late");
-        assert!(!budget.charge(&late, 1000, 5000));
-        assert!(budget.exhausted(&late, 5000));
+        assert!(!budget.exhausted(&late, 5000));
+        assert!(budget.charge(&late, 1000, 5000));
+        assert_eq!(budget.used(&late), 1000);
         assert_eq!(budget.tracked(), 4096);
-        let known = id("s0");
-        assert!(budget.charge(&known, 1000, 5000));
-        assert!(!budget.exhausted(&known, 5000));
+        assert_eq!(budget.used(&id("s0")), 0);
+        assert_eq!(budget.used(&id("s1")), 1000);
+    }
+
+    #[test]
+    fn a_recently_charged_near_cap_session_is_not_the_one_dropped() {
+        let budget = IdleBudget::default();
+        filled(&budget);
+        let busy = id("s0");
+        for _ in 0..4 {
+            assert!(budget.charge(&busy, 1000, 5000));
+        }
+        assert!(budget.charge(&id("late"), 1000, 5000));
+        assert_eq!(budget.used(&busy), 5000);
+        assert!(budget.exhausted(&busy, 5000));
+        assert_eq!(budget.used(&id("s1")), 0);
+        assert_eq!(budget.used(&id("s2")), 1000);
+    }
+
+    #[test]
+    fn the_map_never_grows_past_its_bound_and_charging_a_known_session_drops_nobody() {
+        let budget = IdleBudget::default();
+        filled(&budget);
+        assert!(budget.charge(&id("s7"), 1000, 5000));
+        assert_eq!(budget.used(&id("s0")), 1000);
+        assert_eq!(budget.tracked(), 4096);
+        for n in 0..100 {
+            assert!(budget.charge(&id(&format!("new{n}")), 1000, 5000));
+        }
+        assert_eq!(budget.tracked(), 4096);
+        assert_eq!(budget.used(&id("s7")), 2000);
+        assert_eq!(budget.used(&id("s0")), 0);
+        assert_eq!(budget.used(&id("new99")), 1000);
     }
 
     #[test]
@@ -96,7 +154,7 @@ mod tests {
         let budget = IdleBudget::default();
         let who = id("a");
         let held = std::panic::catch_unwind(|| {
-            let _guard = budget.spent.lock().unwrap();
+            let _guard = budget.ledger.lock().unwrap();
             panic!("poison");
         });
         assert!(held.is_err());
