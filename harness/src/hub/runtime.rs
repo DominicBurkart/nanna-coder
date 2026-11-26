@@ -717,7 +717,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn seat(runtime: &HubRuntime, name: &str) -> SessionBinding {
+    pub(crate) fn seat(runtime: &HubRuntime, name: &str) -> SessionBinding {
         let lineage = Lineage::root_child(RootId::mcp(uuid::Uuid::from_u128(5)));
         let mut card = crate::identity::example();
         card.scope.message_reach = crate::hub::message::MessageReach::Root;
@@ -728,7 +728,7 @@ pub(crate) mod tests {
         binding
     }
 
-    fn mail(to: &SessionBinding) -> crate::hub::message::SendRequest {
+    pub(crate) fn mail(to: &SessionBinding) -> crate::hub::message::SendRequest {
         crate::hub::message::SendRequest {
             to: crate::hub::message::Recipient::Session {
                 id: to.session().clone(),
@@ -740,17 +740,28 @@ pub(crate) mod tests {
         }
     }
 
-    fn rules() -> AuditorFactory {
+    pub(crate) async fn post(
+        runtime: &HubRuntime,
+        from: &SessionBinding,
+        request: crate::hub::message::SendRequest,
+    ) {
+        runtime.hub().unwrap().send(from, request).await.unwrap();
+    }
+
+    pub(crate) fn rules() -> AuditorFactory {
         constant_auditors(Arc::new(crate::action_auditor::RuleMessageAuditor::new()))
     }
 
-    fn assembled(tally: &Arc<Tally>) -> HubRuntime {
+    pub(crate) fn assembled_with(bell: Arc<dyn Doorbell>) -> HubRuntime {
         let sessions = Arc::new(InMemorySessionStore::new());
         let messages = Arc::new(InMemoryMessageStore::new());
-        let bell = tally.clone();
         let sink: Arc<dyn QuarantineSink> = Arc::new(super::super::send::NoopQuarantineSink);
         let clock = Arc::new(SystemClock);
         HubRuntime::assemble_with_sink(sessions, messages, rules(), clock, sink, bell)
+    }
+
+    fn assembled(tally: &Arc<Tally>) -> HubRuntime {
+        assembled_with(tally.clone())
     }
 
     #[tokio::test]

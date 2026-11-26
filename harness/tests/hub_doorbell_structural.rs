@@ -102,8 +102,12 @@ fn the_doorbell_trait_has_one_method_that_takes_a_session_and_a_count() {
 
 #[test]
 fn the_hub_module_has_one_doorbell_implementor_and_it_rings_nowhere() {
-    let implementors = sites("impl Doorbell for");
-    assert_eq!(implementors, ["hub/doorbell.rs"]);
+    let mut implementors = sites("impl Doorbell for");
+    implementors.sort();
+    assert_eq!(
+        implementors,
+        ["harness_adapter/steer.rs", "hub/doorbell.rs"]
+    );
     let text = fs::read_to_string(src().join("hub/doorbell.rs")).unwrap();
     let file = syn::parse_file(&text).unwrap();
     let mut structs = Vec::new();

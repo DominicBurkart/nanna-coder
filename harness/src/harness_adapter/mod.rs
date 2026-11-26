@@ -82,6 +82,7 @@ mod route;
 mod rpc;
 #[cfg(test)]
 mod rpc_tests;
+mod steer;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
@@ -109,6 +110,7 @@ pub use rpc::{
     write_reply, LineReader, ReadLimits, RpcError, MAX_REPLY_BYTES, MAX_RPC_LINE_BYTES,
     MAX_RPC_TOTAL_BYTES, RELAY_HOST, REQUEST_READ_TIMEOUT,
 };
+pub use steer::PiSteerDoorbell;
 
 use crate::auditor::Allowed;
 use crate::effects::EffectClass;

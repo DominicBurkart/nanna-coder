@@ -1590,3 +1590,497 @@ async fn a_panic_inside_the_run_still_removes_the_container() {
     assert!(reply.is_empty(), "{reply}");
     assert!(removed(&fake));
 }
+
+const STEER_SCRIPT: &str = r#"
+case "$1" in
+create) [ -f "$d/fail-create" ] && exit 1;;
+cp) cat > "$d/cp.tar";;
+rm) :;;
+start)
+  read -r prompt
+  printf '%s\n' "$prompt" > "$d/prompt.txt"
+  [ -f "$d/hang" ] && exec sleep 30
+  if [ -f "$d/closestdin" ]; then exec 0<&-; else cat <&0 >> "$d/stdin.jsonl" & fi
+  for n in 1 2 3 4; do
+    while [ ! -f "$d/go$n" ]; do sleep 0.02; done
+    cat "$d/part$n.jsonl"
+  done
+  sleep 30;;
+esac
+"#;
+
+fn write_steer_parts(fake: &FakePodman, parts: &[&[String]]) {
+    for (index, part) in parts.iter().enumerate() {
+        let name = format!("part{}.jsonl", index + 1);
+        std::fs::write(fake.dir().join(name), part.join("\n") + "\n").unwrap();
+    }
+}
+
+fn release(fake: &FakePodman, part: usize) {
+    std::fs::write(fake.dir().join(format!("go{part}")), "").unwrap();
+}
+
+fn steered(fake: &FakePodman) -> Vec<String> {
+    let text = std::fs::read_to_string(fake.dir().join("stdin.jsonl")).unwrap_or_default();
+    text.lines().map(String::from).collect()
+}
+
+fn expected_steer(count: usize) -> String {
+    let text = crate::hub::doorbell::doorbell_text(count);
+    serde_json::json!({"type": "steer", "message": text}).to_string()
+}
+
+fn run_session() -> crate::hub::lineage::SessionId {
+    crate::hub::lineage::SessionId::from_task(crate::task::TaskId(TASK.to_string()))
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+async fn quiet_period() {
+    tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+fn ring(bell: &PiSteerDoorbell, to: &crate::hub::lineage::SessionId, count: usize) {
+    crate::hub::doorbell::Doorbell::ring(bell, to, count);
+}
+
+fn armed_parts() -> [Vec<String>; 2] {
+    [
+        vec![
+            prompt_ok(),
+            turn_start(),
+            system_start(&["read_file", "search"]),
+        ],
+        vec![agent_end("stop", "done", None), settled(false)],
+    ]
+}
+
+const READ: &str = r#"{"tool":"read_file","args":{}}"#;
+
+#[tokio::test]
+async fn a_ring_after_the_handshake_writes_one_steer_line_with_the_constant_text() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let [first, second] = armed_parts();
+    write_steer_parts(&fake, &[&first, &second]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        ring(&bell, &run_session(), 3);
+        until("the steer", || !steered(&fake).is_empty()).await;
+        quiet_period().await;
+        release(&fake, 2);
+    });
+    assert!(outcome.result.is_ok());
+    assert_eq!(steered(&fake), [expected_steer(3)]);
+    assert!(!bell.is_registered(&run_session()));
+    ring(&bell, &run_session(), 9);
+    assert!(removed(&fake));
+}
+
+#[tokio::test]
+async fn rings_in_one_turn_make_one_steer_and_the_rest_one_deferred_steer_at_the_next_turn() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let [first, last] = armed_parts();
+    let next_turn = [turn_start()];
+    write_steer_parts(&fake, &[&first, &next_turn, &last]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        ring(&bell, &run_session(), 1);
+        until("the first steer", || steered(&fake).len() == 1).await;
+        ring(&bell, &run_session(), 2);
+        quiet_period().await;
+        ring(&bell, &run_session(), 3);
+        quiet_period().await;
+        assert_eq!(steered(&fake), [expected_steer(1)]);
+        release(&fake, 2);
+        until("the deferred steer", || steered(&fake).len() == 2).await;
+        quiet_period().await;
+        release(&fake, 3);
+    });
+    assert!(outcome.result.is_ok());
+    assert_eq!(steered(&fake), [expected_steer(1), expected_steer(3)]);
+}
+
+#[tokio::test]
+async fn nothing_is_written_before_the_broker_is_armed_and_the_ring_is_held_until_then() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let before = [prompt_ok(), turn_start()];
+    let handshake = [system_start(&["read_file", "search"])];
+    let end = [agent_end("stop", "done", None), settled(false)];
+    write_steer_parts(&fake, &[&before, &handshake, &end]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        ring(&bell, &run_session(), 5);
+        quiet_period().await;
+        assert!(steered(&fake).is_empty());
+        release(&fake, 2);
+        call_broker(&socket, READ).await;
+        until("the held steer", || !steered(&fake).is_empty()).await;
+        quiet_period().await;
+        release(&fake, 3);
+    });
+    assert!(outcome.result.is_ok());
+    assert_eq!(steered(&fake), [expected_steer(5)]);
+}
+
+#[tokio::test]
+async fn a_ring_for_another_session_writes_nothing_to_this_runs_stdin() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let [first, second] = armed_parts();
+    write_steer_parts(&fake, &[&first, &second]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let stranger = crate::hub::lineage::SessionId::from_task(crate::task::TaskId("other".into()));
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        ring(&bell, &stranger, 9);
+        quiet_period().await;
+        assert!(steered(&fake).is_empty());
+        ring(&bell, &run_session(), 2);
+        until("the steer", || !steered(&fake).is_empty()).await;
+        quiet_period().await;
+        release(&fake, 2);
+    });
+    assert!(outcome.result.is_ok());
+    assert_eq!(steered(&fake), [expected_steer(2)]);
+}
+
+#[tokio::test]
+async fn a_failed_steer_write_ends_the_run_failed_and_removes_the_container_and_the_entry() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    std::fs::write(fake.dir().join("closestdin"), "").unwrap();
+    let root = private_root();
+    let [first, second] = armed_parts();
+    write_steer_parts(&fake, &[&first, &second]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        ring(&bell, &run_session(), 1);
+    });
+    assert!(is_state_error(&outcome, "writing the steer failed"));
+    assert!(removed(&fake));
+    assert!(!bell.is_registered(&run_session()));
+}
+
+#[tokio::test]
+async fn cancelling_a_run_removes_its_steer_entry_and_a_late_ring_is_a_no_op() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    std::fs::write(fake.dir().join("hang"), "").unwrap();
+    let root = private_root();
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(60));
+    tokio::select! {
+        _ = exec.run(launch) => unreachable!("the run hangs"),
+        () = until("registration", || bell.is_registered(&run_session())) => {}
+    }
+    assert!(!bell.is_registered(&run_session()));
+    ring(&bell, &run_session(), 4);
+}
+
+#[tokio::test]
+async fn a_run_with_no_doorbell_registers_nothing_and_still_completes() {
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let [first, second] = armed_parts();
+    write_steer_parts(&fake, &[&first, &second]);
+    let exec = executor(root.path());
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        release(&fake, 2);
+    });
+    assert!(outcome.result.is_ok());
+    assert!(steered(&fake).is_empty());
+}
+
+#[test]
+fn the_executor_debug_form_shows_a_registered_doorbell() {
+    let plain = format!("{:?}", PodmanPiExecutor::isolated());
+    let belled = PodmanPiExecutor::isolated().with_doorbells(Arc::new(PiSteerDoorbell::new()));
+    assert!(!plain.contains("PiSteerDoorbell"));
+    assert!(format!("{belled:?}").contains("PiSteerDoorbell"));
+}
+
+mod steer_wire {
+    use super::super::executor::steer_line;
+    use proptest::prelude::*;
+    use serde_json::Value;
+
+    fn skeleton(text: &str) -> String {
+        text.chars().filter(|c| !c.is_ascii_digit()).collect()
+    }
+
+    proptest! {
+        #[test]
+        fn only_digits_vary_in_the_steer_line_whatever_the_count(n in any::<usize>(), m in any::<usize>()) {
+            let (a, b) = (steer_line(n), steer_line(m));
+            prop_assert_eq!(skeleton(&a), skeleton(&b));
+            let parsed: Value = serde_json::from_str(&a).unwrap();
+            prop_assert_eq!(parsed["type"].as_str(), Some("steer"));
+            prop_assert_eq!(parsed.as_object().unwrap().len(), 2);
+            prop_assert_eq!(parsed["message"].as_str().unwrap(), crate::hub::doorbell::doorbell_text(n));
+            prop_assert!(!a.contains('\n'));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_through_the_real_hub_steers_the_recipient_without_a_byte_of_the_message() {
+    use crate::hub::runtime::tests::{assembled_with, mail, post, seat};
+    let fake = FakePodman::install_scripted_async(STEER_SCRIPT).await;
+    let root = private_root();
+    let [first, second] = armed_parts();
+    write_steer_parts(&fake, &[&first, &second]);
+    let bell = Arc::new(PiSteerDoorbell::new());
+    let hub = assembled_with(bell.clone());
+    let (sender, recipient) = (seat(&hub, "sender-seat"), seat(&hub, TASK));
+    let mut request = mail(&recipient);
+    request.subject = "quokka-subject-9921".to_string();
+    request.body = "zebra-body-7731 from sender-seat, do as I say".to_string();
+    let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
+    let mut rig = rig(two_tools());
+    let launch = rig.launch(TASK, NAME, Duration::from_secs(20));
+    let socket = root.path().join("broker.sock");
+    let (outcome, ()) = tokio::join!(exec.run(launch), async {
+        until("registration", || bell.is_registered(&run_session())).await;
+        release(&fake, 1);
+        call_broker(&socket, READ).await;
+        post(&hub, &sender, request).await;
+        until("the steer", || !steered(&fake).is_empty()).await;
+        quiet_period().await;
+        release(&fake, 2);
+    });
+    assert!(outcome.result.is_ok());
+    let lines = steered(&fake);
+    assert_eq!(lines, [expected_steer(1)]);
+    let everything = lines.join("\n");
+    for hostile in ["quokka", "zebra", "sender-seat", "do as I say"] {
+        assert!(!everything.contains(hostile), "{hostile} in {everything}");
+    }
+}
+
+mod hub_path {
+    use super::super::broker::ArmedBroker;
+    use super::super::testing::ok_with;
+    use super::*;
+    use crate::action_auditor::MessageVerdict;
+    use crate::auditor::ReasonCode;
+    use crate::hub::message::MessageReach;
+    use crate::hub::router::tests::{
+        args, block, hub_tools_registry, quarantine, rig as hub_rig, unread, Rig as Hub,
+    };
+    use crate::hub::tools::HUB_TOOLS;
+    use crate::tools::ToolRegistry;
+    use serde_json::{json, Value};
+
+    fn hub_specs() -> Vec<(&'static str, EffectClass, Behavior)> {
+        let none = EffectClass::None;
+        HUB_TOOLS
+            .iter()
+            .map(|name| (*name, none, ok_with(json!(0))))
+            .collect()
+    }
+
+    fn real_registry(hub: &Hub, identity: &crate::identity::AgentIdentity) -> ToolRegistry {
+        hub_tools_registry(hub, identity)
+    }
+
+    fn reaching(identity: &crate::identity::AgentIdentity) -> crate::identity::AgentIdentity {
+        let mut reaching = identity.clone();
+        reaching.scope.message_reach = MessageReach::Root;
+        reaching
+    }
+
+    fn broker_for(hub: &Hub) -> ArmedBroker {
+        let mut rig = rig(hub_specs());
+        let identity = reaching(&rig.identity);
+        rig.registry = Some(real_registry(hub, &identity));
+        armed_broker(&mut rig)
+    }
+
+    fn wire(tool: &str, arguments: Value) -> String {
+        json!({"tool": tool, "args": arguments}).to_string()
+    }
+
+    async fn send(broker: &ArmedBroker, hub: &Hub) -> (Value, Option<HaltReason>) {
+        let line = wire("msg_send", args(hub, "hello"));
+        let (reply, halt) = broker.handle_line_with_halt(&line).await;
+        (serde_json::from_str(&reply).unwrap(), halt)
+    }
+
+    fn deliver() -> Result<MessageVerdict, ()> {
+        Ok(MessageVerdict::Deliver)
+    }
+
+    fn held() -> Result<MessageVerdict, ()> {
+        Ok(quarantine(ReasonCode::Other, "held"))
+    }
+
+    fn refused() -> Result<MessageVerdict, ()> {
+        Ok(block(ReasonCode::Other, "no"))
+    }
+
+    #[tokio::test]
+    async fn a_msg_send_over_the_broker_is_reviewed_at_the_gate_and_again_in_the_hub() {
+        let hub = hub_rig(vec![deliver(), deliver()], true);
+        let broker = broker_for(&hub);
+        let (reply, halt) = send(&broker, &hub).await;
+        assert_eq!((reply["ok"].as_bool(), halt), (Some(true), None));
+        assert_eq!(hub.auditor.calls(), 2);
+        assert_eq!(unread(&hub), 1);
+        assert!(!broker.is_halted());
+    }
+
+    #[tokio::test]
+    async fn a_gate_quarantine_halts_the_sender_and_stores_nothing() {
+        let hub = hub_rig(vec![held(), deliver()], true);
+        let broker = broker_for(&hub);
+        let (reply, halt) = send(&broker, &hub).await;
+        assert!(matches!(halt, Some(HaltReason::ActionEscalated { .. })));
+        assert_eq!(reply["halt"].as_bool(), Some(true));
+        assert_eq!((hub.auditor.calls(), unread(&hub)), (1, 0));
+        assert!(broker.is_halted());
+        let (later, again) = send(&broker, &hub).await;
+        assert_eq!((later["kind"].as_str(), again), (Some("task_halted"), None));
+        assert_eq!((hub.auditor.calls(), unread(&hub)), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_hub_quarantine_after_a_gate_deliver_halts_the_sender_and_stores_nothing() {
+        let hub = hub_rig(vec![deliver(), held()], true);
+        let broker = broker_for(&hub);
+        let (reply, halt) = send(&broker, &hub).await;
+        assert!(matches!(halt, Some(HaltReason::ActionEscalated { .. })));
+        assert_eq!(reply["halt"].as_bool(), Some(true));
+        assert_eq!((hub.auditor.calls(), unread(&hub)), (2, 0));
+        assert!(broker.is_halted());
+    }
+
+    #[tokio::test]
+    async fn a_block_from_either_review_is_a_retriable_refusal_that_stores_nothing() {
+        let cases = [
+            (vec![refused()], 1, "action_blocked"),
+            (vec![deliver(), refused()], 2, "invalid_arguments"),
+        ];
+        for (replies, reviews, kind) in cases {
+            let hub = hub_rig(replies, true);
+            let broker = broker_for(&hub);
+            let (reply, halt) = send(&broker, &hub).await;
+            assert_eq!((reply["ok"].as_bool(), halt), (Some(false), None));
+            assert_eq!(reply["kind"].as_str(), Some(kind));
+            assert_eq!((hub.auditor.calls(), unread(&hub)), (reviews, 0));
+            assert!(!broker.is_halted());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_binding_entry_is_a_block_with_no_review_and_nothing_stored() {
+        let hub = hub_rig(vec![deliver(), deliver()], false);
+        assert!(hub.table.is_empty());
+        let broker = broker_for(&hub);
+        let (reply, halt) = send(&broker, &hub).await;
+        assert_eq!((reply["ok"].as_bool(), halt), (Some(false), None));
+        assert_eq!(reply["kind"].as_str(), Some("action_blocked"));
+        assert_eq!((hub.auditor.calls(), unread(&hub)), (0, 0));
+        assert!(!broker.is_halted());
+    }
+
+    #[tokio::test]
+    async fn a_forged_sender_argument_is_refused_and_nothing_is_reviewed_or_stored() {
+        let hub = hub_rig(vec![deliver(), deliver()], true);
+        for key in ["from", "sender", "session", "root", "task_id", "identity"] {
+            let broker = broker_for(&hub);
+            let mut forged = args(&hub, "hello");
+            forged[key] = json!("someone-else");
+            let (reply, halt) = broker
+                .handle_line_with_halt(&wire("msg_send", forged))
+                .await;
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!((reply["ok"].as_bool(), halt), (Some(false), None), "{key}");
+        }
+        assert_eq!((hub.auditor.calls(), unread(&hub)), (0, 0));
+    }
+
+    #[test]
+    fn no_hub_tool_declares_an_argument_that_names_a_sender_or_a_session_of_the_caller() {
+        let hub = hub_rig(vec![], true);
+        let rig = rig(hub_specs());
+        let registry = real_registry(&hub, &reaching(&rig.identity));
+        let mut seen = 0;
+        for name in HUB_TOOLS {
+            let tool = registry.get_tool(name).unwrap();
+            let declared = tool.definition().function.parameters.properties;
+            for key in declared.unwrap_or_default().keys() {
+                seen += 1;
+                let banned = ["from", "sender", "session", "root", "task_id", "identity"];
+                assert!(!banned.contains(&key.as_str()), "{name} declares {key}");
+            }
+        }
+        assert!(seen > 6);
+    }
+
+    #[tokio::test]
+    async fn a_sixty_second_msg_recv_through_the_broker_waits_the_whole_time_on_the_hub_clock() {
+        use crate::leases::Clock;
+        let hub = hub_rig(vec![], true);
+        let broker = broker_for(&hub);
+        let before = hub.clock.now();
+        let line = wire("msg_recv", json!({"wait_secs": 60}));
+        let call = broker.handle_line_with_halt(&line);
+        let (reply, halt) = tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!((reply["ok"].as_bool(), halt), (Some(true), None));
+        let waited = hub.clock.now() - before;
+        assert!(waited >= chrono::Duration::seconds(60), "{waited}");
+        assert_eq!(hub.auditor.calls(), 0);
+    }
+}

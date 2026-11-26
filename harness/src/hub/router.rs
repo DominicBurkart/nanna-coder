@@ -563,6 +563,7 @@ pub(crate) mod tests {
         pub(crate) gate: Arc<ActionGate>,
         pub(crate) subject: ActionSubject,
         pub(crate) escalator: Arc<crate::escalation::Escalator>,
+        pub(crate) clock: Arc<SimulatedClock>,
         pub(crate) _guard: Option<BindingGuard>,
     }
 
@@ -628,11 +629,12 @@ pub(crate) mod tests {
             true => Arc::new(Both(sink.clone(), pager.clone())),
             false => sink.clone(),
         };
+        let clock = Arc::new(SimulatedClock::new(at()));
         let hub = MessageHub::new(
             sessions,
             messages.clone(),
             Arc::new(shared),
-            Arc::new(SimulatedClock::new(at())),
+            clock.clone(),
             limits,
             session_registry,
         )
@@ -688,8 +690,22 @@ pub(crate) mod tests {
             gate,
             subject,
             escalator,
+            clock,
             _guard: guard,
         }
+    }
+
+    pub(crate) fn hub_tools_registry(
+        rig: &Rig,
+        identity: &crate::identity::AgentIdentity,
+    ) -> ToolRegistry {
+        let (gate, subject) = (rig.gate.clone(), rig.subject.clone());
+        let mut real = ToolRegistry::new()
+            .with_action_gate(gate, subject)
+            .with_action_escalator(rig.escalator.clone());
+        let binding = crate::hub::tools::HubBinding::new(rig.router.clone(), rig.sender.clone());
+        crate::hub::tools::register(&mut real, &binding, identity);
+        real.scoped_for(identity)
     }
 
     async fn call(rig: &Rig, tool: &str, args: Value) -> ToolResult<Value> {
