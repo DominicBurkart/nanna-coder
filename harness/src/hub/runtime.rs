@@ -6,8 +6,9 @@ use super::registry::SessionRegistry;
 use super::router::{BindingTable, HubRouter, ProductionAuditors};
 use super::send::{AuditorProvider, MessageHub, QuarantineSink};
 use super::store::{
-    messages_path_from, sessions_path_from, HubLock, JsonlMessageStore, JsonlSessionStore,
-    MessageStore, SessionStore, StoreError,
+    activity_path_from, messages_path_from, sessions_path_from, ActivityStore, HubLock,
+    JsonlActivityStore, JsonlMessageStore, JsonlSessionStore, MessageStore, SessionStore,
+    StoreError,
 };
 use crate::escalation::EscalationPlane;
 use crate::leases::{Clock, SystemClock};
@@ -40,6 +41,23 @@ impl HubPaths {
         let sessions = std::env::var(super::store::SESSIONS_PATH_ENV).ok();
         let messages = std::env::var(super::store::MESSAGES_PATH_ENV).ok();
         Self::beside(queue, sessions.as_deref(), messages.as_deref())
+    }
+
+    /// The activity journal: `activity_env` when it is a non-empty path, else `activity.jsonl`
+    /// beside the sessions journal. `HubPaths` itself does not carry it.
+    ///
+    /// ```
+    /// use harness::hub::runtime::HubPaths;
+    /// use std::path::Path;
+    ///
+    /// let paths = HubPaths::beside(Path::new("/s/queue.jsonl"), None, None);
+    /// assert_eq!(paths.activity(None), Path::new("/s/activity.jsonl"));
+    /// assert_eq!(paths.activity(Some("")), Path::new("/s/activity.jsonl"));
+    /// assert_eq!(paths.activity(Some("/a/log.jsonl")), Path::new("/a/log.jsonl"));
+    /// ```
+    pub fn activity(&self, activity_env: Option<&str>) -> PathBuf {
+        let beside = self.sessions.with_file_name("activity.jsonl");
+        activity_path_from(activity_env, None).unwrap_or(beside)
     }
 
     /// The journals named by the two environment values, each defaulting to a file next to `queue`.
@@ -99,6 +117,7 @@ struct Parts {
     clock: Arc<dyn Clock>,
     started: DateTime<Utc>,
     router: Arc<HubRouter>,
+    activity: Option<Arc<dyn ActivityStore>>,
     _locks: Vec<Arc<HubLock>>,
 }
 
@@ -164,6 +183,54 @@ fn open_stores(paths: &HubPaths) -> Result<Opened, StoreError> {
     Ok((sessions, messages, locks))
 }
 
+fn lock_for(
+    dir: &Path,
+    paths: &HubPaths,
+    locks: &[Arc<HubLock>],
+) -> Result<Arc<HubLock>, StoreError> {
+    let beside_sessions = lock_dir(&paths.sessions) == dir;
+    let beside_messages = lock_dir(&paths.messages) == dir;
+    let held = if beside_sessions {
+        locks.first()
+    } else if beside_messages {
+        locks.last()
+    } else {
+        None
+    };
+    match held {
+        Some(lock) => Ok(Arc::clone(lock)),
+        None => HubLock::acquire(dir),
+    }
+}
+
+fn activity_store(
+    path: &Path,
+    paths: &HubPaths,
+    locks: &mut Vec<Arc<HubLock>>,
+) -> Result<Arc<dyn ActivityStore>, StoreError> {
+    let lock = lock_for(lock_dir(path), paths, locks)?;
+    let store = JsonlActivityStore::open(path, &lock)?;
+    locks.push(lock);
+    Ok(Arc::new(store))
+}
+
+fn open_activity(
+    paths: &HubPaths,
+    env: Option<&str>,
+    locks: &mut Vec<Arc<HubLock>>,
+) -> Option<Arc<dyn ActivityStore>> {
+    match activity_store(&paths.activity(env), paths, locks) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            tracing::error!(%error, "{ACTIVITY_UNAVAILABLE}");
+            None
+        }
+    }
+}
+
+const ACTIVITY_UNAVAILABLE: &str =
+    "activity log unavailable: tool calls are not logged and the librarian has no activity; the hub is otherwise up";
+
 impl HubRuntime {
     /// A runtime with no hub: no registry, no tools, and the gate blocks message tools.
     pub fn unavailable() -> Self {
@@ -205,12 +272,15 @@ impl HubRuntime {
         sink: Arc<dyn QuarantineSink>,
     ) -> Self {
         match open_stores(paths) {
-            Ok((sessions, messages, locks)) => {
+            Ok((sessions, messages, mut locks)) => {
+                let env = std::env::var(super::store::ACTIVITY_PATH_ENV).ok();
+                let activity = open_activity(paths, env.as_deref(), &mut locks);
                 let mut runtime =
                     HubRuntime::assemble_with_sink(sessions, messages, auditors, clock, sink);
                 if let Some(parts) = runtime.parts.as_mut() {
                     parts._locks = locks;
                 }
+                runtime.log_activity_to(activity);
                 runtime
             }
             Err(error) => {
@@ -257,8 +327,27 @@ impl HubRuntime {
                 clock,
                 started,
                 router: Arc::new(HubRouter::new(Arc::new(hub), table)),
+                activity: None,
                 _locks: Vec::new(),
             }),
+        }
+    }
+
+    /// The activity log, when the hub and the log both opened.
+    ///
+    /// ```
+    /// use harness::hub::runtime::HubRuntime;
+    ///
+    /// assert!(HubRuntime::unavailable().activity().is_none());
+    /// ```
+    pub fn activity(&self) -> Option<Arc<dyn ActivityStore>> {
+        self.parts.as_ref().and_then(|parts| parts.activity.clone())
+    }
+
+    pub(crate) fn log_activity_to(&mut self, store: Option<Arc<dyn ActivityStore>>) {
+        if let (Some(parts), Some(store)) = (self.parts.as_mut(), store) {
+            parts.router.set_activity(Arc::clone(&store));
+            parts.activity = Some(store);
         }
     }
 
@@ -316,6 +405,8 @@ impl HubRuntime {
 pub(crate) mod tests {
     use super::*;
     use crate::action_auditor::{FailClosedMessageAuditor, MessageAuditor, ModelMessageAuditor};
+    use crate::hub::activity_sink::tests::{capture, serial, text};
+    use crate::hub::lineage::{Lineage, RootId, SessionBinding};
     use crate::hub::store::{InMemoryMessageStore, InMemorySessionStore};
     use std::fs;
 
@@ -412,6 +503,154 @@ pub(crate) mod tests {
             messages: b.path().join("messages.jsonl"),
         };
         assert!(!HubRuntime::open(&messages_taken, opening()).is_available());
+    }
+
+    fn quiet_auditors() -> AuditorFactory {
+        let auditor = FailClosedMessageAuditor::new(ModelMessageAuditor::new(provider(), "m"));
+        constant_auditors(Arc::new(auditor))
+    }
+
+    fn stores(paths: &HubPaths) -> Vec<Arc<HubLock>> {
+        open_stores(paths).unwrap().2
+    }
+
+    #[test]
+    fn the_activity_journal_is_the_override_when_non_empty_else_beside_the_sessions_journal() {
+        let paths = HubPaths::beside(Path::new("/s/queue.jsonl"), Some("/a/x.jsonl"), None);
+        assert_eq!(paths.activity(None), Path::new("/a/activity.jsonl"));
+        assert_eq!(paths.activity(Some("")), Path::new("/a/activity.jsonl"));
+        assert_eq!(paths.activity(Some("/b/y.jsonl")), Path::new("/b/y.jsonl"));
+        assert_eq!(paths.activity(Some("")), paths.activity(None));
+    }
+
+    #[test]
+    fn an_opened_runtime_opens_the_activity_log_beside_the_sessions_under_the_same_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HubRuntime::open(&paths(dir.path()), opening());
+        assert!(runtime.is_available());
+        assert!(runtime.activity().is_some());
+        assert!(dir.path().join("activity.jsonl").exists());
+        let again = HubRuntime::open(&paths(dir.path()), opening());
+        assert!(!again.is_available() && again.activity().is_none());
+    }
+
+    #[test]
+    fn an_activity_log_in_the_messages_directory_shares_that_directorys_lock() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let split = HubPaths {
+            sessions: a.path().join("sessions.jsonl"),
+            messages: b.path().join("messages.jsonl"),
+        };
+        let in_b = b.path().join("activity.jsonl");
+        let mut locks = stores(&split);
+        assert_eq!(locks.len(), 2);
+        assert!(open_activity(&split, in_b.to_str(), &mut locks).is_some());
+        assert!(in_b.exists());
+    }
+
+    #[test]
+    fn an_activity_log_beside_the_sessions_shares_the_sessions_lock_even_when_the_messages_differ()
+    {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let split = HubPaths {
+            sessions: a.path().join("sessions.jsonl"),
+            messages: b.path().join("messages.jsonl"),
+        };
+        let mut locks = stores(&split);
+        assert!(open_activity(&split, None, &mut locks).is_some());
+        assert!(a.path().join("activity.jsonl").exists());
+    }
+
+    #[test]
+    fn an_activity_log_in_a_third_directory_takes_its_own_lock() {
+        let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let target = elsewhere.path().join("log.jsonl");
+        let mut locks = stores(&paths(dir.path()));
+        let store = open_activity(&paths(dir.path()), target.to_str(), &mut locks);
+        assert!(store.is_some() && target.exists());
+        assert!(!dir.path().join("activity.jsonl").exists());
+        assert!(matches!(
+            HubLock::acquire(elsewhere.path()),
+            Err(StoreError::Locked)
+        ));
+        drop((store, locks));
+        assert!(HubLock::acquire(elsewhere.path()).is_ok());
+    }
+
+    #[test]
+    fn an_activity_log_that_cannot_open_gives_no_store_and_a_loud_log() {
+        let (buf, _guard) = capture();
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        fs::write(&blocker, "x").unwrap();
+        let unopenable = blocker.join("activity.jsonl");
+        let mut locks = stores(&paths(dir.path()));
+        assert!(open_activity(&paths(dir.path()), unopenable.to_str(), &mut locks).is_none());
+        let log = text(&buf);
+        assert!(log.contains("activity log unavailable"), "{log}");
+        assert!(log.contains("ERROR"), "{log}");
+        assert!(!log.contains("file/activity.jsonl"), "{log}");
+    }
+
+    #[test]
+    fn an_activity_log_locked_by_another_process_gives_no_store() {
+        let _serial = serial();
+        let (dir, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let held = HubLock::acquire(elsewhere.path()).unwrap();
+        let target = elsewhere.path().join("log.jsonl");
+        let mut locks = stores(&paths(dir.path()));
+        assert!(open_activity(&paths(dir.path()), target.to_str(), &mut locks).is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn a_runtime_whose_activity_log_cannot_open_still_has_its_hub_and_no_sink() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("activity.jsonl")).unwrap();
+        let runtime = HubRuntime::open(&paths(dir.path()), opening());
+        assert!(runtime.is_available());
+        assert!(runtime.activity().is_none());
+        let router = runtime.router_weak().upgrade().unwrap();
+        assert!(router.activity_sink(&sender()).is_none());
+    }
+
+    fn sender() -> SessionBinding {
+        let lineage = Lineage::root_child(RootId::mcp(uuid::Uuid::from_u128(7)));
+        let card = crate::identity::example();
+        SessionBinding::from_audited(&card, crate::task::TaskId("s-1".to_string()), lineage)
+    }
+
+    #[test]
+    fn an_opened_runtime_builds_a_sink_that_writes_to_the_log_it_exposes() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HubRuntime::open(&paths(dir.path()), opening());
+        let router = runtime.router_weak().upgrade().unwrap();
+        let session = sender();
+        let sink = router.activity_sink(&session).unwrap();
+        assert!(sink.record(
+            "write_file",
+            &serde_json::json!({"path": "a"}),
+            &["path"],
+            true
+        ));
+        let kept = runtime.activity().unwrap();
+        let entries = kept.for_session(session.session().clone(), 4096).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session(), session.session());
+    }
+
+    #[test]
+    fn an_assembled_runtime_without_a_log_builds_no_sink() {
+        let runtime = HubRuntime::assemble(
+            Arc::new(InMemorySessionStore::new()),
+            Arc::new(InMemoryMessageStore::new()),
+            quiet_auditors(),
+            Arc::new(SystemClock),
+        );
+        assert!(runtime.activity().is_none());
+        let router = runtime.router_weak().upgrade().unwrap();
+        assert!(router.activity_sink(&sender()).is_none());
     }
 
     #[test]
