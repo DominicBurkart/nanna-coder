@@ -1635,13 +1635,14 @@ fn run_session() -> crate::hub::lineage::SessionId {
 }
 
 async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    for _ in 0..600 {
-        if ready() {
-            return;
-        }
+    let mut tries = 0;
+    let mut done = ready();
+    while !done && tries < 600 {
         tokio::time::sleep(Duration::from_millis(10)).await;
+        tries += 1;
+        done = ready();
     }
-    panic!("timed out waiting for {what}");
+    assert!(done, "timed out waiting for {what}");
 }
 
 async fn quiet_period() {
@@ -1813,10 +1814,11 @@ async fn cancelling_a_run_removes_its_steer_entry_and_a_late_ring_is_a_no_op() {
     let exec = executor(root.path()).with_doorbells(Arc::clone(&bell));
     let mut rig = rig(two_tools());
     let launch = rig.launch(TASK, NAME, Duration::from_secs(60));
-    tokio::select! {
-        _ = exec.run(launch) => unreachable!("the run hangs"),
-        () = until("registration", || bell.is_registered(&run_session())) => {}
-    }
+    let finished = tokio::select! {
+        _ = exec.run(launch) => true,
+        () = until("registration", || bell.is_registered(&run_session())) => false,
+    };
+    assert!(!finished);
     assert!(!bell.is_registered(&run_session()));
     ring(&bell, &run_session(), 4);
 }
