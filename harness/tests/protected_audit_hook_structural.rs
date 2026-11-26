@@ -187,7 +187,7 @@ fn only_the_task_runner_constructs_task_workspaces_and_it_installs_a_hook_each_t
         mentions("TaskWorkspace"),
         pinned(&[
             ("harness_adapter/binding.rs", 3),
-            ("task.rs", 5),
+            ("task.rs", 6),
             ("workspace.rs", 3)
         ]),
         "a new production path names TaskWorkspace; a workspace built without with_audit_hook silently gets NoopAuditHook"

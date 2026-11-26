@@ -335,8 +335,8 @@ fn model_facing_registries_are_built_only_at_the_listed_sites() {
         expected(&[
             "eval/runner.rs: run_agent_in_process calls create_tool_registry_in_checkout",
             "main.rs: registry_for_checkout calls create_tool_registry_in_checkout",
-            "task.rs: registry_for calls build_tool_registry",
-            "task.rs: registry_for calls build_tool_registry_for",
+            "task.rs: ServedTools::registry calls build_tool_registry",
+            "task.rs: ServedTools::registry calls build_tool_registry_for",
             "tools.rs: create_container_tool_registry calls create_container_tool_registry_guarded",
             "tools.rs: create_container_tool_registry_for calls create_container_tool_registry_for_guarded",
             "tools.rs: create_container_tool_registry_guarded calls create_tool_registry_guarded",
