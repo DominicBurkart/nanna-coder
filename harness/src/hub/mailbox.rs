@@ -3,6 +3,8 @@ use std::fmt;
 use uuid::Uuid;
 
 use super::lineage::{RootId, SessionId, SessionIdError};
+use crate::action_auditor::RecipientScope;
+use crate::effects::EffectClass;
 use crate::task::TaskId;
 
 const SIGIL: char = '@';
@@ -173,6 +175,35 @@ pub fn is_mailbox(session: &SessionId) -> bool {
     MailboxId::of(session).is_some()
 }
 
+/// The identity name a root mailbox's review scope carries.
+pub const OPERATOR_IDENTITY: &str = "operator";
+
+/// The review scope of a root mailbox: the most authority any recipient can hold. Its reader is
+/// a human operator, so an outbound review treats every agent sender as less privileged than
+/// the recipient and runs the confused-deputy checks.
+///
+/// ```
+/// use harness::effects::EffectClass;
+/// use harness::hub::lineage::RootId;
+/// use harness::hub::mailbox::{operator_scope, MailboxId};
+///
+/// let mailbox = MailboxId::for_root(&RootId::plan("plan-1").unwrap()).unwrap();
+/// let scope = operator_scope(&mailbox);
+/// assert_eq!(scope.max_effect, EffectClass::Production);
+/// assert_eq!(scope.tools, ["*"]);
+/// assert!(scope.read_paths.is_none());
+/// ```
+pub fn operator_scope(mailbox: &MailboxId) -> RecipientScope {
+    RecipientScope {
+        session: mailbox.session().clone(),
+        identity: OPERATOR_IDENTITY.to_string(),
+        max_effect: EffectClass::Production,
+        tools: vec!["*".to_string()],
+        write_paths: vec!["**".to_string()],
+        read_paths: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +269,20 @@ mod tests {
         let backlogs = (repos, 0u64..3).prop_filter_map("invalid repo", backlog_of);
         let legacies = "[a@/#-]{0,3}".prop_map(|task| legacy(&task));
         prop_oneof![mcps, plans, backlogs, legacies]
+    }
+
+    #[test]
+    fn the_operator_scope_is_the_documented_maximum_for_the_roots_mailbox() {
+        for root in all_four() {
+            let mailbox = mailbox_of(&root);
+            let scope = operator_scope(&mailbox);
+            assert_eq!(scope.session, mailbox.session().clone());
+            assert_eq!(scope.identity, "operator");
+            assert_eq!(scope.max_effect, EffectClass::Production);
+            assert_eq!(scope.tools, vec!["*".to_string()]);
+            assert_eq!(scope.write_paths, vec!["**".to_string()]);
+            assert_eq!(scope.read_paths, None);
+        }
     }
 
     #[test]

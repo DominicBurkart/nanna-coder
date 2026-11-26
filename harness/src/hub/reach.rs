@@ -1,7 +1,10 @@
 use super::error::HubError;
-use super::lineage::SessionBinding;
+use super::lineage::{SessionBinding, SessionId};
+use super::mailbox::{operator_scope, MailboxId};
 use super::message::{MessageReach, Recipient};
+use super::send::scope_of;
 use super::session::SessionRecord;
+use crate::action_auditor::RecipientScope;
 
 /// How a session stands to the sender, by lineage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -90,4 +93,91 @@ pub(crate) fn resolve(
         });
     }
     Ok(active)
+}
+
+/// Where a send goes: active sessions of the sender's root, or the root mailbox.
+#[derive(Debug, Clone)]
+pub(crate) enum Target {
+    Sessions(Vec<SessionRecord>),
+    Mailbox(MailboxId),
+}
+
+impl Target {
+    pub(crate) fn ids(&self) -> Vec<SessionId> {
+        match self {
+            Target::Sessions(to) => to.iter().map(|rec| rec.id.clone()).collect(),
+            Target::Mailbox(mailbox) => vec![mailbox.session().clone()],
+        }
+    }
+
+    pub(crate) fn scopes(&self) -> Vec<RecipientScope> {
+        match self {
+            Target::Sessions(to) => to.iter().map(scope_of).collect(),
+            Target::Mailbox(mailbox) => vec![operator_scope(mailbox)],
+        }
+    }
+
+    pub(crate) fn sessions(&self) -> &[SessionRecord] {
+        match self {
+            Target::Sessions(to) => to,
+            Target::Mailbox(_) => &[],
+        }
+    }
+}
+
+fn names_mailbox(sender: &SessionBinding, to: &Recipient) -> bool {
+    let top = sender.lineage().parent().is_none();
+    matches!(to, Recipient::Root) || (matches!(to, Recipient::Parent) && top)
+}
+
+/// The target `to` names: the root mailbox for [`Recipient::Root`] and for the parent of a
+/// top-level session (when the card's reach is not `none`), otherwise exactly what [`resolve`]
+/// returns. The mailbox is always that of the sender's own root, taken from its lineage.
+pub(crate) fn resolve_target(
+    sender: &SessionBinding,
+    to: &Recipient,
+    in_root: &[SessionRecord],
+    fanout_max: usize,
+) -> Result<Target, HubError> {
+    let reach = sender.identity().scope.message_reach;
+    if reach != MessageReach::None && names_mailbox(sender, to) {
+        let root = sender.lineage().root();
+        let mailbox = MailboxId::for_root(root).map_err(|_| HubError::NoRecipient)?;
+        return Ok(Target::Mailbox(mailbox));
+    }
+    let sessions = resolve(sender, to, in_root, fanout_max)?;
+    Ok(Target::Sessions(sessions))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_mailbox_target_is_built_only_in_the_target_resolver_from_the_senders_own_root() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hub");
+        let mut scanned = 0;
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.ends_with(".rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+                for line in production.lines() {
+                    let code = !line.trim_start().starts_with("///");
+                    if code && line.contains("MailboxId::for_root(") {
+                        found.push(format!("{name}: {}", line.trim()));
+                    }
+                }
+                scanned += 1;
+            }
+        }
+        assert!(scanned >= 10);
+        let own = "let mailbox = MailboxId::for_root(root).map_err(|_| HubError::NoRecipient)?;";
+        found.sort();
+        let release = "operator.rs: let mailbox = MailboxId::for_root(&message.root);";
+        assert_eq!(found, vec![release.to_string(), format!("reach.rs: {own}")]);
+        let source = std::fs::read_to_string(dir.join("reach.rs")).unwrap();
+        let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap();
+        assert!(production.contains("let root = sender.lineage().root();"));
+    }
 }
