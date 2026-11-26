@@ -72,6 +72,21 @@ impl Table for SessionTable {
 }
 
 impl SessionTable {
+    fn in_root(&self, root: &RootId) -> Vec<SessionRecord> {
+        let mut found: Vec<SessionRecord> = self
+            .by_id
+            .values()
+            .filter(|record| record.lineage.root() == root)
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        found
+    }
+
     fn active(&self) -> Vec<ActiveSession> {
         let mut listed = Vec::new();
         for record in self.by_id.values() {
@@ -127,20 +142,7 @@ macro_rules! session_store_impl {
             }
 
             fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
-                let mut found: Vec<SessionRecord> = self.engine.read(|table| {
-                    table
-                        .by_id
-                        .values()
-                        .filter(|record| record.lineage.root() == root)
-                        .cloned()
-                        .collect()
-                });
-                found.sort_by(|a, b| {
-                    a.created_at
-                        .cmp(&b.created_at)
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-                Ok(found)
+                Ok(self.engine.read(|table| table.in_root(root)))
             }
 
             fn update(
@@ -304,6 +306,26 @@ impl JsonlSessionStore {
 }
 
 session_store_impl!(JsonlSessionStore);
+
+pub(crate) struct ReadOnlySessionStore {
+    engine: Engine<SessionTable>,
+}
+
+impl ReadOnlySessionStore {
+    pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            engine: Engine::open_read_only(path)?,
+        })
+    }
+
+    pub(crate) fn get(&self, id: &SessionId) -> Option<SessionRecord> {
+        self.engine.read(|table| table.by_id.get(id).cloned())
+    }
+
+    pub(crate) fn in_root(&self, root: &RootId) -> Vec<SessionRecord> {
+        self.engine.read(|table| table.in_root(root))
+    }
+}
 
 #[cfg(test)]
 mod tests {

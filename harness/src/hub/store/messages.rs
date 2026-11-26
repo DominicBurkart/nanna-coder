@@ -432,6 +432,29 @@ impl JsonlMessageStore {
 
 message_store_impl!(JsonlMessageStore);
 
+pub(crate) struct ReadOnlyMessageStore {
+    engine: Engine<MessageTable>,
+}
+
+impl ReadOnlyMessageStore {
+    pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            engine: Engine::open_read_only(path)?,
+        })
+    }
+
+    pub(crate) fn quarantined(&self) -> Vec<StoredMessage> {
+        self.engine.read(MessageTable::quarantined)
+    }
+
+    pub(crate) fn get(&self, id: MessageId) -> Option<StoredMessage> {
+        self.engine.read(|table| {
+            let seq = table.seq_of.get(&id)?;
+            table.by_seq.get(seq).cloned()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::contract::*;

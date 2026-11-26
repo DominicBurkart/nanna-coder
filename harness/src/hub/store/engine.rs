@@ -60,6 +60,14 @@ fn replay<T: Table>(bytes: &[u8]) -> Result<T, StoreError> {
     Ok(table)
 }
 
+fn read_existing(path: &Path) -> Result<Vec<u8>, StoreError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl<T: Table> Engine<T> {
     pub(super) fn memory() -> Self {
         Self {
@@ -73,11 +81,7 @@ impl<T: Table> Engine<T> {
 
     pub(super) fn open(path: &Path, lock: &Arc<HubLock>) -> Result<Self, StoreError> {
         let claim = lock.claim(path)?;
-        let existing = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
+        let existing = read_existing(path)?;
         let table = replay::<T>(&existing)?;
         journal::rewrite_private(path, &encode(&table.records())?)?;
         let journal = FileJournal::new(journal::open_append(path)?);
@@ -87,6 +91,18 @@ impl<T: Table> Engine<T> {
                 journal: Some(Box::new(journal)),
             }),
             _claim: Some(claim),
+        })
+    }
+
+    pub(super) fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let existing = read_existing(path)?;
+        let table = replay::<T>(&existing)?;
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                table,
+                journal: None,
+            }),
+            _claim: None,
         })
     }
 
