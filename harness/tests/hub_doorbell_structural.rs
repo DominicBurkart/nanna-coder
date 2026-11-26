@@ -155,3 +155,22 @@ fn only_the_hub_constructor_names_the_noop_doorbell() {
     hub.dedup();
     assert_eq!(hub, ["hub/runtime.rs", "hub/send.rs"]);
 }
+
+#[test]
+fn open_hands_the_hub_open_doorbell_to_the_runtime_and_nothing_else_does() {
+    let all = production();
+    let runtime = all
+        .iter()
+        .find(|(name, _)| name == "hub/runtime.rs")
+        .unwrap();
+    let call = "HubRuntime::open_with(paths, factory, Arc::new(SystemClock), sink, doorbell)";
+    assert_eq!(runtime.1.matches(call).count(), 1);
+    assert_eq!(
+        runtime
+            .1
+            .matches("doorbell: Arc::new(NoopDoorbell)")
+            .count(),
+        1
+    );
+    assert_eq!(runtime.1.matches("let bell = doorbell;").count(), 1);
+}

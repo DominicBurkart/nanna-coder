@@ -248,6 +248,40 @@ mod fake {
 #[cfg(unix)]
 pub(crate) use fake::FakePodman;
 
+pub(crate) mod logs {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuf {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    pub(crate) fn capture() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        (buf, tracing::subscriber::set_default(subscriber))
+    }
+}
+
 pub(crate) mod escalation {
     use crate::escalation::{
         DeliveryOutcome, DeliveryReceipt, Escalation, EscalationError, EscalationLog,
@@ -320,6 +354,11 @@ pub(crate) mod escalation {
                 outcome: DeliveryOutcome::Posted,
             })
         }
+    }
+
+    pub(crate) fn plane(sink: &Arc<CapturingSink>) -> crate::escalation::EscalationPlane {
+        let log = Arc::new(EscalationLog::in_memory());
+        crate::escalation::EscalationPlane::new(log, Arc::new(Arc::clone(sink)))
     }
 
     pub(crate) fn escalator(sink: &Arc<CapturingSink>) -> (Arc<Escalator>, Arc<EscalationLog>) {

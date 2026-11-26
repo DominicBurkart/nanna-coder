@@ -46,10 +46,38 @@ impl AuditorProvider for Arc<dyn MessageAuditor> {
     }
 }
 
+/// The path that raised a [`QuarantineEvent`].
+///
+/// ```
+/// use harness::hub::send::QuarantineOrigin;
+///
+/// assert!(QuarantineOrigin::Send.escalated_by_registry());
+/// assert!(QuarantineOrigin::Gate.escalated_by_registry());
+/// assert!(!QuarantineOrigin::Recv.escalated_by_registry());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineOrigin {
+    /// `MessageHub::send` quarantined the message after its own review.
+    Send,
+    /// The action gate quarantined a send or a note before the tool ran.
+    Gate,
+    /// `recv` retired a stored message as quarantined.
+    Recv,
+}
+
+impl QuarantineOrigin {
+    /// Whether `ToolRegistry::execute` already hands this path's halt to the escalator, so a
+    /// sink that pages the human plane must skip it or the human is paged twice.
+    pub fn escalated_by_registry(self) -> bool {
+        matches!(self, QuarantineOrigin::Send | QuarantineOrigin::Gate)
+    }
+}
+
 /// What the human plane is told about a quarantined message: ids, codes, sizes and the hash of
 /// the original content, never text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineEvent {
+    pub origin: QuarantineOrigin,
     pub ids: Vec<MessageId>,
     pub from: SessionId,
     pub codes: Vec<ReasonCode>,
@@ -57,14 +85,16 @@ pub struct QuarantineEvent {
     pub body_len: usize,
 }
 
-/// Where quarantine escalations go. The production sink is wired with the gate (#1072).
+/// Where quarantine events go. The production sink is
+/// [`EscalationQuarantineSink`](super::quarantine_sink::EscalationQuarantineSink).
 pub trait QuarantineSink: Send + Sync {
     fn quarantined(&self, event: &QuarantineEvent) -> Result<(), String>;
 }
 
-/// Drops every event.
-pub struct NoopQuarantineSink;
+#[cfg(test)]
+pub(crate) struct NoopQuarantineSink;
 
+#[cfg(test)]
 impl QuarantineSink for NoopQuarantineSink {
     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
         Ok(())
@@ -191,9 +221,8 @@ pub(super) fn codes_of(verdict: &MessageVerdict) -> Vec<ReasonCode> {
 }
 
 impl MessageHub {
-    /// A hub over the two stores. Quarantine events go to a [`NoopQuarantineSink`] until
-    /// [`MessageHub::with_quarantine_sink`] says otherwise.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         sessions: Arc<dyn SessionStore>,
         messages: Arc<dyn MessageStore>,
         auditors: Arc<dyn AuditorProvider>,
@@ -202,6 +231,20 @@ impl MessageHub {
         registry: Arc<SessionRegistry>,
     ) -> Self {
         let sink: Arc<dyn QuarantineSink> = Arc::new(NoopQuarantineSink);
+        Self::with_sink(sessions, messages, auditors, clock, limits, registry, sink)
+    }
+
+    /// A hub over the two stores that tells `sink` about every quarantine. There is no
+    /// constructor without a sink: a hub that drops quarantines is a test double.
+    pub fn with_sink(
+        sessions: Arc<dyn SessionStore>,
+        messages: Arc<dyn MessageStore>,
+        auditors: Arc<dyn AuditorProvider>,
+        clock: Arc<dyn Clock>,
+        limits: HubLimits,
+        registry: Arc<SessionRegistry>,
+        sink: Arc<dyn QuarantineSink>,
+    ) -> Self {
         Self {
             sessions,
             messages,
@@ -522,6 +565,7 @@ impl MessageHub {
         prepared: &Prepared,
         auditor_name: &str,
         codes: Vec<ReasonCode>,
+        origin: QuarantineOrigin,
     ) -> Result<usize, HubError> {
         let draft = Draft {
             depth: prepared.depth,
@@ -541,6 +585,7 @@ impl MessageHub {
             .collect();
         let ids = self.append_all(stored)?;
         let event = QuarantineEvent {
+            origin,
             ids,
             from: sender.session().clone(),
             codes,
@@ -563,13 +608,15 @@ impl MessageHub {
         codes: Vec<ReasonCode>,
     ) -> Result<usize, HubError> {
         let prepared = self.prepare(sender, req)?;
-        self.store_quarantined(sender, req, &prepared, GATE_AUDITOR, codes)
+        let origin = QuarantineOrigin::Gate;
+        self.store_quarantined(sender, req, &prepared, GATE_AUDITOR, codes, origin)
     }
 
     /// Tell the sink a note was quarantined by the gate. A note has no recipients, so nothing is
     /// stored: the event carries the hash and length only.
     pub fn quarantine_note(&self, sender: &SessionBinding, note: &str, codes: Vec<ReasonCode>) {
         let event = QuarantineEvent {
+            origin: QuarantineOrigin::Gate,
             ids: Vec::new(),
             from: sender.session().clone(),
             codes,
@@ -594,8 +641,9 @@ impl MessageHub {
         match verdict {
             MessageVerdict::Block { .. } => Err(HubError::Blocked(codes)),
             MessageVerdict::Quarantine { .. } => {
+                let (name, origin) = (auditor.name(), QuarantineOrigin::Send);
                 let recipients =
-                    self.store_quarantined(sender, &req, &prepared, auditor.name(), codes)?;
+                    self.store_quarantined(sender, &req, &prepared, name, codes, origin)?;
                 Err(HubError::Quarantined { recipients })
             }
             MessageVerdict::Deliver => {
@@ -1583,6 +1631,7 @@ mod tests {
         assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 0);
         assert!(NoopQuarantineSink
             .quarantined(&QuarantineEvent {
+                origin: QuarantineOrigin::Send,
                 ids: vec![],
                 from: a.session().clone(),
                 codes: vec![],
