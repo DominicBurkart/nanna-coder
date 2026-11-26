@@ -17,7 +17,9 @@ pub use activity_write::{
     ArgsSummary, MAX_ARGS_CHARS, MAX_SUBJECT_CHARS, MAX_TOOL_CHARS, MAX_TURN_BYTES,
 };
 pub use journal::HubLock;
+pub(crate) use messages::ReadOnlyMessageStore;
 pub use messages::{InMemoryMessageStore, JsonlMessageStore};
+pub(crate) use sessions::ReadOnlySessionStore;
 pub use sessions::{InMemorySessionStore, JsonlSessionStore};
 
 use super::lineage::{RootId, SessionId};

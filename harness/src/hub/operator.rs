@@ -1,10 +1,13 @@
 use std::fmt;
 use std::io::IsTerminal;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 
 use super::mailbox::{is_mailbox, MailboxId};
 use super::message::{DeliveryState, MessageId, MessageKind, Release, StoredMessage};
+use super::readonly::{render_sessions, sessions_json, ReadOnlyHub};
+use super::runtime::HubPaths;
 use super::send::{codes_of, MessageHub};
 use super::store::{MessageStore, StoreError};
 use crate::action_auditor::{NullOracle, RuleMessageAuditor};
@@ -38,6 +41,10 @@ pub enum OperatorError {
     AgentSession,
     #[error("no quarantined message with that id")]
     NotQuarantined,
+    #[error("no hub state directory at {0}")]
+    HubMissing(String),
+    #[error("no sessions are known for that root id")]
+    UnknownRoot,
     #[error("release refused: the stored text fails the rules review ({})", code_list(.0))]
     ReleaseRefused(Vec<ReasonCode>),
     #[error("release refused: the recipient session is not active; drop the message instead")]
@@ -174,7 +181,7 @@ fn fenced(label: FenceLabel, text: &str, cap: usize) -> String {
     fenced.replace('\t', "\\t")
 }
 
-fn inline(text: &str) -> String {
+pub(super) fn inline(text: &str) -> String {
     fenced(FenceLabel::AgentText, text, INLINE_CAP).replace('\n', " ")
 }
 
@@ -223,7 +230,21 @@ fn view_of(message: &StoredMessage) -> QuarantineView {
 /// ```
 pub fn quarantine_list(store: &dyn MessageStore) -> Result<Vec<QuarantineView>, OperatorError> {
     let held = store.quarantined()?;
-    Ok(held.iter().map(view_of).collect())
+    Ok(views_of(&held))
+}
+
+fn views_of(held: &[StoredMessage]) -> Vec<QuarantineView> {
+    held.iter().map(view_of).collect()
+}
+
+fn detail_of(found: Option<StoredMessage>) -> Result<QuarantineDetail, OperatorError> {
+    let quarantined = found.filter(|m| m.state == DeliveryState::Quarantined);
+    let message = quarantined.ok_or(OperatorError::NotQuarantined)?;
+    Ok(QuarantineDetail {
+        view: view_of(&message),
+        subject: block(&message.subject, SUBJECT_CAP),
+        body: block(&message.body, BODY_CAP),
+    })
 }
 
 /// One quarantined message with its stored text, fenced and escaped for a terminal. An unknown
@@ -266,38 +287,41 @@ pub fn quarantine_show(
     store: &dyn MessageStore,
     id: MessageId,
 ) -> Result<QuarantineDetail, OperatorError> {
-    let found = store.get(id)?;
-    let quarantined = found.filter(|m| m.state == DeliveryState::Quarantined);
-    let message = quarantined.ok_or(OperatorError::NotQuarantined)?;
-    Ok(QuarantineDetail {
-        view: view_of(&message),
-        subject: block(&message.subject, SUBJECT_CAP),
-        body: block(&message.body, BODY_CAP),
-    })
+    detail_of(store.get(id)?)
 }
 
-fn field(line: &mut String, name: &str, value: &str) {
-    line.push(' ');
-    line.push_str(name);
-    line.push('=');
-    line.push_str(value);
+fn fields_of(view: &QuarantineView) -> Vec<(&'static str, String)> {
+    let codes: Vec<String> = view.held.iter().map(ToString::to_string).collect();
+    vec![
+        ("root", view.root.clone()),
+        ("from", view.from.clone()),
+        ("identity", view.from_identity.clone()),
+        ("to", view.to.clone()),
+        ("kind", format!("{:?}", view.kind)),
+        ("held", codes.join(",")),
+        ("hash", format!("{:016x}", view.original_hash)),
+        ("subject_len", view.subject_len.to_string()),
+        ("body_len", view.body_len.to_string()),
+        ("sent", view.sent_at.to_rfc3339()),
+        ("released", view.human_released.to_string()),
+    ]
 }
 
 fn line_of(view: &QuarantineView) -> String {
-    let codes: Vec<String> = view.held.iter().map(ToString::to_string).collect();
     let mut line = view.id.as_uuid().to_string();
-    field(&mut line, "root", &view.root);
-    field(&mut line, "from", &view.from);
-    field(&mut line, "identity", &view.from_identity);
-    field(&mut line, "to", &view.to);
-    field(&mut line, "kind", &format!("{:?}", view.kind));
-    field(&mut line, "held", &codes.join(","));
-    field(&mut line, "hash", &format!("{:016x}", view.original_hash));
-    field(&mut line, "subject_len", &view.subject_len.to_string());
-    field(&mut line, "body_len", &view.body_len.to_string());
-    field(&mut line, "sent", &view.sent_at.to_rfc3339());
-    field(&mut line, "released", &view.human_released.to_string());
+    for (name, value) in fields_of(view) {
+        line.push_str(&format!(" {name}={value}"));
+    }
     line
+}
+
+fn object_of(view: &QuarantineView) -> serde_json::Map<String, serde_json::Value> {
+    let mut object = serde_json::Map::new();
+    object.insert("id".into(), view.id.as_uuid().to_string().into());
+    for (name, value) in fields_of(view) {
+        object.insert(name.into(), value.into());
+    }
+    object
 }
 
 /// One line per quarantined message: ids, reason codes and sizes, never text.
@@ -336,6 +360,104 @@ pub fn render_detail(detail: &QuarantineDetail) -> String {
         &detail.body,
     ];
     parts.join("\n")
+}
+
+fn json_text(value: serde_json::Value) -> String {
+    value.to_string()
+}
+
+/// `nanna hub quarantine list`: ids, reason codes and sizes of every quarantined message in the
+/// hub directory named by `paths`, read without the hub lock and without writing anything. Needs
+/// no grant because it carries no subject or body. `json` prints the same strings as a JSON array.
+///
+/// ```
+/// use harness::hub::operator::quarantine_list_report;
+/// use harness::hub::runtime::HubPaths;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let paths = HubPaths::beside(&dir.path().join("queue.jsonl"), None, None);
+/// assert_eq!(quarantine_list_report(&paths, false).unwrap(), "no quarantined messages");
+/// assert_eq!(quarantine_list_report(&paths, true).unwrap(), "[]");
+/// assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+/// ```
+pub fn quarantine_list_report(paths: &HubPaths, json: bool) -> Result<String, OperatorError> {
+    let held = ReadOnlyHub::open(paths).quarantined()?;
+    let views = views_of(&held);
+    let objects: Vec<serde_json::Value> = views.iter().map(object_of).map(Into::into).collect();
+    match json {
+        true => Ok(json_text(objects.into())),
+        false => Ok(render_list(&views)),
+    }
+}
+
+/// `nanna hub quarantine show <id>` for the human the grant proves: the list fields plus the
+/// stored, already redacted subject and body, fenced and gutter-prefixed as [`render_detail`]
+/// does. An unparsable id, an unknown id and an id that is not quarantined give the same error.
+/// `json` prints the same strings as one JSON object.
+///
+/// ```
+/// use harness::hub::operator::{quarantine_show_report, OperatorError};
+/// use harness::hub::runtime::HubPaths;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let paths = HubPaths::beside(&dir.path().join("queue.jsonl"), None, None);
+/// let shown = quarantine_show_report(&paths, "not-an-id", false);
+/// assert!(shown.is_err());
+/// ```
+pub fn quarantine_show_report(
+    paths: &HubPaths,
+    id: &str,
+    json: bool,
+) -> Result<String, OperatorError> {
+    let granted = OperatorGrant::from_environment();
+    granted.and_then(|grant| show_report_with(&grant, paths, id, json))
+}
+
+pub(crate) fn show_report_with(
+    _grant: &OperatorGrant,
+    paths: &HubPaths,
+    id: &str,
+    json: bool,
+) -> Result<String, OperatorError> {
+    let parsed = uuid::Uuid::from_str(id).map_err(|_| OperatorError::NotQuarantined)?;
+    let found = ReadOnlyHub::open(paths).message(MessageId::from_uuid(parsed))?;
+    let detail = detail_of(found)?;
+    match json {
+        true => Ok(json_text(detail_object(&detail).into())),
+        false => Ok(render_detail(&detail)),
+    }
+}
+
+fn detail_object(detail: &QuarantineDetail) -> serde_json::Map<String, serde_json::Value> {
+    let mut object = object_of(&detail.view);
+    object.insert("subject".into(), detail.subject.clone().into());
+    object.insert("body".into(), detail.body.clone().into());
+    object
+}
+
+/// `nanna hub sessions --root <id>`: id, identity, status, depth and the bounded redacted note
+/// of every session in one root, read without the hub lock. `root` is `plan-<id>`,
+/// `backlog-<owner/repo>#<n>`, `mcp-<uuid>`, or the id of any session in the root. An id that
+/// names no known session and no parsable root gives [`OperatorError::UnknownRoot`]; a parsable
+/// root with no sessions prints `no sessions in this root`.
+///
+/// ```
+/// use harness::hub::operator::{sessions_report, OperatorError};
+/// use harness::hub::runtime::HubPaths;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let paths = HubPaths::beside(&dir.path().join("queue.jsonl"), None, None);
+/// let empty = sessions_report(&paths, "plan-0a1b", false).unwrap();
+/// assert_eq!(empty, "no sessions in this root");
+/// let unknown = sessions_report(&paths, "some-task", false);
+/// assert!(matches!(unknown, Err(OperatorError::UnknownRoot)));
+/// ```
+pub fn sessions_report(paths: &HubPaths, root: &str, json: bool) -> Result<String, OperatorError> {
+    let lines = ReadOnlyHub::open(paths).sessions(root)?;
+    match json {
+        true => Ok(sessions_json(&lines)),
+        false => Ok(render_sessions(&lines)),
+    }
 }
 
 /// What a human decides for one quarantined message.
@@ -945,6 +1067,231 @@ mod tests {
             prop_assert!(terminal_safe(&list));
             prop_assert!(!list.contains('\n'));
             prop_assert!(!list.contains(TOKEN));
+        }
+    }
+    mod commands {
+        use super::*;
+        use crate::hub::readonly::seed::{message, record, seeded};
+
+        const HOSTILE_ID: &str = "id\u{1b}[31m\u{202e}x";
+
+        fn text_message(n: u128, subject: &str, body: &str) -> StoredMessage {
+            let mut found = message(n, DeliveryState::Quarantined, "");
+            found.subject = subject.into();
+            found.body = body.into();
+            found
+        }
+
+        fn grant() -> OperatorGrant {
+            OperatorGrant::check(true, false).unwrap()
+        }
+
+        fn show(seed: &crate::hub::readonly::seed::Seeded, id: &str, json: bool) -> String {
+            show_report_with(&grant(), &seed.paths, id, json).unwrap()
+        }
+
+        fn uuid_of(n: u128) -> String {
+            uuid::Uuid::from_u128(n).to_string()
+        }
+
+        #[test]
+        fn list_report_has_ids_codes_and_sizes_and_never_the_subject_or_body() {
+            let planted = text_message(1, TOKEN, TOKEN);
+            let seed = seeded(vec![planted], vec![]);
+            let text = quarantine_list_report(&seed.paths, false).unwrap();
+            assert!(text.starts_with(&uuid_of(1)), "{text}");
+            assert!(text.contains(" held=prompt_injection"), "{text}");
+            assert!(text.contains(&format!(
+                " subject_len={} body_len={}",
+                TOKEN.len(),
+                TOKEN.len()
+            )));
+            assert!(!text.contains(TOKEN), "{text}");
+            let json = quarantine_list_report(&seed.paths, true).unwrap();
+            assert!(!json.contains(TOKEN), "{json}");
+        }
+
+        #[test]
+        fn list_report_lists_only_quarantined_messages() {
+            let pending = message(1, DeliveryState::Pending, "p");
+            let seed = seeded(vec![pending], vec![]);
+            let text = quarantine_list_report(&seed.paths, false).unwrap();
+            assert_eq!(text, "no quarantined messages");
+        }
+
+        #[test]
+        fn list_json_is_the_same_strings_as_the_text() {
+            let seed = seeded(
+                vec![text_message(1, "s", "b"), text_message(2, "s", "b")],
+                vec![],
+            );
+            let text = quarantine_list_report(&seed.paths, false).unwrap();
+            let json = quarantine_list_report(&seed.paths, true).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let rows = parsed.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            let lines: Vec<&str> = text.split('\n').collect();
+            for (row, line) in rows.iter().zip(lines) {
+                let id = row["id"].as_str().unwrap();
+                assert!(line.starts_with(id));
+                for key in ["root", "from", "identity", "to", "kind", "held", "hash"] {
+                    let value = row[key].as_str().unwrap();
+                    assert!(line.contains(&format!(" {key}={value}")), "{key}: {line}");
+                }
+            }
+        }
+
+        #[test]
+        fn show_renders_the_stored_text_fenced_and_guttered_from_the_journal() {
+            let seed = seeded(vec![text_message(1, "hello", "line one\nline two")], vec![]);
+            let text = show(&seed, &uuid_of(1), false);
+            assert!(text.starts_with(&uuid_of(1)));
+            assert!(
+                text.contains("\nsubject:\n| <<<UNTRUSTED_AGENT_MESSAGE"),
+                "{text}"
+            );
+            assert!(text.contains("| line one\n| line two\n"), "{text}");
+            assert!(gutter_ok(&text), "{text}");
+        }
+
+        #[test]
+        fn show_json_carries_the_same_header_and_blocks_as_the_text() {
+            let seed = seeded(vec![text_message(1, "hello", "line one")], vec![]);
+            let text = show(&seed, &uuid_of(1), false);
+            let json = show(&seed, &uuid_of(1), true);
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let subject = parsed["subject"].as_str().unwrap();
+            let body = parsed["body"].as_str().unwrap();
+            assert!(text.contains(subject) && text.contains(body));
+            assert_eq!(parsed["id"], uuid_of(1).as_str());
+            assert_eq!(parsed["held"], "prompt_injection");
+        }
+
+        #[test]
+        fn show_of_an_unparsable_unknown_or_unquarantined_id_is_one_byte_identical_error() {
+            let pending = message(2, DeliveryState::Pending, "p");
+            let seed = seeded(vec![text_message(1, "s", "b"), pending], vec![]);
+            let ids = [
+                uuid_of(9),
+                uuid_of(2),
+                "not-a-uuid".to_string(),
+                String::new(),
+            ];
+            let errors: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    show_report_with(&grant(), &seed.paths, id, false)
+                        .unwrap_err()
+                        .to_string()
+                })
+                .collect();
+            assert!(
+                errors
+                    .iter()
+                    .all(|e| e == "no quarantined message with that id"),
+                "{errors:?}"
+            );
+        }
+
+        #[test]
+        fn show_without_a_terminal_grant_is_refused_before_any_journal_is_read() {
+            let seed = seeded(vec![text_message(1, TOKEN, TOKEN)], vec![]);
+            let refused = quarantine_show_report(&seed.paths, &uuid_of(1), false);
+            let error = refused.unwrap_err().to_string();
+            assert!(!error.contains(TOKEN), "{error}");
+        }
+
+        #[test]
+        fn hostile_text_is_terminal_safe_through_list_show_and_sessions_in_both_formats() {
+            let mut checked = 0;
+            for (n, hostile) in CORPUS.iter().enumerate() {
+                let n = n as u128 + 1;
+                let mut held = text_message(n, hostile, hostile);
+                held.from_identity = (*hostile).to_string();
+                let mut seated = record(HOSTILE_ID, hostile, RootId::mcp(uuid::Uuid::from_u128(n)));
+                seated.note = None;
+                let seed = seeded(vec![held], vec![seated]);
+                let root = uuid_of(n);
+                let sessions = sessions_report(&seed.paths, &format!("mcp-{root}"), false).unwrap();
+                let sessions_json =
+                    sessions_report(&seed.paths, &format!("mcp-{root}"), true).unwrap();
+                let list = quarantine_list_report(&seed.paths, false).unwrap();
+                let list_json = quarantine_list_report(&seed.paths, true).unwrap();
+                let shown = show(&seed, &root, false);
+                let shown_json = show(&seed, &root, true);
+                let all = [
+                    sessions,
+                    sessions_json,
+                    list,
+                    list_json,
+                    shown.clone(),
+                    shown_json,
+                ];
+                assert!(all.iter().all(|text| terminal_safe(text)), "{hostile:?}");
+                assert!(gutter_ok(&shown), "{hostile:?}: {shown}");
+                checked += 1;
+            }
+            assert_eq!(checked, CORPUS.len());
+        }
+
+        #[test]
+        fn a_planted_token_appears_only_in_show_and_only_as_stored() {
+            let seed = seeded(
+                vec![text_message(1, TOKEN, TOKEN)],
+                vec![record("a", "coder", RootId::mcp(uuid::Uuid::from_u128(1)))],
+            );
+            let id = uuid_of(1);
+            let others = [
+                quarantine_list_report(&seed.paths, false).unwrap(),
+                quarantine_list_report(&seed.paths, true).unwrap(),
+                sessions_report(&seed.paths, &format!("mcp-{id}"), false).unwrap(),
+            ];
+            assert!(others.iter().all(|text| !text.contains(TOKEN)));
+            assert!(show(&seed, &id, false).contains(TOKEN));
+        }
+
+        #[test]
+        fn sessions_report_scopes_to_the_root_and_refuses_unknown_ids() {
+            let one = record("m1", "coder", RootId::mcp(uuid::Uuid::from_u128(1)));
+            let two = record("m2", "reviewer", RootId::mcp(uuid::Uuid::from_u128(2)));
+            let seed = seeded(vec![], vec![one, two]);
+            let text = sessions_report(&seed.paths, "m1", false).unwrap();
+            assert!(
+                text.contains("coder") && !text.contains("reviewer"),
+                "{text}"
+            );
+            let unknown = sessions_report(&seed.paths, "nope", false).unwrap_err();
+            assert_eq!(
+                unknown.to_string(),
+                "no sessions are known for that root id"
+            );
+            let empty = sessions_report(&seed.paths, "plan-empty", false).unwrap();
+            assert_eq!(empty, "no sessions in this root");
+        }
+
+        #[test]
+        fn the_reports_name_a_missing_hub_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let queue = dir.path().join("gone").join("queue.jsonl");
+            let paths = crate::hub::runtime::HubPaths::beside(&queue, None, None);
+            let expected = format!(
+                "no hub state directory at {}",
+                dir.path().join("gone").display()
+            );
+            assert_eq!(
+                quarantine_list_report(&paths, false)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                sessions_report(&paths, "plan-x", true)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+            let shown = show_report_with(&grant(), &paths, &uuid_of(1), false);
+            assert_eq!(shown.unwrap_err().to_string(), expected);
         }
     }
 }

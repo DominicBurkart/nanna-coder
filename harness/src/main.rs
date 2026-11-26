@@ -208,6 +208,18 @@ enum Commands {
         #[command(subcommand)]
         action: EscalationAction,
     },
+    /// Read the message hub's journals: sessions of a root and quarantined messages
+    Hub {
+        /// Queue log location; the hub journals sit beside it unless
+        /// NANNA_SESSIONS_PATH or NANNA_MESSAGES_PATH name them
+        #[arg(long, global = true)]
+        queue_path: Option<std::path::PathBuf>,
+        /// Print JSON instead of text
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: HubAction,
+    },
     /// Inspect or scaffold the per-repo deployment template (.nanna/deploy.toml)
     Deploy {
         #[command(subcommand)]
@@ -258,6 +270,33 @@ enum EscalationAction {
         /// escalations.jsonl next to the queue log)
         #[arg(long)]
         path: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubAction {
+    /// List the sessions of one root: a `plan-` id, a `backlog-<owner/repo>#<n>` id, an
+    /// `mcp-<uuid>` id or the id of any session in it
+    Sessions {
+        /// Root id or the id of a session in the root
+        #[arg(long)]
+        root: String,
+    },
+    /// Quarantined messages
+    Quarantine {
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineAction {
+    /// List quarantined messages: ids, reason codes and sizes, never text
+    List,
+    /// Show one quarantined message's stored, redacted text (terminal only)
+    Show {
+        /// Message id from `quarantine list`
+        id: String,
     },
 }
 
@@ -631,6 +670,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             action: EscalationAction::Resolve { id, path },
         } => {
             run_escalation_resolve(&id, path)?;
+        }
+        Commands::Hub {
+            queue_path,
+            json,
+            action,
+        } => {
+            run_hub(queue_path, json, action)?;
         }
         Commands::Auditor {
             action:
@@ -1394,6 +1440,31 @@ fn run_escalation_resolve(
         "Resolved incident hold {} on {} (held since {}): {}",
         hold.escalation_id, hold.repo, hold.since, hold.summary
     );
+    Ok(())
+}
+
+fn run_hub(
+    queue_path: Option<std::path::PathBuf>,
+    json: bool,
+    action: HubAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use harness::hub::operator;
+
+    let paths = harness::hub::runtime::HubPaths::resolve(&resolve_queue_path(queue_path)?);
+    let report = match action {
+        HubAction::Sessions { root } => operator::sessions_report(&paths, &root, json),
+        HubAction::Quarantine {
+            action: QuarantineAction::List,
+        } => operator::quarantine_list_report(&paths, json),
+        HubAction::Quarantine {
+            action: QuarantineAction::Show { id },
+        } => operator::quarantine_show_report(&paths, &id, json),
+    };
+    let text = report.unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1)
+    });
+    writeln!(io::stdout().lock(), "{text}")?;
     Ok(())
 }
 
