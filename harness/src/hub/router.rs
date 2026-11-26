@@ -1,11 +1,12 @@
 //! The action gate's view of the hub: who is calling, what the gate reviews, and what halts.
 
+use super::activity_sink::ActivitySink;
 use super::error::HubError;
 use super::lineage::{SessionBinding, SessionId};
 use super::message::SendRequest;
 use super::oracle::{ComposedOracle, GitObjectOracle, GitRunner, HubIdOracle};
 use super::send::{AuditorProvider, MessageHub};
-use super::store::{MessageStore, SessionStore};
+use super::store::{ActivityStore, MessageStore, SessionStore};
 use crate::action_auditor::{
     known_arguments, ActionAuditError, ActionContext, ActionDenied, ActionReview, ActionVerdict,
     FailClosedMessageAuditor, MessageAuditor, MessageVerdict, ModelMessageAuditor, NullOracle,
@@ -16,7 +17,7 @@ use async_trait::async_trait;
 use model::ModelProvider;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 struct Entry {
     binding: Arc<SessionBinding>,
@@ -170,7 +171,7 @@ impl ProductionAuditors {
     }
 }
 
-impl ProductionAuditors {
+impl AuditorProvider for ProductionAuditors {
     fn oracle_for(&self, sender: &SessionBinding) -> SharedOracle {
         let git: SharedOracle = match self.table.workspace(sender.session()) {
             Some(dir) => Arc::new(GitObjectOracle::new(dir, Arc::clone(&self.git))),
@@ -183,9 +184,7 @@ impl ProductionAuditors {
         );
         Arc::new(ComposedOracle::new(git, Arc::new(ids)))
     }
-}
 
-impl AuditorProvider for ProductionAuditors {
     fn for_sender(&self, sender: &SessionBinding) -> Arc<dyn MessageAuditor> {
         let oracle = self.oracle_for(sender);
         let model = ModelMessageAuditor::new(Arc::clone(&self.provider), self.model.clone());
@@ -237,12 +236,33 @@ pub fn halting_denial(error: &HubError) -> Option<ActionDenied> {
 pub struct HubRouter {
     hub: Arc<MessageHub>,
     table: Arc<BindingTable>,
+    activity: OnceLock<Arc<dyn ActivityStore>>,
 }
 
 impl HubRouter {
     /// A router over `hub` and the `table` the task runner fills.
     pub fn new(hub: Arc<MessageHub>, table: Arc<BindingTable>) -> Self {
-        Self { hub, table }
+        let activity = OnceLock::new();
+        Self {
+            hub,
+            table,
+            activity,
+        }
+    }
+
+    /// Log the tool calls of every session this router binds to `store`; the first store wins.
+    pub(crate) fn set_activity(&self, store: Arc<dyn ActivityStore>) -> bool {
+        self.activity.set(store).is_ok()
+    }
+
+    /// The sink that logs `session`'s tool calls, built from the host's binding: the session
+    /// id, the sender's oracle and the hub's clock. `None` when no activity log is open.
+    pub(crate) fn activity_sink(&self, session: &SessionBinding) -> Option<Arc<ActivitySink>> {
+        let store = Arc::clone(self.activity.get()?);
+        let oracle = self.hub.oracle_for(session);
+        let id = session.session().clone();
+        let clock = self.hub.clock();
+        Some(Arc::new(ActivitySink::new(store, id, oracle, clock)))
     }
 
     /// The hub behind this router.
@@ -1192,5 +1212,64 @@ pub(crate) mod tests {
         assert_eq!(*runner.0.lock().unwrap(), vec![PathBuf::from("/work/mine")]);
         assert!(auditors.oracle_for(&mine).is_known_hub_id("mine"));
         assert!(!auditors.oracle_for(&mine).is_known_hub_id("ghost"));
+    }
+
+    #[test]
+    fn the_activity_sink_vouches_with_the_senders_workspace_oracle_and_logs_under_its_session() {
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let messages = Arc::new(InMemoryMessageStore::new());
+        let registry = Arc::new(SessionRegistry::new(sessions.clone()));
+        let mine = binding(&registry, "mine", &RootId::mcp(Uuid::from_u128(3)));
+        let table = BindingTable::new();
+        let provider =
+            Arc::new(model::OllamaProvider::new(model::OllamaConfig::default()).unwrap());
+        let git = Arc::new(Runner(Mutex::new(Vec::new())));
+        let auditors = ProductionAuditors::new(
+            provider,
+            "m",
+            sessions.clone(),
+            messages.clone(),
+            table.clone(),
+            git,
+        );
+        let clock = Arc::new(SimulatedClock::new(at()));
+        let hub = MessageHub::new(
+            sessions,
+            messages,
+            Arc::new(auditors),
+            clock,
+            Default::default(),
+            registry,
+        );
+        let store = Arc::new(crate::hub::store::InMemoryActivityStore::new());
+        let router = HubRouter::new(Arc::new(hub), table.clone());
+        assert!(router.activity_sink(&mine).is_none());
+        assert!(router.set_activity(store.clone()));
+        assert!(!router.set_activity(Arc::new(crate::hub::store::InMemoryActivityStore::new())));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let guard = table.enter(SessionBinding::from_audited(
+            mine.identity(),
+            TaskId("mine".into()),
+            mine.lineage().clone(),
+        ));
+        let before = router.activity_sink(&mine).unwrap();
+        before.record("t", &json!({sha: 1}), &[sha], true);
+        guard.set_workspace(PathBuf::from("/work/mine"));
+        let after = router.activity_sink(&mine).unwrap();
+        after.record("t", &json!({sha: 1}), &[sha], true);
+        let kept = store.for_session(mine.session().clone(), 4096).unwrap();
+        let texts: Vec<String> = kept.iter().map(summary_of).collect();
+        assert_eq!(
+            texts,
+            [format!("{sha}=num"), "[withheld: secret_leak]".into()]
+        );
+        assert_eq!(kept[0].at(), at());
+    }
+
+    fn summary_of(entry: &crate::hub::store::ActivityEntry) -> String {
+        serde_json::to_value(entry).unwrap()["args_summary"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 }
