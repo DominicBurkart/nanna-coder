@@ -73,10 +73,11 @@ impl Facts {
 }
 
 fn self_type_name(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
-        _ => None,
+    let mut found = None;
+    if let syn::Type::Path(path) = ty {
+        found = path.path.segments.last().map(|s| s.ident.to_string());
     }
+    found
 }
 
 impl<'ast> Visit<'ast> for Facts {
@@ -87,37 +88,34 @@ impl<'ast> Visit<'ast> for Facts {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.stack.push(node.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, node);
+            self.stack.pop();
         }
-        self.stack.push(node.sig.ident.to_string());
-        syn::visit::visit_item_fn(self, node);
-        self.stack.pop();
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            let name = self_type_name(&node.self_ty).unwrap_or_default();
+            if let Some((_, path, _)) = &node.trait_ {
+                let last = path.segments.last().map(|s| s.ident.to_string());
+                self.trait_impls
+                    .insert(format!("{name}:{}", last.unwrap_or_default()));
+            }
+            let wanted = self.only_impl.as_ref();
+            self.inside_impl = wanted.is_some_and(|names| names.contains(&name));
+            syn::visit::visit_item_impl(self, node);
+            self.inside_impl = false;
         }
-        let name = self_type_name(&node.self_ty).unwrap_or_default();
-        if let Some((_, path, _)) = &node.trait_ {
-            let last = path.segments.last().map(|s| s.ident.to_string());
-            self.trait_impls
-                .insert(format!("{name}:{}", last.unwrap_or_default()));
-        }
-        let wanted = self.only_impl.as_ref();
-        self.inside_impl = wanted.is_some_and(|names| names.contains(&name));
-        syn::visit::visit_item_impl(self, node);
-        self.inside_impl = false;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if is_cfg_test(&node.attrs) {
-            return;
+        if !is_cfg_test(&node.attrs) {
+            self.stack.push(node.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, node);
+            self.stack.pop();
         }
-        self.stack.push(node.sig.ident.to_string());
-        syn::visit::visit_impl_item_fn(self, node);
-        self.stack.pop();
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
