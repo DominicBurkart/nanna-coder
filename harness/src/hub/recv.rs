@@ -2743,6 +2743,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_default_hub_stops_sleeping_after_exactly_thirty_minutes_of_waits() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.hub(Recorder::deliver());
+        for call in 1..=30 {
+            let page = waited(&hub, &b, 60).await;
+            assert_eq!(page.idle_limit, call == 30, "call {call}");
+        }
+        assert_eq!(world.slept_millis(), 1_800_000);
+        let page = waited(&hub, &b, 60).await;
+        assert!(page.idle_limit);
+        assert_eq!(world.slept_millis(), 1_800_000);
+    }
+
+    #[tokio::test]
     async fn the_cap_boundary_is_reached_at_exactly_the_budget_and_not_before() {
         for (asked, slept, limit) in [(2u8, 2_000i64, false), (3, 3_000, true), (4, 3_000, true)] {
             let world = World::memory();

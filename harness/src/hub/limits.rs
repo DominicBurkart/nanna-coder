@@ -247,6 +247,7 @@ mod tests {
             ),
             (8192, 120, 256, 20, 32)
         );
+        assert_eq!(limits.session_idle_secs, 1800);
     }
 
     #[test]
