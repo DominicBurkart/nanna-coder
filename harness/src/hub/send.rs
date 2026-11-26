@@ -15,7 +15,7 @@ use super::view::CursorTable;
 use super::waiting::Waiters;
 use crate::action_auditor::{
     message_content_hash, MessageAuditor, MessageVerdict, NullOracle, OutboundReview,
-    RecipientScope, RuleMessageAuditor, ThreadMessage,
+    RecipientScope, RuleMessageAuditor, SharedOracle, ThreadMessage,
 };
 use crate::auditor::ReasonCode;
 use crate::leases::Clock;
@@ -31,6 +31,12 @@ pub const THREAD_CONTEXT: usize = 3;
 /// Chooses the auditor for one sender, so a sender-specific oracle can be attached.
 pub trait AuditorProvider: Send + Sync {
     fn for_sender(&self, sender: &SessionBinding) -> Arc<dyn MessageAuditor>;
+
+    /// The oracle that vouches for identifiers of `sender`'s workspace; the default vouches for
+    /// nothing.
+    fn oracle_for(&self, _sender: &SessionBinding) -> SharedOracle {
+        Arc::new(NullOracle)
+    }
 }
 
 impl AuditorProvider for Arc<dyn MessageAuditor> {
@@ -208,6 +214,14 @@ impl MessageHub {
             cursors: CursorTable::new(),
             notices: NoticeTable::default(),
         }
+    }
+
+    pub(crate) fn oracle_for(&self, sender: &SessionBinding) -> SharedOracle {
+        self.auditors.oracle_for(sender)
+    }
+
+    pub(crate) fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
     }
 
     /// Set the caller's own note. The session comes from `caller` only. A blank note clears the
