@@ -11110,7 +11110,7 @@ mod session_registry_tests {
                 sessions: dir.path().join("sessions.jsonl"),
                 messages: dir.path().join("messages.jsonl"),
             };
-            let opened = HubRuntime::open(&paths, provider(), "m");
+            let opened = HubRuntime::open(&paths, crate::hub::runtime::tests::opening());
             assert!(opened.is_available());
             let repo = repo();
             let manager = opened.attach(TaskManager::new(0));
@@ -11477,8 +11477,8 @@ mod session_registry_tests {
                 sessions: dir.path().join("sessions.jsonl"),
                 messages: dir.path().join("messages.jsonl"),
             };
-            let first = HubRuntime::open(&paths, provider(), "m");
-            let second = HubRuntime::open(&paths, provider(), "m");
+            let first = HubRuntime::open(&paths, crate::hub::runtime::tests::opening());
+            let second = HubRuntime::open(&paths, crate::hub::runtime::tests::opening());
             assert!(first.is_available() && !second.is_available());
             let manager = second.attach(TaskManager::new(2));
             assert!(offered(&manager, &reaching_card(), true).await.is_empty());

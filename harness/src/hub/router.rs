@@ -553,6 +553,7 @@ pub(crate) mod tests {
         pub(crate) router: Arc<HubRouter>,
         pub(crate) auditor: Arc<Scripted>,
         pub(crate) sink: Arc<Recording>,
+        pub(crate) pager: Arc<crate::hub::quarantine_sink::EscalationQuarantineSink>,
         pub(crate) sender: Arc<SessionBinding>,
         pub(crate) peer: SessionBinding,
         pub(crate) default: Arc<Counting>,
@@ -583,6 +584,37 @@ pub(crate) mod tests {
         bound: bool,
         limits: crate::hub::limits::HubLimits,
     ) -> Rig {
+        rig_built(replies, bound, limits, false)
+    }
+
+    pub(crate) fn rig_paging(replies: Vec<Result<MessageVerdict, ()>>, bound: bool) -> Rig {
+        rig_built(replies, bound, Default::default(), true)
+    }
+
+    struct Both(
+        Arc<Recording>,
+        Arc<crate::hub::quarantine_sink::EscalationQuarantineSink>,
+    );
+
+    impl QuarantineSink for Both {
+        fn quarantined(&self, event: &QuarantineEvent) -> Result<(), String> {
+            self.0.quarantined(event)?;
+            self.1.quarantined(event)
+        }
+    }
+
+    fn rig_built(
+        replies: Vec<Result<MessageVerdict, ()>>,
+        bound: bool,
+        limits: crate::hub::limits::HubLimits,
+        paging: bool,
+    ) -> Rig {
+        let escalations = crate::test_support::escalation::CapturingSink::new(false);
+        let (escalator, _) = crate::test_support::escalation::escalator(&escalations);
+        let pager = crate::hub::quarantine_sink::EscalationQuarantineSink::new(
+            crate::test_support::escalation::plane(&escalations),
+        );
+        let pager = Arc::new(pager);
         let sessions = Arc::new(InMemorySessionStore::new());
         let messages = Arc::new(InMemoryMessageStore::new());
         let session_registry = Arc::new(SessionRegistry::new(sessions.clone()));
@@ -592,6 +624,10 @@ pub(crate) mod tests {
         let auditor = Scripted::new(replies);
         let shared: Arc<dyn MessageAuditor> = auditor.clone();
         let sink = Arc::new(Recording::default());
+        let hub_sink: Arc<dyn QuarantineSink> = match paging {
+            true => Arc::new(Both(sink.clone(), pager.clone())),
+            false => sink.clone(),
+        };
         let hub = MessageHub::new(
             sessions,
             messages.clone(),
@@ -600,7 +636,7 @@ pub(crate) mod tests {
             limits,
             session_registry,
         )
-        .with_quarantine_sink(sink.clone());
+        .with_quarantine_sink(hub_sink);
         let hub = Arc::new(hub);
         let table = BindingTable::new();
         let router = Arc::new(HubRouter::new(hub.clone(), table.clone()));
@@ -616,8 +652,6 @@ pub(crate) mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let log = ActionAuditLog::file(log_dir.path().join("action_audit.jsonl"));
         let gate = Arc::new(ActionGate::new(Arc::new(routing), log));
-        let escalations = crate::test_support::escalation::CapturingSink::new(false);
-        let (escalator, _) = crate::test_support::escalation::escalator(&escalations);
         let subject = ActionSubject {
             task_id: TaskId("sender".to_string()),
             max_effect: EffectClass::None,
@@ -644,6 +678,7 @@ pub(crate) mod tests {
             router,
             auditor,
             sink,
+            pager,
             sender,
             peer,
             default,

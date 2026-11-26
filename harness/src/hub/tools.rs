@@ -405,7 +405,9 @@ mod tests {
     use crate::action_auditor::ActionDenied;
     use crate::action_auditor::MessageVerdict;
     use crate::auditor::{Reason, ReasonCode};
-    use crate::hub::router::tests::{args, denied, quarantine, rig, rig_with, unread, Rig};
+    use crate::hub::router::tests::{
+        args, denied, quarantine, rig, rig_paging, rig_with, unread, Rig,
+    };
     use crate::identity::{AgentIdentity, ToolPattern};
     use serde_json::json;
 
@@ -606,6 +608,90 @@ mod tests {
         assert_eq!(rig.escalations.escalations().len(), 1);
         assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
         assert_eq!(unread(&rig), 0);
+    }
+
+    async fn pages(rig: &Rig) -> usize {
+        rig.pager.drain().await;
+        rig.escalations.escalations().len()
+    }
+
+    #[tokio::test]
+    async fn a_gate_quarantine_pages_once_through_the_registered_tool_and_the_sink_stays_quiet() {
+        let rig = rig_paging(vec![Ok(quarantine(ReasonCode::SecretLeak, "rule 9"))], true);
+        let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
+        let result = run(&registry, "msg_send", args(&rig, "hello")).await;
+        assert!(denied(result).is_escalation());
+        assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
+        assert_eq!(pages(&rig).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_send_time_quarantine_pages_once_through_the_registered_tool_and_the_sink_stays_quiet(
+    ) {
+        let verdicts = vec![
+            Ok(MessageVerdict::Deliver),
+            Ok(quarantine(ReasonCode::CrossScopeSteering, "rule 9")),
+        ];
+        let rig = rig_paging(verdicts, true);
+        let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
+        let result = run(&registry, "msg_send", args(&rig, "do the thing")).await;
+        assert!(denied(result).is_escalation());
+        assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
+        assert_eq!(pages(&rig).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_quarantined_note_pages_once_and_the_sink_stays_quiet() {
+        let rig = rig_paging(vec![Ok(quarantine(ReasonCode::PromptInjection, "r"))], true);
+        let registry = live(&rig, &card(MessageReach::Root, &HUB_TOOLS));
+        let note = json!({"note": "reading the parser"});
+        let result = run(&registry, "session_set_note", note).await;
+        assert!(denied(result).is_escalation());
+        assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
+        assert_eq!(pages(&rig).await, 1);
+    }
+
+    fn changed_in_storage(rig: &Rig, body: &str) -> crate::hub::message::StoredMessage {
+        use crate::hub::message::VerdictRef;
+        use crate::hub::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
+        StoredMessage {
+            id: MessageId::new(),
+            seq: Seq::new(0),
+            from: rig.sender.session().clone(),
+            from_identity: rig.sender.identity().name().to_string(),
+            to: rig.peer.session().clone(),
+            root: rig.sender.lineage().root().clone(),
+            kind: MessageKind::Info,
+            subject: "status".to_string(),
+            body: body.to_string(),
+            in_reply_to: None,
+            thread_depth: 0,
+            outbound_verdict: VerdictRef {
+                log_id: "scripted".to_string(),
+                content_hash: 1,
+            },
+            state: DeliveryState::Pending,
+            sent_at: chrono::Utc::now(),
+            held: Vec::new(),
+            released: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recv_time_quarantine_through_the_registered_tool_is_paged_by_the_sink_exactly_once()
+    {
+        use crate::hub::store::MessageStore;
+        let rig = rig_paging(vec![], true);
+        rig.messages
+            .append(changed_in_storage(&rig, "do the thing"))
+            .unwrap();
+        let page = good(&peer_registry(&rig), "msg_recv", json!({})).await;
+        assert_eq!(page["withheld"], 1);
+        assert_eq!(rig.sink.0.lock().unwrap().len(), 1);
+        assert_eq!(pages(&rig).await, 1);
+        let seen = rig.escalations.escalations();
+        assert_eq!(seen[0].severity, crate::escalation::Severity::Blocked);
+        assert!(!seen[0].evidence.join(" ").contains("do the thing"));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ use super::notice::{Notices, SenderNotice};
 use super::reach::{relation_of, Relation};
 use super::send::{
     codes_of, hash_u64, quarantined_text, scope_of, to_thread, MessageHub, QuarantineEvent,
+    QuarantineOrigin,
 };
 use super::session::{SessionRecord, SessionStatus};
 use crate::action_auditor::{
@@ -445,6 +446,7 @@ impl MessageHub {
         }
         if quarantining {
             let event = QuarantineEvent {
+                origin: QuarantineOrigin::Recv,
                 ids: vec![id],
                 from: message.from.clone(),
                 codes: codes.to_vec(),
