@@ -3,9 +3,11 @@ use std::io::IsTerminal;
 
 use chrono::{DateTime, Utc};
 
-use super::mailbox::MailboxId;
-use super::message::{DeliveryState, MessageId, MessageKind, StoredMessage};
+use super::mailbox::{is_mailbox, MailboxId};
+use super::message::{DeliveryState, MessageId, MessageKind, Release, StoredMessage};
+use super::send::{codes_of, MessageHub};
 use super::store::{MessageStore, StoreError};
+use crate::action_auditor::{NullOracle, RuleMessageAuditor};
 use crate::auditor::ReasonCode;
 use crate::escalation::AGENT_SESSION_ENV;
 use crate::pr_tools::{fenced_untrusted_as, Budget, FenceLabel};
@@ -36,8 +38,19 @@ pub enum OperatorError {
     AgentSession,
     #[error("no quarantined message with that id")]
     NotQuarantined,
+    #[error("release refused: the stored text fails the rules review ({})", code_list(.0))]
+    ReleaseRefused(Vec<ReasonCode>),
+    #[error("release refused: the recipient session is not active; drop the message instead")]
+    RecipientInactive,
+    #[error("release refused: the recipient inbox is full; drop the message or try later")]
+    InboxFull,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+fn code_list(codes: &[ReasonCode]) -> String {
+    let names: Vec<&str> = codes.iter().map(|code| code.as_str()).collect();
+    names.join(",")
 }
 
 /// Proof that the caller is a human at a terminal. It follows the escalation `ResolveGrant`
@@ -323,6 +336,147 @@ pub fn render_detail(detail: &QuarantineDetail) -> String {
         &detail.body,
     ];
     parts.join("\n")
+}
+
+/// What a human decides for one quarantined message.
+///
+/// ```
+/// use harness::hub::operator::ResolveAction;
+///
+/// assert_ne!(ResolveAction::Release, ResolveAction::Drop);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveAction {
+    Release,
+    Drop,
+}
+
+fn rules_pass(message: &StoredMessage) -> Result<(), OperatorError> {
+    let (subject, body) = (&message.subject, &message.body);
+    let outcome = RuleMessageAuditor::new().review_with(subject, body, &[], &NullOracle);
+    let refused = outcome.verdict.is_block();
+    let codes = codes_of(&outcome.verdict);
+    if refused {
+        return Err(OperatorError::ReleaseRefused(codes));
+    }
+    Ok(())
+}
+
+fn settled(result: Result<StoredMessage, StoreError>) -> Result<DeliveryState, OperatorError> {
+    match result {
+        Ok(written) => Ok(written.state),
+        Err(StoreError::Conflict | StoreError::NotFound) => Err(OperatorError::NotQuarantined),
+        Err(other) => Err(OperatorError::Store(other)),
+    }
+}
+
+impl MessageHub {
+    /// Resolve one quarantined message as the human the grant proves.
+    ///
+    /// `Release` re-runs the rules layer over the STORED, already redacted text and refuses with
+    /// [`OperatorError::ReleaseRefused`] on a `Block`; it needs the recipient session to be active
+    /// (a root mailbox has no session and always is) and its inbox under the cap; then it moves
+    /// the message `Quarantined` to `Pending` and attaches the release marker through
+    /// `MessageStore::transition`, the only writer of the marker. The recipient's next `recv`
+    /// delivers exactly the stored text, fenced, with `released_by_human`. `Drop` moves it to
+    /// `Expired`. Both are compare-and-set on `Quarantined`: an unknown id, a message in any other
+    /// state and the loser of a race all give [`OperatorError::NotQuarantined`] and change
+    /// nothing; a store failure leaves the message quarantined. Returns the state written.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use harness::hub::limits::HubLimits;
+    /// use harness::hub::message::MessageId;
+    /// use harness::hub::operator::{OperatorGrant, ResolveAction};
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::send::{MessageHub, QuarantineEvent, QuarantineSink};
+    /// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+    /// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
+    /// use harness::leases::SimulatedClock;
+    ///
+    /// struct Quiet;
+    /// impl QuarantineSink for Quiet {
+    ///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let sessions = Arc::new(InMemorySessionStore::new());
+    /// let registry = Arc::new(SessionRegistry::new(sessions.clone()));
+    /// let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+    /// let hub = MessageHub::with_sink(
+    ///     sessions,
+    ///     Arc::new(InMemoryMessageStore::new()),
+    ///     Arc::new(auditor),
+    ///     Arc::new(SimulatedClock::new(chrono::Utc::now())),
+    ///     HubLimits::default(),
+    ///     registry,
+    ///     Arc::new(Quiet),
+    /// );
+    /// if let Ok(grant) = OperatorGrant::from_environment() {
+    ///     let result = hub.resolve_quarantine(&grant, MessageId::new(), ResolveAction::Drop);
+    ///     assert!(result.is_err());
+    /// }
+    /// ```
+    pub fn resolve_quarantine(
+        &self,
+        grant: &OperatorGrant,
+        id: MessageId,
+        action: ResolveAction,
+    ) -> Result<DeliveryState, OperatorError> {
+        let state = match action {
+            ResolveAction::Release => self.release_message(grant, id)?,
+            ResolveAction::Drop => self.drop_message(grant, id)?,
+        };
+        let uuid = id.as_uuid();
+        tracing::info!(%uuid, ?action, "quarantined message resolved");
+        Ok(state)
+    }
+
+    fn quarantined_one(&self, id: MessageId) -> Result<StoredMessage, OperatorError> {
+        let found = self.messages.get(id)?;
+        let held = found.filter(|message| message.state == DeliveryState::Quarantined);
+        held.ok_or(OperatorError::NotQuarantined)
+    }
+
+    fn recipient_ready(&self, message: &StoredMessage) -> Result<(), OperatorError> {
+        let seated = self.sessions.in_root(&message.root)?;
+        let found = seated.iter().find(|rec| rec.id == message.to);
+        let active = found.is_some_and(|rec| rec.status.is_active());
+        let ready = active || is_mailbox(&message.to);
+        if !ready {
+            return Err(OperatorError::RecipientInactive);
+        }
+        let unread = self.messages.unread(message.to.clone())?;
+        if unread >= self.limits.inbox_max {
+            return Err(OperatorError::InboxFull);
+        }
+        Ok(())
+    }
+
+    fn release_message(
+        &self,
+        _grant: &OperatorGrant,
+        id: MessageId,
+    ) -> Result<DeliveryState, OperatorError> {
+        let message = self.quarantined_one(id)?;
+        rules_pass(&message)?;
+        self.recipient_ready(&message)?;
+        let at = self.clock.now();
+        let release = Release { at };
+        let (from, to) = (DeliveryState::Quarantined, DeliveryState::Pending);
+        settled(self.messages.transition(id, from, to, Some(release)))
+    }
+
+    fn drop_message(
+        &self,
+        _grant: &OperatorGrant,
+        id: MessageId,
+    ) -> Result<DeliveryState, OperatorError> {
+        self.quarantined_one(id)?;
+        let (from, to) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        settled(self.messages.transition(id, from, to, None))
+    }
 }
 
 #[cfg(test)]
@@ -791,6 +945,1036 @@ mod tests {
             prop_assert!(terminal_safe(&list));
             prop_assert!(!list.contains('\n'));
             prop_assert!(!list.contains(TOKEN));
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use crate::action_auditor::{
+        ActionAuditError, InboundReview, MessageAuditor, MessageVerdict, OutboundReview,
+    };
+    use crate::auditor::{Reason, ReasonCode};
+    use crate::effects::EffectClass;
+    use crate::hub::error::HubError;
+    use crate::hub::limits::HubLimits;
+    use crate::hub::lineage::{Lineage, RootId, SessionBinding, SessionId};
+    use crate::hub::mailbox::MailboxId;
+    use crate::hub::message::{
+        DeliveryState, MessageId, MessageKind, MessageReach, Recipient, Release, SendRequest, Seq,
+        StoredMessage, VerdictRef,
+    };
+    use crate::hub::operator::{OperatorError, OperatorGrant, ResolveAction};
+    use crate::hub::recv::{RecvPage, RecvRequest};
+    use crate::hub::registry::SessionRegistry;
+    use crate::hub::send::{hash_u64, MessageHub};
+    use crate::hub::session::SessionStatus;
+    use crate::hub::store::{
+        HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, MessageStore,
+        Retention, SessionStore, StoreError,
+    };
+    use crate::leases::{Clock, SimulatedClock};
+    use crate::task::TaskId;
+    use async_trait::async_trait;
+    use chrono::{DateTime, Duration, TimeZone, Utc};
+    use futures::FutureExt;
+    use proptest::prelude::*;
+    use std::collections::{BTreeSet, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use uuid::Uuid;
+
+    const UNIFORM: &str = "no quarantined message with that id";
+    const ORIGINAL_SUBJECT: &str = "original subject";
+    const ORIGINAL_BODY: &str = "original body";
+    const STORED_BODY: &str = "stored redacted body";
+    const PLAIN_KEYS: [&str; 10] = [
+        "body",
+        "from",
+        "from_identity",
+        "id",
+        "in_reply_to",
+        "kind",
+        "relation",
+        "sent_at",
+        "seq",
+        "subject",
+    ];
+
+    fn token() -> String {
+        format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")
+    }
+
+    fn grant() -> OperatorGrant {
+        OperatorGrant::check(true, false).unwrap()
+    }
+
+    fn start() -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000, 0).unwrap()
+    }
+
+    struct Scripted {
+        mode: AtomicU8,
+        calls: AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                mode: AtomicU8::new(0),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn quarantine(&self, on: bool) {
+            self.mode.store(u8::from(on), Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn verdict(&self) -> MessageVerdict {
+            let reasons = vec![Reason::new(ReasonCode::PromptInjection, "rule 9")];
+            match self.mode.load(Ordering::SeqCst) {
+                0 => MessageVerdict::Deliver,
+                _ => MessageVerdict::Quarantine { reasons },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessageAuditor for Scripted {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn review_outbound(
+            &self,
+            _review: &OutboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            Ok(self.verdict())
+        }
+
+        async fn review_inbound(
+            &self,
+            _review: &InboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.verdict())
+        }
+    }
+
+    type Doctor = fn(StoredMessage) -> StoredMessage;
+    type AfterGet = Box<dyn FnOnce() + Send>;
+
+    struct Rigged {
+        inner: Arc<dyn MessageStore>,
+        transition_error: Mutex<Option<fn() -> StoreError>>,
+        get_fails: AtomicBool,
+        doctor: Mutex<Option<Doctor>>,
+        after_get: Mutex<Option<AfterGet>>,
+    }
+
+    impl Rigged {
+        fn over(inner: Arc<dyn MessageStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                transition_error: Mutex::new(None),
+                get_fails: AtomicBool::new(false),
+                doctor: Mutex::new(None),
+                after_get: Mutex::new(None),
+            })
+        }
+    }
+
+    fn disk() -> StoreError {
+        StoreError::Io(std::io::Error::other("disk gone"))
+    }
+
+    fn conflict() -> StoreError {
+        StoreError::Conflict
+    }
+
+    fn not_found() -> StoreError {
+        StoreError::NotFound
+    }
+
+    impl MessageStore for Rigged {
+        fn append(&self, m: StoredMessage) -> Result<Seq, StoreError> {
+            self.inner.append(m)
+        }
+
+        fn get(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
+            if self.get_fails.load(Ordering::SeqCst) {
+                return Err(disk());
+            }
+            let found = self.inner.get(id)?;
+            let hook = self.after_get.lock().unwrap().take();
+            if let Some(run) = hook {
+                run();
+            }
+            Ok(found)
+        }
+
+        fn inbox(
+            &self,
+            to: SessionId,
+            after: Option<Seq>,
+            limit: usize,
+        ) -> Result<Vec<StoredMessage>, StoreError> {
+            let listed = self.inner.inbox(to, after, limit)?;
+            let doctor = *self.doctor.lock().unwrap();
+            let apply = |message: StoredMessage| match doctor {
+                Some(fix) => fix(message),
+                None => message,
+            };
+            Ok(listed.into_iter().map(apply).collect())
+        }
+
+        fn ack(&self, to: SessionId, upto: Seq) -> Result<(), StoreError> {
+            self.inner.ack(to, upto)
+        }
+
+        fn unread(&self, to: SessionId) -> Result<usize, StoreError> {
+            self.inner.unread(to)
+        }
+
+        fn outbound_window(
+            &self,
+            from: SessionId,
+            to: Recipient,
+            bytes: usize,
+        ) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.outbound_window(from, to, bytes)
+        }
+
+        fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError> {
+            self.inner.set_state(id, s)
+        }
+
+        fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.quarantined()
+        }
+
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            let planted = *self.transition_error.lock().unwrap();
+            if let Some(error) = planted {
+                return Err(error());
+            }
+            self.inner.transition(id, from, to, release)
+        }
+
+        fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
+            self.inner.prune(now, policy)
+        }
+    }
+
+    fn stores() -> Vec<(Arc<dyn MessageStore>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        let lock = HubLock::acquire(dir.path()).unwrap();
+        let jsonl: Arc<dyn MessageStore> = Arc::new(JsonlMessageStore::open(&path, &lock).unwrap());
+        let memory: Arc<dyn MessageStore> = Arc::new(InMemoryMessageStore::new());
+        vec![(memory, tempfile::tempdir().unwrap()), (jsonl, dir)]
+    }
+
+    struct Rig {
+        sessions: Arc<InMemorySessionStore>,
+        messages: Arc<dyn MessageStore>,
+        registry: Arc<SessionRegistry>,
+        clock: SimulatedClock,
+        auditor: Arc<Scripted>,
+        root: RootId,
+    }
+
+    impl Rig {
+        fn new(messages: Arc<dyn MessageStore>) -> Self {
+            let sessions = Arc::new(InMemorySessionStore::new());
+            Self {
+                registry: Arc::new(SessionRegistry::new(sessions.clone())),
+                sessions,
+                messages,
+                clock: SimulatedClock::new(start()),
+                auditor: Scripted::new(),
+                root: RootId::mcp(Uuid::from_u128(1)),
+            }
+        }
+
+        fn memory() -> Self {
+            Self::new(Arc::new(InMemoryMessageStore::new()))
+        }
+
+        fn seat_with(&self, name: &str, effect: EffectClass) -> SessionBinding {
+            let mut card = crate::identity::example();
+            card.scope.message_reach = MessageReach::Root;
+            card.scope.max_effect = effect;
+            card.scope.read_paths = Some(Vec::new());
+            let lineage = Lineage::root_child(self.root.clone());
+            let binding = SessionBinding::from_audited(&card, TaskId(name.to_string()), lineage);
+            self.registry
+                .register(&binding, "subtask", start())
+                .unwrap();
+            binding
+        }
+
+        fn seat(&self, name: &str) -> SessionBinding {
+            self.seat_with(name, EffectClass::None)
+        }
+
+        fn hub_over(&self, store: Arc<dyn MessageStore>, limits: HubLimits) -> MessageHub {
+            let auditor: Arc<dyn MessageAuditor> = self.auditor.clone();
+            MessageHub::new(
+                self.sessions.clone(),
+                store,
+                Arc::new(auditor),
+                Arc::new(self.clock.clone()),
+                limits,
+                self.registry.clone(),
+            )
+        }
+
+        fn hub(&self) -> MessageHub {
+            self.hub_over(self.messages.clone(), HubLimits::default())
+        }
+
+        fn end(&self, who: &SessionBinding) {
+            let id = who.session().clone();
+            self.sessions
+                .set_status(id, SessionStatus::Completed, start())
+                .unwrap();
+        }
+
+        fn held(
+            &self,
+            from: &SessionBinding,
+            to: &SessionId,
+            state: DeliveryState,
+            body: &str,
+        ) -> StoredMessage {
+            StoredMessage {
+                id: MessageId::new(),
+                seq: Seq::new(0),
+                from: from.session().clone(),
+                from_identity: from.identity().name().to_string(),
+                to: to.clone(),
+                root: self.root.clone(),
+                kind: MessageKind::Info,
+                subject: "stored subject".to_string(),
+                body: body.to_string(),
+                in_reply_to: None,
+                thread_depth: 0,
+                outbound_verdict: VerdictRef {
+                    log_id: "scripted".to_string(),
+                    content_hash: hash_u64(ORIGINAL_SUBJECT, ORIGINAL_BODY),
+                },
+                state,
+                sent_at: start(),
+                held: vec![ReasonCode::PromptInjection],
+                released: None,
+            }
+        }
+
+        fn park_text(&self, from: &SessionBinding, to: &SessionId, body: &str) -> MessageId {
+            let message = self.held(from, to, DeliveryState::Quarantined, body);
+            let id = message.id;
+            self.messages.append(message).unwrap();
+            id
+        }
+
+        fn park(&self, from: &SessionBinding, to: &SessionBinding) -> MessageId {
+            self.park_text(from, to.session(), STORED_BODY)
+        }
+
+        fn pending(&self, from: &SessionBinding, to: &SessionBinding, body: &str) -> MessageId {
+            let mut message = self.held(from, to.session(), DeliveryState::Pending, body);
+            message.subject = "status".to_string();
+            message.held = Vec::new();
+            message.outbound_verdict.content_hash = hash_u64("status", body);
+            let id = message.id;
+            self.messages.append(message).unwrap();
+            id
+        }
+
+        fn record(&self, id: MessageId) -> StoredMessage {
+            self.messages.get(id).unwrap().unwrap()
+        }
+    }
+
+    fn recv_max(hub: &MessageHub, who: &SessionBinding) -> RecvPage {
+        let request = RecvRequest {
+            max: 20,
+            ..RecvRequest::default()
+        };
+        hub.recv(who, request).now_or_never().unwrap().unwrap()
+    }
+
+    fn release(hub: &MessageHub, id: MessageId) -> Result<DeliveryState, OperatorError> {
+        hub.resolve_quarantine(&grant(), id, ResolveAction::Release)
+    }
+
+    fn drop_it(hub: &MessageHub, id: MessageId) -> Result<DeliveryState, OperatorError> {
+        hub.resolve_quarantine(&grant(), id, ResolveAction::Drop)
+    }
+
+    fn keys_of(page: &RecvPage, index: usize) -> BTreeSet<String> {
+        let shown = serde_json::to_value(&page.messages[index]).unwrap();
+        shown.as_object().unwrap().keys().cloned().collect()
+    }
+
+    fn names(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn release_moves_a_quarantined_message_to_pending_with_the_marker_over_both_stores() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            let id = rig.park(&a, &b);
+            let before = rig.record(id);
+            assert_eq!(release(&hub, id).unwrap(), DeliveryState::Pending);
+            let after = rig.record(id);
+            assert_eq!(after.state, DeliveryState::Pending);
+            assert_eq!(
+                after.released,
+                Some(Release {
+                    at: rig.clock.now()
+                })
+            );
+            assert_eq!(after.held, before.held);
+            assert_eq!(
+                (&after.subject, &after.body),
+                (&before.subject, &before.body)
+            );
+            assert_eq!(rig.messages.unread(b.session().clone()).unwrap(), 1);
+            assert!(rig.messages.quarantined().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn drop_expires_a_quarantined_message_and_leaves_it_undeliverable() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            let id = rig.park(&a, &b);
+            assert_eq!(drop_it(&hub, id).unwrap(), DeliveryState::Expired);
+            let after = rig.record(id);
+            assert_eq!(after.state, DeliveryState::Expired);
+            assert_eq!(after.released, None);
+            assert_eq!(rig.messages.unread(b.session().clone()).unwrap(), 0);
+            let page = recv_max(&hub, &b);
+            assert_eq!((page.messages.len(), page.withheld), (0, 0));
+            assert!(rig.messages.quarantined().unwrap().is_empty());
+            assert_eq!(rig.auditor.calls(), 0);
+        }
+    }
+
+    #[test]
+    fn only_a_quarantined_message_is_resolvable_and_every_refusal_is_uniform() {
+        let states = [
+            DeliveryState::Pending,
+            DeliveryState::Delivered,
+            DeliveryState::Acked,
+            DeliveryState::Withheld,
+            DeliveryState::Expired,
+        ];
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            let mut ids = vec![MessageId::new()];
+            for state in states {
+                let message = rig.held(&a, b.session(), state, STORED_BODY);
+                ids.push(message.id);
+                rig.messages.append(message).unwrap();
+            }
+            for id in ids {
+                let seen = rig.messages.get(id).unwrap();
+                for action in [ResolveAction::Release, ResolveAction::Drop] {
+                    let refused = hub.resolve_quarantine(&grant(), id, action);
+                    assert_eq!(refused.unwrap_err().to_string(), UNIFORM);
+                }
+                assert_eq!(rig.messages.get(id).unwrap(), seen);
+            }
+        }
+    }
+
+    #[test]
+    fn a_rules_block_on_the_stored_text_refuses_the_release_and_the_message_stays_held() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let hub = rig.hub();
+        let leaked = format!("key {}", token());
+        let id = rig.park_text(&a, b.session(), &leaked);
+        let refused = release(&hub, id).unwrap_err();
+        assert!(matches!(&refused, OperatorError::ReleaseRefused(codes) if !codes.is_empty()));
+        assert!(!refused.to_string().contains(&token()));
+        assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+        assert_eq!(rig.record(id).released, None);
+        assert_eq!(drop_it(&hub, id).unwrap(), DeliveryState::Expired);
+    }
+
+    #[test]
+    fn an_inactive_recipient_refuses_the_release_and_a_drop_is_the_remedy() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let hub = rig.hub();
+        let id = rig.park(&a, &b);
+        rig.end(&b);
+        let refused = release(&hub, id).unwrap_err();
+        assert!(matches!(refused, OperatorError::RecipientInactive));
+        assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+        assert_eq!(drop_it(&hub, id).unwrap(), DeliveryState::Expired);
+    }
+
+    #[test]
+    fn a_recipient_without_a_session_record_refuses_the_release() {
+        let rig = Rig::memory();
+        let a = rig.seat("a");
+        let hub = rig.hub();
+        let nobody = SessionId::from_task(TaskId("nobody".to_string()));
+        let id = rig.park_text(&a, &nobody, STORED_BODY);
+        let refused = release(&hub, id).unwrap_err();
+        assert!(matches!(refused, OperatorError::RecipientInactive));
+        assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+    }
+
+    #[test]
+    fn a_full_inbox_refuses_the_release_and_nothing_changes() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let limits = HubLimits {
+            inbox_max: 1,
+            ..HubLimits::default()
+        };
+        let hub = rig.hub_over(rig.messages.clone(), limits);
+        rig.pending(&a, &b, "already waiting");
+        let id = rig.park(&a, &b);
+        let refused = release(&hub, id).unwrap_err();
+        assert!(matches!(refused, OperatorError::InboxFull));
+        assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+        assert_eq!(drop_it(&hub, id).unwrap(), DeliveryState::Expired);
+    }
+
+    #[test]
+    fn a_message_to_a_root_mailbox_releases_without_a_session_record() {
+        let rig = Rig::memory();
+        let a = rig.seat("a");
+        let hub = rig.hub();
+        let mailbox = MailboxId::for_root(&rig.root).unwrap().into_session();
+        let id = rig.park_text(&a, &mailbox, STORED_BODY);
+        assert_eq!(release(&hub, id).unwrap(), DeliveryState::Pending);
+        assert!(rig.record(id).released.is_some());
+    }
+
+    #[test]
+    fn a_store_failure_leaves_the_message_quarantined_and_maps_races_to_the_uniform_error() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let rigged = Rigged::over(rig.messages.clone());
+        let hub = rig.hub_over(rigged.clone(), HubLimits::default());
+        let id = rig.park(&a, &b);
+        let plans: [(fn() -> StoreError, bool); 3] =
+            [(disk, true), (conflict, false), (not_found, false)];
+        for (plan, is_store) in plans {
+            *rigged.transition_error.lock().unwrap() = Some(plan);
+            for action in [ResolveAction::Release, ResolveAction::Drop] {
+                let refused = hub.resolve_quarantine(&grant(), id, action).unwrap_err();
+                assert_eq!(matches!(refused, OperatorError::Store(_)), is_store);
+                assert!(is_store || refused.to_string() == UNIFORM);
+                assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+            }
+        }
+        *rigged.transition_error.lock().unwrap() = None;
+        rigged.get_fails.store(true, Ordering::SeqCst);
+        let unreadable = release(&hub, id).unwrap_err();
+        assert!(matches!(unreadable, OperatorError::Store(_)));
+        assert_eq!(rig.record(id).state, DeliveryState::Quarantined);
+    }
+
+    #[test]
+    fn a_release_that_loses_the_race_to_another_release_delivers_nothing_twice() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let rigged = Rigged::over(rig.messages.clone());
+            let slow = rig.hub_over(rigged.clone(), HubLimits::default());
+            let fast = Arc::new(rig.hub());
+            let id = rig.park(&a, &b);
+            let rival = Arc::clone(&fast);
+            let hook = move || assert!(release(&rival, id).is_ok());
+            *rigged.after_get.lock().unwrap() = Some(Box::new(hook));
+            let lost = release(&slow, id).unwrap_err();
+            assert_eq!(lost.to_string(), UNIFORM);
+            assert_eq!(rig.messages.unread(b.session().clone()).unwrap(), 1);
+            let page = recv_max(&fast, &b);
+            assert_eq!(page.messages.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_release_that_loses_the_race_to_a_drop_stays_dropped_and_a_drop_never_undoes_a_release() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let rigged = Rigged::over(rig.messages.clone());
+            let slow = rig.hub_over(rigged.clone(), HubLimits::default());
+            let fast = Arc::new(rig.hub());
+            let dropped = rig.park(&a, &b);
+            let rival = Arc::clone(&fast);
+            let hook = move || assert!(drop_it(&rival, dropped).is_ok());
+            *rigged.after_get.lock().unwrap() = Some(Box::new(hook));
+            assert_eq!(release(&slow, dropped).unwrap_err().to_string(), UNIFORM);
+            assert_eq!(rig.record(dropped).state, DeliveryState::Expired);
+            assert_eq!(rig.record(dropped).released, None);
+            let released = rig.park(&a, &b);
+            let rival = Arc::clone(&fast);
+            let hook = move || assert!(release(&rival, released).is_ok());
+            *rigged.after_get.lock().unwrap() = Some(Box::new(hook));
+            assert_eq!(drop_it(&slow, released).unwrap_err().to_string(), UNIFORM);
+            assert_eq!(rig.record(released).state, DeliveryState::Pending);
+            assert!(rig.record(released).released.is_some());
+        }
+    }
+
+    #[test]
+    fn concurrent_threads_resolving_one_message_have_exactly_one_winner() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            let id = rig.park(&a, &b);
+            let gate = Barrier::new(8);
+            let wins = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for n in 0..8 {
+                    let (hub, gate, wins) = (&hub, &gate, &wins);
+                    scope.spawn(move || {
+                        gate.wait();
+                        let done = match n % 4 {
+                            0 => drop_it(hub, id),
+                            _ => release(hub, id),
+                        };
+                        wins.fetch_add(usize::from(done.is_ok()), Ordering::SeqCst);
+                    });
+                }
+            });
+            assert_eq!(wins.load(Ordering::SeqCst), 1);
+            let unread = rig.messages.unread(b.session().clone()).unwrap();
+            let state = rig.record(id).state;
+            assert_eq!(unread, usize::from(state == DeliveryState::Pending));
+        }
+    }
+
+    #[test]
+    fn a_released_message_is_delivered_once_without_an_auditor_call_for_a_symmetric_pair() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            rig.auditor.quarantine(true);
+            let id = rig.park(&a, &b);
+            release(&hub, id).unwrap();
+            let page = recv_max(&hub, &b);
+            assert_eq!((page.messages.len(), page.withheld), (1, 0));
+            assert!(page.messages[0].released_by_human);
+            assert_eq!(page.messages[0].id, id);
+            assert_eq!(rig.auditor.calls(), 0);
+            assert_eq!(rig.record(id).state, DeliveryState::Delivered);
+            let again = recv_max(&hub, &b);
+            assert!(again.messages.is_empty());
+            assert!(rig.messages.quarantined().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_released_message_is_delivered_once_without_an_auditor_call_for_an_asymmetric_pair() {
+        let rig = Rig::memory();
+        let a = rig.seat_with("a", EffectClass::None);
+        let b = rig.seat_with("b", EffectClass::Workspace);
+        let hub = rig.hub();
+        rig.auditor.quarantine(true);
+        let id = rig.park(&a, &b);
+        release(&hub, id).unwrap();
+        let page = recv_max(&hub, &b);
+        assert_eq!((page.messages.len(), page.withheld), (1, 0));
+        assert_eq!(rig.auditor.calls(), 0);
+        assert!(page.messages[0].released_by_human);
+    }
+
+    #[test]
+    fn without_the_marker_the_same_stale_hash_is_quarantined_again_for_both_pairs() {
+        let rig = Rig::memory();
+        let a = rig.seat_with("a", EffectClass::None);
+        let same = rig.seat_with("same", EffectClass::None);
+        let above = rig.seat_with("above", EffectClass::Workspace);
+        let hub = rig.hub();
+        rig.auditor.quarantine(true);
+        for (to, calls) in [(&same, 0), (&above, 1)] {
+            let id = rig.pending(&a, to, "fresh");
+            let mut stale = rig.record(id);
+            stale.id = MessageId::new();
+            stale.outbound_verdict.content_hash = 7;
+            rig.messages.append(stale).unwrap();
+            let page = recv_max(&hub, to);
+            assert_eq!((page.messages.len(), page.withheld), (0, 2));
+            assert_eq!(rig.auditor.calls(), calls + 1);
+            rig.auditor.calls.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_marker_on_a_never_held_message_is_ignored_and_the_message_is_judged_normally() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let rigged = Rigged::over(rig.messages.clone());
+        let hub = rig.hub_over(rigged.clone(), HubLimits::default());
+        let forge: Doctor = |mut message| {
+            message.released = Some(Release { at: start() });
+            message.held = Vec::new();
+            message
+        };
+        *rigged.doctor.lock().unwrap() = Some(forge);
+        let fresh = rig.pending(&a, &b, "never held");
+        let page = recv_max(&hub, &b);
+        assert_eq!(page.messages.len(), 1);
+        assert!(!page.messages[0].released_by_human);
+        assert_eq!(keys_of(&page, 0), names(&PLAIN_KEYS));
+        assert_eq!(rig.auditor.calls(), 1);
+        assert_eq!(rig.record(fresh).state, DeliveryState::Delivered);
+        rig.auditor.quarantine(true);
+        rig.pending(&a, &b, "second");
+        let blocked = recv_max(&hub, &b);
+        assert_eq!((blocked.messages.len(), blocked.withheld), (0, 1));
+        assert_eq!(rig.auditor.calls(), 2);
+    }
+
+    #[test]
+    fn a_forged_marker_on_a_stale_hash_never_skips_the_quarantine() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let rigged = Rigged::over(rig.messages.clone());
+        let hub = rig.hub_over(rigged.clone(), HubLimits::default());
+        let forge: Doctor = |mut message| {
+            message.released = Some(Release { at: start() });
+            message.held = Vec::new();
+            message.outbound_verdict.content_hash = 7;
+            message
+        };
+        *rigged.doctor.lock().unwrap() = Some(forge);
+        rig.pending(&a, &b, "stale");
+        let page = recv_max(&hub, &b);
+        assert_eq!((page.messages.len(), page.withheld), (0, 1));
+        assert_eq!(rig.auditor.calls(), 0);
+        assert_eq!(rig.messages.quarantined().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn released_by_human_appears_only_for_released_messages_and_the_key_set_is_otherwise_unchanged()
+    {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let hub = rig.hub();
+        rig.pending(&a, &b, "plain");
+        let plain = recv_max(&hub, &b);
+        assert_eq!(keys_of(&plain, 0), names(&PLAIN_KEYS));
+        let id = rig.park(&a, &b);
+        release(&hub, id).unwrap();
+        let marked = recv_max(&hub, &b);
+        let mut with_flag = PLAIN_KEYS.to_vec();
+        with_flag.push("released_by_human");
+        assert_eq!(keys_of(&marked, 0), names(&with_flag));
+        let shown = serde_json::to_value(&marked.messages[0]).unwrap();
+        assert_eq!(shown["released_by_human"], serde_json::Value::Bool(true));
+        let debug = format!("{:?}", marked.messages[0]);
+        assert!(!debug.contains(STORED_BODY));
+    }
+
+    #[test]
+    fn the_original_text_never_reaches_the_recipient_after_a_release() {
+        for (store, _guard) in stores() {
+            let rig = Rig::new(store);
+            let (a, b) = (rig.seat("a"), rig.seat("b"));
+            let hub = rig.hub();
+            let secret = token();
+            rig.auditor.quarantine(true);
+            rig.pending(&a, &b, &format!("please use {secret} now"));
+            let held = recv_max(&hub, &b);
+            assert_eq!((held.messages.len(), held.withheld), (0, 1));
+            let listed = rig.messages.quarantined().unwrap();
+            assert_eq!(listed.len(), 1);
+            let id = listed[0].id;
+            let calls = rig.auditor.calls();
+            assert_eq!(release(&hub, id).unwrap(), DeliveryState::Pending);
+            let page = recv_max(&hub, &b);
+            assert_eq!(page.messages.len(), 1);
+            let shown = serde_json::to_string(&page).unwrap();
+            assert!(!shown.contains(&secret));
+            let stored = serde_json::to_string(&rig.record(id)).unwrap();
+            assert!(!stored.contains(&secret));
+            assert!(stored.contains("released"));
+            assert!(page.messages[0].released_by_human);
+            assert_eq!(rig.auditor.calls(), calls);
+        }
+    }
+
+    #[test]
+    fn no_writer_other_than_the_release_ever_sets_the_marker() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let hub = rig.hub();
+        let mut forged = rig.held(&a, b.session(), DeliveryState::Expired, "x");
+        forged.released = Some(Release { at: start() });
+        let forged_id = forged.id;
+        rig.messages.append(forged).unwrap();
+        assert_eq!(rig.record(forged_id).released, None);
+        rig.auditor.quarantine(true);
+        let request = SendRequest {
+            to: Recipient::Session {
+                id: b.session().clone(),
+            },
+            kind: MessageKind::Info,
+            subject: "s".to_string(),
+            body: "b".to_string(),
+            in_reply_to: None,
+        };
+        let sent = hub.send(&a, request).now_or_never().unwrap();
+        assert!(matches!(sent, Err(HubError::Quarantined { .. })));
+        rig.pending(&a, &b, "retire me");
+        recv_max(&hub, &b);
+        let listed = rig.messages.quarantined().unwrap();
+        assert_eq!(listed.len(), 2);
+        for message in listed {
+            assert_eq!(message.released, None);
+            assert!(!message.held.is_empty());
+        }
+        rig.messages
+            .set_state(forged_id, DeliveryState::Quarantined)
+            .unwrap();
+        assert_eq!(rig.record(forged_id).released, None);
+    }
+
+    #[test]
+    fn the_rigged_store_forwards_the_calls_the_hub_does_not_make_to_its_inner_store() {
+        let rig = Rig::memory();
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let rigged = Rigged::over(rig.messages.clone());
+        let id = rig.park(&a, &b);
+        assert_eq!(rigged.quarantined().unwrap().len(), 1);
+        rigged.ack(b.session().clone(), Seq::new(1)).unwrap();
+        let window = rigged.outbound_window(a.session().clone(), Recipient::Root, 1024);
+        assert_eq!(window.unwrap().len(), 1);
+        assert_eq!(rigged.prune(start(), &Retention::default()).unwrap(), 0);
+        assert_eq!(rigged.get(id).unwrap().unwrap().id, id);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Release(u8),
+        Drop(u8),
+        RecvDeliver,
+        RecvQuarantine,
+        Arrive,
+        Prune,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Mark {
+        Quarantined,
+        Pending,
+        Delivered,
+        Expired,
+        Gone,
+    }
+
+    struct Entry {
+        id: MessageId,
+        state: Mark,
+        marked: bool,
+        was_held: bool,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let one = prop_oneof![
+            (0u8..16).prop_map(Op::Release),
+            (0u8..16).prop_map(Op::Drop),
+            Just(Op::RecvDeliver),
+            Just(Op::RecvQuarantine),
+            Just(Op::Arrive),
+            Just(Op::Prune),
+        ];
+        proptest::collection::vec(one, 1..14)
+    }
+
+    fn state_of(mark: Mark) -> DeliveryState {
+        match mark {
+            Mark::Quarantined => DeliveryState::Quarantined,
+            Mark::Pending => DeliveryState::Pending,
+            Mark::Delivered => DeliveryState::Delivered,
+            _ => DeliveryState::Expired,
+        }
+    }
+
+    fn pick(model: &[Entry], k: u8) -> usize {
+        usize::from(k) % model.len()
+    }
+
+    fn settle(hub: &MessageHub, model: &mut [Entry], op: Op) -> Result<(), TestCaseError> {
+        let target = match op {
+            Op::Release(k) | Op::Drop(k) => Some(pick(model, k)),
+            _ => None,
+        };
+        if let Some(at) = target {
+            let allowed = model[at].state == Mark::Quarantined;
+            let releasing = matches!(op, Op::Release(_));
+            let id = model[at].id;
+            let result = match releasing {
+                true => release(hub, id),
+                false => drop_it(hub, id),
+            };
+            prop_assert_eq!(result.is_ok(), allowed);
+            if allowed {
+                model[at].marked = releasing;
+                model[at].state = if releasing {
+                    Mark::Pending
+                } else {
+                    Mark::Expired
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn run_plan(rig: &Rig, plan: &[Op]) -> Result<(), TestCaseError> {
+        let (a, b) = (rig.seat("a"), rig.seat("b"));
+        let hub = rig.hub();
+        let mut model: Vec<Entry> = Vec::new();
+        for _ in 0..3 {
+            let id = rig.park(&a, &b);
+            model.push(Entry {
+                id,
+                state: Mark::Quarantined,
+                marked: false,
+                was_held: true,
+            });
+        }
+        for op in plan {
+            step(rig, &hub, (&a, &b), &mut model, *op)?;
+            check(rig, &model)?;
+        }
+        Ok(())
+    }
+
+    fn step(
+        rig: &Rig,
+        hub: &MessageHub,
+        seats: (&SessionBinding, &SessionBinding),
+        model: &mut Vec<Entry>,
+        op: Op,
+    ) -> Result<(), TestCaseError> {
+        let (a, b) = seats;
+        match op {
+            Op::Release(_) | Op::Drop(_) => settle(hub, model, op)?,
+            Op::Arrive => {
+                let id = rig.pending(a, b, "arrival");
+                model.push(Entry {
+                    id,
+                    state: Mark::Pending,
+                    marked: false,
+                    was_held: false,
+                });
+            }
+            Op::Prune => {
+                let later = start() + Duration::days(30);
+                rig.messages.prune(later, &Retention::default()).unwrap();
+                for entry in model.iter_mut() {
+                    if entry.state != Mark::Quarantined {
+                        entry.state = Mark::Gone;
+                    }
+                }
+            }
+            Op::RecvDeliver | Op::RecvQuarantine => {
+                let quarantining = matches!(op, Op::RecvQuarantine);
+                rig.auditor.quarantine(quarantining);
+                let known: HashSet<MessageId> = model.iter().map(|e| e.id).collect();
+                let pending = model.iter().filter(|e| e.state == Mark::Pending);
+                let (marked, plain) = pending.fold((0, 0), |(m, p), e| match e.marked {
+                    true => (m + 1, p),
+                    false => (m, p + 1),
+                });
+                let page = recv_max(hub, b);
+                let flagged = page.messages.iter().filter(|m| m.released_by_human);
+                prop_assert_eq!(flagged.count(), marked);
+                let (delivered, withheld) = (page.messages.len(), page.withheld);
+                prop_assert_eq!(delivered, marked + if quarantining { 0 } else { plain });
+                prop_assert_eq!(withheld, if quarantining { plain } else { 0 });
+                for entry in model.iter_mut() {
+                    let was_pending = entry.state == Mark::Pending;
+                    let retired = was_pending && !entry.marked && quarantining;
+                    let next = if retired {
+                        Mark::Expired
+                    } else {
+                        Mark::Delivered
+                    };
+                    entry.state = if was_pending { next } else { entry.state };
+                }
+                for held in rig.messages.quarantined().unwrap() {
+                    if !known.contains(&held.id) {
+                        model.push(Entry {
+                            id: held.id,
+                            state: Mark::Quarantined,
+                            marked: false,
+                            was_held: true,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check(rig: &Rig, model: &[Entry]) -> Result<(), TestCaseError> {
+        for entry in model {
+            let found = rig.messages.get(entry.id).unwrap();
+            if entry.state == Mark::Gone {
+                prop_assert!(found.is_none());
+            } else {
+                let record = found.unwrap();
+                prop_assert_eq!(record.state, state_of(entry.state));
+                prop_assert_eq!(record.released.is_some(), entry.marked);
+                prop_assert!(entry.was_held || record.released.is_none());
+                let pending_marked = record.state == DeliveryState::Pending && entry.marked;
+                prop_assert!(!pending_marked || entry.was_held);
+            }
+        }
+        let quarantined = rig.messages.quarantined().unwrap();
+        let listed: HashSet<MessageId> = quarantined.iter().map(|m| m.id).collect();
+        let expected: HashSet<MessageId> = model
+            .iter()
+            .filter(|e| e.state == Mark::Quarantined)
+            .map(|e| e.id)
+            .collect();
+        prop_assert_eq!(listed, expected);
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn random_interleavings_follow_the_hand_written_transition_table(plan in ops()) {
+            for (store, _guard) in stores() {
+                run_plan(&Rig::new(store), &plan)?;
+            }
         }
     }
 }
