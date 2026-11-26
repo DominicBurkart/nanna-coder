@@ -2584,7 +2584,20 @@ pub(crate) fn model_facing_registry(
     layers: ModelFacingLayers,
 ) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
     let registry = ServedTools::registry(workspace, identity, layers.hub.as_ref())?;
-    Ok(with_model_facing_layers(registry, layers))
+    let hub = identity.and(layers.hub.as_ref());
+    let sink = hub.and_then(|hub| hub.activity());
+    let registry = with_model_facing_layers(registry, layers);
+    Ok(attach_activity(registry, sink))
+}
+
+fn attach_activity(
+    registry: crate::tools::ToolRegistry,
+    sink: Option<Arc<crate::hub::activity_sink::ActivitySink>>,
+) -> crate::tools::ToolRegistry {
+    match sink {
+        Some(sink) => registry.with_activity_sink(sink),
+        None => registry,
+    }
 }
 
 pub(crate) fn with_model_facing_layers(
@@ -4845,6 +4858,71 @@ mod identity_tests {
         assert!(hub_names(&build(&manager, Some(&without_names))).is_empty());
         drop(guard);
         assert!(hub_names(&build(&manager, Some(&card))).is_empty());
+    }
+
+    fn logging_runtime(
+        store: Arc<dyn crate::hub::store::ActivityStore>,
+    ) -> crate::hub::runtime::HubRuntime {
+        let auditor = crate::action_auditor::FailClosedMessageAuditor::new(
+            crate::action_auditor::ModelMessageAuditor::new(MockProvider::new(vec![]), "m"),
+        );
+        let shared: Arc<dyn crate::action_auditor::MessageAuditor> = Arc::new(auditor);
+        let mut runtime = crate::hub::runtime::HubRuntime::assemble(
+            Arc::new(crate::hub::store::InMemorySessionStore::new()),
+            Arc::new(crate::hub::store::InMemoryMessageStore::new()),
+            crate::hub::runtime::tests::constant_auditors(shared),
+            Arc::new(crate::leases::SystemClock),
+        );
+        runtime.log_activity_to(Some(store));
+        runtime
+    }
+
+    #[tokio::test]
+    async fn test_the_shared_constructor_logs_tool_calls_only_for_a_live_bound_session() {
+        use crate::hub::message::MessageReach;
+        let _path = crate::test_support::hold_path_async().await;
+        let repo = repo_with_origin("git@github.com:example/repo.git");
+        let task_id = TaskId::new();
+        let workspace = TaskWorkspace::create(repo.path(), &task_id.0, "HEAD").unwrap();
+        let queued = queued(repo.path());
+        let card = hub_card(MessageReach::Root);
+        let store = Arc::new(crate::hub::store::InMemoryActivityStore::new());
+        let runtime = logging_runtime(store.clone());
+        let manager = runtime.attach(TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS));
+        let table = runtime.router_weak().upgrade().unwrap().table();
+        let session = SessionId::from_task(task_id.clone());
+        let count =
+            || crate::hub::store::ActivityStore::for_session(&*store, session.clone(), usize::MAX);
+        let logged = || count().unwrap().len();
+        let build = |manager: &TaskManager, card: Option<&AgentIdentity>| {
+            let layers = manager.runner.model_facing_layers(&task_id, &queued, card);
+            let mut registry = model_facing_registry(&workspace, card, layers).unwrap();
+            registry.register(Box::new(crate::tools::EchoTool));
+            registry
+        };
+        let args = serde_json::json!({"message": "hi", "session": "forged"});
+        let registry = build(&manager, Some(&card));
+        registry.execute("echo", args.clone()).await.unwrap();
+        assert_eq!(logged(), 0);
+        let proof = SessionBinding::from_audited(
+            &card,
+            task_id.clone(),
+            Lineage::root_child(RootId::legacy(task_id.clone())),
+        );
+        let guard = table.enter(proof);
+        let registry = build(&manager, Some(&card));
+        registry.execute("echo", args.clone()).await.unwrap();
+        assert_eq!(logged(), 1);
+        let bare = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let registry = build(&bare, Some(&card));
+        registry.execute("echo", args.clone()).await.unwrap();
+        let registry = build(&manager, None);
+        registry.execute("echo", args.clone()).await.unwrap();
+        assert_eq!(logged(), 1);
+        drop(guard);
+        let registry = build(&manager, Some(&card));
+        registry.execute("echo", args).await.unwrap();
+        assert_eq!(logged(), 1);
     }
 
     fn shipped_card(name: &str) -> AgentIdentity {
