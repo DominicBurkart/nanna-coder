@@ -1,5 +1,6 @@
 //! The six model-facing hub tools and their registration.
 
+use super::activity_sink::ActivitySink;
 use super::error::HubError;
 use super::lineage::{SessionBinding, SessionId};
 use super::message::{MessageReach, SendRequest, Seq};
@@ -64,12 +65,23 @@ pub fn declared_parameters(tool: &str) -> &'static [&'static str] {
 pub struct HubBinding {
     router: Arc<HubRouter>,
     session: Arc<SessionBinding>,
+    activity: Option<Arc<ActivitySink>>,
 }
 
 impl HubBinding {
     /// Bind `session` to the hub behind `router`.
     pub fn new(router: Arc<HubRouter>, session: Arc<SessionBinding>) -> Self {
-        Self { router, session }
+        let activity = router.activity_sink(&session);
+        Self {
+            router,
+            session,
+            activity,
+        }
+    }
+
+    /// The sink that logs this session's tool calls, when the hub has an activity log open.
+    pub(crate) fn activity(&self) -> Option<Arc<ActivitySink>> {
+        self.activity.clone()
     }
 }
 

@@ -4,6 +4,7 @@ use crate::action_auditor::{
 use crate::auditor::{Reason, ReasonCode};
 use crate::effects::EffectClass;
 use crate::escalation::{Escalation, EscalationLog, EscalationSource, Escalator, Severity};
+use crate::hub::activity_sink::ActivitySink;
 use crate::identity::AgentIdentity;
 use crate::leases::LeaseContext;
 use crate::policy::RepoPolicy;
@@ -122,6 +123,7 @@ pub struct ToolRegistry {
     action_log: Mutex<Vec<ActionAuditLogEntry>>,
     action_escalator: Option<Arc<Escalator>>,
     pr_binding: crate::pr_binding::PrBindingCell,
+    activity: Option<Arc<ActivitySink>>,
 }
 
 struct ProductionHold {
@@ -168,6 +170,7 @@ impl ToolRegistry {
             action_log: Mutex::new(Vec::new()),
             action_escalator: None,
             pr_binding: crate::pr_binding::PrBindingCell::new(),
+            activity: None,
         }
     }
 
@@ -193,6 +196,24 @@ impl ToolRegistry {
     pub fn with_action_escalator(mut self, escalator: Arc<Escalator>) -> Self {
         self.action_escalator = Some(escalator);
         self
+    }
+
+    /// Log every call of a registered tool, once its outcome is known, to `sink`: the tool's
+    /// registered name, the names its own schema declares and the kind and length of each
+    /// value, never a value. A call of an unregistered name is never logged, and a failed
+    /// append never changes a result.
+    pub fn with_activity_sink(mut self, sink: Arc<ActivitySink>) -> Self {
+        self.activity = Some(sink);
+        self
+    }
+
+    fn log_activity(&self, tool: &dyn Tool, args: Option<Value>, result: &ToolResult<Value>) {
+        if let (Some(sink), Some(args)) = (&self.activity, args) {
+            let properties = tool.definition().function.parameters.properties;
+            let names: Vec<String> = properties.unwrap_or_default().into_keys().collect();
+            let known: Vec<&str> = names.iter().map(String::as_str).collect();
+            sink.record(tool.name(), &args, &known, result.is_ok());
+        }
     }
 
     #[cfg(test)]
@@ -349,21 +370,9 @@ impl ToolRegistry {
         let outcome = match (self.tools.get(name), &self.identity) {
             (Some(tool), _) => {
                 let class = tool.effect_class();
-                self.check_production_hold(class)?;
-                if class >= EffectClass::Repository || self.inspects_content(name) {
-                    if let Err(denied) = self.review_action(name, &args, class).await {
-                        if denied.is_escalation() {
-                            self.escalate_denial(name, &denied).await;
-                        }
-                        return Err(ToolError::ActionDenied(denied));
-                    }
-                }
-                let result = tool.execute(args).await;
-                if let Err(ToolError::ActionDenied(denied)) = &result {
-                    if denied.is_escalation() {
-                        self.escalate_denial(name, denied).await;
-                    }
-                }
+                let kept = self.activity.is_some().then(|| args.clone());
+                let result = self.run_reviewed(name, tool.as_ref(), class, args).await;
+                self.log_activity(tool.as_ref(), kept, &result);
                 result
             }
             (None, Some(identity)) => Err(ToolError::ScopeDenied(ScopeDenial {
@@ -387,6 +396,31 @@ impl ToolRegistry {
             _ => {}
         }
         outcome
+    }
+
+    async fn run_reviewed(
+        &self,
+        name: &str,
+        tool: &dyn Tool,
+        class: EffectClass,
+        args: Value,
+    ) -> ToolResult<Value> {
+        self.check_production_hold(class)?;
+        if class >= EffectClass::Repository || self.inspects_content(name) {
+            if let Err(denied) = self.review_action(name, &args, class).await {
+                if denied.is_escalation() {
+                    self.escalate_denial(name, &denied).await;
+                }
+                return Err(ToolError::ActionDenied(denied));
+            }
+        }
+        let result = tool.execute(args).await;
+        if let Err(ToolError::ActionDenied(denied)) = &result {
+            if denied.is_escalation() {
+                self.escalate_denial(name, denied).await;
+            }
+        }
+        result
     }
 
     fn check_production_hold(&self, class: EffectClass) -> ToolResult<()> {
