@@ -2310,14 +2310,8 @@ impl TaskRunner {
             Some((route, audited, audited_ref)) => {
                 let layers = self.model_facing_layers(&task_id, &queued, Some(audited.identity()));
                 workspace.bind_sandbox_pr(&layers.subject);
-                registry_for(&workspace, Some(audited.identity()))
+                pi_grant(&workspace, audited.identity(), layers.hub.as_ref())
                     .map_err(pi_bind_failed("ScopeError"))
-                    .map(|registry| {
-                        crate::harness_adapter::ScopedCapabilities::scope(
-                            registry,
-                            audited.identity(),
-                        )
-                    })
                     .and_then(|scoped| {
                         crate::harness_adapter::ResolvedAgent::resolve(
                             audited.allowed(),
@@ -2538,14 +2532,42 @@ fn network_policy_for(identity: Option<&AgentIdentity>) -> NetworkPolicy {
     }
 }
 
-fn registry_for(
-    workspace: &TaskWorkspace,
-    identity: Option<&AgentIdentity>,
-) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
-    match identity {
-        Some(identity) => workspace.build_tool_registry_for(identity),
-        None => Ok(workspace.build_tool_registry().read_only_unscoped()),
+/// The one place that decides which tools a task is offered. The pi grant and
+/// the registry the broker serves are both built here, from the same inputs, so
+/// the two cannot drift apart.
+///
+/// Hub tools are included only when the task carries a hub binding (a live hub
+/// and a binding-table entry, which only an audited task has) and the identity
+/// has a message reach above none and names the tools.
+pub(crate) struct ServedTools;
+
+impl ServedTools {
+    pub(crate) fn registry(
+        workspace: &TaskWorkspace,
+        identity: Option<&AgentIdentity>,
+        hub: Option<&crate::hub::tools::HubBinding>,
+    ) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
+        let mut registry = match identity {
+            Some(identity) => workspace.build_tool_registry_for(identity)?,
+            None => workspace.build_tool_registry().read_only_unscoped(),
+        };
+        if let (Some(hub), Some(identity)) = (hub, identity) {
+            crate::hub::tools::register(&mut registry, hub, identity);
+        }
+        Ok(registry)
     }
+}
+
+use crate::harness_adapter::ScopedCapabilities;
+
+fn pi_grant(
+    workspace: &TaskWorkspace,
+    identity: &AgentIdentity,
+    hub: Option<&crate::hub::tools::HubBinding>,
+) -> Result<ScopedCapabilities, crate::scope::ScopeError> {
+    let registry = ServedTools::registry(workspace, Some(identity), hub)?;
+    let scoped = ScopedCapabilities::scope(registry, identity);
+    Ok(scoped)
 }
 
 pub(crate) struct ModelFacingLayers {
@@ -2561,10 +2583,7 @@ pub(crate) fn model_facing_registry(
     identity: Option<&AgentIdentity>,
     layers: ModelFacingLayers,
 ) -> Result<crate::tools::ToolRegistry, crate::scope::ScopeError> {
-    let mut registry = registry_for(workspace, identity)?;
-    if let (Some(hub), Some(identity)) = (&layers.hub, identity) {
-        crate::hub::tools::register(&mut registry, hub, identity);
-    }
+    let registry = ServedTools::registry(workspace, identity, layers.hub.as_ref())?;
     let hub = identity.and(layers.hub.as_ref());
     let sink = hub.and_then(|hub| hub.activity());
     let registry = with_model_facing_layers(registry, layers);
@@ -4786,7 +4805,7 @@ mod identity_tests {
         found
     }
 
-    fn hub_runtime() -> crate::hub::runtime::HubRuntime {
+    pub(super) fn hub_runtime() -> crate::hub::runtime::HubRuntime {
         let auditor = crate::action_auditor::FailClosedMessageAuditor::new(
             crate::action_auditor::ModelMessageAuditor::new(MockProvider::new(vec![]), "m"),
         );
@@ -9516,6 +9535,7 @@ mod pi_route_tests {
     use crate::agent::AgentState;
     use crate::auditor::{AuditContext, AuditLog, Gate, RuleAuditor, SpawnRequest, TaskSummary};
     use crate::harness_adapter::{PiExecutor, PiLaunch, PiLimits, PiRoute, PiRunOutcome};
+    use crate::hub::message::MessageReach;
     use crate::identity::{DevLoop, IdentityCatalog};
     use crate::test_support::FakePodman;
 
@@ -10179,6 +10199,107 @@ mod pi_route_tests {
         let bound = BoundIdentity::Audited(audited);
         assert_eq!(bound.identity(), &identity);
         assert_eq!(bound.into_identity(), identity);
+    }
+
+    #[tokio::test]
+    async fn test_only_an_audited_identity_gets_a_session_binding() {
+        let allowed = allowed_for(LABEL).await;
+        let identity = allowed.identity().clone();
+        let task = TaskId::new();
+        let lineage = || Lineage::root_child(RootId::legacy(task.clone()));
+        let audited = BoundIdentity::Audited(AuditedIdentity::split(allowed, &|_| None).1);
+        assert!(session_binding(&Some(audited), &task, lineage()).is_some());
+        let unaudited = Some(BoundIdentity::Unaudited(identity));
+        assert!(session_binding(&unaudited, &task, lineage()).is_none());
+        assert!(session_binding(&None, &task, lineage()).is_none());
+    }
+
+    async fn allowed_hub_card(reach: MessageReach, named: bool) -> Allowed {
+        let mut context = context_with(false, None);
+        let mut card = context.catalog().get("rust-implementer").unwrap().clone();
+        card.scope.message_reach = reach;
+        if named {
+            for name in crate::hub::tools::HUB_TOOLS {
+                card.scope.tools.push(name.parse().unwrap());
+            }
+        }
+        context = context_with_card(card);
+        let request = SpawnRequest {
+            parent_task: TaskSummary::new("parent-1", "Fix bug X", LABEL),
+            identity: "rust-implementer".to_string(),
+            subtask: "Add a regression test.".to_string(),
+            dev_loop: DevLoop::Inner,
+            requested_effect: EffectClass::Workspace,
+        };
+        let gate = Gate::new(RuleAuditor::new(), AuditLog::in_memory());
+        gate.check(request, &context).await.unwrap()
+    }
+
+    fn context_with_card(card: AgentIdentity) -> AuditContext {
+        const FIXTURES: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/identities/global"
+        );
+        let base = IdentityCatalog::load(FIXTURES).unwrap();
+        let auditor = base.get("auditor").unwrap().clone();
+        let mut cards: Vec<AgentIdentity> = Vec::new();
+        for identity in base.iter() {
+            if identity.name() != "rust-implementer" {
+                cards.push(identity.clone());
+            }
+        }
+        cards.push(card);
+        let catalog = IdentityCatalog::from_identities(cards);
+        AuditContext::new(catalog, auditor).unwrap()
+    }
+
+    async fn hub_granted(reach: MessageReach, named: bool, live: bool) -> Vec<String> {
+        let _fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(Mode::Complete);
+        let mut manager = manager_with(&stub);
+        if live {
+            manager = super::identity_tests::hub_runtime().attach(manager);
+        }
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let allowed = allowed_hub_card(reach, named).await;
+        let path = repo.path().to_path_buf();
+        let branch = "HEAD".to_string();
+        let model = "gemma4:e4b".to_string();
+        let spawned = manager.submit_spawn(allowed, path, branch, model, 20, provider());
+        let id = spawned.await.unwrap();
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let completed = matches!(task.status, TaskStatus::Completed { .. });
+        assert!(completed);
+        let mut granted = stub.launches().remove(0).capability_names;
+        granted.retain(|name| crate::hub::tools::HUB_TOOLS.contains(&name.as_str()));
+        granted.sort();
+        granted
+    }
+
+    fn all_hub_tools() -> Vec<String> {
+        let mut all: Vec<String> = Vec::new();
+        for name in crate::hub::tools::HUB_TOOLS {
+            all.push(name.to_string());
+        }
+        all.sort();
+        all
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_on_a_live_hub_with_a_root_card_is_granted_the_hub_tools() {
+        let granted = hub_granted(MessageReach::Root, true, true).await;
+        assert_eq!(granted, all_hub_tools());
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_is_granted_no_hub_tool_without_reach_names_or_a_live_hub() {
+        let none: Vec<String> = Vec::new();
+        let no_reach = hub_granted(MessageReach::None, true, true).await;
+        let no_names = hub_granted(MessageReach::Root, false, true).await;
+        let no_hub = hub_granted(MessageReach::Root, true, false).await;
+        assert_eq!(no_reach, none);
+        assert_eq!(no_names, none);
+        assert_eq!(no_hub, none);
     }
 }
 

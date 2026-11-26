@@ -217,6 +217,10 @@ const TOOLS: Target = Target {
     owner: "tools",
     members: &["register"],
 };
+const SERVED: Target = Target {
+    owner: "ServedTools",
+    members: &["registry"],
+};
 const RESTORE: Target = Target {
     owner: "TaskManager",
     members: &["restore_within_sessions"],
@@ -270,8 +274,35 @@ fn the_router_and_the_production_auditors_are_built_only_by_the_hub_runtime() {
 #[test]
 fn the_hub_tools_are_registered_only_by_the_shared_constructor() {
     let found = sorted(production(TOOLS));
-    let expected = set(&["task.rs: model_facing_registry: tools::register"]);
+    let expected = set(&["task.rs: registry: tools::register"]);
     assert_eq!(found, expected);
+}
+
+#[test]
+fn the_pi_grant_and_the_served_registry_are_built_by_the_same_helper() {
+    assert_eq!(
+        sorted(production(SERVED)),
+        set(&[
+            "task.rs: model_facing_registry: ServedTools::registry",
+            "task.rs: pi_grant: ServedTools::registry",
+        ]),
+        "the grant and the served registry must both come from ServedTools::registry"
+    );
+}
+
+#[test]
+fn the_workspace_registry_is_built_only_inside_the_shared_helper() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/task.rs");
+    let text = fs::read_to_string(path).unwrap();
+    let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+    assert_eq!(production.matches(".build_tool_registry_for(").count(), 1);
+    assert_eq!(production.matches(".build_tool_registry()").count(), 1);
+}
+
+#[test]
+fn the_helper_scanner_finds_a_second_caller_of_the_helper() {
+    let found = sorted(scan("fn a() { ServedTools::registry(w, i, h); }", SERVED));
+    assert_eq!(found, set(&["a: ServedTools::registry"]));
 }
 
 #[test]

@@ -10,6 +10,7 @@ pub mod lineage;
 pub mod mailbox;
 pub mod message;
 pub mod notice;
+pub mod operator;
 pub mod oracle;
 pub mod quarantine_sink;
 pub mod query;
