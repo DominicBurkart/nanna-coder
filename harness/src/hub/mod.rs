@@ -1,3 +1,6 @@
+pub mod activity_sink;
+#[cfg(test)]
+mod activity_tool_tests;
 pub mod doorbell;
 pub mod error;
 pub mod index;
