@@ -195,7 +195,13 @@ const REGISTRY: Target = Target {
 };
 const RUNTIME: Target = Target {
     owner: "HubRuntime",
-    members: &["open", "open_with", "assemble"],
+    members: &[
+        "open",
+        "open_with_doorbell",
+        "open_with",
+        "assemble_with",
+        "assemble",
+    ],
 };
 const ROUTER: Target = Target {
     owner: "HubRouter",
@@ -233,7 +239,7 @@ fn sorted(mut items: Vec<String>) -> Vec<String> {
 fn exactly_one_session_registry_is_built_in_production_and_it_is_the_hub_runtimes() {
     assert_eq!(
         sorted(production(REGISTRY)),
-        set(&["hub/runtime.rs: assemble: SessionRegistry::new"]),
+        set(&["hub/runtime.rs: assemble_with: SessionRegistry::new"]),
         "a SessionRegistry is built outside HubRuntime::assemble: the hub and the TaskManager must share one"
     );
 }
@@ -243,8 +249,8 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
     assert_eq!(
         sorted(production(RUNTIME)),
         set(&[
-            "hub/runtime.rs: open: HubRuntime::open_with",
-            "hub/runtime.rs: open_with: HubRuntime::assemble",
+            "hub/runtime.rs: open: HubRuntime::open_with_doorbell",
+            "hub/runtime.rs: open_with_doorbell: HubRuntime::open_with",
             "main.rs: build_mcp_task_manager_with_budget: HubRuntime::open",
         ]),
         "delegate and backlog-sync must stay hub-less; pin any new opener deliberately"
@@ -255,11 +261,11 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
 fn the_router_and_the_production_auditors_are_built_only_by_the_hub_runtime() {
     assert_eq!(
         sorted(production(ROUTER)),
-        set(&["hub/runtime.rs: assemble: HubRouter::new"])
+        set(&["hub/runtime.rs: assemble_with: HubRouter::new"])
     );
     assert_eq!(
         sorted(production(AUDITORS)),
-        set(&["hub/runtime.rs: open: ProductionAuditors::new"])
+        set(&["hub/runtime.rs: open_with_doorbell: ProductionAuditors::new"])
     );
 }
 

@@ -1,3 +1,4 @@
+use super::doorbell::{Doorbell, NoopDoorbell};
 use super::error::HubError;
 use super::idle::IdleBudget;
 use super::limits::{HubLimits, Windows};
@@ -84,6 +85,7 @@ pub struct MessageHub {
     pub(super) idle: IdleBudget,
     pub(super) cursors: CursorTable,
     pub(super) notices: NoticeTable,
+    doorbell: Arc<dyn Doorbell>,
 }
 
 impl std::fmt::Debug for MessageHub {
@@ -213,6 +215,7 @@ impl MessageHub {
             idle: IdleBudget::default(),
             cursors: CursorTable::new(),
             notices: NoticeTable::default(),
+            doorbell: Arc::new(NoopDoorbell),
         }
     }
 
@@ -255,6 +258,28 @@ impl MessageHub {
     pub fn with_quarantine_sink(mut self, sink: Arc<dyn QuarantineSink>) -> Self {
         self.sink = sink;
         self
+    }
+
+    /// Ring `doorbell` after a message is stored for a recipient. The ring carries the
+    /// recipient's unread count only and is skipped for a recipient inside `msg_recv`, which
+    /// polls and returns on arrival. The default is a [`NoopDoorbell`].
+    pub fn with_doorbell(mut self, doorbell: Arc<dyn Doorbell>) -> Self {
+        self.doorbell = doorbell;
+        self
+    }
+
+    fn ring_all(&self, to: &[SessionRecord]) {
+        for rec in to {
+            self.ring_one(&rec.id);
+        }
+    }
+
+    fn ring_one(&self, id: &SessionId) {
+        let waiting = self.waiters.is_waiting(id);
+        let unread = self.messages.unread(id.clone());
+        if let (Ok(count), false) = (unread, waiting) {
+            self.doorbell.ring(id, count);
+        }
     }
 
     fn windows(&self) -> std::sync::MutexGuard<'_, Windows> {
@@ -591,6 +616,7 @@ impl MessageHub {
                     .map(|rec| self.record(sender, &req, rec, &draft))
                     .collect();
                 let ids = self.append_all(stored)?;
+                self.ring_all(&prepared.to);
                 let notices = self.notices.take(sender.session());
                 Ok(SendReceipt {
                     recipients: ids.len(),
@@ -625,7 +651,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use uuid::Uuid;
 
     fn token() -> String {
@@ -1675,6 +1701,7 @@ mod tests {
         inner: InMemoryMessageStore,
         fail_at: AtomicUsize,
         appends: AtomicUsize,
+        unreadable: AtomicBool,
     }
 
     impl MessageStore for Failing {
@@ -1695,6 +1722,10 @@ mod tests {
             self.inner.ack(to, upto)
         }
         fn unread(&self, to: SessionId) -> Result<usize, StoreError> {
+            let written = self.appends.load(Ordering::SeqCst) > 0;
+            if written && self.unreadable.load(Ordering::SeqCst) {
+                return Err(StoreError::Io(std::io::Error::other("disk gone")));
+            }
             self.inner.unread(to)
         }
         fn outbound_window(&self, from: SessionId, to: Recipient, bytes: usize) -> Page {
@@ -1726,6 +1757,7 @@ mod tests {
             inner: InMemoryMessageStore::new(),
             fail_at: AtomicUsize::new(99),
             appends: AtomicUsize::new(0),
+            unreadable: AtomicBool::new(false),
         };
         assert!(store.quarantined().unwrap().is_empty());
         let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
@@ -1739,6 +1771,7 @@ mod tests {
             inner: InMemoryMessageStore::new(),
             fail_at: AtomicUsize::new(99),
             appends: AtomicUsize::new(0),
+            unreadable: AtomicBool::new(false),
         };
         let who = SessionId::from_task(TaskId("w".into()));
         assert!(store.get(MessageId::new()).unwrap().is_none());
@@ -1753,6 +1786,7 @@ mod tests {
             inner: InMemoryMessageStore::new(),
             fail_at: AtomicUsize::new(3),
             appends: AtomicUsize::new(0),
+            unreadable: AtomicBool::new(false),
         });
         let world = World::new(failing.clone());
         let a = world.bind("a", None, MessageReach::Root);
@@ -2246,5 +2280,214 @@ mod tests {
         let other_root = RootId::mcp(Uuid::from_u128(9));
         let elsewhere = world.bind_in(&other_root, "z", None, MessageReach::None);
         assert!(hub.set_note(&elsewhere, "ok").is_ok());
+    }
+
+    struct Bell {
+        store: Arc<dyn MessageStore>,
+        rings: Mutex<Vec<(SessionId, usize)>>,
+        stored: Mutex<Vec<usize>>,
+    }
+
+    impl Bell {
+        fn new(store: Arc<dyn MessageStore>) -> Arc<Self> {
+            Arc::new(Self {
+                store,
+                rings: Mutex::new(Vec::new()),
+                stored: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn rings(&self) -> Vec<(SessionId, usize)> {
+            self.rings.lock().unwrap().clone()
+        }
+
+        fn stored(&self) -> Vec<usize> {
+            self.stored.lock().unwrap().clone()
+        }
+    }
+
+    impl Doorbell for Bell {
+        fn ring(&self, to: &SessionId, unread: usize) {
+            let visible = self.store.inbox(to.clone(), None, 100).unwrap_or_default();
+            self.stored.lock().unwrap().push(visible.len());
+            self.rings.lock().unwrap().push((to.clone(), unread));
+        }
+    }
+
+    fn ringing(world: &World, auditor: Arc<Scripted>) -> (MessageHub, Arc<Bell>) {
+        let bell = Bell::new(world.messages.clone());
+        let hub = world.hub(auditor).with_doorbell(bell.clone());
+        (hub, bell)
+    }
+
+    fn kids(world: &World, parent: &SessionBinding) -> Vec<SessionBinding> {
+        let mut found = Vec::new();
+        for n in 0..3 {
+            found.push(world.bind(&format!("k{n}"), Some(parent), MessageReach::Root));
+        }
+        found
+    }
+
+    fn pair(world: &World) -> (SessionBinding, SessionBinding) {
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        (a, b)
+    }
+
+    fn failing_store(fail_at: usize, unreadable: bool) -> Arc<Failing> {
+        Arc::new(Failing {
+            inner: InMemoryMessageStore::new(),
+            fail_at: AtomicUsize::new(fail_at),
+            appends: AtomicUsize::new(0),
+            unreadable: AtomicBool::new(unreadable),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_delivered_message_rings_its_recipient_with_the_recipients_unread_count() {
+        for (store, _, _guard) in stores() {
+            let world = World::new(store);
+            let (a, b) = pair(&world);
+            let (hub, bell) = ringing(&world, Scripted::deliver());
+            hub.send(&a, req(&b, "one")).await.unwrap();
+            hub.send(&a, req(&b, "two")).await.unwrap();
+            let to = b.session().clone();
+            assert_eq!(bell.rings(), [(to.clone(), 1), (to, 2)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ring_happens_after_the_message_is_stored() {
+        for (store, _, _guard) in stores() {
+            let world = World::new(store);
+            let (a, b) = pair(&world);
+            let (hub, bell) = ringing(&world, Scripted::deliver());
+            hub.send(&a, req(&b, "one")).await.unwrap();
+            hub.send(&a, req(&b, "two")).await.unwrap();
+            assert_eq!(bell.stored(), [1, 2]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_rings_each_recipient_once_with_its_own_count_and_never_the_sender() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let children = kids(&world, &a);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        hub.send(&a, req(&children[0], "first")).await.unwrap();
+        hub.send(&a, group(Recipient::Children)).await.unwrap();
+        let rings = bell.rings();
+        assert_eq!(rings.len(), 4);
+        let latest: std::collections::HashMap<SessionId, usize> = rings.into_iter().collect();
+        assert_eq!(latest[children[0].session()], 2);
+        assert_eq!(latest[children[1].session()], 1);
+        assert_eq!(latest[children[2].session()], 1);
+        assert!(!latest.contains_key(a.session()));
+    }
+
+    #[tokio::test]
+    async fn a_quarantine_and_a_block_ring_nobody_and_store_no_pending_message() {
+        let code = ReasonCode::SecretLeak;
+        for verdict in [quarantine(code), block(code)] {
+            let world = World::memory();
+            let (a, b) = pair(&world);
+            let (hub, bell) = ringing(&world, Scripted::new(verdict));
+            let err = hub.send(&a, req(&b, "no")).await.unwrap_err();
+            assert!(!matches!(err, HubError::Store(_)), "{err:?}");
+            assert!(bell.rings().is_empty());
+            assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_rings_nobody_even_when_part_of_a_fan_out_was_written() {
+        let world = World::new(failing_store(3, false));
+        let a = world.bind("a", None, MessageReach::Root);
+        let _children = kids(&world, &a);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        let err = hub.send(&a, group(Recipient::Children)).await.unwrap_err();
+        assert!(matches!(err, HubError::Store(_)), "{err:?}");
+        assert!(bell.rings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recipient_inside_a_wait_is_not_rung_and_is_rung_again_after_it_leaves() {
+        let world = World::memory();
+        let (a, b) = pair(&world);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        let waiting = hub.enter_wait(b.session());
+        hub.send(&a, req(&b, "one")).await.unwrap();
+        assert!(bell.rings().is_empty());
+        assert_eq!(world.messages.unread(b.session().clone()).unwrap(), 1);
+        drop(waiting);
+        hub.send(&a, req(&b, "two")).await.unwrap();
+        assert_eq!(bell.rings(), [(b.session().clone(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn only_the_waiting_recipient_of_a_fan_out_is_skipped() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let children = kids(&world, &a);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        let _waiting = hub.enter_wait(children[1].session());
+        hub.send(&a, group(Recipient::Children)).await.unwrap();
+        let rung: HashSet<SessionId> = bell.rings().into_iter().map(|ring| ring.0).collect();
+        assert_eq!(rung.len(), 2);
+        assert!(!rung.contains(children[1].session()));
+    }
+
+    #[test]
+    fn a_session_is_waiting_while_any_wait_of_it_is_alive() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let hub = world.hub(Scripted::deliver());
+        let id = b.session();
+        assert!(!hub.waiters.is_waiting(id));
+        let first = hub.enter_wait(id);
+        let second = hub.enter_wait(id);
+        assert!(hub.waiters.is_waiting(id));
+        drop(first);
+        assert!(hub.waiters.is_waiting(id));
+        drop(second);
+        assert!(!hub.waiters.is_waiting(id));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_count_changes_neither_the_receipt_nor_the_store_and_rings_nobody() {
+        let failing = failing_store(99, true);
+        let world = World::new(failing.clone());
+        let (a, b) = pair(&world);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        let receipt = hub.send(&a, req(&b, "kept")).await.unwrap();
+        assert_eq!((receipt.recipients, receipt.ids.len()), (1, 1));
+        assert!(bell.rings().is_empty());
+        let stored = failing.get(receipt.ids[0]).unwrap().unwrap();
+        assert_eq!(stored.state, DeliveryState::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_ringing_hub_gives_the_same_receipt_and_stored_message_as_a_silent_one() {
+        let mut outcomes = Vec::new();
+        for ring in [false, true] {
+            let world = World::memory();
+            let (a, b) = pair(&world);
+            let hub = world.hub(Scripted::deliver());
+            let bell = Bell::new(world.messages.clone());
+            let hub = if ring { hub.with_doorbell(bell) } else { hub };
+            let receipt = hub.send(&a, req(&b, "same")).await.unwrap();
+            let stored = world.messages.get(receipt.ids[0]).unwrap().unwrap();
+            outcomes.push((receipt.recipients, receipt.notices.items.len(), stored.body));
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
+    fn the_ring_signature_is_a_session_and_a_count_and_nothing_else() {
+        let ring: fn(&Bell, &SessionId, usize) = <Bell as Doorbell>::ring;
+        let to = SessionId::from_task(TaskId("w".to_string()));
+        let bell = Bell::new(Arc::new(InMemoryMessageStore::new()));
+        ring(&bell, &to, 9);
+        assert_eq!(bell.rings(), [(to, 9)]);
     }
 }
