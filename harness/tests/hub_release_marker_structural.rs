@@ -15,8 +15,11 @@ const MUTATORS: &[&str] = &[
     "as_deref_mut",
 ];
 const WRITERS: &[(&str, &str)] = &[("hub/store/messages.rs", "resolve")];
-const RELEASE_BUILDERS: &[(&str, &str)] = &[];
-const TRANSITION_CALLERS: &[(&str, &str)] = &[];
+const RELEASE_BUILDERS: &[(&str, &str)] = &[("hub/operator.rs", "release_message")];
+const TRANSITION_CALLERS: &[(&str, &str)] = &[
+    ("hub/operator.rs", "drop_message"),
+    ("hub/operator.rs", "release_message"),
+];
 
 fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
@@ -228,7 +231,7 @@ fn no_macro_in_production_code_mentions_the_marker() {
 }
 
 #[test]
-fn no_production_code_builds_a_release_or_calls_the_transition_yet() {
+fn only_the_operator_resolvers_build_a_release_or_call_the_transition() {
     let all = production();
     assert_eq!(pairs(&all, builders_of), expected(RELEASE_BUILDERS));
     assert_eq!(pairs(&all, transitions_of), expected(TRANSITION_CALLERS));
