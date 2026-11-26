@@ -50,19 +50,20 @@ fn sites(needle: &str) -> Vec<String> {
 }
 
 fn type_name(ty: &syn::Type) -> String {
-    match ty {
-        syn::Type::Reference(found) => format!("&{}", type_name(&found.elem)),
-        syn::Type::Path(found) => {
-            let parts: Vec<String> = found
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            parts.join("::")
-        }
-        _ => "other".to_string(),
+    let mut name = "other".to_string();
+    if let syn::Type::Reference(found) = ty {
+        name = format!("&{}", type_name(&found.elem));
     }
+    if let syn::Type::Path(found) = ty {
+        let parts: Vec<String> = found
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        name = parts.join("::");
+    }
+    name
 }
 
 fn signature(sig: &syn::Signature) -> Vec<String> {
