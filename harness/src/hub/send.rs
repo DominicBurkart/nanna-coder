@@ -1,4 +1,5 @@
 use super::error::HubError;
+use super::idle::IdleBudget;
 use super::limits::{HubLimits, Windows};
 use super::lineage::{SessionBinding, SessionId};
 use super::message::{
@@ -74,6 +75,7 @@ pub struct MessageHub {
     windows: Mutex<Windows>,
     pub(super) registry: Arc<SessionRegistry>,
     pub(super) waiters: Waiters,
+    pub(super) idle: IdleBudget,
     pub(super) cursors: CursorTable,
     pub(super) notices: NoticeTable,
 }
@@ -201,6 +203,7 @@ impl MessageHub {
             windows: Mutex::new(Windows::default()),
             registry,
             waiters: Waiters::default(),
+            idle: IdleBudget::default(),
             cursors: CursorTable::new(),
             notices: NoticeTable::default(),
         }
