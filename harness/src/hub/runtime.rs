@@ -1,5 +1,6 @@
 //! The production assembly of the message hub: the stores, the one session registry and the hub.
 
+use super::doorbell::{Doorbell, NoopDoorbell};
 use super::oracle::SystemGit;
 use super::quarantine_sink::EscalationQuarantineSink;
 use super::registry::SessionRegistry;
@@ -91,6 +92,7 @@ pub struct HubOpen {
     pub provider: Arc<dyn ModelProvider>,
     pub model: String,
     pub plane: EscalationPlane,
+    pub doorbell: Arc<dyn Doorbell>,
 }
 
 impl HubOpen {
@@ -100,7 +102,15 @@ impl HubOpen {
             provider,
             model: model.to_string(),
             plane,
+            doorbell: Arc::new(NoopDoorbell),
         }
+    }
+
+    /// Ring `doorbell` after every delivered message; without this the hub rings a
+    /// [`NoopDoorbell`].
+    pub fn with_doorbell(mut self, doorbell: Arc<dyn Doorbell>) -> Self {
+        self.doorbell = doorbell;
+        self
     }
 }
 
@@ -247,6 +257,7 @@ impl HubRuntime {
             provider,
             model,
             plane,
+            doorbell,
         } = open;
         let sink: Arc<dyn QuarantineSink> = Arc::new(EscalationQuarantineSink::from_plane(&plane));
         let factory: AuditorFactory = Box::new(move |sessions, messages, table| {
@@ -262,7 +273,7 @@ impl HubRuntime {
             );
             Arc::new(auditors)
         });
-        HubRuntime::open_with(paths, factory, Arc::new(SystemClock), sink)
+        HubRuntime::open_with(paths, factory, Arc::new(SystemClock), sink, doorbell)
     }
 
     pub(crate) fn open_with(
@@ -270,13 +281,15 @@ impl HubRuntime {
         auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
         sink: Arc<dyn QuarantineSink>,
+        doorbell: Arc<dyn Doorbell>,
     ) -> Self {
         match open_stores(paths) {
             Ok((sessions, messages, mut locks)) => {
                 let env = std::env::var(super::store::ACTIVITY_PATH_ENV).ok();
                 let activity = open_activity(paths, env.as_deref(), &mut locks);
+                let bell = doorbell;
                 let mut runtime =
-                    HubRuntime::assemble_with_sink(sessions, messages, auditors, clock, sink);
+                    HubRuntime::assemble_with_sink(sessions, messages, auditors, clock, sink, bell);
                 if let Some(parts) = runtime.parts.as_mut() {
                     parts._locks = locks;
                 }
@@ -298,7 +311,8 @@ impl HubRuntime {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let sink: Arc<dyn QuarantineSink> = Arc::new(super::send::NoopQuarantineSink);
-        Self::assemble_with_sink(sessions, messages, auditors, clock, sink)
+        let bell: Arc<dyn Doorbell> = Arc::new(NoopDoorbell);
+        Self::assemble_with_sink(sessions, messages, auditors, clock, sink, bell)
     }
 
     pub(crate) fn assemble_with_sink(
@@ -307,6 +321,7 @@ impl HubRuntime {
         auditors: AuditorFactory,
         clock: Arc<dyn Clock>,
         sink: Arc<dyn QuarantineSink>,
+        doorbell: Arc<dyn Doorbell>,
     ) -> Self {
         let table = BindingTable::new();
         let auditors = auditors(&sessions, &messages, &table);
@@ -321,6 +336,7 @@ impl HubRuntime {
             Arc::clone(&registry),
             sink,
         );
+        let hub = hub.with_doorbell(doorbell);
         Self {
             parts: Some(Parts {
                 registry,
@@ -690,6 +706,87 @@ pub(crate) mod tests {
         let given = seen.lock().unwrap().clone().unwrap();
         assert!(Arc::ptr_eq(&given, &router.table()));
         assert!(Arc::ptr_eq(&router.hub(), &runtime.hub().unwrap()));
+    }
+
+    #[derive(Default)]
+    struct Tally(std::sync::Mutex<Vec<usize>>);
+
+    impl Doorbell for Tally {
+        fn ring(&self, _to: &super::super::lineage::SessionId, unread: usize) {
+            self.0.lock().unwrap().push(unread);
+        }
+    }
+
+    fn seat(runtime: &HubRuntime, name: &str) -> SessionBinding {
+        let lineage = Lineage::root_child(RootId::mcp(uuid::Uuid::from_u128(5)));
+        let mut card = crate::identity::example();
+        card.scope.message_reach = crate::hub::message::MessageReach::Root;
+        let task = crate::task::TaskId(name.to_string());
+        let binding = SessionBinding::from_audited(&card, task, lineage);
+        let registry = runtime.registry().unwrap();
+        registry.register(&binding, "subtask", Utc::now()).unwrap();
+        binding
+    }
+
+    fn mail(to: &SessionBinding) -> crate::hub::message::SendRequest {
+        crate::hub::message::SendRequest {
+            to: crate::hub::message::Recipient::Session {
+                id: to.session().clone(),
+            },
+            kind: crate::hub::message::MessageKind::Info,
+            subject: "status".to_string(),
+            body: "hello".to_string(),
+            in_reply_to: None,
+        }
+    }
+
+    fn rules() -> AuditorFactory {
+        constant_auditors(Arc::new(crate::action_auditor::RuleMessageAuditor::new()))
+    }
+
+    fn assembled(tally: &Arc<Tally>) -> HubRuntime {
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let messages = Arc::new(InMemoryMessageStore::new());
+        let bell = tally.clone();
+        let sink: Arc<dyn QuarantineSink> = Arc::new(super::super::send::NoopQuarantineSink);
+        let clock = Arc::new(SystemClock);
+        HubRuntime::assemble_with_sink(sessions, messages, rules(), clock, sink, bell)
+    }
+
+    #[tokio::test]
+    async fn an_assembled_runtime_rings_the_doorbell_it_was_given_after_a_delivery() {
+        let tally = Arc::new(Tally::default());
+        let runtime = assembled(&tally);
+        let (a, b) = (seat(&runtime, "a"), seat(&runtime, "b"));
+        runtime.hub().unwrap().send(&a, mail(&b)).await.unwrap();
+        assert_eq!(*tally.0.lock().unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn an_opened_runtime_rings_the_doorbell_it_was_given_and_the_default_rings_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let tally = Arc::new(Tally::default());
+        let (clock, bell) = (Arc::new(SystemClock), tally.clone());
+        let sink: Arc<dyn QuarantineSink> = Arc::new(super::super::send::NoopQuarantineSink);
+        let runtime = HubRuntime::open_with(&paths(dir.path()), rules(), clock, sink, bell);
+        let (a, b) = (seat(&runtime, "a"), seat(&runtime, "b"));
+        runtime.hub().unwrap().send(&a, mail(&b)).await.unwrap();
+        assert_eq!(*tally.0.lock().unwrap(), [1]);
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let messages = Arc::new(InMemoryMessageStore::new());
+        let clock = Arc::new(SystemClock);
+        let quiet = HubRuntime::assemble(sessions, messages, rules(), clock);
+        let (c, d) = (seat(&quiet, "c"), seat(&quiet, "d"));
+        quiet.hub().unwrap().send(&c, mail(&d)).await.unwrap();
+        assert_eq!(*tally.0.lock().unwrap(), [1]);
+    }
+
+    #[test]
+    fn a_doorbell_given_through_hub_open_builds_an_available_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let tally = Arc::new(Tally::default());
+        let opened = HubRuntime::open(&paths(dir.path()), opening().with_doorbell(tally));
+        assert!(opened.is_available());
     }
 
     #[test]

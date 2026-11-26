@@ -22,6 +22,10 @@ impl Waiters {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    pub(super) fn is_waiting(&self, id: &SessionId) -> bool {
+        self.lock().get(id).is_some_and(|waiter| waiter.count > 0)
+    }
 }
 
 /// Keeps a session `WaitingOnMessages` while any blocking `recv` of that session is alive.

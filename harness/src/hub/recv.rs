@@ -3376,6 +3376,31 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct Tally(std::sync::Mutex<Vec<usize>>);
+
+    impl crate::hub::doorbell::Doorbell for Tally {
+        fn ring(&self, _to: &SessionId, unread: usize) {
+            self.0.lock().unwrap().push(unread);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_session_inside_a_blocking_recv_does_not_ring_but_one_after_it_does() {
+        let (world, a, b, gate) = waiting_world();
+        let tally = Arc::new(Tally::default());
+        let hub = world.gated(&gate).with_doorbell(tally.clone());
+        let mut waiting = call(&hub, &b, 30);
+        assert!(parked(&mut waiting));
+        hub.send(&a, send_to(&b, "m1")).await.unwrap();
+        assert!(tally.0.lock().unwrap().is_empty());
+        gate.release(1);
+        let page = finished(waiting).unwrap();
+        assert_eq!(bodies(&page), ["m1"]);
+        hub.send(&a, send_to(&b, "m2")).await.unwrap();
+        assert_eq!(*tally.0.lock().unwrap(), [2]);
+    }
+
     fn blocking(code: ReasonCode) -> Arc<Recorder> {
         Recorder::new(Say::Verdict(block(code)))
     }
