@@ -68,6 +68,8 @@ impl Default for RecvRequest {
 
 /// One delivered message as the recipient's model sees it. Every agent-authored string is
 /// fenced as untrusted data and escaped; `Debug` prints sizes, never text.
+/// `released_by_human` is serialised only when true: a human released this message from
+/// quarantine and it is delivered as stored, not reviewed again.
 #[derive(Clone, Serialize)]
 pub struct RenderedMessage {
     pub id: MessageId,
@@ -80,6 +82,12 @@ pub struct RenderedMessage {
     pub sent_at: DateTime<Utc>,
     pub subject: String,
     pub body: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub released_by_human: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl fmt::Debug for RenderedMessage {
@@ -150,6 +158,11 @@ fn known_sender(rec: &SessionRecord) -> RecipientScope {
         read_paths: rec.read_paths.for_sender(),
         ..scope_of(rec)
     }
+}
+
+fn released_marker_valid(message: &StoredMessage) -> bool {
+    let marked = message.released.is_some() && !message.held.is_empty();
+    marked && message.state == DeliveryState::Pending
 }
 
 fn fence_of(label: FenceLabel, text: &str, cap: usize) -> String {
@@ -283,6 +296,9 @@ impl MessageHub {
         message: &StoredMessage,
         sender: RecipientScope,
     ) -> Result<Decision, HubError> {
+        if released_marker_valid(message) {
+            return Ok(Decision::Deliver);
+        }
         let covered =
             message.outbound_verdict.content_hash == hash_u64(&message.subject, &message.body);
         let bound = BoundVerdict {
@@ -395,6 +411,7 @@ impl MessageHub {
                 SUBJECT_RENDER_CAP,
             ),
             body: fence_of(FenceLabel::AgentMessage, &message.body, body_cap),
+            released_by_human: released_marker_valid(message),
         })
     }
 
