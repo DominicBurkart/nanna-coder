@@ -1109,7 +1109,7 @@ Dependencies and known limits:
 - **Backlog roots are shared per issue.** `RootId::Backlog { repo, issue }` has no run discriminator, so two runs on the same issue share a root and, once §5 exists, can see each other's sessions and messages. This is intended: the issue is the unit of work.
 - **Registry failures (#1069).** `register` failing refuses the spawn; later status writes are best effort. A failed terminal write leaves the record active until the next restore re-registers it or the orphan sweep (section 3.3) closes it, or the root is pruned; a session with no live task cannot read its inbox.
 - **Single process:** the hub covers one nanna host process. Multi-process sharing is out of scope (§4, single writer).
-- **#962 must carry `TaskId` and `SessionBinding`** into `Broker::for_agent`. Today the broker knows only `Allowed` and `ResolvedAgent`.
+- **Pi path (#1075).** The binding reaches the broker through the registry: each hub tool holds the host's `Arc<SessionBinding>`, entered in `TaskManager::run` and removed on every exit path. `Broker::for_agent` takes no binding parameter. The pi grant is computed from the same registry the broker serves, hub tools included, because one helper (`ServedTools::registry`) builds both, so `bind_workspace` accepts it; a card whose reach is `none`, or that does not name a hub tool, is granted none. Unaudited, `delegate` and backlog-sync tasks have no binding entry and get no hub tools.
 
 ---
 

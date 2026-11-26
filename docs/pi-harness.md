@@ -197,6 +197,15 @@ capability satisfies the identity's tool patterns and effect ceiling
 tests cover the same-name exploit, different `paths`/`read_paths`, and a
 deliberately widened grant.
 
+The grant and the registry the broker serves are built by one helper
+(`ServedTools::registry`), so they cannot drift. Hub tools (`msg_*`,
+`sessions_*`) are in both when the hub is live, the task is audited with a
+binding-table entry, the card's message reach is above `none` and the card
+names them. They are effect `None`, so the default broker policy serves them.
+`registry_matches` stays strict: a tool offered but not granted, or granted but
+not offered, refuses the bind. `msg_recv` can hold the broker's serial lock for
+up to 60 s while it waits.
+
 ## Runtime handshake
 
 A runtime that silently ignores a lockdown flag fails open, and
