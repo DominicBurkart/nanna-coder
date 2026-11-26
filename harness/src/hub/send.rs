@@ -129,6 +129,7 @@ struct Draft {
     state: DeliveryState,
     subject: String,
     body: String,
+    held: Vec<ReasonCode>,
 }
 
 pub(super) fn quarantined_text(text: &str, codes: &[ReasonCode]) -> String {
@@ -353,6 +354,8 @@ impl MessageHub {
             outbound_verdict: draft.verdict.clone(),
             state: draft.state,
             sent_at: self.clock.now(),
+            held: draft.held.clone(),
+            released: None,
         }
     }
 
@@ -490,6 +493,7 @@ impl MessageHub {
             state: DeliveryState::Quarantined,
             subject: quarantined_text(&req.subject, &codes),
             body: quarantined_text(&req.body, &codes),
+            held: codes.clone(),
         };
         let stored: Vec<StoredMessage> = prepared
             .to
@@ -565,6 +569,7 @@ impl MessageHub {
                     state: DeliveryState::Pending,
                     subject: req.subject.clone(),
                     body: req.body.clone(),
+                    held: Vec::new(),
                 };
                 let stored: Vec<StoredMessage> = prepared
                     .to
@@ -1309,6 +1314,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn quarantined_sends_record_their_hold_codes_on_both_paths_and_no_marker() {
+        for (store, _path, _guard) in stores() {
+            let world = World::new(store);
+            let a = world.bind("a", None, MessageReach::Root);
+            let b = world.bind("b", None, MessageReach::Root);
+            let hub = world.hub(Scripted::new(quarantine(ReasonCode::PromptInjection)));
+            hub.send(&a, req(&b, "first")).await.unwrap_err();
+            let gate_codes = vec![ReasonCode::SecretLeak, ReasonCode::Other];
+            hub.quarantine_send(&a, &req(&b, "second"), gate_codes.clone())
+                .unwrap();
+            let listed = world.messages.quarantined().unwrap();
+            let held: Vec<Vec<ReasonCode>> = listed.iter().map(|m| m.held.clone()).collect();
+            assert_eq!(held, [vec![ReasonCode::PromptInjection], gate_codes]);
+            assert!(listed.iter().all(|m| m.released.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delivered_send_carries_no_hold_and_no_marker() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        let hub = world.hub(Scripted::deliver());
+        let receipt = hub.send(&a, req(&b, "fine")).await.unwrap();
+        let stored = world.messages.get(receipt.ids[0]).unwrap().unwrap();
+        assert_eq!(stored.state, DeliveryState::Pending);
+        assert!(stored.held.is_empty() && stored.released.is_none());
+        assert!(world.messages.quarantined().unwrap().is_empty());
+    }
+
     struct Capture(Mutex<Vec<QuarantineEvent>>);
 
     impl QuarantineSink for Capture {
@@ -1653,9 +1689,34 @@ mod tests {
         fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError> {
             self.inner.set_state(id, s)
         }
+        fn quarantined(&self) -> Page {
+            self.inner.quarantined()
+        }
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<crate::hub::message::Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            self.inner.transition(id, from, to, release)
+        }
         fn prune(&self, now: chrono::DateTime<Utc>, policy: &Retention) -> Count {
             self.inner.prune(now, policy)
         }
+    }
+
+    #[test]
+    fn the_failing_store_forwards_the_listing_and_the_transition() {
+        let store = Failing {
+            inner: InMemoryMessageStore::new(),
+            fail_at: AtomicUsize::new(99),
+            appends: AtomicUsize::new(0),
+        };
+        assert!(store.quarantined().unwrap().is_empty());
+        let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        let result = store.transition(MessageId::new(), quarantined, expired, None);
+        assert!(matches!(result, Err(StoreError::NotFound)));
     }
 
     #[test]

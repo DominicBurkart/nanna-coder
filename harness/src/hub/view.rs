@@ -2547,6 +2547,8 @@ mod tests {
             },
             state,
             sent_at: at(1),
+            held: Vec::new(),
+            released: None,
         }
     }
 
@@ -2737,10 +2739,37 @@ mod tests {
             self.1.pass()?;
             self.0.set_state(id, s)
         }
+        fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError> {
+            self.1.pass()?;
+            self.0.quarantined()
+        }
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<crate::hub::message::Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            self.1.pass()?;
+            self.0.transition(id, from, to, release)
+        }
         fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
             self.1.pass()?;
             self.0.prune(now, policy)
         }
+    }
+
+    #[test]
+    fn the_flaky_message_wrapper_forwards_the_listing_and_the_transition_until_its_gate_closes() {
+        let open = FlakyMessages(InMemoryMessageStore::new(), Gate::never());
+        assert!(open.quarantined().unwrap().is_empty());
+        let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        let moved = open.transition(MessageId::new(), quarantined, expired, None);
+        assert!(matches!(moved, Err(StoreError::NotFound)));
+        let closed = FlakyMessages(InMemoryMessageStore::new(), Gate::from(0));
+        assert!(matches!(closed.quarantined(), Err(StoreError::Locked)));
+        let refused = closed.transition(MessageId::new(), quarantined, expired, None);
+        assert!(matches!(refused, Err(StoreError::Locked)));
     }
 
     #[test]

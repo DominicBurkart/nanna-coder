@@ -1,5 +1,6 @@
 use super::lineage::{RootId, SessionId};
 use super::notice::Notices;
+use crate::auditor::ReasonCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -283,8 +284,25 @@ pub struct VerdictRef {
     pub content_hash: u64,
 }
 
+/// Host-written proof that a human released a quarantined message. Only
+/// `MessageStore::transition` can attach it to a record.
+///
+/// ```
+/// use harness::hub::message::Release;
+///
+/// let release = Release { at: chrono::Utc::now() };
+/// let json = serde_json::to_string(&release).unwrap();
+/// assert_eq!(serde_json::from_str::<Release>(&json).unwrap(), release);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub at: DateTime<Utc>,
+}
+
 /// One message addressed to one session. Fan-out is one record per
-/// recipient. This is the one place message bodies are stored, so `Debug`
+/// recipient. `held` lists the reason codes of the hold on a quarantined
+/// message (never text); `released` is present only on a message a human
+/// released. This is the one place message bodies are stored, so `Debug`
 /// prints sizes and ids, never subject, body or sender-chosen text.
 ///
 /// ```
@@ -308,6 +326,8 @@ pub struct VerdictRef {
 ///     outbound_verdict: VerdictRef { log_id: "v".into(), content_hash: 1 },
 ///     state: DeliveryState::Pending,
 ///     sent_at: Utc::now(),
+///     held: vec![],
+///     released: None,
 /// };
 /// assert!(!format!("{message:?}").contains("secret"));
 /// ```
@@ -327,6 +347,10 @@ pub struct StoredMessage {
     pub outbound_verdict: VerdictRef,
     pub state: DeliveryState,
     pub sent_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<ReasonCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<Release>,
 }
 
 impl fmt::Debug for StoredMessage {
@@ -341,6 +365,8 @@ impl fmt::Debug for StoredMessage {
             .field("thread_depth", &self.thread_depth)
             .field("state", &self.state)
             .field("sent_at", &self.sent_at)
+            .field("held", &self.held)
+            .field("released", &self.released.is_some())
             .field("subject_bytes", &self.subject.len())
             .field("body_bytes", &self.body.len())
             .finish_non_exhaustive()
@@ -399,6 +425,8 @@ mod tests {
             },
             state: DeliveryState::Pending,
             sent_at: Utc::now(),
+            held: Vec::new(),
+            released: None,
         }
     }
 
@@ -434,6 +462,41 @@ mod tests {
             serde_json::from_str::<StoredMessage>(&json).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn a_message_without_hold_or_marker_serializes_without_the_new_keys() {
+        let json = serde_json::to_value(stored()).unwrap();
+        let keys = json.as_object().unwrap();
+        assert!(!keys.contains_key("held") && !keys.contains_key("released"));
+        assert_eq!(keys.len(), 14);
+    }
+
+    #[test]
+    fn hold_codes_and_the_marker_round_trip_and_old_json_loads_without_them() {
+        let mut message = stored();
+        message.held = vec![ReasonCode::SecretLeak, ReasonCode::CrossScopeSteering];
+        message.released = Some(Release { at: Utc::now() });
+        let json = serde_json::to_value(&message).unwrap();
+        let codes = serde_json::json!(["secret_leak", "cross_scope_steering"]);
+        assert_eq!(json["held"], codes);
+        let back: StoredMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, message);
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("held");
+        old.as_object_mut().unwrap().remove("released");
+        let loaded: StoredMessage = serde_json::from_value(old).unwrap();
+        assert!(loaded.held.is_empty() && loaded.released.is_none());
+    }
+
+    #[test]
+    fn debug_of_a_held_message_shows_codes_and_whether_it_was_released_never_text() {
+        let mut message = stored();
+        message.held = vec![ReasonCode::SecretLeak];
+        let debug = format!("{message:?}");
+        assert!(debug.contains("held: [SecretLeak]"), "{debug}");
+        assert!(debug.contains("released: false"), "{debug}");
+        assert!(!debug.contains("SECRET"), "{debug}");
     }
 
     #[test]

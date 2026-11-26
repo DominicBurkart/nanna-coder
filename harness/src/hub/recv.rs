@@ -404,12 +404,20 @@ impl MessageHub {
         state: DeliveryState,
         codes: &[ReasonCode],
     ) -> Result<(), HubError> {
+        let quarantining = state == DeliveryState::Quarantined;
+        let held = if quarantining {
+            codes.to_vec()
+        } else {
+            Vec::new()
+        };
         let copy = StoredMessage {
             id: MessageId::new(),
             seq: Seq::new(0),
             subject: quarantined_text(&message.subject, codes),
             body: quarantined_text(&message.body, codes),
             state,
+            held,
+            released: None,
             ..message.clone()
         };
         let id = copy.id;
@@ -418,7 +426,7 @@ impl MessageHub {
             let _ = self.messages.set_state(id, DeliveryState::Expired);
             return Err(error.into());
         }
-        if state == DeliveryState::Quarantined {
+        if quarantining {
             let event = QuarantineEvent {
                 ids: vec![id],
                 from: message.from.clone(),
@@ -717,6 +725,20 @@ mod tests {
                 return Err(disk());
             }
             self.inner.set_state(id, s)
+        }
+
+        fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.quarantined()
+        }
+
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<crate::hub::message::Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            self.inner.transition(id, from, to, release)
         }
 
         fn prune(
@@ -1135,6 +1157,8 @@ mod tests {
             },
             state,
             sent_at: start(),
+            held: Vec::new(),
+            released: None,
         }
     }
 
@@ -1451,6 +1475,54 @@ mod tests {
                 let again = hub.recv(&b, RecvRequest::default()).await.unwrap();
                 assert_eq!((again.messages.len(), again.withheld), (0, 0));
             }
+        }
+    }
+
+    #[test]
+    fn the_flaky_store_forwards_the_listing_and_the_transition_to_its_inner_store() {
+        let flaky = Flaky::new();
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let mut parked = stored(&a, &b, "s", "b", DeliveryState::Quarantined);
+        parked.held = vec![ReasonCode::Other];
+        let id = parked.id;
+        flaky.append(parked).unwrap();
+        assert_eq!(flaky.quarantined().unwrap().len(), 1);
+        let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        let moved = flaky.transition(id, quarantined, expired, None).unwrap();
+        assert_eq!(moved.state, expired);
+        assert!(flaky.quarantined().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_quarantine_keeps_its_hold_codes_and_a_withhold_keeps_none() {
+        let cases = [
+            (
+                Say::Verdict(quarantine(ReasonCode::CrossScopeSteering)),
+                DeliveryState::Quarantined,
+                vec![ReasonCode::CrossScopeSteering],
+            ),
+            (
+                Say::Verdict(block(ReasonCode::PromptInjection)),
+                DeliveryState::Withheld,
+                Vec::new(),
+            ),
+            (
+                Say::Fail,
+                DeliveryState::Quarantined,
+                vec![ReasonCode::ModelFailure],
+            ),
+        ];
+        for (say, state, held) in cases {
+            let world = World::memory();
+            let (a, b) = (world.seat("a"), world.seat("b"));
+            let hub = world.hub(Recorder::new(say));
+            world.put(&a, &b, "please look");
+            hub.recv(&b, RecvRequest::default()).await.unwrap();
+            let copies = world.everything_from(&a);
+            let copy = copies.last().unwrap();
+            assert_eq!((copy.state, &copy.held), (state, &held));
+            assert!(copy.released.is_none());
         }
     }
 
