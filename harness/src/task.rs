@@ -10301,6 +10301,85 @@ mod pi_route_tests {
         assert_eq!(no_names, none);
         assert_eq!(no_hub, none);
     }
+
+    struct Hubbed {
+        _fake: FakePodman,
+        _repo: tempfile::TempDir,
+        stub: Arc<Stub>,
+        manager: TaskManager,
+        table: Arc<crate::hub::router::BindingTable>,
+        id: TaskId,
+    }
+
+    async fn hubbed(mode: Mode) -> Hubbed {
+        let fake = FakePodman::install_async(None).await;
+        let stub = Stub::new(mode);
+        let runtime = super::identity_tests::hub_runtime();
+        let table = runtime.router_weak().upgrade().unwrap().table();
+        let manager = runtime.attach(manager_with(&stub));
+        let repo = repo_with_origin("https://github.com/example/repo.git");
+        let allowed = allowed_hub_card(MessageReach::Root, true).await;
+        let path = repo.path().to_path_buf();
+        let model = "gemma4:e4b".to_string();
+        let spawned =
+            manager.submit_spawn(allowed, path, "HEAD".to_string(), model, 20, provider());
+        let id = spawned.await.unwrap();
+        Hubbed {
+            _fake: fake,
+            _repo: repo,
+            stub,
+            manager,
+            table,
+            id,
+        }
+    }
+
+    async fn drained(table: &crate::hub::router::BindingTable) -> bool {
+        for _ in 0..500 {
+            if table.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        table.is_empty()
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_is_bound_while_it_runs_and_unbound_when_it_is_cancelled() {
+        let run = hubbed(Mode::Hang).await;
+        let wait = std::time::Duration::from_secs(10);
+        tokio::time::timeout(wait, run.stub.started.notified())
+            .await
+            .expect("the pi executor never started");
+        assert_eq!(run.table.len(), 1);
+        run.manager.cancel(&run.id).await.unwrap();
+        assert!(drained(&run.table).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_is_unbound_when_the_executor_fails() {
+        let run = hubbed(Mode::Fail).await;
+        let task = wait_for(&run.manager, &run.id, |status| status.is_terminal()).await;
+        assert!(matches!(task.status, TaskStatus::Failed { .. }));
+        assert!(drained(&run.table).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_is_unbound_when_the_executor_completes() {
+        let run = hubbed(Mode::Complete).await;
+        let task = wait_for(&run.manager, &run.id, |status| status.is_terminal()).await;
+        assert!(matches!(task.status, TaskStatus::Completed { .. }));
+        assert!(drained(&run.table).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_pi_task_is_unbound_when_the_executor_panics() {
+        let run = hubbed(Mode::Panic).await;
+        let removed = format!("rm -f nanna-pi-{}", run.id.0);
+        assert!(calls_until(&run._fake, &removed).await.contains(&removed));
+        assert!(drained(&run.table).await);
+        assert_eq!(run.stub.launches().len(), 1);
+    }
 }
 
 #[cfg(test)]
