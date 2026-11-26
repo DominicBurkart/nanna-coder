@@ -451,6 +451,8 @@ mod tests {
             outbound_verdict: verdict,
             state: DeliveryState::Pending,
             sent_at: chrono::Utc::now(),
+            held: Vec::new(),
+            released: None,
         }
     }
 

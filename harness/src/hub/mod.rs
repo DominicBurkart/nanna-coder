@@ -3,6 +3,7 @@ pub mod activity_sink;
 mod activity_tool_tests;
 pub mod doorbell;
 pub mod error;
+mod idle;
 pub mod index;
 pub mod limits;
 pub mod lineage;

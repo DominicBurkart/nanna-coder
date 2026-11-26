@@ -1409,6 +1409,8 @@ mod tests {
                     },
                     state: DeliveryState::Delivered,
                     sent_at: at(0),
+                    held: Vec::new(),
+                    released: None,
                 };
                 messages.push_str(&format!(
                     "{{\"op\":\"append\",\"message\":{}}}\n",
@@ -1461,6 +1463,8 @@ mod tests {
                     },
                     state: DeliveryState::Delivered,
                     sent_at: at(0),
+                    held: Vec::new(),
+                    released: None,
                 };
                 let started = Instant::now();
                 message_store.append(message).unwrap();

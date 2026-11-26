@@ -95,12 +95,15 @@ impl fmt::Debug for RenderedMessage {
 }
 
 /// What `msg_recv` returns. `withheld` counts messages held back from the caller (blocked or
-/// quarantined by the inbound review); it never says why or what they said.
+/// quarantined by the inbound review); it never says why or what they said. `idle_limit` is true
+/// once the session has spent `HubLimits::session_idle_secs` blocked inside `msg_recv`: the call
+/// then no longer waits, still delivers what is pending, and the session is left as it was.
 #[derive(Clone, Serialize)]
 pub struct RecvPage {
     pub messages: Vec<RenderedMessage>,
     pub remaining: usize,
     pub all_peers_waiting: bool,
+    pub idle_limit: bool,
     pub withheld: usize,
     pub notice: String,
     #[serde(skip_serializing_if = "Notices::is_empty")]
@@ -113,6 +116,7 @@ impl fmt::Debug for RecvPage {
             .field("messages", &self.messages)
             .field("remaining", &self.remaining)
             .field("all_peers_waiting", &self.all_peers_waiting)
+            .field("idle_limit", &self.idle_limit)
             .field("withheld", &self.withheld)
             .finish_non_exhaustive()
     }
@@ -166,8 +170,11 @@ impl MessageHub {
     /// The review runs before any state changes and nothing is held across a wait, so dropping
     /// the future leaves every message as it was. Only a call that is about to block marks the
     /// session `WaitingOnMessages` (a call that returns at once writes nothing); the session is
-    /// `Running` again on every exit: a message, the timeout, an error or a dropped future. A
-    /// per-session waiter count keeps concurrent calls of one session waiting until the last of
+    /// `Running` again on every exit: a message, the timeout, an error or a dropped future.
+    /// Each tick of a wait is charged to the session's idle budget before the sleep; when the
+    /// budget is spent the call stops waiting and every later call of that session returns at
+    /// once with `idle_limit` set. The budget lives in memory and starts over with the hub.
+    /// A per-session waiter count keeps concurrent calls of one session waiting until the last of
     /// them ends, and the leave never revives a session that was finished meanwhile.
     pub async fn recv(&self, to: &SessionBinding, req: RecvRequest) -> Result<RecvPage, HubError> {
         let root = to.lineage().root();
@@ -184,12 +191,16 @@ impl MessageHub {
         }
         let max = usize::from(req.max.clamp(1, RECV_MAX));
         let mut left = i64::from(req.wait_secs.min(RECV_WAIT_MAX_SECS)) * 1000;
+        let cap = i64::from(self.limits.session_idle_secs) * 1000;
         let mut waiting = None;
         loop {
             let (judged, total) = self.judge_all(to, &in_root, max).await?;
-            if !judged.is_empty() || left <= 0 {
+            let waits = judged.is_empty() && left > 0;
+            let ready = !waits || !self.idle.charge(to.session(), RECV_POLL_MILLIS, cap);
+            if ready {
                 let mut page = self.commit(judged, total)?;
                 page.all_peers_waiting = self.peers_waiting(to);
+                page.idle_limit = self.idle.exhausted(to.session(), cap);
                 page.notices = self.notices.take(to.session());
                 return Ok(page);
             }
@@ -346,6 +357,7 @@ impl MessageHub {
             messages,
             remaining,
             all_peers_waiting: false,
+            idle_limit: false,
             withheld,
             notice: format!(
                 "{} {}",
@@ -392,12 +404,20 @@ impl MessageHub {
         state: DeliveryState,
         codes: &[ReasonCode],
     ) -> Result<(), HubError> {
+        let quarantining = state == DeliveryState::Quarantined;
+        let held = if quarantining {
+            codes.to_vec()
+        } else {
+            Vec::new()
+        };
         let copy = StoredMessage {
             id: MessageId::new(),
             seq: Seq::new(0),
             subject: quarantined_text(&message.subject, codes),
             body: quarantined_text(&message.body, codes),
             state,
+            held,
+            released: None,
             ..message.clone()
         };
         let id = copy.id;
@@ -406,7 +426,7 @@ impl MessageHub {
             let _ = self.messages.set_state(id, DeliveryState::Expired);
             return Err(error.into());
         }
-        if state == DeliveryState::Quarantined {
+        if quarantining {
             let event = QuarantineEvent {
                 ids: vec![id],
                 from: message.from.clone(),
@@ -705,6 +725,20 @@ mod tests {
                 return Err(disk());
             }
             self.inner.set_state(id, s)
+        }
+
+        fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.quarantined()
+        }
+
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<crate::hub::message::Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            self.inner.transition(id, from, to, release)
         }
 
         fn prune(
@@ -1042,6 +1076,20 @@ mod tests {
             self.sessions.get(who.session().clone()).unwrap().unwrap()
         }
 
+        fn capped_gated(&self, gate: &Arc<GateClock>, secs: u32) -> MessageHub {
+            MessageHub::new(
+                self.sessions.clone(),
+                self.messages.clone(),
+                Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
+                gate.clone(),
+                HubLimits {
+                    session_idle_secs: secs,
+                    ..HubLimits::default()
+                },
+                self.registry.clone(),
+            )
+        }
+
         fn gated(&self, gate: &Arc<GateClock>) -> MessageHub {
             MessageHub::new(
                 self.sessions.clone(),
@@ -1109,6 +1157,8 @@ mod tests {
             },
             state,
             sent_at: start(),
+            held: Vec::new(),
+            released: None,
         }
     }
 
@@ -1425,6 +1475,54 @@ mod tests {
                 let again = hub.recv(&b, RecvRequest::default()).await.unwrap();
                 assert_eq!((again.messages.len(), again.withheld), (0, 0));
             }
+        }
+    }
+
+    #[test]
+    fn the_flaky_store_forwards_the_listing_and_the_transition_to_its_inner_store() {
+        let flaky = Flaky::new();
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let mut parked = stored(&a, &b, "s", "b", DeliveryState::Quarantined);
+        parked.held = vec![ReasonCode::Other];
+        let id = parked.id;
+        flaky.append(parked).unwrap();
+        assert_eq!(flaky.quarantined().unwrap().len(), 1);
+        let (quarantined, expired) = (DeliveryState::Quarantined, DeliveryState::Expired);
+        let moved = flaky.transition(id, quarantined, expired, None).unwrap();
+        assert_eq!(moved.state, expired);
+        assert!(flaky.quarantined().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_quarantine_keeps_its_hold_codes_and_a_withhold_keeps_none() {
+        let cases = [
+            (
+                Say::Verdict(quarantine(ReasonCode::CrossScopeSteering)),
+                DeliveryState::Quarantined,
+                vec![ReasonCode::CrossScopeSteering],
+            ),
+            (
+                Say::Verdict(block(ReasonCode::PromptInjection)),
+                DeliveryState::Withheld,
+                Vec::new(),
+            ),
+            (
+                Say::Fail,
+                DeliveryState::Quarantined,
+                vec![ReasonCode::ModelFailure],
+            ),
+        ];
+        for (say, state, held) in cases {
+            let world = World::memory();
+            let (a, b) = (world.seat("a"), world.seat("b"));
+            let hub = world.hub(Recorder::new(say));
+            world.put(&a, &b, "please look");
+            hub.recv(&b, RecvRequest::default()).await.unwrap();
+            let copies = world.everything_from(&a);
+            let copy = copies.last().unwrap();
+            assert_eq!((copy.state, &copy.held), (state, &held));
+            assert!(copy.released.is_none());
         }
     }
 
@@ -2666,6 +2764,239 @@ mod tests {
         #[test]
         fn the_session_status_follows_the_live_waiters_and_never_leaves_a_terminal(plan in lives()) {
             check_lives(plan)?;
+        }
+    }
+
+    impl World {
+        fn capped(&self, secs: u32) -> MessageHub {
+            MessageHub::new(
+                self.sessions.clone(),
+                self.messages.clone(),
+                Arc::new(Recorder::deliver() as Arc<dyn MessageAuditor>),
+                Arc::new(self.clock.clone()),
+                HubLimits {
+                    session_idle_secs: secs,
+                    ..HubLimits::default()
+                },
+                self.registry.clone(),
+            )
+        }
+
+        fn slept_millis(&self) -> i64 {
+            let sleeps = self.clock.sleeps();
+            sleeps.iter().map(|each| each.num_milliseconds()).sum()
+        }
+    }
+
+    async fn waited(hub: &MessageHub, who: &SessionBinding, wait_secs: u8) -> RecvPage {
+        let request = RecvRequest {
+            wait_secs,
+            ..RecvRequest::default()
+        };
+        hub.recv(who, request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_long_waits_sleep_exactly_the_cap_and_report_idle_limit_from_then_on() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.capped(1800);
+        for call in 1..=30 {
+            let page = waited(&hub, &b, 60).await;
+            assert_eq!(page.idle_limit, call == 30, "call {call}");
+        }
+        assert_eq!(world.slept_millis(), 1_800_000);
+        assert_eq!(world.clock.sleeps().len(), 1800);
+        for _ in 0..3 {
+            let page = waited(&hub, &b, 60).await;
+            assert!(page.idle_limit);
+        }
+        assert_eq!(world.clock.sleeps().len(), 1800);
+    }
+
+    #[tokio::test]
+    async fn a_default_hub_stops_sleeping_after_exactly_thirty_minutes_of_waits() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.hub(Recorder::deliver());
+        for call in 1..=30 {
+            let page = waited(&hub, &b, 60).await;
+            assert_eq!(page.idle_limit, call == 30, "call {call}");
+        }
+        assert_eq!(world.slept_millis(), 1_800_000);
+        let page = waited(&hub, &b, 60).await;
+        assert!(page.idle_limit);
+        assert_eq!(world.slept_millis(), 1_800_000);
+    }
+
+    #[tokio::test]
+    async fn the_cap_boundary_is_reached_at_exactly_the_budget_and_not_before() {
+        for (asked, slept, limit) in [(2u8, 2_000i64, false), (3, 3_000, true), (4, 3_000, true)] {
+            let world = World::memory();
+            let b = world.seat("b");
+            let hub = world.capped(3);
+            let page = waited(&hub, &b, asked).await;
+            assert_eq!(world.slept_millis(), slept, "asked {asked}");
+            assert_eq!(page.idle_limit, limit, "asked {asked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_wait_before_the_cap_is_not_idle_limited_and_a_zero_cap_never_waits() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let page = waited(&world.capped(5), &b, 0).await;
+        assert!(!page.idle_limit);
+        let page = waited(&world.capped(0), &b, 9).await;
+        assert!(page.idle_limit);
+        assert!(world.clock.sleeps().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_budget_is_kept_across_calls_so_one_second_waits_cannot_dodge_it() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.capped(5);
+        for _ in 0..40 {
+            waited(&hub, &b, 1).await;
+        }
+        assert_eq!(world.clock.sleeps().len(), 5);
+        assert_eq!(world.slept_millis(), 5_000);
+    }
+
+    #[tokio::test]
+    async fn a_huge_wait_is_clamped_to_sixty_seconds_and_then_to_what_is_left() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.capped(100);
+        let first = waited(&hub, &b, 255).await;
+        assert_eq!((world.slept_millis(), first.idle_limit), (60_000, false));
+        let second = waited(&hub, &b, 255).await;
+        assert_eq!((world.slept_millis(), second.idle_limit), (100_000, true));
+    }
+
+    #[tokio::test]
+    async fn each_session_has_its_own_budget() {
+        let world = World::memory();
+        let (b, c) = (world.seat("b"), world.seat("c"));
+        let hub = world.capped(4);
+        assert!(waited(&hub, &b, 10).await.idle_limit);
+        assert_eq!(world.slept_millis(), 4_000);
+        let page = waited(&hub, &c, 2).await;
+        assert!(!page.idle_limit);
+        assert_eq!(world.slept_millis(), 6_000);
+        assert!(waited(&hub, &c, 10).await.idle_limit);
+        assert_eq!(world.slept_millis(), 8_000);
+    }
+
+    #[tokio::test]
+    async fn after_the_cap_recv_returns_at_once_and_leaves_the_session_untouched() {
+        let world = World::memory();
+        let b = world.seat("b");
+        world.run(&b);
+        let hub = world.capped(2);
+        waited(&hub, &b, 10).await;
+        let before = world.record(&b);
+        world.sessions.written();
+        let sleeps = world.clock.sleeps().len();
+        for _ in 0..3 {
+            let page = waited(&hub, &b, 60).await;
+            assert!(page.idle_limit && page.messages.is_empty());
+        }
+        assert_eq!(world.clock.sleeps().len(), sleeps);
+        assert!(world.sessions.written().is_empty());
+        let after = world.record(&b);
+        assert_eq!(after.status, SessionStatus::Running);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.last_activity, before.last_activity);
+        assert_eq!(after.ended_at, before.ended_at);
+    }
+
+    #[tokio::test]
+    async fn a_message_that_arrives_after_the_cap_is_still_delivered() {
+        let world = World::memory();
+        let (a, b) = (world.seat("a"), world.seat("b"));
+        let hub = world.capped(2);
+        waited(&hub, &b, 10).await;
+        world.put(&a, &b, "late");
+        let page = waited(&hub, &b, 60).await;
+        assert_eq!(bodies(&page), ["late"]);
+        assert!(page.idle_limit);
+        assert_eq!(world.slept_millis(), 2_000);
+    }
+
+    #[test]
+    fn a_wait_dropped_mid_sleep_is_still_charged_for_that_tick() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.capped_gated(&gate, 3);
+        let mut dropped = call(&hub, &b, 30);
+        assert!(parked(&mut dropped));
+        drop(dropped);
+        let started = world.clock.now();
+        gate.release(10);
+        let page = finished(call(&hub, &b, 30)).unwrap();
+        assert_eq!(world.clock.now() - started, Duration::seconds(2));
+        assert!(page.idle_limit);
+    }
+
+    #[test]
+    fn concurrent_waits_of_one_session_never_spend_more_than_the_cap() {
+        let (world, _a, b, gate) = waiting_world();
+        let hub = world.capped_gated(&gate, 3);
+        let mut first = call(&hub, &b, 30);
+        let mut second = call(&hub, &b, 30);
+        assert!(parked(&mut first) && parked(&mut second));
+        let started = world.clock.now();
+        gate.release(10);
+        let one = finished(first).unwrap();
+        let two = finished(second).unwrap();
+        assert!(one.idle_limit && two.idle_limit);
+        assert_eq!(world.clock.now() - started, Duration::seconds(3));
+    }
+
+    #[tokio::test]
+    async fn the_page_carries_idle_limit_as_a_plain_boolean_key() {
+        let world = World::memory();
+        let b = world.seat("b");
+        let hub = world.capped(1);
+        let before = serde_json::to_value(waited(&hub, &b, 0).await).unwrap();
+        assert_eq!(before["idle_limit"], serde_json::json!(false));
+        let after = serde_json::to_value(waited(&hub, &b, 5).await).unwrap();
+        assert_eq!(after["idle_limit"], serde_json::json!(true));
+        let rendered = format!("{:?}", waited(&hub, &b, 0).await);
+        assert!(rendered.contains("idle_limit: true"), "{rendered}");
+    }
+
+    fn idle_plan() -> impl Strategy<Value = Vec<(bool, u8)>> {
+        proptest::collection::vec((any::<bool>(), 0u8..=70), 0..30)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn sleeping_follows_a_plain_tick_model_per_session(plan in idle_plan()) {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let world = World::memory();
+                let seats = [world.seat("b"), world.seat("c")];
+                let hub = world.capped(40);
+                let mut charged = [0usize; 2];
+                let mut slept_so_far = 0usize;
+                for (second, asked) in plan {
+                    let who = usize::from(second);
+                    let page = waited(&hub, &seats[who], asked).await;
+                    let mut ticks = 0usize;
+                    while ticks < usize::from(asked).min(60) && charged[who] < 40 {
+                        ticks += 1;
+                        charged[who] += 1;
+                    }
+                    slept_so_far += ticks;
+                    prop_assert_eq!(world.clock.sleeps().len(), slept_so_far);
+                    prop_assert_eq!(page.idle_limit, charged[who] >= 40);
+                    prop_assert!(charged[who] <= 40);
+                }
+                Ok::<(), TestCaseError>(())
+            })?;
         }
     }
 

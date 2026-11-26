@@ -1,8 +1,9 @@
 use super::engine::{invalid, Engine, Table};
 use super::journal::HubLock;
 use super::{MessageStore, Retention, StoreError};
+use crate::auditor::ReasonCode;
 use crate::hub::lineage::SessionId;
-use crate::hub::message::{DeliveryState, MessageId, Recipient, Seq, StoredMessage};
+use crate::hub::message::{DeliveryState, MessageId, Recipient, Release, Seq, StoredMessage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -13,10 +14,25 @@ use std::sync::Arc;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(super) enum Record {
-    Counter { next: u64 },
-    Append { message: Box<StoredMessage> },
-    State { id: MessageId, state: DeliveryState },
-    Drop { id: MessageId },
+    Counter {
+        next: u64,
+    },
+    Append {
+        message: Box<StoredMessage>,
+    },
+    State {
+        id: MessageId,
+        state: DeliveryState,
+    },
+    Transition {
+        id: MessageId,
+        from: DeliveryState,
+        to: DeliveryState,
+        release: Option<Release>,
+    },
+    Drop {
+        id: MessageId,
+    },
 }
 
 #[derive(Clone)]
@@ -33,6 +49,12 @@ impl Default for MessageTable {
             by_seq: BTreeMap::new(),
             seq_of: HashMap::new(),
         }
+    }
+}
+
+fn ensure_held(message: &mut StoredMessage) {
+    if message.state == DeliveryState::Quarantined && message.held.is_empty() {
+        message.held.push(ReasonCode::Other);
     }
 }
 
@@ -60,13 +82,25 @@ impl Table for MessageTable {
                     .ok_or_else(|| invalid("message sequence is exhausted or out of order"))?;
                 self.next = after;
                 self.seq_of.insert(message.id, message.seq);
-                self.by_seq.insert(message.seq, (**message).clone());
+                let mut stored = (**message).clone();
+                ensure_held(&mut stored);
+                self.by_seq.insert(message.seq, stored);
             }
             Record::State { id, state } => {
                 let seq = self.seq_of.get(id).ok_or(StoreError::NotFound)?;
                 if let Some(found) = self.by_seq.get_mut(seq) {
                     found.state = *state;
+                    ensure_held(found);
                 }
+            }
+            Record::Transition {
+                id,
+                from,
+                to,
+                release,
+            } => {
+                let updated = self.resolve(*id, *from, *to, *release)?;
+                self.by_seq.insert(updated.seq, updated);
             }
             Record::Drop { id } => {
                 let seq = self.seq_of.remove(id).ok_or(StoreError::NotFound)?;
@@ -90,6 +124,59 @@ impl Table for MessageTable {
 }
 
 impl MessageTable {
+    fn admit(&self, message: StoredMessage) -> StoredMessage {
+        StoredMessage {
+            seq: Seq::new(self.next),
+            released: None,
+            ..message
+        }
+    }
+
+    fn quarantined(&self) -> Vec<StoredMessage> {
+        let all = self.by_seq.values();
+        let held = all.filter(|message| message.state == DeliveryState::Quarantined);
+        held.cloned().collect()
+    }
+
+    fn resolve(
+        &self,
+        id: MessageId,
+        from: DeliveryState,
+        to: DeliveryState,
+        release: Option<Release>,
+    ) -> Result<StoredMessage, StoreError> {
+        let seq = self.seq_of.get(&id).ok_or(StoreError::NotFound)?;
+        let found = self.by_seq.get(seq).ok_or(StoreError::NotFound)?;
+        let release_pair = from == DeliveryState::Quarantined && to == DeliveryState::Pending;
+        let marker_allowed = release.is_none() || release_pair;
+        if found.state != from || !marker_allowed {
+            return Err(StoreError::Conflict);
+        }
+        let mut updated = found.clone();
+        let kept = updated.released.take();
+        updated.released = release.or(kept);
+        updated.state = to;
+        ensure_held(&mut updated);
+        Ok(updated)
+    }
+
+    fn plan_transition(
+        &self,
+        id: MessageId,
+        from: DeliveryState,
+        to: DeliveryState,
+        release: Option<Release>,
+    ) -> Result<(StoredMessage, Vec<Record>), StoreError> {
+        let updated = self.resolve(id, from, to, release)?;
+        let record = Record::Transition {
+            id,
+            from,
+            to,
+            release,
+        };
+        Ok((updated, vec![record]))
+    }
+
     fn expired_ids(&self, now: DateTime<Utc>, policy: &Retention) -> Vec<MessageId> {
         self.by_seq
             .values()
@@ -111,8 +198,8 @@ macro_rules! message_store_impl {
         impl MessageStore for $ty {
             fn append(&self, m: StoredMessage) -> Result<Seq, StoreError> {
                 self.engine.commit(|table| {
-                    let seq = Seq::new(table.next);
-                    let message = StoredMessage { seq, ..m };
+                    let message = table.admit(m);
+                    let seq = message.seq;
                     Ok((
                         seq,
                         vec![Record::Append {
@@ -214,6 +301,21 @@ macro_rules! message_store_impl {
                     .commit(|_| Ok(((), vec![Record::State { id, state: s }])))
             }
 
+            fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError> {
+                Ok(self.engine.read(|table| table.quarantined()))
+            }
+
+            fn transition(
+                &self,
+                id: MessageId,
+                from: DeliveryState,
+                to: DeliveryState,
+                release: Option<Release>,
+            ) -> Result<StoredMessage, StoreError> {
+                let plan = |table: &MessageTable| table.plan_transition(id, from, to, release);
+                self.engine.commit(plan)
+            }
+
             fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError> {
                 self.engine.commit(|table| {
                     let ids = table.expired_ids(now, policy);
@@ -295,6 +397,8 @@ message_store_impl!(InMemoryMessageStore);
 ///     outbound_verdict: VerdictRef { log_id: "v".into(), content_hash: 1 },
 ///     state: DeliveryState::Pending,
 ///     sent_at: Utc::now(),
+///     held: vec![],
+///     released: None,
 /// };
 /// let seq = JsonlMessageStore::open(&path, &lock).unwrap().append(message).unwrap();
 /// assert_eq!(seq, Seq::new(1));
@@ -333,6 +437,7 @@ mod tests {
     use super::super::contract::*;
     use super::super::journal::Journal;
     use super::*;
+    use crate::auditor::ReasonCode;
     use proptest::prelude::*;
     use std::sync::atomic::Ordering;
 
@@ -538,6 +643,256 @@ mod tests {
         let result = store.append(message(1, "a", "b", DeliveryState::Pending, 0, "m"));
         assert!(matches!(result, Err(StoreError::Io(_))));
         assert_eq!(store.get(mid(1)).unwrap(), None);
+    }
+
+    const LEGACY_QUARANTINED: &str = r#"{"op":"append","message":{"id":"00000000-0000-0000-0000-000000000001","seq":1,"from":"a","from_identity":"identity-a","to":"b","root":{"kind":"mcp","id":"00000000-0000-0000-0000-000000000001"},"kind":"info","subject":"s","body":"stored redacted text","in_reply_to":null,"thread_depth":0,"outbound_verdict":{"log_id":"v","content_hash":7},"state":"quarantined","sent_at":"2023-11-14T22:13:20Z"}}"#;
+
+    #[test]
+    fn a_legacy_quarantined_record_loads_held_and_is_not_deliverable() {
+        let fixture = Fixture::new();
+        let renumbered = LEGACY_QUARANTINED.replace("0001\",\"seq\":1", "0002\",\"seq\":2");
+        let pending = renumbered.replace("\"quarantined\"", "\"pending\"");
+        let journal = format!("{LEGACY_QUARANTINED}\n{pending}\n");
+        assert!(!journal.contains("held") && !journal.contains("released"));
+        std::fs::write(fixture.path("messages.jsonl"), journal).unwrap();
+        let store = open(&fixture).unwrap();
+        let loaded = store.get(mid(1)).unwrap().unwrap();
+        assert_eq!(loaded.state, DeliveryState::Quarantined);
+        assert_eq!(loaded.held, [ReasonCode::Other]);
+        assert_eq!(loaded.released, None);
+        let inbox = store.inbox(sid("b"), None, 10).unwrap();
+        let waiting: Vec<MessageId> = inbox.iter().map(|m| m.id).collect();
+        assert_eq!(waiting, [mid(2)]);
+        assert_eq!(store.unread(sid("b")).unwrap(), 1);
+        let listed = store.quarantined().unwrap();
+        let held: Vec<MessageId> = listed.iter().map(|m| m.id).collect();
+        assert_eq!(held, [mid(1)]);
+        assert!(store.get(mid(2)).unwrap().unwrap().held.is_empty());
+        drop(store);
+        let reopened = open(&fixture).unwrap();
+        assert_eq!(reopened.get(mid(1)).unwrap().unwrap().held, loaded.held);
+        assert!(file_text(&fixture).contains(r#""held":["other"]"#));
+    }
+
+    #[test]
+    fn a_transition_and_its_marker_survive_a_reopen_and_a_compaction() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        let mut parked = message(1, "a", "b", DeliveryState::Quarantined, 0, "stored");
+        parked.held = vec![ReasonCode::PromptInjection];
+        store.append(parked).unwrap();
+        let release = Release { at: at(5) };
+        let (quarantined, pending) = (DeliveryState::Quarantined, DeliveryState::Pending);
+        let marker = Some(release);
+        store
+            .transition(mid(1), quarantined, pending, marker)
+            .unwrap();
+        assert!(file_text(&fixture).contains(r#""op":"transition""#));
+        drop(store);
+        for _ in 0..2 {
+            let reopened = open(&fixture).unwrap();
+            let found = reopened.get(mid(1)).unwrap().unwrap();
+            assert_eq!(found.state, pending);
+            assert_eq!(found.released, Some(release));
+            assert_eq!(found.held, [ReasonCode::PromptInjection]);
+            let stale = reopened.transition(mid(1), quarantined, DeliveryState::Expired, None);
+            assert!(matches!(stale, Err(StoreError::Conflict)));
+            assert_eq!(reopened.get(mid(1)).unwrap().unwrap(), found);
+        }
+    }
+
+    #[test]
+    fn a_caller_supplied_marker_never_reaches_the_journal() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        let mut forged = message(1, "a", "b", DeliveryState::Pending, 0, "m");
+        forged.released = Some(Release { at: at(1) });
+        store.append(forged).unwrap();
+        assert!(!file_text(&fixture).contains("released"));
+        assert_eq!(store.get(mid(1)).unwrap().unwrap().released, None);
+    }
+
+    #[test]
+    fn a_journal_transition_that_cannot_apply_is_corrupt() {
+        let fixture = Fixture::new();
+        let store = open(&fixture).unwrap();
+        let pending = message(1, "a", "b", DeliveryState::Pending, 0, "m");
+        store.append(pending).unwrap();
+        drop(store);
+        let good = file_text(&fixture);
+        let mut appends = good.lines().filter(|l| l.contains(r#""op":"append""#));
+        let first = appends.next().unwrap();
+        let tail = r#""to":"expired","release":null}"#;
+        let transition = |n: u128, from: &str| {
+            let id = mid(n).as_uuid();
+            format!(r#"{{"op":"transition","id":"{id}","from":"{from}",{tail}"#)
+        };
+        let wrong_state = format!("{first}\n{}\n", transition(1, "quarantined"));
+        std::fs::write(fixture.path("messages.jsonl"), wrong_state).unwrap();
+        assert!(matches!(open(&fixture).err(), Some(StoreError::Corrupt(2))));
+        let unknown = format!("{first}\n{}\n", transition(9, "pending"));
+        std::fs::write(fixture.path("messages.jsonl"), unknown).unwrap();
+        assert!(matches!(open(&fixture).err(), Some(StoreError::Corrupt(2))));
+        let fine = format!("{first}\n{}\n", transition(1, "pending"));
+        std::fs::write(fixture.path("messages.jsonl"), fine).unwrap();
+        let reopened = open(&fixture).unwrap();
+        let state = reopened.get(mid(1)).unwrap().unwrap().state;
+        assert_eq!(state, DeliveryState::Expired);
+    }
+
+    #[test]
+    fn a_failed_disk_write_in_a_transition_leaves_the_old_state_and_no_marker() {
+        let (store, fail, written) = flaky_store();
+        let mut parked = message(1, "a", "b", DeliveryState::Quarantined, 0, "stored");
+        parked.held = vec![ReasonCode::SecretLeak];
+        store.append(parked).unwrap();
+        let written_before = written.lock().unwrap().clone();
+        fail.store(true, Ordering::SeqCst);
+        let (quarantined, pending) = (DeliveryState::Quarantined, DeliveryState::Pending);
+        let release = Some(Release { at: at(3) });
+        let refused = store.transition(mid(1), quarantined, pending, release);
+        assert!(matches!(refused, Err(StoreError::Io(_))));
+        let kept = store.get(mid(1)).unwrap().unwrap();
+        assert_eq!((kept.state, kept.released), (quarantined, None));
+        assert_eq!(*written.lock().unwrap(), written_before);
+        fail.store(false, Ordering::SeqCst);
+        let retried = store.transition(mid(1), quarantined, pending, release);
+        assert_eq!(retried.unwrap().released, release);
+    }
+
+    #[derive(Debug, Clone)]
+    enum HoldOp {
+        Put { id: u8, state: u8 },
+        SetState { id: u8, state: u8 },
+        Move(u8, u8, u8, bool),
+        Prune,
+        Reopen,
+    }
+
+    fn to_move(parts: (u8, u8, u8, bool)) -> HoldOp {
+        HoldOp::Move(parts.0, parts.1, parts.2, parts.3)
+    }
+
+    fn hold_strategy() -> impl Strategy<Value = HoldOp> {
+        prop_oneof![
+            (0u8..6, 0u8..6).prop_map(|(id, state)| HoldOp::Put { id, state }),
+            (0u8..6, 0u8..6).prop_map(|(id, state)| HoldOp::SetState { id, state }),
+            Strategy::prop_map((0u8..6, 0u8..6, 0u8..6, any::<bool>()), to_move),
+            Just(HoldOp::Prune),
+            Just(HoldOp::Reopen),
+        ]
+    }
+
+    struct Seen {
+        id: u8,
+        seq: u64,
+        state: DeliveryState,
+        marked: bool,
+    }
+
+    fn allowed(from: DeliveryState, to: DeliveryState, release: bool) -> bool {
+        let marked_moves = [(DeliveryState::Quarantined, DeliveryState::Pending)];
+        !release || marked_moves.contains(&(from, to))
+    }
+
+    fn run_holds(
+        ops: &[HoldOp],
+        mut store: Box<dyn MessageStore>,
+        mut reopen: impl FnMut(Box<dyn MessageStore>) -> Box<dyn MessageStore>,
+    ) {
+        let mut model: Vec<Seen> = Vec::new();
+        let mut counter = 1u64;
+        for op in ops {
+            match op {
+                HoldOp::Put { id, state } => {
+                    let state = state_of(*state);
+                    let record = message(u128::from(*id), "a", "b", state, 0, "m");
+                    let result = store.append(record);
+                    if model.iter().any(|e| e.id == *id) {
+                        assert!(matches!(result, Err(StoreError::Duplicate)));
+                    } else {
+                        assert_eq!(result.unwrap().get(), counter);
+                        model.push(Seen {
+                            id: *id,
+                            seq: counter,
+                            state,
+                            marked: false,
+                        });
+                        counter += 1;
+                    }
+                }
+                HoldOp::SetState { id, state } => {
+                    let state = state_of(*state);
+                    let result = store.set_state(mid(u128::from(*id)), state);
+                    match model.iter_mut().find(|e| e.id == *id) {
+                        None => assert!(matches!(result, Err(StoreError::NotFound))),
+                        Some(entry) => {
+                            result.unwrap();
+                            entry.state = state;
+                        }
+                    }
+                }
+                HoldOp::Move(id, from, to, release) => {
+                    let stamp = Release { at: at(9) };
+                    let marker = if *release { Some(stamp) } else { None };
+                    let (from, to) = (state_of(*from), state_of(*to));
+                    let result = store.transition(mid(u128::from(*id)), from, to, marker);
+                    match model.iter_mut().find(|e| e.id == *id) {
+                        None => assert!(matches!(result, Err(StoreError::NotFound))),
+                        Some(entry) if entry.state == from && allowed(from, to, *release) => {
+                            result.unwrap();
+                            entry.state = to;
+                            entry.marked = entry.marked || *release;
+                        }
+                        Some(_) => assert!(matches!(result, Err(StoreError::Conflict))),
+                    }
+                }
+                HoldOp::Prune => {
+                    let far = at(10_000_000);
+                    store.prune(far, &policy()).unwrap();
+                    model.retain(|e| e.state == DeliveryState::Quarantined);
+                }
+                HoldOp::Reopen => store = reopen(store),
+            }
+            let mut expected: Vec<(u64, u8)> = Vec::new();
+            for entry in &model {
+                if entry.state == DeliveryState::Quarantined {
+                    expected.push((entry.seq, entry.id));
+                }
+            }
+            expected.sort();
+            let listed = store.quarantined().unwrap();
+            let mut got: Vec<(u64, u8)> = Vec::new();
+            for found in &listed {
+                got.push((found.seq.get(), found.id.as_uuid().as_u128() as u8));
+                assert!(!found.held.is_empty());
+            }
+            assert_eq!(got, expected);
+            for entry in &model {
+                let found = store.get(mid(u128::from(entry.id))).unwrap().unwrap();
+                assert_eq!(found.state, entry.state);
+                assert_eq!(found.released.is_some(), entry.marked);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        #[test]
+        fn the_memory_store_listing_and_transitions_match_a_plain_model(ops in proptest::collection::vec(hold_strategy(), 0..40)) {
+            run_holds(&ops, Box::new(InMemoryMessageStore::new()), |store| store);
+        }
+
+        #[test]
+        fn the_jsonl_store_listing_and_transitions_match_a_plain_model_across_reopens(ops in proptest::collection::vec(hold_strategy(), 0..40)) {
+            let fixture = Fixture::new();
+            let store = Box::new(open(&fixture).unwrap());
+            run_holds(&ops, store, |old| {
+                drop(old);
+                Box::new(open(&fixture).unwrap())
+            });
+        }
     }
 
     fn flaky_store() -> (
