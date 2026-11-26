@@ -389,21 +389,29 @@ impl MessageHub {
     /// use harness::hub::message::MessageId;
     /// use harness::hub::operator::{OperatorGrant, ResolveAction};
     /// use harness::hub::registry::SessionRegistry;
-    /// use harness::hub::send::MessageHub;
+    /// use harness::hub::send::{MessageHub, QuarantineEvent, QuarantineSink};
     /// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
     /// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
     /// use harness::leases::SimulatedClock;
     ///
+    /// struct Quiet;
+    /// impl QuarantineSink for Quiet {
+    ///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
     /// let sessions = Arc::new(InMemorySessionStore::new());
     /// let registry = Arc::new(SessionRegistry::new(sessions.clone()));
     /// let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
-    /// let hub = MessageHub::new(
+    /// let hub = MessageHub::with_sink(
     ///     sessions,
     ///     Arc::new(InMemoryMessageStore::new()),
     ///     Arc::new(auditor),
     ///     Arc::new(SimulatedClock::new(chrono::Utc::now())),
     ///     HubLimits::default(),
     ///     registry,
+    ///     Arc::new(Quiet),
     /// );
     /// if let Ok(grant) = OperatorGrant::from_environment() {
     ///     let result = hub.resolve_quarantine(&grant, MessageId::new(), ResolveAction::Drop);
