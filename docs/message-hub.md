@@ -246,6 +246,8 @@ pub trait MessageStore: Send + Sync {
     fn unread(&self, to: SessionId) -> Result<usize, StoreError>;
     fn outbound_window(&self, from: SessionId, to: Recipient, bytes: usize) -> Result<Vec<StoredMessage>, StoreError>;
     fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError>;
+    fn quarantined(&self) -> Result<Vec<StoredMessage>, StoreError>;   // added in #1074 P2: every root, ascending Seq, state Quarantined only
+    fn transition(&self, id: MessageId, from: DeliveryState, to: DeliveryState, release: Option<Release>) -> Result<StoredMessage, StoreError>; // added in #1074 P2: compare-and-set
     fn prune(&self, now: DateTime<Utc>, policy: &Retention) -> Result<usize, StoreError>;
 }
 
@@ -262,7 +264,7 @@ pub struct Retention {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum StoreError { #[error("io: {0}")] Io(#[from] io::Error), #[error("corrupt record at line {0}")] Corrupt(usize), #[error("hub state locked by another nanna process")] Locked }
+pub enum StoreError { #[error("io: {0}")] Io(#[from] io::Error), #[error("corrupt record at line {0}")] Corrupt(usize), #[error("hub state locked by another nanna process")] Locked, /* + NotFound, Duplicate (#1061) and Conflict (#1074 P2, below) */ }
 ```
 
 ### 4.1 Session activity log (the librarian's detail source)
@@ -324,6 +326,15 @@ pub trait ActivityStore: Send + Sync {
 11. Durability and crash behaviour: each commit is one `write_all` plus `flush` of whole lines, and a failed write is truncated back so the next append starts on a record boundary. If the truncate fails too, the journal refuses all later appends until reopen. There is no `fsync` per append, so the log survives a process crash but not necessarily power loss. A multi-record commit (`prune`, `ack`) can be partly written after a crash; both are monotone, so replaying the partial result is safe. `open` compacts through a `0600` temporary file and an atomic rename, which also narrows a pre-existing wider file.
 12. Every commit clones the whole table (the pattern of `leases/jsonl.rs`), so a commit costs time proportional to the store size. That is acceptable for the bounded retention above and is a known limit.
 
+**As built in #1074 P2 (`store/mod.rs`, `store/messages.rs`, `message.rs`): listing, compare-and-set transition, held and released.**
+
+- **`quarantined()`** returns every `Quarantined` record of every root in ascending `Seq`, and nothing else (a `Delivered`, `Pending`, `Withheld`, `Acked` or `Expired` message never appears). It returns the stored records, so the text is the stored redacted text and the reason codes of the hold are visible in `held`; no text is added. A read failure is an error, never an empty list. `Quarantined` messages are still never pruned.
+- **`transition(id, from, to, release)`** is a compare-and-set: it reads the record and writes the new state in one `Engine::commit`, so the check and the write happen under one hold of the store's lock and, of two writers racing for the same message, exactly one wins; the other gets `StoreError::Conflict` and nothing changes. A writer holding a stale view never overwrites a newer state: after a drop (`Quarantined` to `Expired`) a stale release gets `Conflict` and the record stays `Expired`, and after the message was pruned it gets `NotFound`. An unknown id is `NotFound`. The journal record is `{"op":"transition","id","from","to","release"}` and replay re-checks `from`, so a journal whose transition cannot apply opens as `Corrupt(line)`. `set_state` stays unconditional (the hub's own writers use it).
+- **`StoreError::Conflict`** (`record is not in the expected state`) carries no content, like every other variant.
+- **`held: Vec<ReasonCode>`** on `StoredMessage` (`#[serde(default, skip_serializing_if = "Vec::is_empty")]`): the codes of the hold. It never carries text. The send-time quarantine, the action gate's `quarantine_send` (one site, `store_quarantined`) and the recv-time `retire` of a `Quarantined` copy write the codes; a `Withheld` copy and every delivered message have an empty `held`. `held` keeps the codes after the message leaves `Quarantined`, so a later release can tell a message that was held from one that never was.
+- **`released: Option<Release>`** on `StoredMessage` (`Release { at }`, `#[serde(default, skip_serializing_if = "Option::is_none")]`): host-written proof that a human released the message. The only code path that writes it is `transition` with `release: Some(..)`, and the store accepts it only for `Quarantined` to `Pending` (any other combination is `Conflict` and changes nothing). `append` discards a `released` the caller supplied, so no caller can store a marker, and a transition without `release` keeps the marker the record already has. A structural test (`harness/tests/hub_release_marker_structural.rs`) parses every production source file and pins that the single function that assigns the field is `MessageTable::resolve` in `store/messages.rs`, that no macro mentions the field, and that no production code builds a `Release` or calls `transition` yet; the release and drop commands and the grant (#1074 P3, P4) will extend that list on purpose.
+- **Old journals still load.** A record written before these fields existed has neither key and loads with `held` empty and `released` absent. Because an empty `held` would read as "never held", the table normalises on every path (append, replay, `set_state`, `transition`): a `Quarantined` record with an empty `held` gets `[other]`. So a legacy quarantined message loads as held, is invisible to `inbox` and `unread`, is listed by `quarantined()`, and the next compaction rewrites it with `"held":["other"]`. A test loads such a record from a literal pre-change journal line.
+
 ---
 
 ## 5. Messages
@@ -369,7 +380,14 @@ pub struct StoredMessage {
     pub outbound_verdict: VerdictRef,    // audit log id + content hash
     pub state: DeliveryState,
     pub sent_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<ReasonCode>,          // #1074 P2: codes of the hold, never text; empty for a message never held
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<Release>,      // #1074 P2: host-written, only via MessageStore::transition
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release { pub at: DateTime<Utc> }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -720,6 +738,7 @@ impl IndexView { pub(crate) fn freeze(sessions: &dyn SessionStore, activity: Opt
 | `Block` | `ActionDenied::Block`; the agent sees reason codes only, never the matched text; the 3rd denial escalates via `RepeatedDenials` | Withheld; the sender is notified with the reason code |
 | `Quarantine` | `ActionDenied::Escalate`; the sender halts; the message is stored `Quarantined`; the Escalator is notified (`Severity::Blocked`, `EscalationSource::Auditor`) | Quarantined and escalated |
 
+- **Hold codes (as built, #1074 P2).** Every `Quarantine` outcome (send-time, gate and recv-time) stores the reason codes of the hold on the quarantined record (`StoredMessage::held`, section 4), so the human who resolves it can see why; the codes are values of the fixed `ReasonCode` enum and never text. `MessageStore::quarantined()` lists those records; `MessageStore::transition` is the only way to move one out of `Quarantined`, atomically, and the only writer of the release marker (section 4).
 - **Sender notice for an inbound `Block` (as built, #1072d).** "The sender is notified with the reason code" is delivered through a hub-authored `SenderNotice { message_id, codes, at }` (plus a host-rendered line), never through the message store. `codes` are values of the fixed `ReasonCode` enum: there is no free-text field, so a notice cannot become a side channel, and the original subject, body and reason details are never copied into it. The hub keeps at most 16 per session in memory (`NoticeTable`), dropping the oldest and counting the drops. Only an inbound `Block` creates one, after the withheld copy is stored; an inbound `Quarantine`, an auditor outage and a changed-hash quarantine create none, because they escalate to humans. The next successful `msg_recv` or `msg_send` result of the sender carries the notices once, oldest first, in a distinct `notices` field (`items` and `dropped`, omitted when empty), rendered by the host as `[nanna] message <id> was not delivered: <code>[, <code>]`; a failed call keeps them. A notice is not a `StoredMessage`, is not fenced as an agent message, has no `Deserialize`, and is constructed in one place only (a structural test pins it); a notice that cannot be kept never changes the recipient-side verdict. It does not survive a restart.
 - **No plaintext message content in audit output.** The args of `msg_send`, `session_set_note` and `sessions_query` are the message, note or query itself. Before any append, `ActionAuditLog` (and the registry's in-memory `action_reviews`, which end up in task results) replaces them with `{redacted, keys (only the argument names the tool itself defines, from `known_arguments`; any other key is `?`, because key names are agent-controlled and can be a secret), bytes, hash}` (`redact_for_log`). The hash is the non-cryptographic 64-bit `content_hash`: it lets a reader confirm a guess of the exact content, it neither recovers it nor attests integrity. Telemetry events and escalation evidence carry no args by construction. Every other tool's entries are byte-identical to before. A test plants a token-shaped string and asserts it appears in none of the audit file, telemetry output, escalation evidence or error returned to the agent.
 - **Never silently redacting message bodies** (decision D3). Redaction changes meaning, and the sender learns nothing from it. Summaries *are* redacted, because they have no sender to inform.
