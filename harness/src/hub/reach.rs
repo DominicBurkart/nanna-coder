@@ -160,7 +160,9 @@ mod tests {
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             if name.ends_with(".rs") {
-                let text = std::fs::read_to_string(&path).unwrap();
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\r\n", "\n");
                 let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
                 for line in production.lines() {
                     let code = !line.trim_start().starts_with("///");
@@ -177,6 +179,7 @@ mod tests {
         let release = "operator.rs: let mailbox = MailboxId::for_root(&message.root);";
         assert_eq!(found, vec![release.to_string(), format!("reach.rs: {own}")]);
         let source = std::fs::read_to_string(dir.join("reach.rs")).unwrap();
+        let source = source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap();
         assert!(production.contains("let root = sender.lineage().root();"));
     }
