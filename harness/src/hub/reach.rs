@@ -177,7 +177,14 @@ mod tests {
         let own = "let mailbox = MailboxId::for_root(root).map_err(|_| HubError::NoRecipient)?;";
         found.sort();
         let release = "operator.rs: let mailbox = MailboxId::for_root(&message.root);";
-        assert_eq!(found, vec![release.to_string(), format!("reach.rs: {own}")]);
+        let operator =
+            "let mailbox = MailboxId::for_root(root).map_err(|_| HubError::NotVisible)?;";
+        let expected = vec![
+            release.to_string(),
+            format!("reach.rs: {own}"),
+            format!("send.rs: {operator}"),
+        ];
+        assert_eq!(found, expected);
         let source = std::fs::read_to_string(dir.join("reach.rs")).unwrap();
         let source = source.replace("\r\n", "\n");
         let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap();

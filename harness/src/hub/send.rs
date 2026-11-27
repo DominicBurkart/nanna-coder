@@ -2,11 +2,14 @@ use super::doorbell::{Doorbell, NoopDoorbell};
 use super::error::HubError;
 use super::idle::IdleBudget;
 use super::limits::{HubLimits, Windows};
-use super::lineage::{SessionBinding, SessionId};
+use super::lineage::{RootId, SessionBinding, SessionId};
+use super::mailbox::{MailboxId, OPERATOR_IDENTITY};
 use super::message::{
-    DeliveryState, MessageId, Recipient, SendReceipt, SendRequest, Seq, StoredMessage, VerdictRef,
+    DeliveryState, MessageId, MessageKind, Recipient, SendReceipt, SendRequest, Seq, StoredMessage,
+    VerdictRef,
 };
-use super::notice::NoticeTable;
+use super::notice::{NoticeTable, Notices};
+use super::oracle::HubIdOracle;
 use super::reach::{resolve_target, Target};
 use super::registry::{RegistryError, SessionRegistry};
 use super::session::SessionRecord;
@@ -188,6 +191,86 @@ pub(super) fn quarantined_text(text: &str, codes: &[ReasonCode]) -> String {
     match RuleMessageAuditor::new().review_field_with(capped, &NullOracle) {
         Some(reason) => format!("[withheld: {}]", reason.code.as_str()),
         None => capped.to_string(),
+    }
+}
+
+/// The subject an operator message carries when the operator gives none.
+pub const OPERATOR_SUBJECT: &str = "operator message";
+
+/// The auditor name stored with an operator message: only the rules layer reviewed it.
+pub const OPERATOR_AUDITOR: &str = "operator-rules";
+
+/// Whom an operator message goes to. Both forms are resolved inside the operator's own root.
+///
+/// ```
+/// use harness::hub::lineage::SessionId;
+/// use harness::hub::send::OperatorTarget;
+/// use harness::task::TaskId;
+///
+/// let one = OperatorTarget::Session { id: SessionId::from_task(TaskId("a".into())) };
+/// assert_ne!(one, OperatorTarget::TopLevel);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorTarget {
+    Session { id: SessionId },
+    TopLevel,
+}
+
+/// What the operator of a root asks the hub to deliver. There is no sender field: the hub
+/// stamps the root mailbox and the identity `operator` itself. `Debug` prints lengths, never
+/// text.
+///
+/// ```
+/// use harness::hub::message::MessageKind;
+/// use harness::hub::send::{OperatorSend, OperatorTarget};
+///
+/// let req = OperatorSend {
+///     to: OperatorTarget::TopLevel,
+///     kind: MessageKind::Info,
+///     subject: None,
+///     body: "a private plan".into(),
+/// };
+/// assert!(!format!("{req:?}").contains("private"));
+/// assert!(format!("{req:?}").contains("body_len: 14"));
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperatorSend {
+    pub to: OperatorTarget,
+    pub kind: MessageKind,
+    pub subject: Option<String>,
+    pub body: String,
+}
+
+impl std::fmt::Debug for OperatorSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorSend")
+            .field("to", &self.to)
+            .field("kind", &self.kind)
+            .field("subject_len", &self.subject.as_ref().map(String::len))
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+fn operator_pick(
+    in_root: Vec<SessionRecord>,
+    to: &OperatorTarget,
+) -> Result<Vec<SessionRecord>, HubError> {
+    match to {
+        OperatorTarget::Session { id } => {
+            let found = in_root.into_iter().find(|rec| rec.id == *id);
+            let rec = found.ok_or(HubError::NotVisible)?;
+            if !rec.status.is_active() {
+                return Err(HubError::RecipientInactive);
+            }
+            Ok(vec![rec])
+        }
+        OperatorTarget::TopLevel => {
+            let top = |rec: &SessionRecord| rec.lineage.parent().is_none();
+            let live = |rec: &SessionRecord| rec.status.is_active();
+            let picked = in_root.into_iter().filter(top).filter(live);
+            Ok(picked.collect())
+        }
     }
 }
 
@@ -406,10 +489,19 @@ impl MessageHub {
         sender: &SessionBinding,
         to: &[SessionId],
     ) -> Result<Reservation<'_>, HubError> {
+        self.reserve_for(sender.session(), sender.lineage().root(), to)
+    }
+
+    fn reserve_for(
+        &self,
+        session: &SessionId,
+        root: &RootId,
+        to: &[SessionId],
+    ) -> Result<Reservation<'_>, HubError> {
         let now = self.clock.now();
         let mut windows = self.windows();
         self.inbox_check(&windows, to)?;
-        windows.admit(now, sender.session(), sender.lineage().root(), &self.limits)?;
+        windows.admit(now, session, root, &self.limits)?;
         let held = to.to_vec();
         windows.reserve(&held);
         Ok(Reservation { hub: self, held })
@@ -644,6 +736,158 @@ impl MessageHub {
         }
     }
 
+    fn operator_window(
+        &self,
+        mailbox: &MailboxId,
+        targets: &[SessionId],
+    ) -> Result<Vec<StoredMessage>, HubError> {
+        let to = match targets {
+            [only] => Recipient::Session { id: only.clone() },
+            _ => Recipient::Root,
+        };
+        let from = mailbox.session().clone();
+        Ok(self.messages.outbound_window(from, to, WINDOW_BYTES)?)
+    }
+
+    fn operator_records(
+        &self,
+        mailbox: &MailboxId,
+        request: &SendRequest,
+        targets: &[SessionId],
+    ) -> Vec<StoredMessage> {
+        let verdict = VerdictRef {
+            log_id: OPERATOR_AUDITOR.to_string(),
+            content_hash: hash_u64(&request.subject, &request.body),
+        };
+        let mut stored = Vec::new();
+        for to in targets {
+            stored.push(StoredMessage {
+                id: MessageId::new(),
+                seq: Seq::new(0),
+                from: mailbox.session().clone(),
+                from_identity: OPERATOR_IDENTITY.to_string(),
+                to: to.clone(),
+                root: mailbox.root().clone(),
+                kind: request.kind,
+                subject: request.subject.clone(),
+                body: request.body.clone(),
+                in_reply_to: None,
+                thread_depth: 0,
+                outbound_verdict: verdict.clone(),
+                state: DeliveryState::Pending,
+                sent_at: self.clock.now(),
+                held: Vec::new(),
+                released: None,
+            });
+        }
+        stored
+    }
+
+    /// Send from the operator of `root` to one active session of that root, or to its active
+    /// top-level sessions (at most the fan-out limit).
+    ///
+    /// The sender is always the root mailbox with the identity `operator`; the request has no
+    /// field that could name another. A session of another root and an unknown id are the same
+    /// [`HubError::NotVisible`]. The only review is the deterministic rules layer: a `Block` and
+    /// a `Quarantine` verdict both refuse with reason codes and store nothing, and no model
+    /// auditor is reached. The send takes a slot in the root's hourly window and in the
+    /// mailbox's own sender window, and the recipient's inbox cap applies. The recipient reviews
+    /// the message inbound like any other and receives it fenced as untrusted text.
+    ///
+    /// ```
+    /// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
+    /// use harness::hub::limits::HubLimits;
+    /// use harness::hub::lineage::RootId;
+    /// use harness::hub::message::MessageKind;
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::send::{
+    ///     AuditorProvider, MessageHub, OperatorSend, OperatorTarget, QuarantineEvent,
+    ///     QuarantineSink,
+    /// };
+    /// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+    /// use harness::leases::SystemClock;
+    /// use std::sync::Arc;
+    ///
+    /// struct Rules;
+    /// impl AuditorProvider for Rules {
+    ///     fn for_sender(&self, _s: &harness::hub::lineage::SessionBinding) -> Arc<dyn MessageAuditor> {
+    ///         Arc::new(RuleMessageAuditor::new())
+    ///     }
+    /// }
+    /// struct Silent;
+    /// impl QuarantineSink for Silent {
+    ///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+    ///         Ok(())
+    ///     }
+    /// }
+    /// let sessions = Arc::new(InMemorySessionStore::new());
+    /// let hub = MessageHub::with_sink(
+    ///     sessions.clone(),
+    ///     Arc::new(InMemoryMessageStore::new()),
+    ///     Arc::new(Rules),
+    ///     Arc::new(SystemClock),
+    ///     HubLimits::default(),
+    ///     Arc::new(SessionRegistry::new(sessions)),
+    ///     Arc::new(Silent),
+    /// );
+    /// let request = OperatorSend {
+    ///     to: OperatorTarget::TopLevel,
+    ///     kind: MessageKind::Info,
+    ///     subject: None,
+    ///     body: "please summarise your progress".into(),
+    /// };
+    /// let root = RootId::plan("plan-1").unwrap();
+    /// let refused = hub.send_as_operator(&root, request).unwrap_err();
+    /// assert_eq!(refused.to_string(), "no active session matches that recipient");
+    /// ```
+    pub fn send_as_operator(
+        &self,
+        root: &RootId,
+        req: OperatorSend,
+    ) -> Result<SendReceipt, HubError> {
+        let mailbox = MailboxId::for_root(root).map_err(|_| HubError::NotVisible)?;
+        let subject = req.subject.unwrap_or_else(|| OPERATOR_SUBJECT.to_string());
+        let (kind, body) = (req.kind, req.body);
+        let request = SendRequest {
+            to: Recipient::Root,
+            kind,
+            subject,
+            body,
+            in_reply_to: None,
+        };
+        self.check_size(&request)?;
+        let in_root = self.sessions.in_root(root)?;
+        let to = operator_pick(in_root, &req.to)?;
+        if to.is_empty() {
+            return Err(HubError::NoRecipient);
+        }
+        if to.len() > self.limits.fanout_max {
+            return Err(HubError::TooLarge {
+                field: "recipients",
+                max: self.limits.fanout_max,
+            });
+        }
+        let targets: Vec<SessionId> = to.iter().map(|rec| rec.id.clone()).collect();
+        let _reservation = self.reserve_for(mailbox.session(), root, &targets)?;
+        let window = self.operator_window(&mailbox, &targets)?;
+        let bodies: Vec<&str> = window.iter().map(|m| m.body.as_str()).collect();
+        let (sessions, messages) = (Arc::clone(&self.sessions), Arc::clone(&self.messages));
+        let oracle = HubIdOracle::new(root.clone(), sessions, messages);
+        let rules = RuleMessageAuditor::new();
+        let outcome = rules.review_with(&request.subject, &request.body, &bodies, &oracle);
+        if !outcome.verdict.is_deliver() {
+            return Err(HubError::Blocked(codes_of(&outcome.verdict)));
+        }
+        let stored = self.operator_records(&mailbox, &request, &targets);
+        let ids = self.append_all(stored)?;
+        self.ring_all(&to);
+        Ok(SendReceipt {
+            recipients: ids.len(),
+            ids,
+            notices: Notices::default(),
+        })
+    }
+
     /// Send `req` from `sender`. Every failure leaves nothing delivered.
     pub async fn send(
         &self,
@@ -701,6 +945,7 @@ mod tests {
     use crate::hub::mailbox::{is_mailbox, operator_scope, MailboxId};
     use crate::hub::message::{MessageKind, MessageReach};
     use crate::hub::oracle::{GitObjectOracle, GitRunner};
+    use crate::hub::recv::RecvRequest;
     use crate::hub::registry::SessionRegistry;
     use crate::hub::session::{ReadScope, SessionStatus};
     use crate::hub::store::{
@@ -3124,5 +3369,725 @@ mod tests {
         hub.send(&a, group(Recipient::Root)).await.unwrap();
         assert_eq!(*spy.held.lock().unwrap(), vec![1]);
         assert_eq!(hub.windows().held(mailbox.session()), 0);
+    }
+
+    fn operator_req(to: OperatorTarget, body: &str) -> OperatorSend {
+        OperatorSend {
+            to,
+            kind: MessageKind::Info,
+            subject: None,
+            body: body.into(),
+        }
+    }
+
+    fn to_one(who: &SessionBinding) -> OperatorTarget {
+        let id = who.session().clone();
+        OperatorTarget::Session { id }
+    }
+
+    fn stored_for(world: &World, who: &SessionBinding) -> Vec<StoredMessage> {
+        world
+            .messages
+            .inbox(who.session().clone(), None, 100)
+            .unwrap()
+    }
+
+    fn env_note() -> &'static str {
+        "my .env has\nPORT=8080\nHOST=localhost\nMODE=dev"
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    fn finish_session(world: &World, who: &SessionBinding) {
+        let running = SessionStatus::Running;
+        world
+            .registry
+            .set_status(who.session(), running, start())
+            .unwrap();
+        let done = SessionStatus::Completed;
+        world
+            .registry
+            .finish(who.session(), done, None, start())
+            .unwrap();
+    }
+
+    struct Counting {
+        calls: AtomicUsize,
+        inner: Arc<dyn MessageAuditor>,
+    }
+
+    impl AuditorProvider for Counting {
+        fn for_sender(&self, _sender: &SessionBinding) -> Arc<dyn MessageAuditor> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.clone()
+        }
+    }
+
+    fn counting_hub(world: &World) -> (MessageHub, Arc<Counting>) {
+        let inner: Arc<dyn MessageAuditor> = Scripted::deliver();
+        let counting = Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+            inner,
+        });
+        let hub = world.hub_with(counting.clone(), HubLimits::default());
+        (hub, counting)
+    }
+
+    fn lenient(world: &World) -> MessageHub {
+        world.hub(Scripted::deliver())
+    }
+
+    fn limited_hub(world: &World, limits: HubLimits) -> MessageHub {
+        let shared: Arc<dyn MessageAuditor> = Scripted::deliver();
+        world.hub_with(Arc::new(shared), limits)
+    }
+
+    #[test]
+    fn an_operator_message_is_stored_pending_from_the_roots_mailbox_over_both_stores() {
+        for (store, path, _guard) in stores() {
+            let world = World::new(store);
+            let mailbox = mailbox_for(&world.root);
+            let b = world.bind("b", None, MessageReach::None);
+            let hub = lenient(&world);
+            let request = operator_req(to_one(&b), "status please");
+            let receipt = hub.send_as_operator(&world.root, request).unwrap();
+            assert_eq!((receipt.recipients, receipt.ids.len()), (1, 1));
+            let inbox = stored_for(&world, &b);
+            assert_eq!(inbox.len(), 1);
+            let stored = &inbox[0];
+            assert_eq!(stored.id, receipt.ids[0]);
+            assert_eq!(stored.state, DeliveryState::Pending);
+            assert_eq!(stored.from, mailbox.session().clone());
+            assert_eq!(stored.from_identity, "operator");
+            assert_eq!(stored.to, b.session().clone());
+            assert_eq!(stored.root, world.root);
+            assert_eq!(stored.subject, "operator message");
+            assert_eq!(stored.body, "status please");
+            assert_eq!((stored.thread_depth, stored.in_reply_to), (0, None));
+            assert_eq!(stored.outbound_verdict.log_id, "operator-rules");
+            let hash = hash_u64("operator message", "status please");
+            assert_eq!(stored.outbound_verdict.content_hash, hash);
+            assert!(stored.held.is_empty() && stored.released.is_none());
+            if let Some(file) = path {
+                let on_disk = std::fs::read_to_string(file).unwrap();
+                assert!(on_disk.contains("operator-rules"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_given_subject_and_kind_are_stored_as_given() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let mut request = operator_req(to_one(&b), "details");
+        request.subject = Some("deploy window".into());
+        request.kind = MessageKind::Question;
+        hub.send_as_operator(&world.root, request).unwrap();
+        let stored = stored_for(&world, &b);
+        assert_eq!(stored[0].subject, "deploy window");
+        assert_eq!(stored[0].kind, MessageKind::Question);
+    }
+
+    #[test]
+    fn top_level_reaches_every_active_top_level_session_of_the_root_and_nobody_else() {
+        let world = World::memory();
+        let other = RootId::mcp(Uuid::from_u128(9));
+        let a = world.bind("a", None, MessageReach::None);
+        let b = world.bind("b", None, MessageReach::None);
+        let child = world.bind("child", Some(&a), MessageReach::None);
+        let done = world.bind("done", None, MessageReach::None);
+        let foreign = world.bind_in(&other, "foreign", None, MessageReach::None);
+        finish_session(&world, &done);
+        let hub = lenient(&world);
+        let request = operator_req(OperatorTarget::TopLevel, "hello");
+        let receipt = hub.send_as_operator(&world.root, request).unwrap();
+        assert_eq!((receipt.recipients, receipt.ids.len()), (2, 2));
+        assert_eq!(stored_for(&world, &a).len(), 1);
+        assert_eq!(stored_for(&world, &b).len(), 1);
+        assert!(stored_for(&world, &child).is_empty());
+        assert!(stored_for(&world, &done).is_empty());
+        assert!(stored_for(&world, &foreign).is_empty());
+    }
+
+    #[test]
+    fn top_level_with_no_active_top_level_session_is_no_recipient() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::None);
+        world.bind("child", Some(&a), MessageReach::None);
+        finish_session(&world, &a);
+        let hub = lenient(&world);
+        let request = operator_req(OperatorTarget::TopLevel, "hello");
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::NoRecipient), "{err:?}");
+    }
+
+    #[test]
+    fn a_session_of_another_root_is_not_visible_and_identical_to_an_unknown_id() {
+        let world = World::memory();
+        let other = RootId::mcp(Uuid::from_u128(9));
+        let foreign = world.bind_in(&other, "foreign", None, MessageReach::None);
+        let hub = lenient(&world);
+        let unknown = SessionId::from_task(TaskId("never-registered".into()));
+        let unknown_to = OperatorTarget::Session { id: unknown };
+        let first = hub.send_as_operator(&world.root, operator_req(to_one(&foreign), "x"));
+        let second = hub.send_as_operator(&world.root, operator_req(unknown_to, "x"));
+        let (first, second) = (first.unwrap_err(), second.unwrap_err());
+        assert!(matches!(first, HubError::NotVisible), "{first:?}");
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert!(stored_for(&world, &foreign).is_empty());
+    }
+
+    #[test]
+    fn the_operator_of_one_root_cannot_reach_the_sessions_or_the_mailbox_of_another() {
+        let world = World::memory();
+        let other = RootId::mcp(Uuid::from_u128(9));
+        let here = world.bind("here", None, MessageReach::None);
+        let there = world.bind_in(&other, "there", None, MessageReach::None);
+        let hub = lenient(&world);
+        let theirs = mailbox_for(&other).into_session();
+        let ours = mailbox_for(&world.root).into_session();
+        for id in [theirs, ours] {
+            let target = OperatorTarget::Session { id };
+            let err = hub
+                .send_as_operator(&world.root, operator_req(target, "x"))
+                .unwrap_err();
+            assert!(matches!(err, HubError::NotVisible), "{err:?}");
+        }
+        let own = operator_req(to_one(&there), "x");
+        hub.send_as_operator(&other, own).unwrap();
+        let crossed = hub.send_as_operator(&other, operator_req(to_one(&here), "x"));
+        assert!(matches!(crossed, Err(HubError::NotVisible)));
+        assert!(stored_for(&world, &here).is_empty());
+        let stored = stored_for(&world, &there);
+        assert_eq!(stored[0].root, other);
+        assert_eq!(stored[0].from, mailbox_for(&other).into_session());
+    }
+
+    #[test]
+    fn an_invalid_root_has_no_mailbox_and_is_not_visible() {
+        let world = World::memory();
+        let forged = RootId::Plan {
+            id: "NOT VALID".into(),
+        };
+        let hub = lenient(&world);
+        let request = operator_req(OperatorTarget::TopLevel, "x");
+        let err = hub.send_as_operator(&forged, request).unwrap_err();
+        assert!(matches!(err, HubError::NotVisible), "{err:?}");
+    }
+
+    #[test]
+    fn a_finished_session_is_refused_as_inactive_and_nothing_is_stored() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        finish_session(&world, &b);
+        let hub = lenient(&world);
+        let request = operator_req(to_one(&b), "x");
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::RecipientInactive), "{err:?}");
+        assert!(stored_for(&world, &b).is_empty());
+    }
+
+    #[test]
+    fn the_fan_out_limit_is_twenty_recipients_and_over_it_nothing_is_stored() {
+        let world = World::memory();
+        let mut sessions = Vec::new();
+        for n in 0..21 {
+            sessions.push(world.bind(&format!("s{n}"), None, MessageReach::None));
+        }
+        let hub = lenient(&world);
+        let request = operator_req(OperatorTarget::TopLevel, "hello");
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        let expected = HubError::TooLarge {
+            field: "recipients",
+            max: 20,
+        };
+        assert_eq!(err.to_string(), expected.to_string());
+        for who in &sessions {
+            assert!(stored_for(&world, who).is_empty());
+        }
+        finish_session(&world, &sessions[0]);
+        let request = operator_req(OperatorTarget::TopLevel, "hello");
+        let receipt = hub.send_as_operator(&world.root, request).unwrap();
+        assert_eq!(receipt.recipients, 20);
+    }
+
+    #[test]
+    fn no_model_auditor_is_ever_reached_by_an_operator_send() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let (hub, counting) = counting_hub(&world);
+        let fine = operator_req(to_one(&b), "fine");
+        hub.send_as_operator(&world.root, fine).unwrap();
+        let leak = operator_req(to_one(&b), &token());
+        assert!(hub.send_as_operator(&world.root, leak).is_err());
+        assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_secret_shaped_token_is_blocked_with_codes_only_and_nothing_is_stored() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let secret = token();
+        let request = operator_req(to_one(&b), &format!("use {secret} now"));
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        let leaked =
+            matches!(&err, HubError::Blocked(codes) if codes.contains(&ReasonCode::SecretLeak));
+        assert!(leaked, "{err:?}");
+        assert!(!err.to_string().contains(&secret));
+        assert!(!format!("{err:?}").contains(&secret));
+        assert!(stored_for(&world, &b).is_empty());
+        assert_eq!(unread_of(&world, b.session()), 0);
+    }
+
+    #[test]
+    fn a_secret_in_the_subject_is_blocked_too() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let mut request = operator_req(to_one(&b), "fine");
+        request.subject = Some(token());
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::Blocked(_)), "{err:?}");
+        assert!(stored_for(&world, &b).is_empty());
+    }
+
+    #[test]
+    fn a_credential_file_shape_the_rules_quarantine_is_refused_and_not_stored() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let rules = RuleMessageAuditor::new().review("s", env_note(), &[]);
+        assert!(rules.verdict.is_quarantine());
+        let request = operator_req(to_one(&b), env_note());
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::Blocked(_)), "{err:?}");
+        assert!(!err.to_string().contains("PORT=8080"));
+        assert!(stored_for(&world, &b).is_empty());
+        assert!(world.messages.quarantined().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_operators_own_recent_text_is_in_the_window_so_a_split_token_is_blocked() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let c = world.bind("c", None, MessageReach::None);
+        let hub = lenient(&world);
+        let secret = token();
+        let (first, second) = secret.split_at(18);
+        let ok = hub.send_as_operator(&world.root, operator_req(to_one(&b), first));
+        assert!(ok.is_ok());
+        let split = hub.send_as_operator(&world.root, operator_req(to_one(&b), second));
+        assert!(matches!(split, Err(HubError::Blocked(_))), "{split:?}");
+        let elsewhere = hub.send_as_operator(&world.root, operator_req(to_one(&c), second));
+        assert!(elsewhere.is_ok());
+        assert_eq!(stored_for(&world, &b).len(), 1);
+    }
+
+    #[test]
+    fn an_agents_recent_text_is_not_in_the_operators_window() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        let hub = lenient(&world);
+        let secret = token();
+        let (first, second) = secret.split_at(18);
+        runtime().block_on(hub.send(&a, req(&b, first))).unwrap();
+        let sent = hub.send_as_operator(&world.root, operator_req(to_one(&b), second));
+        assert!(sent.is_ok(), "{sent:?}");
+    }
+
+    #[test]
+    fn the_body_and_subject_limits_apply() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let fits = operator_req(to_one(&b), &"x".repeat(8192));
+        assert!(hub.send_as_operator(&world.root, fits).is_ok());
+        let long = operator_req(to_one(&b), &"x".repeat(8193));
+        let err = hub.send_as_operator(&world.root, long).unwrap_err();
+        let body = HubError::TooLarge {
+            field: "body",
+            max: 8192,
+        };
+        assert_eq!(err.to_string(), body.to_string());
+        let mut wide = operator_req(to_one(&b), "x");
+        wide.subject = Some("é".repeat(121));
+        let err = hub.send_as_operator(&world.root, wide).unwrap_err();
+        let subject = HubError::TooLarge {
+            field: "subject",
+            max: 120,
+        };
+        assert_eq!(err.to_string(), subject.to_string());
+        assert_eq!(unread_of(&world, b.session()), 1);
+    }
+
+    #[test]
+    fn the_mailbox_has_its_own_ten_minute_window_which_slides() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        let limits = HubLimits {
+            per_sender_per_10m: 2,
+            ..HubLimits::default()
+        };
+        let hub = limited_hub(&world, limits);
+        let rt = runtime();
+        rt.block_on(hub.send(&a, req(&b, "one"))).unwrap();
+        rt.block_on(hub.send(&a, req(&b, "two"))).unwrap();
+        for body in ["x", "y"] {
+            let sent = hub.send_as_operator(&world.root, operator_req(to_one(&b), body));
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        let third = hub.send_as_operator(&world.root, operator_req(to_one(&b), "z"));
+        assert!(matches!(third, Err(HubError::RateLimited(_))), "{third:?}");
+        world.clock.advance(Span::seconds(601));
+        let later = hub.send_as_operator(&world.root, operator_req(to_one(&b), "z"));
+        assert!(later.is_ok(), "{later:?}");
+    }
+
+    #[test]
+    fn the_hourly_root_window_is_shared_between_agents_and_the_operator() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        let limits = HubLimits {
+            per_root_per_hour: 2,
+            ..HubLimits::default()
+        };
+        let hub = limited_hub(&world, limits);
+        let rt = runtime();
+        rt.block_on(hub.send(&a, req(&b, "one"))).unwrap();
+        let ok = hub.send_as_operator(&world.root, operator_req(to_one(&b), "two"));
+        assert!(ok.is_ok());
+        let over = hub.send_as_operator(&world.root, operator_req(to_one(&b), "three"));
+        assert!(matches!(over, Err(HubError::RateLimited(_))), "{over:?}");
+        let agent = rt.block_on(hub.send(&a, req(&b, "four")));
+        assert!(matches!(agent, Err(HubError::RateLimited(_))));
+        assert_eq!(unread_of(&world, b.session()), 2);
+    }
+
+    #[test]
+    fn a_full_inbox_refuses_an_operator_message() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let limits = HubLimits {
+            inbox_max: 2,
+            ..HubLimits::default()
+        };
+        let hub = limited_hub(&world, limits);
+        for body in ["one", "two"] {
+            let request = operator_req(to_one(&b), body);
+            hub.send_as_operator(&world.root, request).unwrap();
+        }
+        let full = hub.send_as_operator(&world.root, operator_req(to_one(&b), "three"));
+        assert!(matches!(full, Err(HubError::InboxFull)), "{full:?}");
+        assert_eq!(unread_of(&world, b.session()), 2);
+        assert_eq!(hub.windows().held(b.session()), 0);
+    }
+
+    #[test]
+    fn a_refused_send_leaves_no_reservation_behind() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let blocked = hub.send_as_operator(&world.root, operator_req(to_one(&b), &token()));
+        assert!(blocked.is_err());
+        assert_eq!(hub.windows().held(b.session()), 0);
+    }
+
+    fn store_failing_at(world: &World, fail_at: usize) -> (MessageHub, Arc<Failing>) {
+        let store = Arc::new(Failing {
+            inner: InMemoryMessageStore::new(),
+            fail_at: AtomicUsize::new(fail_at),
+            appends: AtomicUsize::new(0),
+            unreadable: AtomicBool::new(false),
+        });
+        let shared: Arc<dyn MessageAuditor> = Scripted::deliver();
+        let hub = MessageHub::new(
+            world.sessions.clone(),
+            store.clone(),
+            Arc::new(shared),
+            Arc::new(world.clock.clone()),
+            HubLimits::default(),
+            world.registry.clone(),
+        );
+        (hub, store)
+    }
+
+    #[test]
+    fn a_store_failure_delivers_nothing() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let (hub, store) = store_failing_at(&world, 1);
+        let request = operator_req(to_one(&b), "x");
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::Store(_)), "{err:?}");
+        assert_eq!(store.inner.unread(b.session().clone()).unwrap(), 0);
+        assert_eq!(hub.windows().held(b.session()), 0);
+    }
+
+    #[test]
+    fn a_failure_part_way_through_a_fan_out_expires_the_earlier_records() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::None);
+        let b = world.bind("b", None, MessageReach::None);
+        let (hub, store) = store_failing_at(&world, 2);
+        let request = operator_req(OperatorTarget::TopLevel, "x");
+        let err = hub.send_as_operator(&world.root, request).unwrap_err();
+        assert!(matches!(err, HubError::Store(_)), "{err:?}");
+        let from = mailbox_for(&world.root).into_session();
+        let kept = store
+            .inner
+            .outbound_window(from, Recipient::Root, 10_000)
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].state, DeliveryState::Expired);
+        assert_eq!(store.inner.unread(a.session().clone()).unwrap(), 0);
+        assert_eq!(store.inner.unread(b.session().clone()).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_doorbell_rings_each_recipient_with_its_unread_count() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::None);
+        let b = world.bind("b", None, MessageReach::None);
+        let (hub, bell) = ringing(&world, Scripted::deliver());
+        let request = operator_req(OperatorTarget::TopLevel, "hello");
+        hub.send_as_operator(&world.root, request).unwrap();
+        let mut rung = bell.rings();
+        rung.sort_by_key(|(id, _)| id.to_string());
+        let expected = vec![(a.session().clone(), 1), (b.session().clone(), 1)];
+        assert_eq!(rung, expected);
+        assert_eq!(bell.stored(), vec![1, 1]);
+    }
+
+    #[test]
+    fn debug_error_and_receipt_text_never_carry_the_message_text() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::None);
+        let hub = lenient(&world);
+        let planted = "PLANTED-OPERATOR-TEXT-91f3";
+        let request = operator_req(to_one(&b), planted);
+        assert!(!format!("{request:?}").contains(planted));
+        let receipt = hub.send_as_operator(&world.root, request).unwrap();
+        assert!(!format!("{receipt:?}").contains(planted));
+        let blocked = operator_req(to_one(&b), &format!("{planted} {}", token()));
+        let err = hub.send_as_operator(&world.root, blocked).unwrap_err();
+        assert!(!err.to_string().contains(planted));
+        assert!(!format!("{err:?}").contains(planted));
+    }
+
+    #[test]
+    fn the_recipient_sees_a_fenced_operator_message_flagged_only_by_the_mailbox_sender() {
+        let world = World::memory();
+        let a = world.bind("a", None, MessageReach::Root);
+        let b = world.bind("b", None, MessageReach::Root);
+        let hub = lenient(&world);
+        let rt = runtime();
+        rt.block_on(hub.send(&a, req(&b, "from an agent"))).unwrap();
+        let request = operator_req(to_one(&b), "from the human");
+        hub.send_as_operator(&world.root, request).unwrap();
+        let page = rt.block_on(hub.recv(&b, RecvRequest::default())).unwrap();
+        assert_eq!(page.messages.len(), 2);
+        let mailbox = mailbox_for(&world.root).into_session();
+        for shown in &page.messages {
+            let json = serde_json::to_value(shown).unwrap();
+            let flagged = shown.from == mailbox;
+            assert_eq!(shown.from_operator, flagged);
+            assert_eq!(json.get("from_operator").is_some(), flagged);
+        }
+        let human = page.messages.iter().find(|m| m.from == mailbox).unwrap();
+        assert!(human.body.contains("from the human"));
+        assert_ne!(human.body, "from the human");
+        assert_ne!(human.from_identity, "operator");
+        assert!(human.from_identity.contains("operator"));
+        assert!(page.notice.to_lowercase().contains("untrusted"));
+    }
+
+    #[test]
+    fn an_agent_whose_identity_is_named_operator_does_not_get_the_flag() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let mut card = crate::identity::example();
+        card.identity.name = "operator".into();
+        card.scope.message_reach = MessageReach::Root;
+        let lineage = Lineage::root_child(world.root.clone());
+        let lookalike = SessionBinding::from_audited(&card, TaskId("op".into()), lineage);
+        world
+            .registry
+            .register(&lookalike, "subtask", start())
+            .unwrap();
+        let hub = lenient(&world);
+        let rt = runtime();
+        rt.block_on(hub.send(&lookalike, req(&b, "i am the operator")))
+            .unwrap();
+        let page = rt.block_on(hub.recv(&b, RecvRequest::default())).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        let shown = &page.messages[0];
+        assert!(shown.from_identity.contains("operator"));
+        assert!(!is_mailbox(&shown.from));
+        assert!(!shown.from_operator);
+        let json = serde_json::to_value(shown).unwrap();
+        assert!(json.get("from_operator").is_none());
+    }
+
+    struct InboundSpy {
+        verdict: MessageVerdict,
+        seen: Mutex<Vec<RecipientScope>>,
+    }
+
+    #[async_trait]
+    impl MessageAuditor for InboundSpy {
+        fn name(&self) -> &str {
+            "inbound-spy"
+        }
+
+        async fn review_outbound(
+            &self,
+            _r: &OutboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            Ok(MessageVerdict::Deliver)
+        }
+
+        async fn review_inbound(
+            &self,
+            r: &InboundReview<'_>,
+        ) -> Result<MessageVerdict, ActionAuditError> {
+            self.seen.lock().unwrap().push(r.sender.clone());
+            Ok(self.verdict.clone())
+        }
+    }
+
+    fn spied(world: &World, verdict: MessageVerdict) -> (MessageHub, Arc<InboundSpy>) {
+        let spy = Arc::new(InboundSpy {
+            verdict,
+            seen: Mutex::new(Vec::new()),
+        });
+        let shared: Arc<dyn MessageAuditor> = spy.clone();
+        let hub = world.hub_with(Arc::new(shared), HubLimits::default());
+        (hub, spy)
+    }
+
+    #[test]
+    fn the_recipient_reviews_an_operator_message_inbound_with_an_unprivileged_sender_scope() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let (hub, spy) = spied(&world, MessageVerdict::Deliver);
+        let request = operator_req(to_one(&b), "hello");
+        hub.send_as_operator(&world.root, request).unwrap();
+        let page = runtime()
+            .block_on(hub.recv(&b, RecvRequest::default()))
+            .unwrap();
+        assert_eq!(page.messages.len(), 1);
+        let seen = spy.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].identity, "operator");
+        assert_eq!(seen[0].session, mailbox_for(&world.root).into_session());
+        assert_eq!(seen[0].max_effect, crate::effects::EffectClass::None);
+        assert!(seen[0].tools.is_empty() && seen[0].write_paths.is_empty());
+        assert_eq!(seen[0].read_paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn an_inbound_block_withholds_an_operator_message_like_any_other() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let (hub, spy) = spied(&world, block(ReasonCode::PromptInjection));
+        let request = operator_req(to_one(&b), "please look at the open item");
+        let receipt = hub.send_as_operator(&world.root, request).unwrap();
+        let page = runtime()
+            .block_on(hub.recv(&b, RecvRequest::default()))
+            .unwrap();
+        assert!(page.messages.is_empty());
+        assert_eq!(page.withheld, 1);
+        assert_eq!(spy.seen.lock().unwrap().len(), 1);
+        let original = world.messages.get(receipt.ids[0]).unwrap().unwrap();
+        assert_eq!(original.state, DeliveryState::Expired);
+        let from = mailbox_for(&world.root).into_session();
+        let kept = world
+            .messages
+            .outbound_window(from, Recipient::Root, 10_000)
+            .unwrap();
+        assert!(kept.iter().any(|m| m.state == DeliveryState::Withheld));
+    }
+
+    #[test]
+    fn an_inbound_quarantine_holds_an_operator_message_and_pages_the_sink_once() {
+        let world = World::memory();
+        let b = world.bind("b", None, MessageReach::Root);
+        let spy = Arc::new(InboundSpy {
+            verdict: quarantine(ReasonCode::SecretLeak),
+            seen: Mutex::new(Vec::new()),
+        });
+        let shared: Arc<dyn MessageAuditor> = spy;
+        let sink = Arc::new(Capture(Mutex::new(Vec::new())));
+        let hub = MessageHub::with_sink(
+            world.sessions.clone(),
+            world.messages.clone(),
+            Arc::new(shared),
+            Arc::new(world.clock.clone()),
+            HubLimits::default(),
+            world.registry.clone(),
+            sink.clone(),
+        );
+        let request = operator_req(to_one(&b), "hello");
+        hub.send_as_operator(&world.root, request).unwrap();
+        assert_eq!(sink.0.lock().unwrap().len(), 0);
+        let page = runtime()
+            .block_on(hub.recv(&b, RecvRequest::default()))
+            .unwrap();
+        assert_eq!(page.withheld, 1);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        let held = world.messages.quarantined().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].from, mailbox_for(&world.root).into_session());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn an_operator_send_is_stored_exactly_when_the_rules_deliver_and_always_from_the_mailbox(
+            body in "[ -~\n]{0,80}",
+            subject in "[ -~]{0,30}",
+        ) {
+            let world = World::memory();
+            let b = world.bind("b", None, MessageReach::None);
+            let hub = lenient(&world);
+            let mut request = operator_req(to_one(&b), &body);
+            request.subject = Some(subject.clone());
+            let outcome = hub.send_as_operator(&world.root, request);
+            let reference = RuleMessageAuditor::new().review(&subject, &body, &[]);
+            let stored = stored_for(&world, &b);
+            prop_assert_eq!(outcome.is_ok(), reference.verdict.is_deliver());
+            prop_assert_eq!(stored.len(), usize::from(outcome.is_ok()));
+            let mailbox = mailbox_for(&world.root).into_session();
+            for message in &stored {
+                prop_assert_eq!(&message.from, &mailbox);
+                prop_assert_eq!(&message.body, &body);
+                prop_assert_eq!(message.state, DeliveryState::Pending);
+            }
+        }
+
+        #[test]
+        fn a_top_level_fan_out_succeeds_exactly_for_one_to_twenty_active_sessions(
+            count in 0usize..24,
+        ) {
+            let world = World::memory();
+            for n in 0..count {
+                world.bind(&format!("s{n}"), None, MessageReach::None);
+            }
+            let hub = lenient(&world);
+            let request = operator_req(OperatorTarget::TopLevel, "hello");
+            let outcome = hub.send_as_operator(&world.root, request);
+            prop_assert_eq!(outcome.is_ok(), (1..=20).contains(&count));
+        }
     }
 }
