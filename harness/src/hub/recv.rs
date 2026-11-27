@@ -39,6 +39,10 @@ pub const RECV_POLL_MILLIS: i64 = 1000;
 /// The longest one `recv` spends reviewing, in seconds on the hub's clock; messages left over stay `Pending`.
 pub const RECV_REVIEW_BUDGET_SECS: i64 = 60;
 
+mod root_inbox;
+
+pub use root_inbox::{RootMessage, RootPage, RootRequest};
+
 const SCAN_PAGE: usize = 64;
 const SUBJECT_RENDER_CAP: usize = 480;
 const IDENTITY_RENDER_CAP: usize = 120;
@@ -519,6 +523,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    mod root_inbox_tests;
 
     fn token() -> String {
         format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")

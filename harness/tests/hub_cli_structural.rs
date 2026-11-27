@@ -265,6 +265,7 @@ fn the_cli_binary_reaches_the_journals_only_through_the_operator_reports() {
     let main = facts(&source("main.rs"), Some("run_hub"), None);
     for banned in [
         "HubRuntime",
+        "open_offline",
         "HubLock",
         "JsonlMessageStore",
         "JsonlSessionStore",
@@ -279,6 +280,7 @@ fn the_cli_binary_reaches_the_journals_only_through_the_operator_reports() {
         "sessions_report",
         "quarantine_list_report",
         "quarantine_show_report",
+        "quarantine_resolve_report",
     ] {
         assert!(main.idents.contains(wanted), "{wanted}");
     }
@@ -389,4 +391,29 @@ fn the_grant_signature_check_accepts_a_grant_first_and_refuses_its_absence() {
     let open = "fn show(p: u8, _g: &OperatorGrant) {}";
     assert!(!signature_takes_grant(open, "show"));
     assert!(!signature_takes_grant("fn show() {}", "show"));
+}
+
+#[test]
+fn the_offline_resolver_takes_the_grant_first_and_only_it_opens_the_offline_hub() {
+    let text = source("hub/operator.rs");
+    assert!(signature_takes_grant(&text, "resolve_report_with"));
+    let operator = facts(&text, None, None);
+    assert!(operator
+        .callers
+        .contains("quarantine_resolve_report->and_then"));
+    assert!(operator
+        .callers
+        .contains("resolve_report_with->resolve_quarantine"));
+    let openers = mentions(&["open_offline"]);
+    assert_eq!(
+        openers,
+        set(&["hub/operator.rs", "hub/runtime.rs"]),
+        "{openers:?}"
+    );
+}
+
+#[test]
+fn the_offline_quarantine_sink_is_named_only_by_the_runtime() {
+    let named = mentions(&["OfflineQuarantineSink"]);
+    assert_eq!(named, set(&["hub/runtime.rs"]), "{named:?}");
 }

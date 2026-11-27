@@ -16,7 +16,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
+
+static FORKS: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    FORKS.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 const TOKEN: &str = "PLANTED-TOKEN-7c1e";
 const LOCK_FILE: &str = "hub.lock";
@@ -89,6 +96,7 @@ impl Hub {
     }
 
     fn seed(&self, messages: Vec<StoredMessage>, sessions: Vec<SessionRecord>) {
+        let _forks = serial();
         let lock = HubLock::acquire(self.dir.path()).unwrap();
         let store = JsonlMessageStore::open(&self.dir.path().join("messages.jsonl"), &lock);
         let store = store.unwrap();
@@ -123,6 +131,7 @@ fn run_at(queue: &Path, args: &[&str], agent: Option<&str>) -> Output {
         command.env(AGENT_SESSION_ENV, marker);
     }
     command.stdin(std::process::Stdio::null());
+    let _forks = serial();
     command.output().unwrap()
 }
 
@@ -367,4 +376,271 @@ fn a_corrupt_journal_is_exit_one_not_a_partial_listing() {
         err(&output)
     );
     assert!(out(&output).is_empty());
+}
+
+const UNIFORM: &str = "no quarantined message with that id";
+
+fn recipient(n: u128) -> SessionRecord {
+    session(&format!("to-{n}"), "coder", RootId::mcp(uuid_of(n)))
+}
+
+fn message_of(hub: &Hub, n: u128) -> StoredMessage {
+    let _forks = serial();
+    let lock = HubLock::acquire(hub.dir.path()).unwrap();
+    let store = JsonlMessageStore::open(&hub.dir.path().join("messages.jsonl"), &lock).unwrap();
+    store
+        .get(MessageId::from_uuid(uuid_of(n)))
+        .unwrap()
+        .unwrap()
+}
+
+fn stays_quarantined(hub: &Hub, n: u128) {
+    let found = message_of(hub, n);
+    assert_eq!(found.state, DeliveryState::Quarantined);
+    assert!(found.released.is_none());
+}
+
+#[test]
+fn release_and_drop_without_a_terminal_are_refused_and_the_message_stays_quarantined() {
+    let hub = Hub::new();
+    hub.seed(vec![held(1, "coder", TOKEN, TOKEN)], vec![recipient(1)]);
+    let id = uuid_of(1).to_string();
+    for verb in ["release", "drop"] {
+        let output = hub.run(&["quarantine", verb, &id]);
+        assert_eq!(output.status.code(), Some(1), "{verb}");
+        assert!(
+            err(&output).contains("operator commands need a terminal"),
+            "{}",
+            err(&output)
+        );
+        assert!(out(&output).is_empty());
+        assert!(!err(&output).contains(TOKEN));
+    }
+    stays_quarantined(&hub, 1);
+}
+
+#[test]
+fn release_and_drop_under_an_agent_session_marker_are_refused_and_the_message_stays_quarantined() {
+    let hub = Hub::new();
+    hub.seed(vec![held(1, "coder", TOKEN, TOKEN)], vec![recipient(1)]);
+    let id = uuid_of(1).to_string();
+    for verb in ["release", "drop"] {
+        let output = run_at(&hub.queue(), &["quarantine", verb, &id], Some("task-1"));
+        assert_eq!(output.status.code(), Some(1), "{verb}");
+        assert!(
+            err(&output).contains("refused inside an agent session"),
+            "{}",
+            err(&output)
+        );
+        assert!(out(&output).is_empty());
+    }
+    stays_quarantined(&hub, 1);
+}
+
+#[test]
+fn release_and_drop_need_an_id_argument() {
+    let hub = Hub::new();
+    for verb in ["release", "drop"] {
+        let output = hub.run(&["quarantine", verb]);
+        assert_eq!(output.status.code(), Some(2), "{verb}");
+        assert!(err(&output).contains("<ID>"), "{}", err(&output));
+    }
+}
+
+#[cfg(unix)]
+mod terminal {
+    use super::*;
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+
+    fn pty() -> (OwnedFd, OwnedFd) {
+        let mut master = 0;
+        let mut slave = 0;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+    }
+
+    struct Ran {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn on_a_terminal(queue: &Path, args: &[&str]) -> Ran {
+        let (master, slave) = pty();
+        let stdin = File::from(slave.try_clone().unwrap());
+        let stdout = File::from(slave);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nanna"));
+        command.arg("hub").args(args).arg("--queue-path").arg(queue);
+        for name in [
+            AGENT_SESSION_ENV,
+            "NANNA_SESSIONS_PATH",
+            "NANNA_MESSAGES_PATH",
+            "NANNA_QUEUE_PATH",
+            "RUST_LOG",
+        ] {
+            command.env_remove(name);
+        }
+        command.stdin(Stdio::from(stdin));
+        command.stdout(Stdio::from(stdout));
+        command.stderr(Stdio::piped());
+        let forks = serial();
+        let output = command.output().unwrap();
+        drop(forks);
+        drop(command);
+        let mut bytes = Vec::new();
+        let _ = File::from(master).read_to_end(&mut bytes);
+        Ran {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    fn resolve(hub: &Hub, verb: &str, id: &str) -> Ran {
+        on_a_terminal(&hub.queue(), &["quarantine", verb, id])
+    }
+
+    #[test]
+    fn release_on_a_terminal_moves_the_message_to_pending_with_the_marker_and_prints_ids_only() {
+        let hub = Hub::new();
+        hub.seed(
+            vec![held(1, "coder", "subject-x", TOKEN)],
+            vec![recipient(1)],
+        );
+        let id = uuid_of(1).to_string();
+        let ran = resolve(&hub, "release", &id);
+        assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+        assert_eq!(ran.stdout.trim(), format!("released {id}: pending"));
+        assert!(!ran.stdout.contains(TOKEN) && !ran.stderr.contains(TOKEN));
+        let found = message_of(&hub, 1);
+        assert_eq!(found.state, DeliveryState::Pending);
+        assert!(found.released.is_some());
+        assert_eq!(found.body, TOKEN);
+    }
+
+    #[test]
+    fn drop_on_a_terminal_expires_the_message_without_a_marker() {
+        let hub = Hub::new();
+        hub.seed(vec![held(1, "coder", "s", TOKEN)], vec![]);
+        let id = uuid_of(1).to_string();
+        let ran = resolve(&hub, "drop", &id);
+        assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+        assert_eq!(ran.stdout.trim(), format!("dropped {id}: expired"));
+        let found = message_of(&hub, 1);
+        assert_eq!(found.state, DeliveryState::Expired);
+        assert!(found.released.is_none());
+    }
+
+    #[test]
+    fn json_prints_the_id_the_action_and_the_state() {
+        let hub = Hub::new();
+        hub.seed(vec![held(1, "coder", "s", "b")], vec![recipient(1)]);
+        let id = uuid_of(1).to_string();
+        let ran = on_a_terminal(&hub.queue(), &["quarantine", "release", &id, "--json"]);
+        assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+        let parsed: serde_json::Value = serde_json::from_str(ran.stdout.trim()).unwrap();
+        let expected = serde_json::json!({"id": id, "action": "released", "state": "pending"});
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn an_unparsable_unknown_and_non_quarantined_id_give_the_same_error_and_change_nothing() {
+        let hub = Hub::new();
+        let mut done = held(2, "coder", "s", "b");
+        done.state = DeliveryState::Expired;
+        hub.seed(
+            vec![held(1, "coder", "s", "b"), done],
+            vec![recipient(1), recipient(2)],
+        );
+        for verb in ["release", "drop"] {
+            for id in [
+                "not-an-id".to_string(),
+                uuid_of(404).to_string(),
+                uuid_of(2).to_string(),
+            ] {
+                let ran = resolve(&hub, verb, &id);
+                assert_eq!(ran.code, Some(1), "{verb} {id}");
+                assert_eq!(ran.stderr.trim(), format!("Error: {UNIFORM}"));
+                assert!(ran.stdout.is_empty());
+            }
+        }
+        stays_quarantined(&hub, 1);
+        assert_eq!(message_of(&hub, 2).state, DeliveryState::Expired);
+    }
+
+    #[test]
+    fn a_hub_held_by_a_running_process_is_refused_with_the_in_use_message_and_nothing_changes() {
+        let hub = Hub::new();
+        hub.seed(vec![held(1, "coder", "s", "b")], vec![recipient(1)]);
+        let forks = serial();
+        let holder = HubLock::acquire(hub.dir.path()).unwrap();
+        drop(forks);
+        let id = uuid_of(1).to_string();
+        for verb in ["release", "drop"] {
+            let ran = resolve(&hub, verb, &id);
+            assert_eq!(ran.code, Some(1), "{verb}");
+            assert!(
+                ran.stderr
+                    .contains("the hub is in use by a running nanna process"),
+                "{}",
+                ran.stderr
+            );
+            assert!(ran.stdout.is_empty());
+        }
+        drop(holder);
+        stays_quarantined(&hub, 1);
+    }
+
+    #[test]
+    fn a_release_to_an_inactive_recipient_is_refused_and_the_message_stays_quarantined() {
+        let hub = Hub::new();
+        hub.seed(vec![held(1, "coder", "s", "b")], vec![]);
+        let ran = resolve(&hub, "release", &uuid_of(1).to_string());
+        assert_eq!(ran.code, Some(1));
+        assert!(
+            ran.stderr.contains("recipient session is not active"),
+            "{}",
+            ran.stderr
+        );
+        stays_quarantined(&hub, 1);
+    }
+
+    #[test]
+    fn a_missing_hub_directory_is_exit_one_and_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("absent").join("queue.jsonl");
+        let ran = on_a_terminal(&queue, &["quarantine", "drop", &uuid_of(1).to_string()]);
+        assert_eq!(ran.code, Some(1));
+        assert!(
+            ran.stderr.contains("no hub state directory at"),
+            "{}",
+            ran.stderr
+        );
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[test]
+    fn a_dropped_message_is_never_listed_again_and_a_second_drop_is_the_uniform_error() {
+        let hub = Hub::new();
+        hub.seed(vec![held(1, "coder", "s", "b")], vec![]);
+        let id = uuid_of(1).to_string();
+        assert_eq!(resolve(&hub, "drop", &id).code, Some(0));
+        let listed = hub.run(&["quarantine", "list"]);
+        assert_eq!(out(&listed), "no quarantined messages\n");
+        let again = resolve(&hub, "drop", &id);
+        assert_eq!(again.code, Some(1));
+        assert_eq!(again.stderr.trim(), format!("Error: {UNIFORM}"));
+    }
 }
