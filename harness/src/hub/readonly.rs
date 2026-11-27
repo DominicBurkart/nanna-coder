@@ -22,7 +22,7 @@ fn journal_dir(path: &Path) -> &Path {
     }
 }
 
-fn present(path: &Path) -> Result<(), OperatorError> {
+pub(super) fn present(path: &Path) -> Result<(), OperatorError> {
     let dir = journal_dir(path);
     if dir.is_dir() {
         return Ok(());
