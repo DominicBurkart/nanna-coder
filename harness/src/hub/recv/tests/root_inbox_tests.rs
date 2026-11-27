@@ -653,3 +653,46 @@ fn a_mailbox_larger_than_the_scan_page_is_paged_through_in_order_without_foreign
     }
     assert_eq!(seen, expected);
 }
+
+#[test]
+fn resolve_root_reads_the_prefixed_forms_and_a_session_id_on_the_host() {
+    let world = World::memory();
+    let other = other_root();
+    let a = world.seat_in(&world.root, "task-a", EffectClass::None);
+    let b = world.seat_in(&other, "task-b", EffectClass::None);
+    let hub = world.hub(Recorder::new(Say::Fail));
+    let uuid = Uuid::from_u128(7);
+    let plan = RootId::plan("plan-0a1b").unwrap();
+    let backlog = RootId::backlog("example/repo", 42).unwrap();
+    assert_eq!(hub.resolve_root("plan-0a1b").unwrap(), plan);
+    assert_eq!(
+        hub.resolve_root("backlog-example/repo#42").unwrap(),
+        backlog
+    );
+    assert_eq!(
+        hub.resolve_root(&format!("mcp-{uuid}")).unwrap(),
+        RootId::mcp(uuid)
+    );
+    assert_eq!(hub.resolve_root("task-a").unwrap(), *a.lineage().root());
+    assert_eq!(hub.resolve_root("task-b").unwrap(), *b.lineage().root());
+    assert_ne!(
+        hub.resolve_root("task-a").unwrap(),
+        hub.resolve_root("task-b").unwrap()
+    );
+}
+
+#[test]
+fn resolve_root_answers_every_unresolvable_text_with_the_same_error() {
+    let world = World::memory();
+    let hub = world.hub(Recorder::new(Say::Fail));
+    let mailbox = mailbox_of(&world.root).to_string();
+    let texts = ["no-such-task", "mcp-not-a-uuid", "backlog-x", "", &mailbox];
+    let shown: Vec<String> = texts
+        .iter()
+        .map(|text| format!("{:?}", hub.resolve_root(text)))
+        .collect();
+    assert!(
+        shown.iter().all(|line| line == "Err(NotVisible)"),
+        "{shown:?}"
+    );
+}
