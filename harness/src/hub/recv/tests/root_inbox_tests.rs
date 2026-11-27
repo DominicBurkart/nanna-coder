@@ -621,3 +621,35 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_mailbox_larger_than_the_scan_page_is_paged_through_in_order_without_foreign_mail() {
+    let world = World::memory();
+    let a = world.seat("a");
+    let x = world.seat_in(&other_root(), "x", EffectClass::None);
+    let hub = world.hub(Recorder::deliver());
+    let mut expected: Vec<String> = Vec::new();
+    for n in 0..150 {
+        let body = format!("note number {n}");
+        put_mail(&world, &a, &body);
+        expected.push(body);
+        let mut stray = mail(&x, "s", "from-another-root", DeliveryState::Pending);
+        stray.to = mailbox_of(&world.root);
+        world.messages.append(stray).unwrap();
+    }
+    let first = hub.root_inbox(&world.root, ask(20)).unwrap();
+    assert_eq!(first.remaining, 130);
+    let mut seen: Vec<String> = Vec::new();
+    let mut after: Option<Seq> = None;
+    for _ in 0..10 {
+        let req = RootRequest { after, ..ask(20) };
+        let page = hub.root_inbox(&world.root, req).unwrap();
+        for message in &page.messages {
+            seen.push(inner_text(&message.body).to_string());
+        }
+        if let Some(last) = page.messages.last() {
+            after = Some(last.seq);
+        }
+    }
+    assert_eq!(seen, expected);
+}
