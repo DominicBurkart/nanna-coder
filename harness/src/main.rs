@@ -2312,7 +2312,6 @@ async fn run_mcp_server(
         plane,
     )?;
     let mut server = NannaMcpServer::new(task_manager, provider, gate, max_iterations);
-    server = server.with_manager_hub();
     if let Some(planner) = planner_model {
         info!("plan_task enabled (planner model: {})", planner);
         server = server.with_planner(planner);
