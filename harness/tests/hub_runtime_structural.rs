@@ -195,7 +195,13 @@ const REGISTRY: Target = Target {
 };
 const RUNTIME: Target = Target {
     owner: "HubRuntime",
-    members: &["open", "open_with", "assemble", "assemble_with_sink"],
+    members: &[
+        "open",
+        "open_offline",
+        "open_with",
+        "assemble",
+        "assemble_with_sink",
+    ],
 };
 const SINK: Target = Target {
     owner: "EscalationQuarantineSink",
@@ -251,7 +257,9 @@ fn only_the_mcp_serve_builder_opens_a_hub_runtime() {
     assert_eq!(
         sorted(production(RUNTIME)),
         set(&[
+            "hub/operator.rs: resolve_report_with: HubRuntime::open_offline",
             "hub/runtime.rs: open: HubRuntime::open_with",
+            "hub/runtime.rs: open_offline: HubRuntime::assemble_with_sink",
             "hub/runtime.rs: open_with: HubRuntime::assemble_with_sink",
             "main.rs: build_mcp_task_manager_with_budget: HubRuntime::open",
         ]),

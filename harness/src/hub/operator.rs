@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 
 use super::mailbox::{is_mailbox, MailboxId};
 use super::message::{DeliveryState, MessageId, MessageKind, Release, StoredMessage};
-use super::readonly::{render_sessions, sessions_json, ReadOnlyHub};
-use super::runtime::HubPaths;
+use super::readonly::{present, render_sessions, sessions_json, ReadOnlyHub};
+use super::runtime::{HubPaths, HubRuntime};
 use super::send::{codes_of, MessageHub};
 use super::store::{MessageStore, StoreError};
 use crate::action_auditor::{NullOracle, RuleMessageAuditor};
@@ -41,6 +41,8 @@ pub enum OperatorError {
     AgentSession,
     #[error("no quarantined message with that id")]
     NotQuarantined,
+    #[error("the hub is in use by a running nanna process; stop it (release and drop only work while mcp-serve is stopped) and retry")]
+    HubInUse,
     #[error("no hub state directory at {0}")]
     HubMissing(String),
     #[error("no sessions are known for that root id")]
@@ -471,6 +473,68 @@ pub fn sessions_report(paths: &HubPaths, root: &str, json: bool) -> Result<Strin
 pub enum ResolveAction {
     Release,
     Drop,
+}
+
+fn offline_error(error: StoreError) -> OperatorError {
+    match error {
+        StoreError::Locked => OperatorError::HubInUse,
+        other => OperatorError::Store(other),
+    }
+}
+
+fn confirmation(action: ResolveAction, state: DeliveryState, id: &str, json: bool) -> String {
+    let verb = match action {
+        ResolveAction::Release => "released",
+        ResolveAction::Drop => "dropped",
+    };
+    let state = format!("{state:?}").to_lowercase();
+    match json {
+        true => json_text(serde_json::json!({"id": id, "action": verb, "state": state})),
+        false => format!("{verb} {id}: {state}"),
+    }
+}
+
+/// `nanna hub quarantine release <id>` and `drop <id>` for the human the grant proves. The
+/// command takes the exclusive hub lock itself, so it works only while no other nanna process
+/// (`mcp-serve`) holds the hub and refuses with [`OperatorError::HubInUse`] otherwise. It then
+/// resolves through [`MessageHub::resolve_quarantine`] and prints the id and the new state only,
+/// never any text. An unparsable id, an unknown id and an id that is not quarantined all give
+/// [`OperatorError::NotQuarantined`] and change nothing.
+///
+/// ```
+/// use harness::hub::operator::{quarantine_resolve_report, OperatorError, ResolveAction};
+/// use harness::hub::runtime::HubPaths;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let paths = HubPaths::beside(&dir.path().join("queue.jsonl"), None, None);
+/// let refused = quarantine_resolve_report(&paths, "not-an-id", ResolveAction::Drop, false);
+/// assert!(refused.is_err());
+/// ```
+pub fn quarantine_resolve_report(
+    paths: &HubPaths,
+    id: &str,
+    action: ResolveAction,
+    json: bool,
+) -> Result<String, OperatorError> {
+    let granted = OperatorGrant::from_environment();
+    granted.and_then(|grant| resolve_report_with(&grant, paths, id, action, json))
+}
+
+pub(crate) fn resolve_report_with(
+    grant: &OperatorGrant,
+    paths: &HubPaths,
+    id: &str,
+    action: ResolveAction,
+    json: bool,
+) -> Result<String, OperatorError> {
+    let parsed = uuid::Uuid::from_str(id).map_err(|_| OperatorError::NotQuarantined)?;
+    present(&paths.sessions)?;
+    present(&paths.messages)?;
+    let runtime = HubRuntime::open_offline(paths).map_err(offline_error)?;
+    let hub = runtime.hub().ok_or(OperatorError::HubInUse)?;
+    let message = MessageId::from_uuid(parsed);
+    let state = hub.resolve_quarantine(grant, message, action)?;
+    Ok(confirmation(action, state, &parsed.to_string(), json))
 }
 
 fn rules_pass(message: &StoredMessage) -> Result<(), OperatorError> {
@@ -2323,5 +2387,187 @@ mod resolve_tests {
                 run_plan(&Rig::new(store), &plan)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+    use crate::hub::lineage::RootId;
+    use crate::hub::readonly::seed::{message, record, seeded, Seeded};
+    use crate::hub::store::HubLock;
+
+    const TOKEN: &str = "PLANTED-TOKEN-5d2f";
+    const UNIFORM: &str = "no quarantined message with that id";
+
+    fn grant() -> OperatorGrant {
+        OperatorGrant::check(true, false).unwrap()
+    }
+
+    fn uuid_of(n: u128) -> String {
+        uuid::Uuid::from_u128(n).to_string()
+    }
+
+    fn held(n: u128, body: &str) -> StoredMessage {
+        let mut found = message(n, DeliveryState::Quarantined, "");
+        found.subject = "plain subject".into();
+        found.body = body.into();
+        found
+    }
+
+    fn recipient(n: u128) -> crate::hub::session::SessionRecord {
+        record(
+            &format!("to-{n}"),
+            "coder",
+            RootId::mcp(uuid::Uuid::from_u128(n)),
+        )
+    }
+
+    fn run(seed: &Seeded, id: &str, action: ResolveAction) -> Result<String, OperatorError> {
+        resolve_report_with(&grant(), &seed.paths, id, action, false)
+    }
+
+    fn state_of(seed: &Seeded, n: u128) -> Option<StoredMessage> {
+        let id = MessageId::from_uuid(uuid::Uuid::from_u128(n));
+        ReadOnlyHub::open(&seed.paths).message(id).unwrap()
+    }
+
+    fn stays(seed: &Seeded, n: u128) {
+        let found = state_of(seed, n).unwrap();
+        assert_eq!(found.state, DeliveryState::Quarantined);
+        assert!(found.released.is_none());
+    }
+
+    #[test]
+    fn release_moves_the_message_to_pending_with_the_marker_and_prints_the_id_and_state() {
+        let seed = seeded(vec![held(1, TOKEN)], vec![recipient(1)]);
+        let text = run(&seed, &uuid_of(1), ResolveAction::Release).unwrap();
+        assert_eq!(text, format!("released {}: pending", uuid_of(1)));
+        let found = state_of(&seed, 1).unwrap();
+        assert_eq!(found.state, DeliveryState::Pending);
+        assert!(found.released.is_some());
+        assert_eq!(found.body, TOKEN);
+        assert!(!text.contains(TOKEN));
+    }
+
+    #[test]
+    fn drop_moves_the_message_to_expired_without_a_marker() {
+        let seed = seeded(vec![held(1, TOKEN)], vec![]);
+        let text = run(&seed, &uuid_of(1), ResolveAction::Drop).unwrap();
+        assert_eq!(text, format!("dropped {}: expired", uuid_of(1)));
+        let found = state_of(&seed, 1).unwrap();
+        assert_eq!(found.state, DeliveryState::Expired);
+        assert!(found.released.is_none());
+    }
+
+    #[test]
+    fn the_json_confirmation_has_the_id_the_action_and_the_state_only() {
+        let seed = seeded(vec![held(1, TOKEN)], vec![recipient(1)]);
+        let id = uuid_of(1);
+        let paths = &seed.paths;
+        let text = resolve_report_with(&grant(), paths, &id, ResolveAction::Release, true);
+        let parsed: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+        let expected = serde_json::json!({"id": id, "action": "released", "state": "pending"});
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn a_hub_held_by_another_process_is_refused_with_the_in_use_message_and_changes_nothing() {
+        let seed = seeded(vec![held(1, "b")], vec![recipient(1)]);
+        let holder = HubLock::acquire(seed.dir.path()).unwrap();
+        for action in [ResolveAction::Release, ResolveAction::Drop] {
+            let refused = run(&seed, &uuid_of(1), action).unwrap_err();
+            assert!(matches!(refused, OperatorError::HubInUse), "{refused}");
+            let text = refused.to_string();
+            assert!(text.contains("the hub is in use by a running nanna process"));
+        }
+        drop(holder);
+        stays(&seed, 1);
+    }
+
+    #[test]
+    fn an_unparsable_unknown_and_non_quarantined_id_give_one_uniform_error_and_change_nothing() {
+        let mut pending = held(2, "b");
+        pending.state = DeliveryState::Pending;
+        let seed = seeded(
+            vec![held(1, "b"), pending],
+            vec![recipient(1), recipient(2)],
+        );
+        for action in [ResolveAction::Release, ResolveAction::Drop] {
+            for id in ["not-an-id", &uuid_of(404), &uuid_of(2)] {
+                let refused = run(&seed, id, action).unwrap_err();
+                assert_eq!(refused.to_string(), UNIFORM, "{id}");
+            }
+        }
+        stays(&seed, 1);
+        assert_eq!(state_of(&seed, 2).unwrap().state, DeliveryState::Pending);
+    }
+
+    #[test]
+    fn a_release_to_an_inactive_recipient_or_with_blocked_stored_text_is_refused_and_stays_held() {
+        let token = format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let seed = seeded(vec![held(1, "b"), held(2, &token)], vec![recipient(2)]);
+        let inactive = run(&seed, &uuid_of(1), ResolveAction::Release).unwrap_err();
+        assert!(matches!(inactive, OperatorError::RecipientInactive));
+        let blocked = run(&seed, &uuid_of(2), ResolveAction::Release).unwrap_err();
+        assert!(matches!(blocked, OperatorError::ReleaseRefused(_)));
+        assert!(!blocked.to_string().contains(&token));
+        stays(&seed, 1);
+        stays(&seed, 2);
+    }
+
+    #[test]
+    fn a_missing_hub_directory_is_refused_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("absent").join("queue.jsonl");
+        let paths = HubPaths::beside(&queue, None, None);
+        let refused =
+            resolve_report_with(&grant(), &paths, &uuid_of(1), ResolveAction::Drop, false);
+        assert!(matches!(refused, Err(OperatorError::HubMissing(_))));
+        assert!(!dir.path().join("absent").exists());
+    }
+
+    #[test]
+    fn a_corrupt_journal_is_a_store_error_and_the_bytes_are_untouched() {
+        let seed = seeded(vec![held(1, "b")], vec![recipient(1)]);
+        let before = std::fs::read(&seed.paths.messages).unwrap();
+        let mut bytes = b"garbage\n".to_vec();
+        bytes.extend_from_slice(&before);
+        std::fs::write(&seed.paths.messages, &bytes).unwrap();
+        let refused = run(&seed, &uuid_of(1), ResolveAction::Drop).unwrap_err();
+        assert!(matches!(
+            refused,
+            OperatorError::Store(StoreError::Corrupt(1))
+        ));
+        assert_eq!(std::fs::read(&seed.paths.messages).unwrap(), bytes);
+    }
+
+    #[test]
+    fn the_grant_gated_entry_never_leaks_text_and_changes_nothing_when_it_refuses() {
+        let seed = seeded(vec![held(1, TOKEN)], vec![recipient(1)]);
+        let outcome =
+            quarantine_resolve_report(&seed.paths, &uuid_of(1), ResolveAction::Drop, false);
+        if let Err(error) = outcome {
+            assert!(!error.to_string().contains(TOKEN));
+            stays(&seed, 1);
+        }
+    }
+
+    #[test]
+    fn the_offline_runtime_holds_the_lock_while_it_lives() {
+        let seed = seeded(vec![], vec![]);
+        let runtime = HubRuntime::open_offline(&seed.paths).unwrap();
+        let second = HubLock::acquire(seed.dir.path());
+        assert!(matches!(second, Err(StoreError::Locked)));
+        drop(runtime);
+    }
+
+    #[test]
+    fn the_confirmation_prints_the_canonical_lowercase_id_not_the_argument() {
+        let seed = seeded(vec![held(0xabcdef, "b")], vec![]);
+        let upper = uuid_of(0xabcdef).to_uppercase();
+        assert_ne!(upper, uuid_of(0xabcdef));
+        let text = run(&seed, &upper, ResolveAction::Drop).unwrap();
+        assert_eq!(text, format!("dropped {}: expired", uuid_of(0xabcdef)));
     }
 }
