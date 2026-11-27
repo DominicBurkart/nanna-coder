@@ -4,11 +4,13 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 
+use super::error::HubError;
+use super::lineage::RootId;
 use super::mailbox::{is_mailbox, MailboxId};
-use super::message::{DeliveryState, MessageId, MessageKind, Release, StoredMessage};
+use super::message::{DeliveryState, MessageId, MessageKind, Release, SendReceipt, StoredMessage};
 use super::readonly::{present, render_sessions, sessions_json, ReadOnlyHub};
 use super::runtime::{HubPaths, HubRuntime};
-use super::send::{codes_of, MessageHub};
+use super::send::{codes_of, MessageHub, OperatorSend};
 use super::store::{MessageStore, StoreError};
 use crate::action_auditor::{NullOracle, RuleMessageAuditor};
 use crate::auditor::ReasonCode;
@@ -98,10 +100,117 @@ impl OperatorGrant {
     /// assert!(refused || std::env::var_os("NANNA_AGENT_SESSION").is_none());
     /// ```
     pub fn from_environment() -> Result<Self, OperatorError> {
-        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        let agent_session = std::env::var_os(AGENT_SESSION_ENV).is_some();
+        let (interactive, agent_session) = environment();
         Self::check(interactive, agent_session)
     }
+}
+
+fn environment() -> (bool, bool) {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let agent_session = std::env::var_os(AGENT_SESSION_ENV).is_some();
+    (interactive, agent_session)
+}
+
+fn available(interactive: bool, agent_session: bool) -> bool {
+    OperatorGrant::check(interactive, agent_session).is_ok()
+}
+
+/// Whether this process could obtain an [`OperatorGrant`] right now: stdin and stdout are
+/// terminals and the agent-session marker is unset. The MCP server lists `hub_send` only when
+/// this is true; under a stdio MCP server stdin is a pipe, so it is false.
+///
+/// ```
+/// use harness::hub::operator::send_grant_available;
+///
+/// let _ = send_grant_available();
+/// ```
+pub fn send_grant_available() -> bool {
+    let (interactive, agent_session) = environment();
+    available(interactive, agent_session)
+}
+
+/// Send as the operator of `root`: the only production path to
+/// [`MessageHub::send_as_operator`]. The grant is a proof that a human is at this terminal.
+///
+/// ```
+/// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
+/// use harness::hub::limits::HubLimits;
+/// use harness::hub::lineage::RootId;
+/// use harness::hub::message::MessageKind;
+/// use harness::hub::operator::{send_with_grant, OperatorGrant};
+/// use harness::hub::registry::SessionRegistry;
+/// use harness::hub::send::{
+///     MessageHub, OperatorSend, OperatorTarget, QuarantineEvent, QuarantineSink,
+/// };
+/// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+/// use harness::leases::SystemClock;
+/// use std::sync::Arc;
+///
+/// struct Quiet;
+/// impl QuarantineSink for Quiet {
+///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+///         Ok(())
+///     }
+/// }
+///
+/// if let Ok(grant) = OperatorGrant::from_environment() {
+///     let sessions = Arc::new(InMemorySessionStore::new());
+///     let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+///     let hub = MessageHub::with_sink(
+///         sessions.clone(),
+///         Arc::new(InMemoryMessageStore::new()),
+///         Arc::new(auditor),
+///         Arc::new(SystemClock),
+///         HubLimits::default(),
+///         Arc::new(SessionRegistry::new(sessions)),
+///         Arc::new(Quiet),
+///     );
+///     let root = RootId::plan("plan-1").unwrap();
+///     let request = OperatorSend {
+///         to: OperatorTarget::TopLevel,
+///         kind: MessageKind::Info,
+///         subject: None,
+///         body: "hello".into(),
+///     };
+///     assert!(send_with_grant(&grant, &hub, &root, request).is_err());
+/// }
+/// ```
+pub fn send_with_grant(
+    _grant: &OperatorGrant,
+    hub: &MessageHub,
+    root: &RootId,
+    req: OperatorSend,
+) -> Result<SendReceipt, HubError> {
+    hub.send_as_operator(root, req)
+}
+
+fn send_checked(
+    granted: Result<OperatorGrant, OperatorError>,
+    hub: &MessageHub,
+    root: &RootId,
+    req: OperatorSend,
+) -> Result<SendReceipt, HubError> {
+    let grant = granted.map_err(|_| HubError::NotVisible)?;
+    send_with_grant(&grant, hub, root, req)
+}
+
+/// [`send_with_grant`] with the grant taken from this process's environment. Without a grant
+/// the call is refused as [`HubError::NotVisible`] and nothing is stored.
+pub fn send_from_terminal(
+    hub: &MessageHub,
+    root: &RootId,
+    req: OperatorSend,
+) -> Result<SendReceipt, HubError> {
+    send_checked(OperatorGrant::from_environment(), hub, root, req)
+}
+
+#[cfg(test)]
+pub(crate) fn send_with_test_grant(
+    hub: &MessageHub,
+    root: &RootId,
+    req: OperatorSend,
+) -> Result<SendReceipt, HubError> {
+    send_checked(OperatorGrant::check(true, false), hub, root, req)
 }
 
 impl fmt::Debug for OperatorGrant {
@@ -1375,10 +1484,14 @@ mod resolve_tests {
         DeliveryState, MessageId, MessageKind, MessageReach, Recipient, Release, SendRequest, Seq,
         StoredMessage, VerdictRef,
     };
-    use crate::hub::operator::{OperatorError, OperatorGrant, ResolveAction};
+    use crate::hub::operator::{
+        available, send_checked, send_grant_available, send_with_test_grant, OperatorError,
+        OperatorGrant, ResolveAction,
+    };
     use crate::hub::recv::{RecvPage, RecvRequest};
     use crate::hub::registry::SessionRegistry;
     use crate::hub::send::{hash_u64, MessageHub};
+    use crate::hub::send::{OperatorSend, OperatorTarget};
     use crate::hub::session::SessionStatus;
     use crate::hub::store::{
         HubLock, InMemoryMessageStore, InMemorySessionStore, JsonlMessageStore, MessageStore,
@@ -1478,6 +1591,58 @@ mod resolve_tests {
 
     type Doctor = fn(StoredMessage) -> StoredMessage;
     type AfterGet = Box<dyn FnOnce() + Send>;
+
+    fn operator_send(body: &str) -> OperatorSend {
+        OperatorSend {
+            to: OperatorTarget::Session {
+                id: SessionId::from_task(TaskId("seat".to_string())),
+            },
+            kind: MessageKind::Info,
+            subject: None,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_send_grant_is_available_only_for_a_terminal_without_an_agent_marker() {
+        assert!(available(true, false));
+        assert!(!available(false, false));
+        assert!(!available(true, true));
+        assert!(!available(false, true));
+    }
+
+    #[test]
+    fn the_send_grant_availability_is_the_process_grant() {
+        let granted = OperatorGrant::from_environment().is_ok();
+        assert_eq!(send_grant_available(), granted);
+    }
+
+    #[test]
+    fn a_send_without_a_grant_is_refused_as_not_visible_and_stores_nothing() {
+        let rig = Rig::memory();
+        let seated = rig.seat("seat");
+        let hub = rig.hub();
+        for refused in [OperatorError::NotATerminal, OperatorError::AgentSession] {
+            let sent = send_checked(Err(refused), &hub, &rig.root, operator_send("hello"));
+            assert!(matches!(sent, Err(HubError::NotVisible)));
+        }
+        let inbox = rig.messages.inbox(seated.session().clone(), None, 10);
+        assert!(inbox.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_send_with_a_grant_delivers_as_the_operator() {
+        let rig = Rig::memory();
+        let seated = rig.seat("seat");
+        let hub = rig.hub();
+        let sent = send_with_test_grant(&hub, &rig.root, operator_send("hello"));
+        assert_eq!(sent.unwrap().recipients, 1);
+        let inbox = rig
+            .messages
+            .inbox(seated.session().clone(), None, 10)
+            .unwrap();
+        assert_eq!(inbox[0].from_identity, "operator");
+    }
 
     struct Rigged {
         inner: Arc<dyn MessageStore>,

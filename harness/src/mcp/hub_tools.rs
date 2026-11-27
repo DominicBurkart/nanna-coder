@@ -1,8 +1,10 @@
 use super::jsonrpc::JsonRpcResponse;
 use crate::hub::error::HubError;
-use crate::hub::message::Seq;
+use crate::hub::lineage::{RootId, SessionId};
+use crate::hub::message::{MessageKind, SendReceipt, Seq};
+use crate::hub::operator;
 use crate::hub::recv::{RootPage, RootRequest, RECV_DEFAULT, RECV_MAX};
-use crate::hub::send::MessageHub;
+use crate::hub::send::{MessageHub, OperatorSend, OperatorTarget};
 use serde_json::{json, Map, Value};
 
 pub(super) const HUB_INBOX: &str = "hub_inbox";
@@ -53,7 +55,7 @@ const DEFINITION: &str = r#"{
         }
     }"#;
 
-pub(super) fn tool_definition() -> Value {
+fn inbox_definition() -> Value {
     let text = DEFINITION.replace("__MAX__", &RECV_MAX.to_string());
     serde_json::from_str(&text).unwrap_or_default()
 }
@@ -63,8 +65,8 @@ fn object_of(args: &Value) -> Result<&Map<String, Value>, Refusal> {
         .ok_or(invalid("arguments must be an object"))
 }
 
-fn check_keys(map: &Map<String, Value>) -> Result<(), Refusal> {
-    let known = map.keys().all(|key| KEYS.contains(&key.as_str()));
+fn check_keys(map: &Map<String, Value>, allowed: &[&str]) -> Result<(), Refusal> {
+    let known = map.keys().all(|key| allowed.contains(&key.as_str()));
     if known {
         Ok(())
     } else {
@@ -102,7 +104,7 @@ fn max_of(map: &Map<String, Value>) -> Result<u8, Refusal> {
 
 fn parse(args: &Value) -> Result<(&str, RootRequest), Refusal> {
     let map = object_of(args)?;
-    check_keys(map)?;
+    check_keys(map, &KEYS)?;
     let after = cursor_of(map)?;
     let request = RootRequest {
         max: max_of(map)?,
@@ -136,7 +138,11 @@ fn read_inbox(args: &Value, hub: &MessageHub) -> Result<Value, Refusal> {
 
 fn page_result(page: &RootPage) -> Result<Value, Refusal> {
     let body = serde_json::to_string(page).map_err(|_| internal())?;
-    Ok(json!({ "content": [{ "type": "text", "text": body }], "isError": false }))
+    Ok(text_result(&body, false))
+}
+
+fn text_result(text: &str, is_error: bool) -> Value {
+    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
 /// Serve one `hub_inbox` call. The root comes from `root_task_id` resolved on the host, never
@@ -158,9 +164,288 @@ pub(super) fn call_hub_inbox(
     } else {
         read_inbox(args, hub)
     };
+    answer(id, outcome)
+}
+
+pub(super) const HUB_SEND: &str = "hub_send";
+
+const BODY_MAX: usize = 8192;
+const SUBJECT_MAX: usize = 120;
+const SEND_KEYS: [&str; 5] = ["root_task_id", "to", "body", "subject", "kind"];
+
+/// The definition `tools/list` advertises for `hub_send`, appended only when the server has a
+/// hub.
+const SEND_DEFINITION: &str = r#"{
+        "name": "hub_send",
+        "description": "Send a message as the operator of one root to one active session of that root, or to the active top-level sessions of that root. Only the rules layer reviews it on the way out; the recipient reviews it again and receives it fenced as untrusted text, never as a command. A refused send stores nothing and returns reason codes only. This server has no caller authentication: anyone who can reach it and knows a root or task id can send.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_task_id": {
+                    "type": "string",
+                    "description": "A plan id (plan-...), a backlog id (backlog-<repo>#<n>), an mcp-<uuid> root id, or the taskId returned by assign_task or plan_task. The host resolves it to a root; the send is scoped to that root."
+                },
+                "to": {
+                    "description": "The recipient: the string top_level, or an object with to set to session and the id of one active session of that root.",
+                    "oneOf": [
+                        { "type": "string", "enum": ["top_level"] },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "to": { "type": "string", "enum": ["session"] },
+                                "id": { "type": "string" }
+                            },
+                            "required": ["to", "id"],
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "body": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": __BODY__,
+                    "description": "The message text, at most __BODY__ bytes."
+                },
+                "subject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": __SUBJECT__,
+                    "description": "Optional subject, at most __SUBJECT__ characters (default: operator message)."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["info", "question", "answer", "handoff", "status_update"],
+                    "description": "Optional message kind (default: info)."
+                }
+            },
+            "required": ["root_task_id", "to", "body"],
+            "additionalProperties": false
+        }
+    }"#;
+
+fn send_definition() -> Value {
+    let text = SEND_DEFINITION
+        .replace("__BODY__", &BODY_MAX.to_string())
+        .replace("__SUBJECT__", &SUBJECT_MAX.to_string());
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+type SendFn = fn(&MessageHub, &RootId, OperatorSend) -> Result<SendReceipt, HubError>;
+
+/// Whether `hub_send` is offered and how it sends. In production it is offered only while the
+/// operator grant is available to this process, and sends through the operator module.
+#[derive(Clone, Copy)]
+pub(super) struct SendGate {
+    available: fn() -> bool,
+    sender: SendFn,
+}
+
+impl SendGate {
+    pub(super) fn from_terminal() -> Self {
+        Self {
+            available: operator::send_grant_available,
+            sender: operator::send_from_terminal,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(available: fn() -> bool) -> Self {
+        Self {
+            available,
+            sender: operator::send_with_test_grant,
+        }
+    }
+
+    fn open(&self) -> bool {
+        (self.available)()
+    }
+}
+
+pub(super) fn tool_definitions(gate: &SendGate) -> Vec<Value> {
+    let mut all = vec![inbox_definition()];
+    if gate.open() {
+        all.push(send_definition());
+    }
+    all
+}
+
+pub(super) fn is_hub_tool(name: &str, gate: &SendGate) -> bool {
+    name == HUB_INBOX || (name == HUB_SEND && gate.open())
+}
+
+fn send_failure(error: HubError) -> Refusal {
+    if matches!(error, HubError::NotVisible) {
+        invalid("not visible")
+    } else {
+        internal()
+    }
+}
+
+fn target_of(map: &Map<String, Value>) -> Result<OperatorTarget, Refusal> {
+    let raw = map.get("to");
+    let top = raw
+        .and_then(Value::as_str)
+        .filter(|text| *text == "top_level");
+    match top {
+        Some(_) => Ok(OperatorTarget::TopLevel),
+        None => session_target(raw),
+    }
+}
+
+fn session_target(raw: Option<&Value>) -> Result<OperatorTarget, Refusal> {
+    let object = raw.and_then(Value::as_object);
+    let named = |map: &&Map<String, Value>| {
+        map.len() == 2 && map.get("to").and_then(Value::as_str) == Some("session")
+    };
+    let shaped = object.filter(named);
+    let text = shaped.and_then(|map| map.get("id")).and_then(Value::as_str);
+    let sized = text.filter(|text| text.len() <= ROOT_TEXT_MAX);
+    let id = sized.and_then(|text| text.parse::<SessionId>().ok());
+    id.map(|id| OperatorTarget::Session { id }).ok_or(invalid(
+        "to must be top_level or an object of to=session and an id",
+    ))
+}
+
+fn body_of(map: &Map<String, Value>) -> Result<String, Refusal> {
+    let text = map.get("body").and_then(Value::as_str);
+    let sized = text.filter(|text| !text.is_empty() && text.len() <= BODY_MAX);
+    sized.map(str::to_string).ok_or(invalid(
+        "body must be a non-empty string of at most 8192 bytes",
+    ))
+}
+
+fn subject_of(map: &Map<String, Value>) -> Result<Option<String>, Refusal> {
+    let Some(raw) = map.get("subject") else {
+        return Ok(None);
+    };
+    let text = raw.as_str();
+    let sized = text.filter(|text| !text.is_empty() && text.chars().count() <= SUBJECT_MAX);
+    sized.map(|text| Some(text.to_string())).ok_or(invalid(
+        "subject must be a non-empty string of at most 120 characters",
+    ))
+}
+
+fn kind_of(map: &Map<String, Value>) -> Result<MessageKind, Refusal> {
+    let Some(raw) = map.get("kind") else {
+        return Ok(MessageKind::Info);
+    };
+    serde_json::from_value(raw.clone()).map_err(|_| invalid("kind is not a known message kind"))
+}
+
+fn parse_send(args: &Value) -> Result<(&str, OperatorSend), Refusal> {
+    let map = object_of(args)?;
+    check_keys(map, &SEND_KEYS)?;
+    let to = target_of(map)?;
+    let kind = kind_of(map)?;
+    let subject = subject_of(map)?;
+    let body = body_of(map)?;
+    let request = OperatorSend {
+        to,
+        kind,
+        subject,
+        body,
+    };
+    Ok((root_text(map)?, request))
+}
+
+fn refusal_kind(error: &HubError) -> &'static str {
+    match error {
+        HubError::NoRecipient => "no_recipient",
+        HubError::RecipientInactive => "recipient_inactive",
+        HubError::RateLimited(_) => "rate_limited",
+        HubError::InboxFull => "inbox_full",
+        HubError::TooLarge { .. } => "too_large",
+        HubError::Blocked(_) => "blocked",
+        _ => "not_delivered",
+    }
+}
+
+fn refusal_codes(error: &HubError) -> Vec<&'static str> {
+    match error {
+        HubError::Blocked(codes) => codes.iter().map(|code| code.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn refusal_result(error: &HubError) -> Value {
+    let shown = json!({
+        "delivered": false,
+        "refused": refusal_kind(error),
+        "codes": refusal_codes(error)
+    });
+    text_result(&shown.to_string(), true)
+}
+
+fn refused(error: HubError) -> Result<Value, Refusal> {
+    let host = matches!(error, HubError::NotVisible | HubError::Store(_));
+    if host {
+        Err(send_failure(error))
+    } else {
+        Ok(refusal_result(&error))
+    }
+}
+
+fn receipt_result(receipt: &SendReceipt) -> Result<Value, Refusal> {
+    let body = serde_json::to_string(receipt).map_err(|_| internal())?;
+    Ok(text_result(&body, false))
+}
+
+fn send_message(args: &Value, hub: &MessageHub, sender: SendFn) -> Result<Value, Refusal> {
+    let (text, request) = parse_send(args)?;
+    let root = hub.resolve_root(text).map_err(send_failure)?;
+    match sender(hub, &root, request) {
+        Ok(receipt) => receipt_result(&receipt),
+        Err(error) => refused(error),
+    }
+}
+
+fn answer(id: Option<Value>, outcome: Result<Value, Refusal>) -> JsonRpcResponse {
     match outcome {
         Ok(value) => JsonRpcResponse::success(id, value),
         Err(refusal) => JsonRpcResponse::error(id, refusal.code, refusal.text.to_string()),
+    }
+}
+
+/// Serve one `hub_send` call; the dispatcher reaches it only while the gate is open (the
+/// operator grant is available), otherwise the tool is an unknown tool. The root comes from `root_task_id` resolved on the host, never
+/// from an argument typed as a root, and the sender is always the root mailbox: the arguments
+/// have no field that could name another. Arguments are strict (unknown keys and out-of-range
+/// values are refused, not clamped); the call is not task-augmented; errors are fixed texts that
+/// echo no input; a refused send returns reason codes and never text. This is an
+/// unauthenticated write path to agents: whoever can talk to the server and knows a root or
+/// task id can send, and agents receive the text fenced as untrusted.
+pub(super) fn call_hub_send(
+    id: Option<Value>,
+    args: &Value,
+    augmented: bool,
+    hub: &MessageHub,
+    sender: SendFn,
+) -> JsonRpcResponse {
+    let refused = Refusal {
+        code: UNSUPPORTED,
+        text: "Tool 'hub_send' does not support task augmentation",
+    };
+    let outcome = if augmented {
+        Err(refused)
+    } else {
+        send_message(args, hub, sender)
+    };
+    answer(id, outcome)
+}
+
+/// Serve one call of a tool for which [`is_hub_tool`] is true.
+pub(super) fn call_hub_tool(
+    id: Option<Value>,
+    name: &str,
+    args: &Value,
+    augmented: bool,
+    hub: &MessageHub,
+    gate: &SendGate,
+) -> JsonRpcResponse {
+    if name == HUB_SEND {
+        call_hub_send(id, args, augmented, hub, gate.sender)
+    } else {
+        call_hub_inbox(id, args, augmented, hub)
     }
 }
 
@@ -173,13 +458,16 @@ mod tests {
     use crate::hub::lineage::{Lineage, RootId, SessionBinding, SessionId};
     use crate::hub::mailbox::MailboxId;
     use crate::hub::message::{
-        DeliveryState, MessageId, MessageKind, Release, StoredMessage, VerdictRef,
+        DeliveryState, MessageId, MessageKind, Recipient, Release, StoredMessage, VerdictRef,
     };
+    use crate::hub::recv::RecvRequest;
     use crate::hub::registry::test_support::Flaky;
     use crate::hub::registry::SessionRegistry;
     use crate::hub::send::NoopQuarantineSink;
+    use crate::hub::session::SessionStatus;
     use crate::hub::store::{
-        InMemoryMessageStore, InMemorySessionStore, MessageStore, SessionStore,
+        InMemoryMessageStore, InMemorySessionStore, MessageStore, Retention, SessionStore,
+        StoreError,
     };
     use crate::leases::SimulatedClock;
     use crate::mcp::jsonrpc::JsonRpcRequest;
@@ -236,11 +524,12 @@ mod tests {
         RootId::mcp(Uuid::from_u128(2))
     }
 
-    fn seat(rig: &Rig, root: &RootId, name: &str) {
+    fn seat(rig: &Rig, root: &RootId, name: &str) -> SessionBinding {
         let lineage = Lineage::root_child(root.clone());
         let card = crate::identity::example();
         let binding = SessionBinding::from_audited(&card, TaskId(name.to_string()), lineage);
         rig.registry.register(&binding, "subtask", start()).unwrap();
+        binding
     }
 
     fn mail_with(root: &RootId, subject: &str, body: &str, hash_of: &str) -> StoredMessage {
@@ -295,13 +584,21 @@ mod tests {
         rig.messages.get(id).unwrap().unwrap().state
     }
 
+    fn open_gate() -> bool {
+        true
+    }
+
+    fn shut_gate() -> bool {
+        false
+    }
+
     fn server_over(hub: Option<Arc<MessageHub>>) -> NannaMcpServer {
         let provider = model::OllamaProvider::new(model::OllamaConfig::default()).unwrap();
         let gate = crate::auditor::test_support::fixture_gate();
         let manager = Arc::new(TaskManager::new(0));
         let mut server = NannaMcpServer::new(manager, Arc::new(provider), gate, 100);
         if let Some(hub) = hub {
-            server = server.with_hub(hub);
+            server = server.with_hub(hub).with_send_gate(open_gate);
         }
         server
     }
@@ -615,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_a_hub_tools_list_is_the_base_tools_plus_exactly_hub_inbox() {
+    async fn with_a_hub_tools_list_is_the_base_tools_plus_exactly_hub_inbox_and_hub_send() {
         let bare = server_over(None);
         let with = server_over(Some(rig().hub));
         let base = rpc(&bare, "tools/list", json!({})).await.result.unwrap();
@@ -623,13 +920,23 @@ mod tests {
         let base_tools = base["tools"].as_array().unwrap();
         let all = listed["tools"].as_array().unwrap();
         assert_eq!(&all[..base_tools.len()], &base_tools[..]);
-        assert_eq!(all.len(), base_tools.len() + 1);
+        assert_eq!(all.len(), base_tools.len() + 2);
         let added = &all[base_tools.len()];
         assert_eq!(added["name"], "hub_inbox");
         assert_eq!(added["inputSchema"]["required"], json!(["root_task_id"]));
         assert_eq!(added["inputSchema"]["additionalProperties"], false);
         assert_eq!(added["inputSchema"]["properties"]["max"]["maximum"], 20);
         assert!(added.get("execution").is_none());
+        let sender = &all[base_tools.len() + 1];
+        assert_eq!(sender["name"], "hub_send");
+        let schema = &sender["inputSchema"];
+        assert_eq!(schema["required"], json!(["root_task_id", "to", "body"]));
+        assert_eq!(schema["additionalProperties"], false);
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["body", "kind", "root_task_id", "subject", "to"]);
+        assert_eq!(schema["properties"]["body"]["maxLength"], 8192);
+        assert_eq!(schema["properties"]["subject"]["maxLength"], 120);
+        assert!(sender.get("execution").is_none());
     }
 
     #[tokio::test]
@@ -656,13 +963,615 @@ mod tests {
             .await
             .result
             .unwrap();
-        assert_eq!(listed["tools"].as_array().unwrap().len(), 3);
+        let offered = 3 + usize::from(operator::send_grant_available());
+        assert_eq!(listed["tools"].as_array().unwrap().len(), offered);
         let explicit = server_over(Some(rig.hub.clone())).with_manager_hub();
         let kept = rpc(&explicit, "tools/list", json!({}))
             .await
             .result
             .unwrap();
-        assert_eq!(kept["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(kept["tools"].as_array().unwrap().len(), 4);
+    }
+
+    fn who(name: &str) -> SessionId {
+        SessionId::from_task(TaskId(name.to_string()))
+    }
+
+    fn one(name: &str) -> Value {
+        json!({ "to": "session", "id": name })
+    }
+
+    async fn send_to(server: &NannaMcpServer, args: Value) -> JsonRpcResponse {
+        let params = json!({ "name": "hub_send", "arguments": args });
+        rpc(server, "tools/call", params).await
+    }
+
+    async fn sent(server: &NannaMcpServer, args: Value) -> Value {
+        let response = send_to(server, args).await;
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn declined(server: &NannaMcpServer, args: Value) -> Value {
+        let response = send_to(server, args).await;
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn send_refusal(server: &NannaMcpServer, args: Value) -> (i32, String) {
+        let error = send_to(server, args).await.error.unwrap();
+        (error.code, error.message)
+    }
+
+    fn inbox_of(rig: &Rig, name: &str) -> Vec<StoredMessage> {
+        rig.messages.inbox(who(name), None, 100).unwrap()
+    }
+
+    fn base_args(name: &str) -> Value {
+        json!({ "root_task_id": "plan-aaaa", "to": one(name), "body": CLEAN })
+    }
+
+    #[tokio::test]
+    async fn a_send_reaches_the_named_session_of_the_root_and_is_stored_as_the_operator() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        seat(&rig, &root_a(), "task-a2");
+        let server = server_over(Some(rig.hub.clone()));
+        let args = json!({
+            "root_task_id": "plan-aaaa",
+            "to": one("task-a"),
+            "body": CLEAN,
+            "subject": "status please",
+            "kind": "question"
+        });
+        let receipt = sent(&server, args).await;
+        assert_eq!(receipt["recipients"], 1);
+        assert_eq!(receipt["ids"].as_array().unwrap().len(), 1);
+        let stored = inbox_of(&rig, "task-a");
+        assert_eq!(stored.len(), 1);
+        let message = &stored[0];
+        let mailbox = MailboxId::for_root(&root_a()).unwrap().into_session();
+        assert_eq!(message.from, mailbox);
+        assert_eq!(message.from_identity, "operator");
+        assert_eq!(message.root, root_a());
+        assert_eq!(message.kind, MessageKind::Question);
+        assert_eq!(message.subject, "status please");
+        assert_eq!(message.body, CLEAN);
+        assert_eq!(message.outbound_verdict.log_id, "operator-rules");
+        assert!(inbox_of(&rig, "task-a2").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_subject_and_kind_default_when_absent() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        sent(&server, base_args("task-a")).await;
+        let message = &inbox_of(&rig, "task-a")[0];
+        assert_eq!(message.subject, "operator message");
+        assert_eq!(message.kind, MessageKind::Info);
+    }
+
+    #[tokio::test]
+    async fn a_task_id_of_a_session_names_its_root_and_the_message_is_stored_with_that_root() {
+        let rig = rig();
+        seat(&rig, &root_b(), "task-b");
+        seat(&rig, &root_b(), "task-b2");
+        let server = server_over(Some(rig.hub.clone()));
+        let args = json!({ "root_task_id": "task-b", "to": one("task-b2"), "body": CLEAN });
+        sent(&server, args).await;
+        let stored = inbox_of(&rig, "task-b2");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].root, root_b());
+    }
+
+    #[tokio::test]
+    async fn a_root_a_task_cannot_reach_a_root_b_session_and_the_refusal_matches_unknown() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        seat(&rig, &root_b(), "task-b");
+        let server = server_over(Some(rig.hub.clone()));
+        let crossed = send_refusal(&server, base_args("task-b")).await;
+        let unknown = send_refusal(&server, base_args("no-such-session")).await;
+        let no_root = json!({ "root_task_id": "no-such-task", "to": one("task-a"), "body": CLEAN });
+        let lost = send_refusal(&server, no_root).await;
+        assert_eq!(crossed, unknown);
+        assert_eq!(crossed, lost);
+        assert_eq!(crossed, (-32602, "not visible".to_string()));
+        assert!(inbox_of(&rig, "task-b").is_empty());
+        let mailbox = MailboxId::for_root(&root_a()).unwrap().into_session();
+        let to_mailbox = base_args(&mailbox.to_string());
+        assert_eq!(send_refusal(&server, to_mailbox).await, crossed);
+    }
+
+    #[tokio::test]
+    async fn top_level_reaches_every_active_top_level_session_of_the_root_only() {
+        let rig = rig();
+        seat(&rig, &root_a(), "top-1");
+        seat(&rig, &root_a(), "top-2");
+        seat(&rig, &root_b(), "other-root");
+        let server = server_over(Some(rig.hub.clone()));
+        let args = json!({ "root_task_id": "plan-aaaa", "to": "top_level", "body": CLEAN });
+        let receipt = sent(&server, args).await;
+        assert_eq!(receipt["recipients"], 2);
+        assert_eq!(inbox_of(&rig, "top-1").len(), 1);
+        assert_eq!(inbox_of(&rig, "top-2").len(), 1);
+        assert!(inbox_of(&rig, "other-root").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_root_without_an_active_target_is_a_refusal_with_a_kind_and_no_codes() {
+        let rig = rig();
+        let server = server_over(Some(rig.hub.clone()));
+        let args = json!({ "root_task_id": "plan-aaaa", "to": "top_level", "body": CLEAN });
+        let shown = declined(&server, args).await;
+        assert_eq!(
+            shown,
+            json!({ "delivered": false, "refused": "no_recipient", "codes": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inactive_session_is_refused_and_nothing_is_stored() {
+        let rig = rig();
+        let done = seat(&rig, &root_a(), "task-done");
+        let running = SessionStatus::Running;
+        rig.registry
+            .set_status(done.session(), running, start())
+            .unwrap();
+        let ended = SessionStatus::Completed;
+        rig.registry
+            .finish(done.session(), ended, None, start())
+            .unwrap();
+        let server = server_over(Some(rig.hub.clone()));
+        let shown = declined(&server, base_args("task-done")).await;
+        assert_eq!(shown["refused"], "recipient_inactive");
+        assert!(inbox_of(&rig, "task-done").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rules_block_returns_reason_codes_only_and_stores_nothing() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let token = format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": token });
+        let response = send_to(&server, args).await;
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(!wire.contains(&token));
+        assert!(!format!("{response:?}").contains(&token));
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let shown: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(shown["delivered"], false);
+        assert_eq!(shown["refused"], "blocked");
+        let codes = shown["codes"].as_array().unwrap();
+        assert!(!codes.is_empty());
+        assert!(codes.iter().all(|code| code == "secret_leak"));
+        assert!(inbox_of(&rig, "task-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rules_quarantine_verdict_also_refuses_and_stores_nothing() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let note = "my .env has\nPORT=8080\nHOST=localhost\nMODE=dev";
+        let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": note });
+        let shown = declined(&server, args).await;
+        assert_eq!(shown["refused"], "blocked");
+        assert!(inbox_of(&rig, "task-a").is_empty());
+        assert!(rig.messages.quarantined().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_recipient_gets_the_operator_text_fenced_as_untrusted_and_marked() {
+        let rig = rig();
+        let binding = seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        sent(&server, base_args("task-a")).await;
+        let page = rig
+            .hub
+            .recv(&binding, RecvRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len(), 1);
+        let message = &page.messages[0];
+        assert!(message.from_operator);
+        assert!(message.body.starts_with(FenceLabel::AgentMessage.open()));
+        assert!(message.body.ends_with(FenceLabel::AgentMessage.close()));
+    }
+
+    #[tokio::test]
+    async fn every_malformed_argument_is_refused_with_a_fixed_text_and_nothing_is_stored() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let long = "x".repeat(257);
+        let big = "b".repeat(8193);
+        let wide = "é".repeat(121);
+        let top = "top_level";
+        let ok = || one("task-a");
+        let bad = [
+            json!("plan-aaaa"),
+            json!({}),
+            json!({ "to": top, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": top }),
+            json!({ "root_task_id": 5, "to": top, "body": "x" }),
+            json!({ "root_task_id": "", "to": top, "body": "x" }),
+            json!({ "root_task_id": long, "to": top, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "" }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": 7 }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": big }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "subject": "" }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "subject": wide }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "subject": 3 }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "kind": "shout" }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "kind": null }),
+            json!({ "root_task_id": "plan-aaaa", "to": top, "body": "x", "kind": 1 }),
+            json!({ "root_task_id": "plan-aaaa", "to": "TOP_LEVEL", "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": "session", "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": null, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "top_level" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "id": "task-a" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session", "id": 4 }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session", "id": "" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session", "id": long }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "other", "id": "task-a" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session", "id": "task-a", "x": 1 }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": { "to": "session", "who": "task-a" }, "body": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": ok(), "body": "x", "root": "plan-bbbb" }),
+            json!({ "root_task_id": "plan-aaaa", "to": ok(), "body": "x", "from": "task-a" }),
+            json!({ "root_task_id": "plan-aaaa", "to": ok(), "body": "x", "from_identity": "operator" }),
+            json!({ "root_task_id": "plan-aaaa", "to": ok(), "body": "x", "in_reply_to": "x" }),
+            json!({ "root_task_id": "plan-aaaa", "to": ok(), "body": "x", "task": {} }),
+        ];
+        for args in bad {
+            let (code, text) = send_refusal(&server, args.clone()).await;
+            assert_eq!(code, -32602, "{args}");
+            assert!(!text.contains("plan-aaaa"), "{text}");
+            assert!(!text.contains("xxxx"), "{text}");
+            assert!(!text.contains("shout"), "{text}");
+        }
+        assert!(inbox_of(&rig, "task-a").is_empty());
+        assert!(rig.messages.quarantined().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_size_boundaries_are_accepted_and_counted_in_bytes_and_characters() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let body = "word ".repeat(1638);
+        let subject = "é".repeat(120);
+        let args = json!({
+            "root_task_id": "plan-aaaa",
+            "to": one("task-a"),
+            "body": body,
+            "subject": subject
+        });
+        let shown = send_to(&server, args).await;
+        assert!(shown.result.is_some(), "{shown:?}");
+        let stored = inbox_of(&rig, "task-a");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body.len(), 8190);
+        assert_eq!(stored[0].subject.chars().count(), 120);
+    }
+
+    #[tokio::test]
+    async fn a_body_of_exactly_the_limit_is_accepted_and_one_byte_more_is_not() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let exact = "a".repeat(8192);
+        let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": exact });
+        let shown = send_to(&server, args).await;
+        assert!(shown.error.is_none(), "{shown:?}");
+        let over = "a".repeat(8193);
+        let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": over });
+        assert_eq!(send_refusal(&server, args).await.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn a_task_field_on_hub_send_is_method_not_found_and_sends_nothing() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let params = json!({ "name": "hub_send", "arguments": base_args("task-a"), "task": {} });
+        let response = rpc(&server, "tools/call", params).await;
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32601);
+        assert_eq!(
+            error.message,
+            "Tool 'hub_send' does not support task augmentation"
+        );
+        assert!(inbox_of(&rig, "task-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_hub_hub_send_is_an_unknown_tool_and_not_listed() {
+        let server = server_over(None);
+        let listed = rpc(&server, "tools/list", json!({})).await.result.unwrap();
+        assert!(!listed.to_string().contains("hub_send"));
+        let (code, text) = send_refusal(&server, base_args("task-a")).await;
+        assert_eq!((code, text.as_str()), (-32602, "Unknown tool: hub_send"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_is_an_internal_error_with_a_fixed_text() {
+        let flaky = Flaky::new();
+        let rig = rig_over(flaky.clone());
+        let server = server_over(Some(rig.hub.clone()));
+        flaky.reads.store(true, Ordering::SeqCst);
+        let args = json!({ "root_task_id": "some-task", "to": "top_level", "body": CLEAN });
+        let (code, text) = send_refusal(&server, args).await;
+        assert_eq!((code, text.as_str()), (-32603, "hub unavailable"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_append_is_an_internal_error_and_nothing_is_delivered() {
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let registry = Arc::new(SessionRegistry::new(sessions.clone()));
+        let inner = Arc::new(InMemoryMessageStore::new());
+        let store = Arc::new(FailAppend {
+            inner: inner.clone(),
+        });
+        let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+        let hub = MessageHub::with_sink(
+            sessions,
+            store,
+            Arc::new(auditor),
+            Arc::new(SimulatedClock::new(start())),
+            HubLimits::default(),
+            registry.clone(),
+            Arc::new(NoopQuarantineSink),
+        );
+        let rig = Rig {
+            hub: Arc::new(hub),
+            messages: inner,
+            registry,
+        };
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let (code, text) = send_refusal(&server, base_args("task-a")).await;
+        assert_eq!((code, text.as_str()), (-32603, "hub unavailable"));
+        assert!(inbox_of(&rig, "task-a").is_empty());
+    }
+
+    struct FailAppend {
+        inner: Arc<InMemoryMessageStore>,
+    }
+
+    type Page = Result<Vec<StoredMessage>, StoreError>;
+
+    impl MessageStore for FailAppend {
+        fn append(&self, _m: StoredMessage) -> Result<Seq, StoreError> {
+            Err(StoreError::Io(std::io::Error::other("disk gone")))
+        }
+        fn get(&self, id: MessageId) -> Result<Option<StoredMessage>, StoreError> {
+            self.inner.get(id)
+        }
+        fn inbox(&self, to: SessionId, after: Option<Seq>, limit: usize) -> Page {
+            self.inner.inbox(to, after, limit)
+        }
+        fn ack(&self, to: SessionId, upto: Seq) -> Result<(), StoreError> {
+            self.inner.ack(to, upto)
+        }
+        fn unread(&self, to: SessionId) -> Result<usize, StoreError> {
+            self.inner.unread(to)
+        }
+        fn outbound_window(&self, from: SessionId, to: Recipient, bytes: usize) -> Page {
+            self.inner.outbound_window(from, to, bytes)
+        }
+        fn set_state(&self, id: MessageId, s: DeliveryState) -> Result<(), StoreError> {
+            self.inner.set_state(id, s)
+        }
+        fn quarantined(&self) -> Page {
+            self.inner.quarantined()
+        }
+        fn transition(
+            &self,
+            id: MessageId,
+            from: DeliveryState,
+            to: DeliveryState,
+            release: Option<Release>,
+        ) -> Result<StoredMessage, StoreError> {
+            self.inner.transition(id, from, to, release)
+        }
+        fn prune(
+            &self,
+            now: chrono::DateTime<Utc>,
+            policy: &Retention,
+        ) -> Result<usize, StoreError> {
+            self.inner.prune(now, policy)
+        }
+    }
+
+    #[test]
+    fn the_failing_store_passes_every_read_through() {
+        let inner = Arc::new(InMemoryMessageStore::new());
+        let store = FailAppend {
+            inner: inner.clone(),
+        };
+        let message = mail_with(&root_a(), "status", CLEAN, CLEAN);
+        let id = message.id;
+        let to = message.to.clone();
+        let seq = inner.append(message.clone()).unwrap();
+        assert!(store.append(message).is_err());
+        assert!(store.get(id).unwrap().is_some());
+        assert_eq!(store.inbox(to.clone(), None, 5).unwrap().len(), 1);
+        assert_eq!(store.unread(to.clone()).unwrap(), 1);
+        let window = store.outbound_window(who("worker"), Recipient::Root, 100);
+        assert!(window.is_ok());
+        store.set_state(id, DeliveryState::Delivered).unwrap();
+        store.ack(to, seq).unwrap();
+        assert!(store.quarantined().unwrap().is_empty());
+        let moved = store.transition(id, DeliveryState::Acked, DeliveryState::Expired, None);
+        assert!(moved.is_ok());
+        let policy = Retention::default();
+        assert!(store.prune(start(), &policy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_thirty_first_send_in_a_window_is_rate_limited_with_a_kind_only() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        for index in 0..30 {
+            let body = format!("note number {index}");
+            let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": body });
+            sent(&server, args).await;
+        }
+        let args = json!({ "root_task_id": "plan-aaaa", "to": one("task-a"), "body": "one more" });
+        let shown = declined(&server, args).await;
+        assert_eq!(shown["refused"], "rate_limited");
+        assert_eq!(inbox_of(&rig, "task-a").len(), 30);
+    }
+
+    #[test]
+    fn every_hub_error_maps_to_a_fixed_refusal_kind_without_text() {
+        let wait = std::time::Duration::from_secs(1);
+        let cases = [
+            (HubError::NoRecipient, "no_recipient"),
+            (HubError::RecipientInactive, "recipient_inactive"),
+            (HubError::RateLimited(wait), "rate_limited"),
+            (HubError::InboxFull, "inbox_full"),
+            (
+                HubError::TooLarge {
+                    field: "recipients",
+                    max: 20,
+                },
+                "too_large",
+            ),
+            (HubError::Blocked(vec![ReasonCode::SecretLeak]), "blocked"),
+            (HubError::ThreadTooDeep, "not_delivered"),
+            (HubError::AuditUnavailable, "not_delivered"),
+            (HubError::Quarantined { recipients: 1 }, "not_delivered"),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(refusal_kind(&error), kind, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn the_host_failures_are_errors_and_every_other_refusal_is_a_result() {
+        assert_eq!(refused(HubError::NotVisible).unwrap_err().code, -32602);
+        let disk = StoreError::Io(std::io::Error::other("disk gone"));
+        assert_eq!(refused(HubError::Store(disk)).unwrap_err().code, -32603);
+        assert!(refused(HubError::InboxFull).is_ok());
+    }
+
+    #[test]
+    fn the_tool_limits_equal_the_hubs_own_limits() {
+        let limits = HubLimits::default();
+        assert_eq!(BODY_MAX, limits.body_max);
+        assert_eq!(SUBJECT_MAX, limits.subject_max);
+    }
+
+    #[tokio::test]
+    async fn a_planted_token_is_in_no_send_error_text_and_no_debug_output() {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let token = format!("{}_{}", "ghp", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let by_root = json!({ "root_task_id": token.clone(), "to": "top_level", "body": CLEAN });
+        let by_session = json!({ "root_task_id": "plan-aaaa", "to": one(&token), "body": CLEAN });
+        let by_key = json!({ "root_task_id": "plan-aaaa", "to": "top_level", "body": CLEAN, token.clone(): 1 });
+        for args in [by_root, by_session, by_key] {
+            let response = send_to(&server, args).await;
+            assert!(!format!("{response:?}").contains(&token));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hostile_text_sent_by_the_operator_is_refused_and_never_reaches_the_recipient() {
+        let rig = rig();
+        let binding = seat(&rig, &root_a(), "task-a");
+        let server = server_over(Some(rig.hub.clone()));
+        let args = json!({
+            "root_task_id": "plan-aaaa",
+            "to": one("task-a"),
+            "body": "status \u{1b}[31m \u{202e} line",
+            "subject": "sub\u{85}ject"
+        });
+        let shown = declined(&server, args).await;
+        assert_eq!(shown["refused"], "blocked");
+        let page = rig
+            .hub
+            .recv(&binding, RecvRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len() + page.withheld, 0);
+        let text = serde_json::to_string(&page).unwrap();
+        assert!(!hostile(&text), "{text:?}");
+    }
+
+    fn names_of(listed: &Value) -> Vec<&str> {
+        let all = listed["tools"].as_array().unwrap();
+        all.iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect()
+    }
+
+    fn locked_server(rig: &Rig) -> NannaMcpServer {
+        server_over(Some(rig.hub.clone())).with_send_gate(shut_gate)
+    }
+
+    #[tokio::test]
+    async fn without_the_grant_the_list_is_the_base_tools_plus_hub_inbox_only() {
+        let rig = rig();
+        let locked = locked_server(&rig);
+        let listed = rpc(&locked, "tools/list", json!({})).await.result.unwrap();
+        assert_eq!(
+            names_of(&listed),
+            ["assign_task", "onboard_repo", "hub_inbox"]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_grant_hub_send_is_an_unknown_tool_like_any_unlisted_name_and_stores_nothing(
+    ) {
+        let rig = rig();
+        seat(&rig, &root_a(), "task-a");
+        let locked = locked_server(&rig);
+        let known = send_refusal(&locked, base_args("task-a")).await;
+        assert_eq!(known, (-32602, "Unknown tool: hub_send".to_string()));
+        let params = json!({ "name": "hub_sent", "arguments": base_args("task-a") });
+        let other = rpc(&locked, "tools/call", params).await.error.unwrap();
+        assert_eq!(other.code, known.0);
+        assert_eq!(other.message.replace("hub_sent", "hub_send"), known.1);
+        let with_task = json!({ "name": "hub_send", "arguments": base_args("task-a"), "task": {} });
+        let tasked = rpc(&locked, "tools/call", with_task).await.error.unwrap();
+        assert_eq!(tasked.code, -32602);
+        assert!(inbox_of(&rig, "task-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_the_grant_hub_inbox_still_reads() {
+        let rig = rig();
+        put(&rig, &root_a(), "status", CLEAN);
+        let locked = locked_server(&rig);
+        let (_, shown) = page(&locked, json!({ "root_task_id": "plan-aaaa" })).await;
+        assert_eq!(bodies(&shown), [CLEAN]);
+    }
+
+    #[tokio::test]
+    async fn the_default_gate_offers_hub_send_exactly_when_the_process_has_the_grant() {
+        let provider = model::OllamaProvider::new(model::OllamaConfig::default()).unwrap();
+        let gate = crate::auditor::test_support::fixture_gate();
+        let manager = Arc::new(TaskManager::new(0));
+        let server =
+            NannaMcpServer::new(manager, Arc::new(provider), gate, 100).with_hub(rig().hub);
+        let listed = rpc(&server, "tools/list", json!({})).await.result.unwrap();
+        let offered = names_of(&listed).contains(&"hub_send");
+        assert_eq!(offered, operator::send_grant_available());
     }
 
     const GOLDEN_INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tasks":{"cancel":{},"list":{},"requests":{"tools":{"call":{}}}},"tools":{}},"protocolVersion":"2025-11-25","serverInfo":{"name":"nanna","version":"VERSION"}}}"#;
