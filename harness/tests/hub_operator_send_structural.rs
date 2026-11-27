@@ -24,8 +24,8 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 
 fn last_name(path: &syn::Path) -> String {
     let last = path.segments.last();
-    last.map(|segment| segment.ident.to_string())
-        .unwrap_or_default()
+    let name = last.map(|segment| segment.ident.to_string());
+    name.unwrap_or_default()
 }
 
 fn member_name(member: &syn::Member) -> String {
@@ -89,11 +89,8 @@ impl<'ast> Visit<'ast> for Facts {
     }
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        let names: Vec<String> = node
-            .fields
-            .iter()
-            .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
-            .collect();
+        let idents = node.fields.iter().filter_map(|field| field.ident.as_ref());
+        let names: Vec<String> = idents.map(ToString::to_string).collect();
         self.struct_fields.insert(node.ident.to_string(), names);
         syn::visit::visit_item_struct(self, node);
     }
@@ -147,10 +144,8 @@ fn flag_comes_from_the_sender_id_alone(text: &str) -> bool {
 fn operator_request_has_no_sender_fields(text: &str) -> bool {
     let found = facts(text);
     let fields = found.struct_fields.get("OperatorSend");
-    let wanted: Vec<String> = ["to", "kind", "subject", "body"]
-        .iter()
-        .map(|item| item.to_string())
-        .collect();
+    let keys = ["to", "kind", "subject", "body"];
+    let wanted: Vec<String> = keys.iter().map(|item| item.to_string()).collect();
     fields == Some(&wanted)
 }
 
@@ -277,10 +272,8 @@ fn the_stored_sender_is_the_roots_mailbox_and_the_identity_is_the_host_constant(
 fn the_operator_send_is_named_only_in_the_send_module_of_the_hub() {
     let all = production_facts();
     for name in OPERATOR_NAMES {
-        let hub_files: BTreeSet<String> = holders(&all, name)
-            .into_iter()
-            .filter(|file| file.starts_with("hub/"))
-            .collect();
+        let holding = holders(&all, name).into_iter();
+        let hub_files: BTreeSet<String> = holding.filter(|f| f.starts_with("hub/")).collect();
         assert_eq!(hub_files, names(&["hub/send.rs"]), "{name}");
     }
 }
