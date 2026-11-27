@@ -1,9 +1,11 @@
 pub mod client;
 pub mod handlers;
+mod hub_tools;
 pub mod jsonrpc;
 pub mod plan;
 
 use crate::auditor::SpawnGate;
+use crate::hub::send::MessageHub;
 use crate::task::{TaskId, TaskManager};
 use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 use model::provider::ModelProvider;
@@ -18,6 +20,7 @@ pub struct NannaMcpServer {
     default_max_iterations: usize,
     planner_model: Option<String>,
     plans: Arc<plan::PlanRegistry>,
+    hub: Option<Arc<MessageHub>>,
 }
 
 impl NannaMcpServer {
@@ -37,6 +40,7 @@ impl NannaMcpServer {
             default_max_iterations,
             planner_model: None,
             plans: Arc::new(plan::PlanRegistry::default()),
+            hub: None,
         }
     }
 
@@ -52,6 +56,69 @@ impl NannaMcpServer {
     /// ```
     pub fn with_planner(mut self, model: impl Into<String>) -> Self {
         self.planner_model = Some(model.into());
+        self
+    }
+
+    /// Offer the `hub_inbox` tool, the operator's read of the root mailbox, over `hub`. Without
+    /// this call the server lists no hub tool and `hub_inbox` is an unknown tool.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
+    /// use harness::hub::limits::HubLimits;
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::send::{MessageHub, QuarantineEvent, QuarantineSink};
+    /// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+    /// use harness::leases::SimulatedClock;
+    /// use harness::mcp::NannaMcpServer;
+    /// use harness::task::TaskManager;
+    ///
+    /// struct Quiet;
+    /// impl QuarantineSink for Quiet {
+    ///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # fn build(provider: Arc<dyn model::ModelProvider>, gate: harness::auditor::SpawnGate) {
+    /// let sessions = Arc::new(InMemorySessionStore::new());
+    /// let registry = Arc::new(SessionRegistry::new(sessions.clone()));
+    /// let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+    /// let hub = MessageHub::with_sink(
+    ///     sessions,
+    ///     Arc::new(InMemoryMessageStore::new()),
+    ///     Arc::new(auditor),
+    ///     Arc::new(SimulatedClock::new(chrono::Utc::now())),
+    ///     HubLimits::default(),
+    ///     registry,
+    ///     Arc::new(Quiet),
+    /// );
+    /// let server = NannaMcpServer::new(Arc::new(TaskManager::default()), provider, gate, 10)
+    ///     .with_hub(Arc::new(hub));
+    /// # let _ = server;
+    /// # }
+    /// ```
+    pub fn with_hub(mut self, hub: Arc<MessageHub>) -> Self {
+        self.hub = Some(hub);
+        self
+    }
+
+    /// Offer the hub tools only when the task manager this server drives has a hub. A manager
+    /// without one (locked stores, no hub runtime) leaves the server exactly as it was.
+    ///
+    /// ```
+    /// use harness::mcp::NannaMcpServer;
+    /// use harness::task::TaskManager;
+    /// use std::sync::Arc;
+    /// # fn build(provider: Arc<dyn model::ModelProvider>, gate: harness::auditor::SpawnGate) {
+    /// let server = NannaMcpServer::new(Arc::new(TaskManager::default()), provider, gate, 10)
+    ///     .with_manager_hub();
+    /// # let _ = server;
+    /// # }
+    /// ```
+    pub fn with_manager_hub(mut self) -> Self {
+        let found = self.task_manager.hub().or(self.hub.take());
+        self.hub = found;
         self
     }
 
@@ -179,6 +246,9 @@ impl NannaMcpServer {
         if let (Some(_), Some(list)) = (&self.planner_model, tools.as_array_mut()) {
             list.push(plan::tool_definition());
         }
+        if let (Some(_), Some(list)) = (&self.hub, tools.as_array_mut()) {
+            list.push(hub_tools::tool_definition());
+        }
         tools
     }
 
@@ -262,6 +332,14 @@ impl NannaMcpServer {
         let requested_ttl = task_field
             .and_then(|t| t.get("ttl"))
             .and_then(|v| v.as_u64());
+
+        let hub = self
+            .hub
+            .as_ref()
+            .filter(|_| tool_name == hub_tools::HUB_INBOX);
+        if let Some(hub) = hub {
+            return hub_tools::call_hub_inbox(id, &tool_params, task_field.is_some(), hub);
+        }
 
         match tool_name.as_str() {
             // `assign_task` is `taskSupport: "required"`: it MUST be invoked as
