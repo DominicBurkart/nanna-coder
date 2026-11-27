@@ -1,7 +1,7 @@
 use super::jsonrpc::JsonRpcResponse;
 use crate::hub::error::HubError;
 use crate::hub::message::Seq;
-use crate::hub::recv::{RootRequest, RECV_DEFAULT, RECV_MAX};
+use crate::hub::recv::{RootPage, RootRequest, RECV_DEFAULT, RECV_MAX};
 use crate::hub::send::MessageHub;
 use serde_json::{json, Map, Value};
 
@@ -128,7 +128,11 @@ fn read_inbox(args: &Value, hub: &MessageHub) -> Result<Value, Refusal> {
     let (text, request) = parse(args)?;
     let root = hub.resolve_root(text).map_err(host_failure)?;
     let page = hub.root_inbox(&root, request).map_err(host_failure)?;
-    let body = serde_json::to_string(&page).map_err(|_| internal())?;
+    page_result(&page)
+}
+
+fn page_result(page: &RootPage) -> Result<Value, Refusal> {
+    let body = serde_json::to_string(page).map_err(|_| internal())?;
     Ok(json!({ "content": [{ "type": "text", "text": body }], "isError": false }))
 }
 
