@@ -29,10 +29,11 @@ fn last_name(path: &syn::Path) -> String {
 }
 
 fn member_name(member: &syn::Member) -> String {
-    match member {
-        syn::Member::Named(ident) => ident.to_string(),
-        syn::Member::Unnamed(index) => index.index.to_string(),
+    let mut name = String::new();
+    if let syn::Member::Named(ident) = member {
+        name = ident.to_string();
     }
+    name
 }
 
 #[derive(Default)]
