@@ -208,7 +208,7 @@ enum Commands {
         #[command(subcommand)]
         action: EscalationAction,
     },
-    /// Read the message hub's journals: sessions of a root and quarantined messages
+    /// The message hub: sessions of a root, and quarantined messages to list, show, release or drop
     Hub {
         /// Queue log location; the hub journals sit beside it unless
         /// NANNA_SESSIONS_PATH or NANNA_MESSAGES_PATH name them
@@ -295,6 +295,18 @@ enum QuarantineAction {
     List,
     /// Show one quarantined message's stored, redacted text (terminal only)
     Show {
+        /// Message id from `quarantine list`
+        id: String,
+    },
+    /// Release one quarantined message to its recipient (terminal only; works only while
+    /// no other nanna process, such as mcp-serve, holds the hub)
+    Release {
+        /// Message id from `quarantine list`
+        id: String,
+    },
+    /// Drop one quarantined message so it is never delivered (terminal only; works only
+    /// while no other nanna process, such as mcp-serve, holds the hub)
+    Drop {
         /// Message id from `quarantine list`
         id: String,
     },
@@ -1448,7 +1460,7 @@ fn run_hub(
     json: bool,
     action: HubAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use harness::hub::operator;
+    use harness::hub::operator::{self, ResolveAction};
 
     let paths = harness::hub::runtime::HubPaths::resolve(&resolve_queue_path(queue_path)?);
     let report = match action {
@@ -1459,6 +1471,12 @@ fn run_hub(
         HubAction::Quarantine {
             action: QuarantineAction::Show { id },
         } => operator::quarantine_show_report(&paths, &id, json),
+        HubAction::Quarantine {
+            action: QuarantineAction::Release { id },
+        } => operator::quarantine_resolve_report(&paths, &id, ResolveAction::Release, json),
+        HubAction::Quarantine {
+            action: QuarantineAction::Drop { id },
+        } => operator::quarantine_resolve_report(&paths, &id, ResolveAction::Drop, json),
     };
     let text = report.unwrap_or_else(|error| {
         eprintln!("Error: {error}");

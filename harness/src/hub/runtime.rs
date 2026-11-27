@@ -5,12 +5,13 @@ use super::oracle::SystemGit;
 use super::quarantine_sink::EscalationQuarantineSink;
 use super::registry::SessionRegistry;
 use super::router::{BindingTable, HubRouter, ProductionAuditors};
-use super::send::{AuditorProvider, MessageHub, QuarantineSink};
+use super::send::{AuditorProvider, MessageHub, QuarantineEvent, QuarantineSink};
 use super::store::{
     activity_path_from, messages_path_from, sessions_path_from, ActivityStore, HubLock,
     JsonlActivityStore, JsonlMessageStore, JsonlSessionStore, MessageStore, SessionStore,
     StoreError,
 };
+use crate::action_auditor::{MessageAuditor, RuleMessageAuditor};
 use crate::escalation::EscalationPlane;
 use crate::leases::{Clock, SystemClock};
 use crate::scheduler::QueueStoreError;
@@ -241,6 +242,16 @@ fn open_activity(
 const ACTIVITY_UNAVAILABLE: &str =
     "activity log unavailable: tool calls are not logged and the librarian has no activity; the hub is otherwise up";
 
+const OFFLINE_SINK: &str = "offline hub has no escalation plane";
+
+struct OfflineQuarantineSink;
+
+impl QuarantineSink for OfflineQuarantineSink {
+    fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+        Err(OFFLINE_SINK.to_string())
+    }
+}
+
 impl HubRuntime {
     /// A runtime with no hub: no registry, no tools, and the gate blocks message tools.
     pub fn unavailable() -> Self {
@@ -301,6 +312,24 @@ impl HubRuntime {
                 Self::unavailable()
             }
         }
+    }
+
+    /// Take the exclusive hub lock and build a hub over the journals at `paths` for one short
+    /// offline operator command. It audits with the rules layer only, pages nobody and rings no
+    /// doorbell. A hub held by another process gives [`StoreError::Locked`].
+    pub(crate) fn open_offline(paths: &HubPaths) -> Result<Self, StoreError> {
+        let (sessions, messages, locks) = open_stores(paths)?;
+        let rules: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+        let factory: AuditorFactory = Box::new(move |_, _, _| Arc::new(rules));
+        let sink: Arc<dyn QuarantineSink> = Arc::new(OfflineQuarantineSink);
+        let bell: Arc<dyn Doorbell> = Arc::new(NoopDoorbell);
+        let clock = Arc::new(SystemClock);
+        let mut runtime =
+            HubRuntime::assemble_with_sink(sessions, messages, factory, clock, sink, bell);
+        if let Some(parts) = runtime.parts.as_mut() {
+            parts._locks = locks;
+        }
+        Ok(runtime)
     }
 
     #[cfg(test)]
@@ -485,6 +514,20 @@ pub(crate) mod tests {
         assert!(dir.path().join("messages.jsonl").exists());
         assert!(dir.path().join("hub.lock").exists());
         assert_eq!(format!("{runtime:?}"), "HubRuntime { available: true }");
+    }
+
+    #[test]
+    fn the_offline_sink_refuses_every_event_and_names_no_text() {
+        let event = QuarantineEvent {
+            origin: super::super::send::QuarantineOrigin::Send,
+            ids: Vec::new(),
+            from: super::super::lineage::SessionId::from_task(crate::task::TaskId("t".into())),
+            codes: Vec::new(),
+            content_hash: String::new(),
+            body_len: 0,
+        };
+        let refused = OfflineQuarantineSink.quarantined(&event);
+        assert_eq!(refused, Err(OFFLINE_SINK.to_string()));
     }
 
     #[test]
