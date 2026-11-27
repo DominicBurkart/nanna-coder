@@ -1,5 +1,6 @@
 use super::error::HubError;
 use super::lineage::{RootId, SessionBinding, SessionId};
+use super::mailbox::is_mailbox;
 use super::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
 use super::notice::{Notices, SenderNotice};
 use super::reach::{relation_of, Relation};
@@ -74,7 +75,10 @@ impl Default for RecvRequest {
 /// One delivered message as the recipient's model sees it. Every agent-authored string is
 /// fenced as untrusted data and escaped; `Debug` prints sizes, never text.
 /// `released_by_human` is serialised only when true: a human released this message from
-/// quarantine and it is delivered as stored, not reviewed again.
+/// quarantine and it is delivered as stored, not reviewed again. `from_operator` is serialised
+/// only when true: the stored sender is a root mailbox, which only the hub's operator send can
+/// write. It is computed from the sender id alone, never from the identity name, and it relaxes
+/// no review: the text is reviewed inbound and fenced as untrusted like any other message.
 #[derive(Clone, Serialize)]
 pub struct RenderedMessage {
     pub id: MessageId,
@@ -89,6 +93,8 @@ pub struct RenderedMessage {
     pub body: String,
     #[serde(skip_serializing_if = "is_false")]
     pub released_by_human: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub from_operator: bool,
 }
 
 fn is_false(flag: &bool) -> bool {
@@ -417,6 +423,7 @@ impl MessageHub {
             ),
             body: fence_of(FenceLabel::AgentMessage, &message.body, body_cap),
             released_by_human: released_marker_valid(message),
+            from_operator: is_mailbox(&message.from),
         })
     }
 
