@@ -5,11 +5,12 @@ use super::{
 use crate::action_auditor::{MessageVerdict, NullOracle, RuleMessageAuditor};
 use crate::auditor::ReasonCode;
 use crate::hub::error::HubError;
-use crate::hub::lineage::{RootId, SessionId};
+use crate::hub::lineage::{derive_lineage, RootId, SessionId};
 use crate::hub::mailbox::MailboxId;
 use crate::hub::message::{DeliveryState, MessageId, MessageKind, Seq, StoredMessage};
 use crate::hub::send::{codes_of, hash_u64, MessageHub};
 use crate::pr_tools::{untrusted_notice_as, FenceLabel};
+use crate::task::TaskId;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -137,6 +138,61 @@ fn root_decision(message: &StoredMessage) -> RootDecision {
 }
 
 impl MessageHub {
+    /// The root a caller named by text, resolved on the host. `plan-<id>`, `backlog-<repo>#<n>`
+    /// and `mcp-<uuid>` name their root directly; any other text is the id of a session and
+    /// resolves to the root of that session. A malformed prefixed id falls back to the session
+    /// lookup, and text that matches no session is [`HubError::NotVisible`], the same error for
+    /// an unknown id and for every unparsable one. A parsable root with no mail or sessions
+    /// resolves like any other.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use harness::action_auditor::{MessageAuditor, RuleMessageAuditor};
+    /// use harness::hub::error::HubError;
+    /// use harness::hub::limits::HubLimits;
+    /// use harness::hub::registry::SessionRegistry;
+    /// use harness::hub::send::{MessageHub, QuarantineEvent, QuarantineSink};
+    /// use harness::hub::store::{InMemoryMessageStore, InMemorySessionStore};
+    /// use harness::leases::SimulatedClock;
+    ///
+    /// struct Quiet;
+    /// impl QuarantineSink for Quiet {
+    ///     fn quarantined(&self, _event: &QuarantineEvent) -> Result<(), String> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let sessions = Arc::new(InMemorySessionStore::new());
+    /// let registry = Arc::new(SessionRegistry::new(sessions.clone()));
+    /// let auditor: Arc<dyn MessageAuditor> = Arc::new(RuleMessageAuditor::new());
+    /// let hub = MessageHub::with_sink(
+    ///     sessions,
+    ///     Arc::new(InMemoryMessageStore::new()),
+    ///     Arc::new(auditor),
+    ///     Arc::new(SimulatedClock::new(chrono::Utc::now())),
+    ///     HubLimits::default(),
+    ///     registry,
+    ///     Arc::new(Quiet),
+    /// );
+    /// assert!(hub.resolve_root("plan-0a1b").is_ok());
+    /// assert!(matches!(hub.resolve_root("no-such-task"), Err(HubError::NotVisible)));
+    /// ```
+    pub fn resolve_root(&self, text: &str) -> Result<RootId, HubError> {
+        let prefixed = derive_lineage(text, &|_| None).ok().flatten();
+        let named = prefixed.map(|lineage| lineage.root().clone());
+        let found = match named {
+            Some(root) => Some(root),
+            None => self.session_root(text)?,
+        };
+        found.ok_or(HubError::NotVisible)
+    }
+
+    fn session_root(&self, text: &str) -> Result<Option<RootId>, HubError> {
+        let id = SessionId::from_task(TaskId(text.to_string()));
+        let record = self.sessions.get(id)?;
+        Ok(record.map(|record| record.lineage.root().clone()))
+    }
+
     /// Read the root mailbox of `root`: the operator's side of `Recipient::Root`.
     ///
     /// Only messages with `to` equal to the mailbox of `root` AND `root` equal to `root` are
