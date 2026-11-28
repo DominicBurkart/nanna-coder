@@ -74,6 +74,39 @@ impl fmt::Display for TaskOrigin {
     }
 }
 
+/// What a queued entry launches. `Repo` is every ordinary task: a worktree of
+/// `repo_path`, a scope check against the audited repository and a row in the
+/// persisted queue. `Librarian` is the session librarian: it has no repository,
+/// no worktree and no scope check, it runs only through the pi container route,
+/// and its entry is never persisted, so a restart cannot restore and re-audit it.
+///
+/// ```
+/// use harness::scheduler::LaunchTarget;
+///
+/// assert_eq!(LaunchTarget::default(), LaunchTarget::Repo);
+/// assert!(LaunchTarget::Repo.persisted());
+/// assert!(!LaunchTarget::Librarian.persisted());
+/// assert_eq!(serde_json::to_string(&LaunchTarget::Librarian).unwrap(), "\"librarian\"");
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchTarget {
+    #[default]
+    Repo,
+    Librarian,
+}
+
+impl LaunchTarget {
+    /// Whether an entry with this target may be written to the queue store.
+    pub const fn persisted(self) -> bool {
+        matches!(self, LaunchTarget::Repo)
+    }
+
+    fn is_repo(&self) -> bool {
+        matches!(self, LaunchTarget::Repo)
+    }
+}
+
 /// A task waiting for a slot. This is the unit the queue orders, the policy
 /// selects and the store persists; the runtime state of a dispatched task
 /// lives in [`crate::task::Task`].
@@ -103,6 +136,9 @@ pub struct QueuedTask {
     /// before lineage existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<crate::hub::lineage::Lineage>,
+    /// What the entry launches. Entries written before the field existed are `Repo`.
+    #[serde(default, skip_serializing_if = "LaunchTarget::is_repo")]
+    pub launch: LaunchTarget,
 }
 
 impl QueuedTask {
@@ -128,7 +164,14 @@ impl QueuedTask {
             identity_hint: None,
             origin: None,
             lineage: None,
+            launch: LaunchTarget::Repo,
         }
+    }
+
+    /// Choose what the entry launches.
+    pub fn with_launch(mut self, launch: LaunchTarget) -> Self {
+        self.launch = launch;
+        self
     }
 
     /// Record where the entry sits in its session tree.

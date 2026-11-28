@@ -1,6 +1,6 @@
 use super::{
-    QueueMetrics, QueueStore, QueueStoreError, QueuedTask, SchedulingPolicy, Side, SlotState,
-    TaskQueue,
+    LaunchTarget, QueueMetrics, QueueStore, QueueStoreError, QueuedTask, SchedulingPolicy, Side,
+    SlotState, TaskQueue,
 };
 use crate::leases::{Clock, SystemClock};
 use crate::task::TaskId;
@@ -42,12 +42,18 @@ pub enum CancelOutcome {
 struct RunningSlot {
     side: Side,
     repo: PathBuf,
+    launch: LaunchTarget,
     abort: AbortHandle,
 }
 
 impl RunningSlot {
-    fn new(side: Side, repo: PathBuf, abort: AbortHandle) -> Self {
-        Self { side, repo, abort }
+    fn new(side: Side, repo: PathBuf, launch: LaunchTarget, abort: AbortHandle) -> Self {
+        Self {
+            side,
+            repo,
+            launch,
+            abort,
+        }
     }
 }
 
@@ -99,6 +105,10 @@ pub struct Dispatcher<L: Launcher> {
     dispatched_oldest: AtomicU64,
 }
 
+fn split_persisted(entries: Vec<QueuedTask>) -> (Vec<QueuedTask>, Vec<QueuedTask>) {
+    entries.into_iter().partition(|t| t.launch.persisted())
+}
+
 impl<L: Launcher> Dispatcher<L> {
     /// Build a dispatcher whose queue is reloaded from `store`. Nothing is
     /// dispatched until [`dispatch`](Self::dispatch) or
@@ -122,7 +132,14 @@ impl<L: Launcher> Dispatcher<L> {
         max_concurrent: usize,
         clock: Arc<dyn Clock>,
     ) -> Result<Arc<Self>, QueueStoreError> {
-        let queue = TaskQueue::from_entries(store.load()?);
+        let (kept, forged) = split_persisted(store.load()?);
+        for task in &forged {
+            tracing::error!(task_id = %task.id, "Dropping a stored queue entry whose launch target is never persisted");
+            if let Err(e) = store.remove(&task.id) {
+                tracing::error!(task_id = %task.id, error = %e, "Failed to remove a forged queue entry");
+            }
+        }
+        let queue = TaskQueue::from_entries(kept);
         Ok(Arc::new(Self {
             launcher,
             policy,
@@ -167,20 +184,31 @@ impl<L: Launcher> Dispatcher<L> {
     }
 
     /// Persist and queue `task`, then dispatch whatever may start. Returns
-    /// the stored entry with its sequence number assigned.
+    /// the stored entry with its sequence number assigned. An entry whose
+    /// launch target is not persisted is queued in memory only.
     pub async fn enqueue(
         self: &Arc<Self>,
         task: QueuedTask,
     ) -> Result<QueuedTask, QueueStoreError> {
         let mut state = self.state.lock().await;
         let stored = state.queue.push(task);
-        if let Err(e) = self.store.insert(&stored) {
-            state.queue.remove(&stored.id);
-            return Err(e);
+        if stored.launch.persisted() {
+            if let Err(e) = self.store.insert(&stored) {
+                state.queue.remove(&stored.id);
+                return Err(e);
+            }
         }
         drop(state);
         self.dispatch().await;
         Ok(stored)
+    }
+
+    /// Queue `task` in memory only and dispatch whatever may start. The entry is never written to
+    /// the store, so a restart cannot restore it and releasing or cancelling it leaves the store
+    /// untouched. It cannot fail, because nothing is persisted.
+    pub async fn enqueue_ephemeral(self: &Arc<Self>, task: QueuedTask) {
+        self.state.lock().await.queue.push(task);
+        self.dispatch().await;
     }
 
     /// Run the policy until no further entry may start, and arm the wake
@@ -204,7 +232,8 @@ impl<L: Launcher> Dispatcher<L> {
                 this.release(&id).await;
             });
             state.slots.occupy(side, &task.repo_path);
-            let slot = RunningSlot::new(side, task.repo_path.clone(), handle.abort_handle());
+            let (repo, launch) = (task.repo_path.clone(), task.launch);
+            let slot = RunningSlot::new(side, repo, launch, handle.abort_handle());
             state.running.insert(task.id.clone(), slot);
             match side {
                 Side::Newest => self.dispatched_newest.fetch_add(1, Ordering::Relaxed),
@@ -234,11 +263,19 @@ impl<L: Launcher> Dispatcher<L> {
     /// Free the slot held by `id` (if any), forget it in the store, and
     /// dispatch the next entry.
     pub async fn release(self: &Arc<Self>, id: &TaskId) {
-        if self.take_running(id).await.is_some() {
-            if let Err(e) = self.store.remove(id) {
+        if let Some(slot) = self.take_running(id).await {
+            if let Err(e) = self.forget_entry(id, slot.launch) {
                 tracing::error!(task_id = %id, error = %e, "Failed to remove finished task from queue store");
             }
             self.dispatch().await;
+        }
+    }
+
+    fn forget_entry(&self, id: &TaskId, launch: LaunchTarget) -> Result<(), QueueStoreError> {
+        if launch.persisted() {
+            self.store.remove(id)
+        } else {
+            Ok(())
         }
     }
 
@@ -260,17 +297,20 @@ impl<L: Launcher> Dispatcher<L> {
     /// Remove `id` from the queue, or abort it if running.
     pub async fn cancel(self: &Arc<Self>, id: &TaskId) -> Result<CancelOutcome, QueueStoreError> {
         let queued = self.state.lock().await.queue.remove(id);
-        let outcome = match queued {
-            Some(task) => CancelOutcome::Queued(Box::new(task)),
+        let (outcome, launch) = match queued {
+            Some(task) => {
+                let launch = task.launch;
+                (CancelOutcome::Queued(Box::new(task)), launch)
+            }
             None => match self.take_running(id).await {
                 Some(slot) => {
                     slot.abort.abort();
-                    CancelOutcome::Running
+                    (CancelOutcome::Running, slot.launch)
                 }
                 None => return Ok(CancelOutcome::NotFound),
             },
         };
-        self.store.remove(id)?;
+        self.forget_entry(id, launch)?;
         if outcome == CancelOutcome::Running {
             self.dispatch().await;
         }
@@ -635,5 +675,86 @@ mod tests {
         assert!(dispatcher.cancel(&second.id).await.is_err());
         dispatcher.release(&second.id).await;
         assert!(!dispatcher.is_running(&second.id).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_librarian_entry_is_queued_and_launched_without_touching_the_store() {
+        let store = InMemoryQueueStore::default();
+        let (dispatcher, launcher) = dispatcher(1, Box::new(store.clone()));
+        let librarian = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let repo = task("/r");
+        let librarian = dispatcher.enqueue(librarian).await.unwrap();
+        wait_for_started(&launcher, 1).await;
+        assert!(store.load().unwrap().is_empty());
+        let repo = dispatcher.enqueue(repo).await.unwrap();
+        assert_eq!(store.load().unwrap().len(), 1);
+        launcher.finish(&librarian.id);
+        wait_for_started(&launcher, 2).await;
+        assert_eq!(launcher.started()[1].0, repo.id);
+        assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_drops_a_stored_librarian_entry_and_keeps_the_repo_entries() {
+        let store = InMemoryQueueStore::default();
+        let librarian = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let repo = task("/r");
+        store.insert(&librarian).unwrap();
+        store.insert(&repo).unwrap();
+        let (dispatcher, launcher) = dispatcher(0, Box::new(store.clone()));
+        let queued = dispatcher.queued().await;
+        assert_eq!(
+            queued.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            vec![&repo.id]
+        );
+        assert_eq!(store.load().unwrap(), vec![repo]);
+        assert!(launcher.started().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_still_drops_a_stored_librarian_entry_when_the_store_cannot_remove_it() {
+        let inner = InMemoryQueueStore::default();
+        let librarian = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let repo = task("/r");
+        inner.insert(&librarian).unwrap();
+        inner.insert(&repo).unwrap();
+        let (dispatcher, launcher) = dispatcher(0, Box::new(RemoveFailsStore(inner)));
+        let queued = dispatcher.queued().await;
+        let ids: Vec<&TaskId> = queued.iter().map(|t| &t.id).collect();
+        assert_eq!(ids, vec![&repo.id]);
+        assert!(launcher.started().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ephemeral_entry_runs_and_cancels_without_a_single_store_call() {
+        let (dispatcher, launcher) =
+            dispatcher(1, Box::new(RemoveFailsStore(InMemoryQueueStore::default())));
+        let librarian = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let running = librarian.id.clone();
+        dispatcher.enqueue_ephemeral(librarian).await;
+        wait_for_started(&launcher, 1).await;
+        let waiting = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let queued = waiting.id.clone();
+        dispatcher.enqueue_ephemeral(waiting).await;
+        assert!(dispatcher.is_queued(&queued).await);
+        assert!(matches!(
+            dispatcher.cancel(&queued).await,
+            Ok(CancelOutcome::Queued(_))
+        ));
+        assert_eq!(
+            dispatcher.cancel(&running).await.unwrap(),
+            CancelOutcome::Running
+        );
+        assert!(!dispatcher.is_running(&running).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repo_entry_still_reaches_the_store_on_release_and_cancel() {
+        let store = RemoveFailsStore(InMemoryQueueStore::default());
+        let (dispatcher, _launcher) = dispatcher(1, Box::new(store));
+        let running = dispatcher.enqueue(task("/r")).await.unwrap();
+        let queued = dispatcher.enqueue(task("/r")).await.unwrap();
+        assert!(dispatcher.cancel(&queued.id).await.is_err());
+        assert!(dispatcher.cancel(&running.id).await.is_err());
     }
 }

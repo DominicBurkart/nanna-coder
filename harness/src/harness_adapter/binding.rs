@@ -2,7 +2,9 @@ use super::ResolvedAgent;
 use crate::effects::EffectClass;
 use crate::identity::AgentIdentity;
 use crate::scope::{check_repo, names_repo, origin_slug, ScopeError};
-use crate::task::{model_facing_registry, BoundIdentity, ModelFacingLayers, TaskId};
+use crate::task::{
+    model_facing_registry, with_model_facing_layers, BoundIdentity, ModelFacingLayers, TaskId,
+};
 use crate::tools::ToolRegistry;
 use crate::workspace::TaskWorkspace;
 use std::path::Path;
@@ -215,7 +217,57 @@ fn layers_match(
     }
 }
 
+fn registry_layers_match(
+    identity: &AgentIdentity,
+    task_id: &TaskId,
+    layers: &ModelFacingLayers,
+) -> Result<(), BindError> {
+    let subject = &layers.subject;
+    let checks: [(&'static str, bool); 3] = [
+        ("task id", subject.task_id == *task_id),
+        (
+            "effect ceiling",
+            subject.max_effect == identity.scope.max_effect,
+        ),
+        ("path scope", subject.paths == identity.scope.paths),
+    ];
+    match checks.iter().find(|(_, same)| !same) {
+        Some((field, _)) => Err(BindError::LayersMismatch { field }),
+        None => Ok(()),
+    }
+}
+
 impl ResolvedAgent {
+    /// Bind an agent that has no workspace to the registry its broker serves: the librarian.
+    /// The agent must have been resolved from this audited identity and repository label, the
+    /// layers must describe this task and identity, and the registry (scoped to the identity and
+    /// wrapped in the layers here) must offer exactly the agent's capabilities. There is no
+    /// repository on disk to name or check; only [`ResolvedAgent::bind_workspace`] and this
+    /// method build a [`BoundWorkspace`].
+    pub(crate) fn bind_registry(
+        &self,
+        audited: AuditedRef<'_>,
+        audited_repo: &str,
+        task_id: &TaskId,
+        base: ToolRegistry,
+        layers: ModelFacingLayers,
+    ) -> Result<BoundWorkspace, BindError> {
+        let identity = audited.identity;
+        if !agent_matches_identity(self, identity, audited_repo) {
+            return Err(BindError::AgentMismatch);
+        }
+        registry_layers_match(identity, task_id, &layers)?;
+        let registry = with_model_facing_layers(base.scoped_for(identity), layers);
+        registry_matches(self, &registry)?;
+        Ok(BoundWorkspace {
+            registry,
+            identity: identity.clone(),
+            audited_repo: audited_repo.to_string(),
+            task_id: task_id.clone(),
+            capabilities: capability_snapshot(self),
+        })
+    }
+
     pub(crate) fn bind_workspace(
         &self,
         audited: AuditedRef<'_>,

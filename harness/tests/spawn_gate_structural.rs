@@ -537,10 +537,12 @@ fn the_set_of_submit_and_enqueue_functions_is_pinned() {
             "backlog.rs: StoreSink::enqueue (private)",
             "mcp/client.rs: NannaMcpClient::submit_task (pub)",
             "scheduler/dispatch.rs: Dispatcher::enqueue (pub)",
+            "scheduler/dispatch.rs: Dispatcher::enqueue_ephemeral (pub)",
             "task.rs: TaskManager::submit_audited (pub(restricted))",
             "task.rs: TaskManager::submit_spawn (pub)",
             "task.rs: TaskManager::submit_task (pub(restricted))",
             "task.rs: TaskManager::submit_bound (private)",
+            "task/librarian.rs: TaskManager::submit_librarian (pub(restricted))",
         ]),
         "a submit/enqueue function was added, removed or had its visibility changed; every such function must go through SpawnGate and be reviewed here"
     );
@@ -578,6 +580,10 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         ("task.rs: TaskManager::submit_spawn uses submit_bound", 1),
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
         ("task.rs: TaskManager::submit_bound uses submit_task", 1),
+        (
+            "task/librarian.rs: TaskManager::submit_librarian uses enqueue_ephemeral",
+            1,
+        ),
     ]
     .into_iter()
     .map(|(key, count)| (key.to_string(), count))
@@ -856,8 +862,10 @@ fn the_audit_token_is_minted_only_where_the_gate_proof_is_consumed() {
             "task.rs: audit_restored constructs AuditedIdentity::split",
             "task.rs: token shape: derives Debug",
             "task.rs: token shape: split is private",
+            "task/librarian.rs: TaskManager::submit_librarian constructs AuditedIdentity::split",
+            "task/librarian.rs: TaskManager::submit_librarian constructs BoundIdentity::Audited",
         ]),
-        "the audited-identity token may only be created from a gate proof in submit_spawn, submit_audited and audit_restored"
+        "the audited-identity token may only be created from a gate proof in submit_spawn, submit_audited, submit_librarian and audit_restored"
     );
 }
 
@@ -1039,6 +1047,8 @@ fn every_production_mention_of_the_bound_identity_map_is_counted_per_function() 
             ("task.rs: TaskManager::submit_bound", 1),
             ("task.rs: TaskRunner::resolve_identity", 1),
             ("task.rs: TaskRunner::set_status", 1),
+            ("task/librarian.rs: TaskManager::submit_librarian", 1),
+            ("task/librarian.rs: TaskRunner::run_librarian", 1),
         ]),
         "a production function started or stopped touching `runner.bound`, or reaches it through an alias, helper or macro; review that every insert still has a remove"
     );
@@ -1061,6 +1071,10 @@ fn every_production_operation_on_the_bound_identity_map_is_counted_per_function(
             ("task.rs: TaskRunner::resolve_identity bound.write", 1),
             ("task.rs: TaskRunner::set_status bound.remove", 1),
             ("task.rs: TaskRunner::set_status bound.write", 1),
+            ("task/librarian.rs: TaskManager::submit_librarian bound.insert", 1),
+            ("task/librarian.rs: TaskManager::submit_librarian bound.write", 1),
+            ("task/librarian.rs: TaskRunner::run_librarian bound.remove", 1),
+            ("task/librarian.rs: TaskRunner::run_librarian bound.write", 1),
         ]),
         "an insert into or removal from `runner.bound` was added, removed or moved to another function; every insert site needs a matching remove path"
     );
@@ -1081,6 +1095,7 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
             "task.rs: TaskManager::admit_restored",
             "task.rs: TaskManager::submit_audited",
             "task.rs: TaskManager::submit_bound",
+            "task/librarian.rs: TaskManager::submit_librarian",
         ]),
         "an insert into `runner.bound` was added or moved: give the new site a remove path (terminal status, cancel, or consumption by resolve_identity) and update this list in the same change"
     );
@@ -1090,6 +1105,7 @@ fn every_bound_identity_insert_has_a_remove_path_on_failure_cancel_and_terminal_
             "task.rs: TaskManager::cancel",
             "task.rs: TaskRunner::resolve_identity",
             "task.rs: TaskRunner::set_status",
+            "task/librarian.rs: TaskRunner::run_librarian",
         ]),
         "a removal from `runner.bound` was added, deleted or moved: every insert site needs a remove reachable for it; update this list only after checking that"
     );
@@ -1212,6 +1228,7 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "identities",
             "image_cache",
             "leases",
+            "librarian_tools",
             "pi_route",
             "progress",
             "providers",

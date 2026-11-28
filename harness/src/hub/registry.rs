@@ -49,6 +49,10 @@ pub enum RegistryError {
 /// from the record.
 pub const ORPHAN_SUMMARY: &str = "failed: orphaned";
 
+/// The result summary a finished librarian session stores in place of its reply, which is model
+/// text derived from other sessions.
+pub const LIBRARIAN_SUMMARY: &str = "[reply withheld]";
+
 fn is_orphan(tracked: &HashSet<SessionId>, entry: &ActiveSession, started: DateTime<Utc>) -> bool {
     !tracked.contains(&entry.id) && entry.last_activity < started
 }
@@ -126,10 +130,18 @@ impl SessionRegistry {
         self.vet(text).chars().take(MAX_FIELD_CHARS).collect()
     }
 
+    fn summary_of(&self, kind: SessionKind, text: &str) -> String {
+        match kind {
+            SessionKind::Agent => self.vet_bounded(text),
+            SessionKind::Librarian => LIBRARIAN_SUMMARY.to_string(),
+        }
+    }
+
     fn build(
         &self,
         binding: &SessionBinding,
-        subtask: &str,
+        kind: SessionKind,
+        subtask: String,
         at: DateTime<Utc>,
         created_at: DateTime<Utc>,
     ) -> SessionRecord {
@@ -137,7 +149,7 @@ impl SessionRegistry {
         SessionRecord {
             id: binding.session().clone(),
             lineage: binding.lineage().clone(),
-            kind: SessionKind::Agent,
+            kind,
             identity: card.name().to_string(),
             role: card.identity.description.clone(),
             dev_loop: card.identity.dev_loop,
@@ -150,7 +162,7 @@ impl SessionRegistry {
                 .collect(),
             write_paths: card.scope.paths.clone(),
             read_paths: ReadScope::of_card(card.scope.read_paths.as_deref()),
-            subtask: self.vet_bounded(subtask),
+            subtask,
             note: None,
             result_summary: None,
             touched_paths: Vec::new(),
@@ -169,11 +181,36 @@ impl SessionRegistry {
         subtask: &str,
         at: DateTime<Utc>,
     ) -> Result<(), RegistryError> {
+        let subtask = self.vet_bounded(subtask);
+        self.register_kind(binding, SessionKind::Agent, subtask, at)
+    }
+
+    /// Register a librarian session as `Pending`. The record stores the fixed marker
+    /// `[query withheld; N chars]` and never the query, so no peer can read another agent's
+    /// question through `session_describe`. The id is tracked like any other session.
+    pub fn register_librarian_session(
+        &self,
+        binding: &SessionBinding,
+        query_chars: usize,
+        at: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
+        let subtask = format!("[query withheld; {query_chars} chars]");
+        self.register_kind(binding, SessionKind::Librarian, subtask, at)
+    }
+
+    fn register_kind(
+        &self,
+        binding: &SessionBinding,
+        kind: SessionKind,
+        subtask: String,
+        at: DateTime<Utc>,
+    ) -> Result<(), RegistryError> {
         let mut tracked = self.lock();
         if self.store.get(binding.session().clone())?.is_some() {
             return Err(RegistryError::Duplicate);
         }
-        self.store.upsert(self.build(binding, subtask, at, at))?;
+        let record = self.build(binding, kind, subtask, at, at);
+        self.store.upsert(record)?;
         tracked.insert(binding.session().clone());
         Ok(())
     }
@@ -192,8 +229,10 @@ impl SessionRegistry {
             Some(existing) if existing.status.is_active() => existing.created_at,
             Some(_) => return Err(RegistryError::AlreadyTerminal),
         };
-        self.store
-            .upsert(self.build(binding, subtask, at, created_at))?;
+        let subtask = self.vet_bounded(subtask);
+        let kind = SessionKind::Agent;
+        let record = self.build(binding, kind, subtask, at, created_at);
+        self.store.upsert(record)?;
         tracked.insert(binding.session().clone());
         Ok(())
     }
@@ -344,7 +383,8 @@ impl SessionRegistry {
             record.status = to;
             record.ended_at = Some(at);
             record.last_activity = at;
-            record.result_summary = summary.map(|text| self.vet_bounded(text));
+            let kind = record.kind;
+            record.result_summary = summary.map(|text| self.summary_of(kind, text));
             Ok(record)
         })?;
         tracked.remove(id);
@@ -646,6 +686,76 @@ mod tests {
         assert_eq!((record.created_at, record.last_activity), (at(5), at(5)));
         assert_eq!(record.ended_at, None);
         assert!(registry.tracks(&sid("t1")));
+    }
+
+    #[test]
+    fn register_librarian_session_stores_a_librarian_record_with_the_query_withheld() {
+        let (store, registry) = registry();
+        registry
+            .register_librarian_session(&binding("lib"), 41, at(5))
+            .unwrap();
+        let record = stored(&store, "lib");
+        assert_eq!(record.kind, SessionKind::Librarian);
+        assert_eq!(record.subtask, "[query withheld; 41 chars]");
+        assert_eq!(record.status, SessionStatus::Pending);
+        assert!(registry.tracks(&sid("lib")));
+    }
+
+    #[test]
+    fn register_librarian_session_refuses_a_duplicate_session() {
+        let (_store, registry) = registry();
+        registry
+            .register_librarian_session(&binding("lib"), 3, at(0))
+            .unwrap();
+        let again = registry.register_librarian_session(&binding("lib"), 3, at(1));
+        assert!(matches!(again, Err(RegistryError::Duplicate)));
+        let agent = registry.register(&binding("lib"), "x", at(1));
+        assert!(matches!(agent, Err(RegistryError::Duplicate)));
+    }
+
+    #[test]
+    fn a_finished_librarian_session_stores_a_fixed_summary_and_an_agent_keeps_its_own() {
+        let (store, registry) = registry();
+        registry
+            .register_librarian_session(&binding("lib"), 3, at(0))
+            .unwrap();
+        registry.register(&binding("ag"), "work", at(0)).unwrap();
+        let reply = format!("{{\"matches\": [], \"leak\": \"{}\"}}", token());
+        registry
+            .set_status(&sid("lib"), SessionStatus::Running, at(1))
+            .unwrap();
+        registry
+            .set_status(&sid("ag"), SessionStatus::Running, at(1))
+            .unwrap();
+        registry
+            .finish(&sid("lib"), SessionStatus::Completed, Some(&reply), at(2))
+            .unwrap();
+        registry
+            .finish(
+                &sid("ag"),
+                SessionStatus::Completed,
+                Some("all done"),
+                at(2),
+            )
+            .unwrap();
+        assert_eq!(
+            stored(&store, "lib").result_summary.as_deref(),
+            Some(LIBRARIAN_SUMMARY)
+        );
+        assert_eq!(
+            stored(&store, "ag").result_summary.as_deref(),
+            Some("all done")
+        );
+        assert!(!registry.tracks(&sid("lib")));
+    }
+
+    #[test]
+    fn the_normal_register_and_reregister_always_store_an_agent() {
+        let (store, registry) = registry();
+        registry.register(&binding("a"), "work", at(0)).unwrap();
+        registry.reregister(&binding("b"), "work", at(0)).unwrap();
+        assert_eq!(stored(&store, "a").kind, SessionKind::Agent);
+        assert_eq!(stored(&store, "b").kind, SessionKind::Agent);
     }
 
     fn binding_reading(name: &str, read_paths: Option<Vec<String>>) -> SessionBinding {

@@ -20,8 +20,8 @@ use crate::leases::{InMemoryLeaseStore, LeaseError, LeaseSnapshot, LeaseStore, S
 use crate::protected::{AuditHook, ProtectedPathViolation};
 use crate::qa::QaSummary;
 use crate::scheduler::{
-    BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, Launcher, QueueMetrics, QueueStore,
-    QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
+    BoxFuture, Dispatcher, HybridPolicy, InMemoryQueueStore, LaunchTarget, Launcher, QueueMetrics,
+    QueueStore, QueueStoreError, QueuedTask, SchedulingPolicy, Side, TaskOrigin,
 };
 use crate::scope::ScopeDenial;
 use crate::workspace::TaskWorkspace;
@@ -36,6 +36,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{watch, Mutex, RwLock};
 use uuid::Uuid;
+
+mod librarian;
 
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
@@ -379,6 +381,7 @@ struct TaskRunner {
     check_runner: std::sync::RwLock<Option<Arc<dyn crate::verify::CheckRunner>>>,
     sessions: std::sync::RwLock<Option<Arc<SessionRegistry>>>,
     hub: std::sync::RwLock<Option<Arc<crate::hub::router::HubRouter>>>,
+    librarian_tools: std::sync::Mutex<HashMap<TaskId, librarian::LibrarianTools>>,
 }
 
 const DEFAULT_ACTION_LEASE_TTL: chrono::Duration = chrono::Duration::minutes(10);
@@ -1099,6 +1102,7 @@ impl TaskManager {
             check_runner: std::sync::RwLock::new(None),
             sessions: std::sync::RwLock::new(None),
             hub: std::sync::RwLock::new(None),
+            librarian_tools: std::sync::Mutex::new(HashMap::new()),
         });
         let dispatcher =
             Dispatcher::open(Arc::clone(&runner), policy, store, max_concurrent_tasks)?;
@@ -1767,6 +1771,7 @@ assert!(!TaskManager::new(1).with_pi_route(None).has_pi_route());
         };
         self.runner.release_leases(task_id);
         self.runner.mirror_session(task_id, &cancelled.status);
+        self.runner.take_tools(task_id);
         if dequeued {
             self.runner.bound.write().await.remove(task_id);
         }
@@ -1922,6 +1927,7 @@ impl TaskRunner {
         if status.is_terminal() {
             self.release_leases(task_id);
             self.bound.write().await.remove(task_id);
+            self.take_tools(task_id);
         }
         self.mirror_session(task_id, &status);
         let senders = self.status_senders.read().await;
@@ -1956,8 +1962,12 @@ impl TaskRunner {
         };
         let binding = audited.binding(queued.id.clone(), final_lineage(queued));
         let now = Utc::now();
+        let librarian = queued.launch == LaunchTarget::Librarian;
+        let query_chars = queued.description.chars().count();
         let result = if restored {
             registry.reregister(&binding, &queued.description, now)
+        } else if librarian {
+            registry.register_librarian_session(&binding, query_chars, now)
         } else {
             registry.register(&binding, &queued.description, now)
         };
@@ -2129,6 +2139,9 @@ impl TaskRunner {
     }
 
     async fn run(self: Arc<Self>, queued: QueuedTask, side: Side) {
+        if queued.launch == LaunchTarget::Librarian {
+            return self.run_librarian(queued, side).await;
+        }
         let task_id = queued.id.clone();
         let provider = {
             let mut providers = self.providers.write().await;
