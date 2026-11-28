@@ -119,8 +119,8 @@ fn task_prompt_preamble(identity: Option<&AgentIdentity>, tool_names: &[&str]) -
         "Tools you may call: {}. Never call a tool that is not listed; an unknown name is an error.\n\
          File paths are relative to the repository root, which is your working directory. \
          If you are unsure of a path, call list_directory on `.` first.\n\
-         read_file output prefixes each line with its line number. Those numbers are not part of the file: \
-         never copy them into old_string or content.\n\
+         read_file shows a header line, then the file's text exactly as it is, without line numbers. \
+         Copy old_string from that text, leaving out the header and any bracketed hint after it.\n\
          Change one thing at a time and read the tool result: an `Error:` result means the change did not happen. \
          When the task is done, reply with a short summary of what you changed. \
          If it cannot be done, reply with one sentence starting with `CANNOT:` that says why.",
@@ -3467,7 +3467,8 @@ max_concurrent = 1
             preamble.contains("relative to the repository root"),
             "{preamble}"
         );
-        assert!(preamble.contains("line number"), "{preamble}");
+        assert!(preamble.contains("without line numbers"), "{preamble}");
+        assert!(!preamble.contains("prefixes each line"), "{preamble}");
         assert!(preamble.contains("CANNOT:"), "{preamble}");
         assert!(
             preamble.contains("Never call a tool that is not listed"),
@@ -3706,7 +3707,7 @@ max_concurrent = 1
 
         ensure_tracing_subscriber();
         let repo_dir = tempfile::tempdir().unwrap();
-        let rows = format!("{}\n", "x".repeat(20)).repeat(500);
+        let rows = format!("{}\n", "x".repeat(40)).repeat(500);
         std::fs::write(repo_dir.path().join("big.txt"), rows).unwrap();
         init_test_git_repo(repo_dir.path());
         let read = || {
