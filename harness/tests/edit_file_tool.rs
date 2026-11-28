@@ -820,9 +820,27 @@ async fn copied_line_numbers_and_escapes_are_named_with_the_corrected_first_line
         );
         assert!(text.contains("new_string"), "{text}");
         let corrected = text.split("Corrected first line:\n").nth(1).expect(&text);
-        assert_eq!(corrected.lines().next().unwrap().trim(), FEATURE, "{text}");
+        assert_eq!(corrected.lines().next().unwrap(), FEATURE, "{text}");
         assert!(text.contains("line 1, line 3"), "{text}");
+        assert!(text.contains("pass `line`"), "{text}");
         assert!(text.len() < 1500);
+    }
+}
+
+#[tokio::test]
+async fn the_corrected_first_line_keeps_the_indentation_the_file_has() {
+    let dir = workspace_with("a.rs", b"fn f() {\n    let x = 1;\n}\n");
+    for old in ["     2  let x = 1;", "     2            let x = 1;"] {
+        let text = refused(
+            dir.path(),
+            json!({"path": "a.rs", "old_string": old, "new_string": "y"}),
+        )
+        .await;
+        assert!(
+            text.contains("Corrected first line:\n    let x = 1;\nIt appears at line 2."),
+            "{old}: {text}"
+        );
+        assert!(!text.contains("pass `line`"), "{text}");
     }
 }
 

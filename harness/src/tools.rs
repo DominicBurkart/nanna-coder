@@ -1257,11 +1257,21 @@ fn copy_mistake_message(path: &str, content: &str, old_string: &str) -> Option<S
             if escapes {
                 found.push(r#"literal \" or \n escapes"#);
             }
-            let shown: String = line.chars().take(EDIT_HINT_LINE_CHARS).collect();
+            let shown: String = content
+                .lines()
+                .nth(hits[0] - 1)?
+                .chars()
+                .take(EDIT_HINT_LINE_CHARS)
+                .collect();
+            let choose = if hits.len() > 1 {
+                " If the corrected old_string matches more than once, pass `line`."
+            } else {
+                ""
+            };
             Some(format!(
                 "old_string matched 0 times in {path}. It contains {} that are not in the file. \
                  Send the file's own characters in old_string, and correct new_string the same way. \
-                 Corrected first line:\n{shown}\nIt appears at {}.",
+                 Corrected first line:\n{shown}\nIt appears at {}.{choose}",
                 found.join(" and "),
                 line_list(&hits)
             ))
