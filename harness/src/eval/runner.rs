@@ -1501,6 +1501,16 @@ echo "this is not json" > "$out"
         assert!(matches!(result.unwrap_err(), EvalRunnerError::Timeout(_)));
     }
 
+    fn scrubbed_git() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(key);
+            }
+        }
+        cmd
+    }
+
     /// Build a tiny local bare git repo + return (bare_path, head_oid).
     /// Mirrors the pattern in `eval::swebench::tests::init_local_fixture`
     /// so we can exercise `materialize` without a network round-trip.
@@ -1511,7 +1521,7 @@ echo "this is not json" > "$out"
             I: IntoIterator<Item = S>,
             S: AsRef<std::ffi::OsStr>,
         {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = scrubbed_git();
             cmd.args(args)
                 .current_dir(cwd)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1530,7 +1540,7 @@ echo "this is not json" > "$out"
         git_must(["config", "commit.gpgsign", "false"], seed);
         std::fs::write(seed.join("hello.py"), "print('hi')\n").unwrap();
         git_must(["add", "hello.py"], seed);
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = scrubbed_git();
         cmd.args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"])
             .current_dir(seed)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1542,7 +1552,7 @@ echo "this is not json" > "$out"
             .env("GIT_COMMITTER_EMAIL", "t@t");
         assert!(cmd.output().unwrap().status.success());
         let oid = String::from_utf8(
-            std::process::Command::new("git")
+            scrubbed_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(seed)
                 .output()
@@ -1625,7 +1635,7 @@ JSON
             "repo": "fake-owner/fake-repo",
             "base_commit": oid,
             "patch": "",
-            "test_patch": "",
+            "test_patch": "diff --git a/test_new.py b/test_new.py\nnew file mode 100644\n--- /dev/null\n+++ b/test_new.py\n@@ -0,0 +1,1 @@\n+def test_stub(): assert False\n",
             "problem_statement": "irrelevant for this test",
             "FAIL_TO_PASS": [],
             "PASS_TO_PASS": [],
@@ -1705,6 +1715,10 @@ tags = ["{tag}"]
         assert!(
             !patch.contains("__nanna_agent_report"),
             "swebench_patch leaked the report JSON file:\n{patch}"
+        );
+        assert!(
+            !patch.contains("test_new.py"),
+            "test_patch content reached the model patch:\n{patch}"
         );
         // Iteration count from the fake report.
         assert_eq!(result.iterations, 2);
@@ -1875,13 +1889,8 @@ tags = ["{}"]
         let oid = init_local_bare_repo(seed.path(), bare.path());
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "wrapper-001".to_string(),
@@ -1926,13 +1935,8 @@ tags = ["{}"]
 
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "verifier-fake-001".to_string(),
@@ -1982,13 +1986,8 @@ tags = ["{}"]
         let oid = init_local_bare_repo(seed.path(), bare.path());
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "verifier-fake-002".to_string(),
