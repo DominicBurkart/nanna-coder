@@ -1145,6 +1145,7 @@ impl Tool for WriteFileTool {
 const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const EDIT_HINT_LINE_CHARS: usize = 80;
 const EDIT_HINT_MAX_LINES: usize = 5;
+const EDIT_LISTED_STARTS: usize = 20;
 
 fn resolve_write_target(
     scope: Option<&PathScope>,
@@ -1193,10 +1194,6 @@ fn to_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-fn line_of(content: &str, byte: usize) -> usize {
-    content[..byte].matches('\n').count() + 1
-}
-
 fn line_list(lines: &[usize]) -> String {
     lines
         .iter()
@@ -1205,7 +1202,76 @@ fn line_list(lines: &[usize]) -> String {
         .join(", ")
 }
 
+fn without_line_number(line: &str) -> Option<&str> {
+    let numbered = line.trim_start_matches(' ');
+    let rest = numbered.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == numbered.len() {
+        return None;
+    }
+    rest.strip_prefix("  ")
+}
+
+fn first_filled_line(text: &str) -> Option<&str> {
+    text.lines().find(|line| !line.trim().is_empty())
+}
+
+fn lines_containing(content: &str, needle: &str) -> Vec<usize> {
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(needle))
+        .map(|(i, _)| i + 1)
+        .take(EDIT_HINT_MAX_LINES)
+        .collect()
+}
+
+fn copy_mistake_message(path: &str, content: &str, old_string: &str) -> Option<String> {
+    let raw = first_filled_line(old_string)?.trim();
+    if content.contains(raw) {
+        return None;
+    }
+    let unescaped = old_string.replace("\\\"", "\"").replace("\\n", "\n");
+    [(true, false), (false, true), (true, true)]
+        .into_iter()
+        .find_map(|(numbers, escapes)| {
+            if escapes && unescaped == old_string {
+                return None;
+            }
+            let text = if escapes { &unescaped } else { old_string };
+            let mut line = first_filled_line(text)?;
+            if numbers {
+                line = without_line_number(line)?;
+            }
+            let wanted = line.trim();
+            if wanted.is_empty() {
+                return None;
+            }
+            let hits = lines_containing(content, wanted);
+            if hits.is_empty() {
+                return None;
+            }
+            let mut found = Vec::new();
+            if numbers {
+                found.push("read_file line numbers");
+            }
+            if escapes {
+                found.push(r#"literal \" or \n escapes"#);
+            }
+            let shown: String = line.chars().take(EDIT_HINT_LINE_CHARS).collect();
+            Some(format!(
+                "old_string matched 0 times in {path}. It contains {} that are not in the file. \
+                 Send the file's own characters in old_string, and correct new_string the same way. \
+                 Corrected first line:\n{shown}\nIt appears at {}.",
+                found.join(" and "),
+                line_list(&hits)
+            ))
+        })
+}
+
 fn no_match_message(path: &str, content: &str, old_string: &str) -> String {
+    if let Some(message) = copy_mistake_message(path, content, old_string) {
+        return message;
+    }
     let mut message = format!(
         "old_string matched 0 times in {path}. Call read_file on this path and copy the text \
          exactly, including indentation and blank lines."
@@ -1219,13 +1285,7 @@ fn no_match_message(path: &str, content: &str, old_string: &str) -> String {
         return message;
     }
     let shown: String = first.chars().take(EDIT_HINT_LINE_CHARS).collect();
-    let hits: Vec<usize> = content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains(first))
-        .map(|(i, _)| i + 1)
-        .take(EDIT_HINT_MAX_LINES)
-        .collect();
+    let hits = lines_containing(content, first);
     if hits.is_empty() {
         message.push_str(&format!(
             " The first line of old_string `{shown}` does not appear in the file."
@@ -1239,18 +1299,87 @@ fn no_match_message(path: &str, content: &str, old_string: &str) -> String {
     message
 }
 
-fn multiple_match_message(path: &str, content: &str, positions: &[usize], count: usize) -> String {
-    let lines: Vec<usize> = positions
+fn start_lines(content: &str, positions: &[usize]) -> String {
+    let mut lines: Vec<usize> = Vec::new();
+    let mut line = 1;
+    let mut counted = 0;
+    for &position in positions {
+        line += content[counted..position].matches('\n').count();
+        counted = position;
+        if lines.last() != Some(&line) {
+            lines.push(line);
+        }
+    }
+    let noun = if lines.len() == 1 { "line" } else { "lines" };
+    let listed: Vec<String> = lines
         .iter()
-        .take(EDIT_HINT_MAX_LINES)
-        .map(|p| line_of(content, *p))
+        .take(EDIT_LISTED_STARTS)
+        .map(ToString::to_string)
         .collect();
+    let mut text = format!("starting at {noun} {}", listed.join(", "));
+    if lines.len() > listed.len() {
+        text.push_str(&format!(" and {} more", lines.len() - listed.len()));
+    }
+    text
+}
+
+fn multiple_match_message(path: &str, content: &str, positions: &[usize]) -> String {
     format!(
-        "old_string matched {count} times in {path} (at {}). It must match exactly once. \
-         Add more surrounding lines to old_string so it is unique, or set replace_all to true to \
-         change every match. Call read_file and copy the text exactly, including indentation.",
-        line_list(&lines)
+        "old_string matched {} times in {path}, {}. Pass `line` with the start line of the one to \
+         change, add more surrounding lines to old_string, or set replace_all to true to change \
+         every match. Call read_file to see which one you mean.",
+        positions.len(),
+        start_lines(content, positions)
     )
+}
+
+fn starts_on_line(content: &str, old: &str, line: usize) -> Vec<usize> {
+    let mut ends = content.match_indices('\n').map(|(i, _)| i);
+    let start = match line {
+        1 => 0,
+        _ => match ends.nth(line - 2) {
+            Some(end) => end + 1,
+            None => return Vec::new(),
+        },
+    };
+    let end = ends.next().unwrap_or(content.len());
+    let mut found = Vec::new();
+    let mut from = start;
+    while let Some(offset) = content[from..].find(old) {
+        let position = from + offset;
+        if position > end {
+            break;
+        }
+        found.push(position);
+        let step = content[position..].chars().next().map_or(0, char::len_utf8);
+        if step == 0 {
+            break;
+        }
+        from = position + step;
+    }
+    found
+}
+
+fn position_on_line(
+    path: &str,
+    content: &str,
+    old: &str,
+    positions: &[usize],
+    line: usize,
+) -> ToolResult<usize> {
+    match starts_on_line(content, old, line)[..] {
+        [position] => Ok(position),
+        [] => Err(invalid(&format!(
+            "no occurrence of old_string starts on line {line} in {path}. It occurs {}. \
+             Pass one of those as `line`.",
+            start_lines(content, positions)
+        ))),
+        ref several => Err(invalid(&format!(
+            "{} occurrences start on line {line} in {path}, so `line` cannot choose between them. \
+             Use a longer old_string that includes the text around the one to change.",
+            several.len()
+        ))),
+    }
 }
 
 fn snippet(content: &str, byte: usize) -> String {
@@ -1313,6 +1442,17 @@ impl Tool for EditFileTool {
         );
         props.insert("new_string".to_string(), string("Text to put in its place"));
         props.insert(
+            "line".to_string(),
+            PropertySchema {
+                schema_type: SchemaType::Integer,
+                description: Some(
+                    "Line on which the occurrence to replace starts, when old_string matches more than once"
+                        .to_string(),
+                ),
+                items: None,
+            },
+        );
+        props.insert(
             "replace_all".to_string(),
             PropertySchema {
                 schema_type: SchemaType::Boolean,
@@ -1326,7 +1466,7 @@ impl Tool for EditFileTool {
         ToolDefinition {
             function: FunctionDefinition {
                 name: "edit_file".to_string(),
-                description: "Replace an exact piece of text in an existing file. Call read_file first and copy old_string exactly, including indentation. Use write_file only to create a new file.".to_string(),
+                description: "Replace an exact piece of text in an existing file. Call read_file first and copy old_string exactly, including indentation. If it matches more than once, pass line. Use write_file only to create a new file.".to_string(),
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
                     properties: Some(props),
@@ -1356,6 +1496,19 @@ impl Tool for EditFileTool {
                 })
             }
         };
+        let line = match args.get("line") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64().filter(|number| *number >= 1) {
+                Some(number) => Some(number as usize),
+                None => return Err(invalid("'line' must be a whole number of 1 or more")),
+            },
+        };
+        if line.is_some() && replace_all {
+            return Err(invalid(
+                "Pass either line, to change one occurrence, or replace_all, to change \
+                 every one, not both.",
+            ));
+        }
         if old_string.is_empty() {
             return Err(invalid(
                 "old_string is empty. Copy the exact text to replace from read_file. \
@@ -1423,27 +1576,29 @@ impl Tool for EditFileTool {
             .match_indices(old.as_str())
             .map(|(i, _)| i)
             .collect();
-        match positions.len() {
-            0 => return Err(invalid(&no_match_message(path_str, &content, old_string))),
-            1 => {}
-            n if !replace_all => {
+        if positions.is_empty() {
+            return Err(invalid(&no_match_message(path_str, &content, old_string)));
+        }
+        let first = match line {
+            Some(line) => position_on_line(path_str, &content, &old, &positions, line)?,
+            None if positions.len() > 1 && !replace_all => {
                 return Err(invalid(&multiple_match_message(
-                    path_str, &content, &positions, n,
+                    path_str, &content, &positions,
                 )))
             }
-            _ => {}
-        }
+            None => positions[0],
+        };
 
         let updated = if replace_all {
             content.replace(old.as_str(), &new)
         } else {
-            content.replacen(old.as_str(), &new, 1)
+            let (head, tail) = (&content[..first], &content[first + old.len()..]);
+            format!("{head}{new}{tail}")
         };
         if updated.len() as u64 > MAX_EDIT_FILE_BYTES {
             return Err(too_large(path_str));
         }
 
-        let first = positions[0];
         let before = snippet(&content, first);
         let after = snippet(&updated, first);
 

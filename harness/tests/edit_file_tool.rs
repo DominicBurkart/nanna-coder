@@ -518,7 +518,7 @@ fn the_tool_is_workspace_class_with_the_documented_schema() {
     assert!(description.contains("read_file") && description.contains("write_file"));
     assert!(description.len() < 400);
     let props = function["parameters"]["properties"].as_object().unwrap();
-    for key in ["path", "old_string", "new_string", "replace_all"] {
+    for key in ["path", "old_string", "new_string", "replace_all", "line"] {
         assert!(props.contains_key(key), "{key}");
     }
     assert_eq!(
@@ -578,4 +578,284 @@ async fn the_scoped_registry_edits_through_the_same_scope_as_write_file() {
         std::fs::read(dir.path().join("src/a.rs")).unwrap(),
         b"new\n"
     );
+}
+
+fn eighteen_features() -> String {
+    (0..18)
+        .map(|n| format!("#[cfg(feature = \"cli\")]\nuse item{n};\n"))
+        .collect()
+}
+
+const FEATURE: &str = "#[cfg(feature = \"cli\")]";
+
+async fn refused(root: &Path, args: Value) -> String {
+    let before = std::fs::read(root.join("a.rs")).unwrap();
+    let err = edit(root, args.clone()).await.unwrap_err();
+    assert!(
+        matches!(err, ToolError::InvalidArguments { .. }),
+        "{args}: {err:?}"
+    );
+    assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), before, "{args}");
+    message(&err)
+}
+
+#[tokio::test]
+async fn line_one_among_eighteen_matches_changes_only_that_occurrence() {
+    let source = eighteen_features();
+    let dir = workspace_with("a.rs", source.as_bytes());
+    let new = format!("#![forbid(unsafe_code)]\n{FEATURE}");
+    let result = edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": FEATURE, "new_string": new, "line": 1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["replacements"], 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        format!("#![forbid(unsafe_code)]\n{source}")
+    );
+}
+
+#[tokio::test]
+async fn line_picks_a_later_occurrence_and_the_result_shows_it() {
+    let dir = workspace_with("a.rs", b"x = 1\na\nb\nc\nx = 1\nd\n");
+    let result = edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "x = 1", "new_string": "x = 2", "line": 5}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("a.rs")).unwrap(),
+        b"x = 1\na\nb\nc\nx = 2\nd\n"
+    );
+    assert!(result["before"].as_str().unwrap().contains("5  x = 1"));
+    assert!(result["after"].as_str().unwrap().contains("5  x = 2"));
+}
+
+#[tokio::test]
+async fn several_matches_without_line_list_the_start_lines_and_ask_for_line() {
+    let dir = workspace_with("a.rs", eighteen_features().as_bytes());
+    let text = refused(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": FEATURE, "new_string": "y"}),
+    )
+    .await;
+    assert!(text.contains("18 times"), "{text}");
+    assert!(
+        text.contains(
+            "starting at lines 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("Pass `line`"), "{text}");
+    assert!(text.contains("replace_all"), "{text}");
+}
+
+#[tokio::test]
+async fn a_long_list_of_start_lines_is_bounded() {
+    let dir = workspace_with("a.rs", "needle\n".repeat(500).as_bytes());
+    for args in [
+        json!({"path": "a.rs", "old_string": "needle", "new_string": "y"}),
+        json!({"path": "a.rs", "old_string": "needle", "new_string": "y", "line": 999}),
+    ] {
+        let text = refused(dir.path(), args).await;
+        assert!(text.contains("19, 20 and 480 more"), "{text}");
+        assert!(text.len() < 600, "{}", text.len());
+    }
+}
+
+#[tokio::test]
+async fn a_line_where_no_occurrence_starts_is_refused_with_where_they_do() {
+    for source in ["a\nneedle\nb\nneedle\n", "a\nneedle\nb\n"] {
+        let dir = workspace_with("a.rs", source.as_bytes());
+        for line in [1, 3, 99] {
+            let text = refused(
+                dir.path(),
+                json!({"path": "a.rs", "old_string": "needle", "new_string": "y", "line": line}),
+            )
+            .await;
+            assert!(
+                text.contains(&format!(
+                    "no occurrence of old_string starts on line {line}"
+                )),
+                "{text}"
+            );
+            assert!(text.contains("starting at line"), "{text}");
+            assert!(text.contains('2'), "{text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_multi_line_old_string_is_chosen_by_its_first_line_even_when_matches_overlap() {
+    let dir = workspace_with("a.rs", b"}\n}\n}\nend\n");
+    edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "}\n}", "new_string": "]\n]", "line": 2}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("a.rs")).unwrap(),
+        b"}\n]\n]\nend\n"
+    );
+}
+
+#[tokio::test]
+async fn two_occurrences_starting_on_the_same_line_are_refused() {
+    let dir = workspace_with("a.rs", b"z\nx x\n");
+    let text = refused(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "x", "new_string": "y", "line": 2}),
+    )
+    .await;
+    assert!(text.contains("2 occurrences start on line 2"), "{text}");
+    assert!(text.contains("longer old_string"), "{text}");
+}
+
+#[tokio::test]
+async fn line_with_no_match_at_all_reports_the_no_match_error() {
+    let dir = workspace_with("a.rs", b"abc\n");
+    let text = refused(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "zzz", "new_string": "y", "line": 1}),
+    )
+    .await;
+    assert!(text.contains("0 times"), "{text}");
+}
+
+#[tokio::test]
+async fn line_together_with_replace_all_is_refused() {
+    let dir = workspace_with("a.rs", b"abc\n");
+    let text = refused(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "abc", "new_string": "y", "line": 1, "replace_all": true}),
+    )
+    .await;
+    assert!(
+        text.contains("line") && text.contains("replace_all"),
+        "{text}"
+    );
+    edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "abc", "new_string": "y", "line": 1, "replace_all": false}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn line_must_be_a_whole_number_of_one_or_more() {
+    let dir = workspace_with("a.rs", b"abc\n");
+    for line in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(1.0),
+        json!("1"),
+        json!(true),
+        json!([1]),
+    ] {
+        let text = refused(
+            dir.path(),
+            json!({"path": "a.rs", "old_string": "abc", "new_string": "y", "line": line}),
+        )
+        .await;
+        assert!(
+            text.contains("'line' must be a whole number of 1 or more"),
+            "{text}"
+        );
+    }
+    edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "abc", "new_string": "y", "line": null}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn line_works_on_crlf_files_and_keeps_their_endings() {
+    let dir = workspace_with("a.rs", b"k\r\nv\r\nk\r\nv\r\n");
+    edit(
+        dir.path(),
+        json!({"path": "a.rs", "old_string": "k\nv", "new_string": "K\nV", "line": 3}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("a.rs")).unwrap(),
+        b"k\r\nv\r\nK\r\nV\r\n"
+    );
+}
+
+const FEATURES_IN_FILE: &str = "#[cfg(feature = \"cli\")]\nuse anyhow::Result;\n#[cfg(feature = \"cli\")]\nuse clap::Parser;\n";
+
+#[tokio::test]
+async fn copied_line_numbers_and_escapes_are_named_with_the_corrected_first_line() {
+    let numbered_and_escaped = r#"     1  #[cfg(feature = \"cli\")]\n     2  use anyhow::Result;"#;
+    let indented_and_escaped = r#"     #[cfg(feature = \"cli\")]"#;
+    let numbered = "     1  #[cfg(feature = \"cli\")]";
+    let escaped_breaks = r#"#[cfg(feature = "cli")]\nuse anyhow::Result;"#;
+    for (old, gutter, escapes) in [
+        (numbered_and_escaped, true, true),
+        (indented_and_escaped, false, true),
+        (numbered, true, false),
+        (escaped_breaks, false, true),
+    ] {
+        let dir = workspace_with("a.rs", FEATURES_IN_FILE.as_bytes());
+        let text = refused(
+            dir.path(),
+            json!({"path": "a.rs", "old_string": old, "new_string": "y", "line": 1}),
+        )
+        .await;
+        assert!(text.contains("0 times"), "{text}");
+        assert_eq!(text.contains("line numbers"), gutter, "{old}: {text}");
+        assert_eq!(
+            text.contains(r#"literal \" or \n"#),
+            escapes,
+            "{old}: {text}"
+        );
+        assert!(text.contains("new_string"), "{text}");
+        let corrected = text.split("Corrected first line:\n").nth(1).expect(&text);
+        assert_eq!(corrected.lines().next().unwrap().trim(), FEATURE, "{text}");
+        assert!(text.contains("line 1, line 3"), "{text}");
+        assert!(text.len() < 1500);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_match_on_real_backslashes_or_numbers_is_not_blamed_on_copying() {
+    let source = "let a = \"say \\\"hi\\\"\\n\";\n1  one\nlet b = 2;\n";
+    let dir = workspace_with("a.rs", source.as_bytes());
+    for old in [
+        "let a = \"say \\\"hi\\\"\\n\";\nlet c = 3;",
+        "1  one\nlet c = 3;",
+        "     7  absent",
+        r#"absent \"x\""#,
+    ] {
+        let text = refused(
+            dir.path(),
+            json!({"path": "a.rs", "old_string": old, "new_string": "y"}),
+        )
+        .await;
+        assert!(!text.contains("Corrected first line"), "{old}: {text}");
+        assert!(text.contains("read_file"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn arguments_with_copying_mistakes_are_never_repaired() {
+    let dir = workspace_with("a.rs", FEATURES_IN_FILE.as_bytes());
+    refused(
+        dir.path(),
+        json!({
+            "path": "a.rs",
+            "old_string": "     2  use anyhow::Result;",
+            "new_string": "     2  use anyhow::Error;",
+        }),
+    )
+    .await;
 }
