@@ -55,6 +55,61 @@ const MAX_TURNS_WITHOUT_EDIT: usize = 32;
 const FILE_EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
 const DEFAULT_MAX_NO_PROGRESS_NUDGES: usize = 2;
 const MAX_NO_PROGRESS_MESSAGE_CHARS: usize = 500;
+const MAX_NO_PROGRESS_TOOL_ERROR_CHARS: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressLimit {
+    Turns,
+    Window { secs: u64 },
+    Reminders,
+    EmptyResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoProgressDetail {
+    pub limit: ProgressLimit,
+    pub turns: usize,
+    pub failed_edits: usize,
+    pub last_tool_error: Option<String>,
+}
+
+impl std::fmt::Display for ProgressLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turns => write!(
+                f,
+                "{MAX_TURNS_WITHOUT_EDIT} model turns passed without an edit"
+            ),
+            Self::Window { secs } => {
+                write!(f, "the {secs}s inactivity window passed without an edit")
+            }
+            Self::Reminders => f.write_str("the model stopped again after the last reminder"),
+            Self::EmptyResponse => f.write_str("the model returned an empty response"),
+        }
+    }
+}
+
+impl std::fmt::Display for NoProgressDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Ended by: {}. Model turns used: {}. Failed edits: {}.",
+            self.limit, self.turns, self.failed_edits
+        )?;
+        match &self.last_tool_error {
+            Some(error) => write!(f, " Last tool error: {error}"),
+            None => Ok(()),
+        }
+    }
+}
+
+fn last_message_suffix(message: &str) -> String {
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(" Last message: {message}")
+    }
+}
 
 /// Errors that can occur in the agent
 #[derive(Error, Debug)]
@@ -90,9 +145,10 @@ pub enum AgentError {
         conversation_snapshot: Vec<ChatMessage>,
         last_agent_state: AgentState,
     },
-    #[error("Agent made no progress: it changed no files before it gave up, after {nudges} reminder(s). Last message: {last_message}")]
+    #[error("Agent made no progress: it changed no files before it gave up, after {nudges} reminder(s). {detail}{}", last_message_suffix(.last_message))]
     NoProgress {
         nudges: usize,
+        detail: Box<NoProgressDetail>,
         last_message: String,
         iterations_completed: usize,
         tool_calls_made: Vec<ToolCallRecord>,
@@ -418,6 +474,16 @@ struct ProgressGuard {
     last_progress: tokio::time::Instant,
     turns_since_edit: usize,
     cut_off: bool,
+    failed_edits: usize,
+    last_tool_error: Option<String>,
+    failed_calls: Vec<FailedCall>,
+}
+
+#[derive(Debug)]
+struct FailedCall {
+    name: String,
+    arguments: serde_json::Value,
+    error: String,
 }
 
 impl Default for ProgressGuard {
@@ -429,6 +495,9 @@ impl Default for ProgressGuard {
             last_progress: tokio::time::Instant::now(),
             turns_since_edit: 0,
             cut_off: false,
+            failed_edits: 0,
+            last_tool_error: None,
+            failed_calls: Vec::new(),
         }
     }
 }
@@ -604,18 +673,31 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         }
     }
 
-    fn cutoff_reached(&self) -> bool {
-        self.progress.turns_since_edit >= MAX_TURNS_WITHOUT_EDIT
-            || self
-                .config
-                .max_inactivity
-                .is_some_and(|window| self.progress.last_progress.elapsed() >= window)
+    fn cutoff(&self) -> Option<ProgressLimit> {
+        if self.progress.turns_since_edit >= MAX_TURNS_WITHOUT_EDIT {
+            return Some(ProgressLimit::Turns);
+        }
+        self.config
+            .max_inactivity
+            .filter(|window| self.progress.last_progress.elapsed() >= *window)
+            .map(|window| ProgressLimit::Window {
+                secs: window.as_secs(),
+            })
     }
 
-    fn require_an_edit(&self) -> AgentResult<()> {
+    fn stop_limit(&self) -> ProgressLimit {
+        match self.config.max_inactivity {
+            Some(window) => ProgressLimit::Window {
+                secs: window.as_secs(),
+            },
+            None => ProgressLimit::Reminders,
+        }
+    }
+
+    fn require_an_edit(&self, limit: ProgressLimit) -> AgentResult<()> {
         if self.is_guarded() {
             let last = extract_result_summary(&self.conversation_history);
-            return Err(self.no_progress_error(&last));
+            return Err(self.no_progress_error(limit, &last));
         }
         Ok(())
     }
@@ -628,11 +710,44 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 .as_ref()
                 .and_then(|registry| registry.effect_class_of(name))
                 .is_some_and(|class| class > crate::effects::EffectClass::None);
+        if !succeeded && FILE_EDIT_TOOLS.contains(&name) {
+            self.progress.failed_edits += 1;
+        }
         if writes {
             self.progress.write_calls += 1;
             self.progress.turns_since_edit = 0;
             self.progress.last_progress = tokio::time::Instant::now();
         }
+    }
+
+    fn answer_tool_call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        outcome: &crate::tools::ToolResult<serde_json::Value>,
+    ) -> String {
+        self.note_tool_call(name, outcome.is_ok());
+        let Err(error) = outcome else {
+            return tool_output::render(name, outcome);
+        };
+        let error = error.to_string();
+        self.progress.last_tool_error =
+            Some(bounded_chars(&error, MAX_NO_PROGRESS_TOOL_ERROR_CHARS));
+        let earlier = self
+            .progress
+            .failed_calls
+            .iter_mut()
+            .find(|call| call.name == name && call.arguments == *arguments);
+        match earlier {
+            Some(call) if call.error == error => return tool_output::render_repeat(&error),
+            Some(call) => call.error = error,
+            None => self.progress.failed_calls.push(FailedCall {
+                name: name.to_string(),
+                arguments: arguments.clone(),
+                error,
+            }),
+        }
+        tool_output::render(name, outcome)
     }
 
     fn nudge_text(&self) -> String {
@@ -666,9 +781,15 @@ impl<S: EntityStore + Send> AgentLoop<S> {
         StopVerdict::GiveUp
     }
 
-    fn no_progress_error(&self, last_message: &str) -> AgentError {
+    fn no_progress_error(&self, limit: ProgressLimit, last_message: &str) -> AgentError {
         self.enrich_error(AgentError::NoProgress {
             nudges: self.progress.nudges,
+            detail: Box::new(NoProgressDetail {
+                limit,
+                turns: self.progress.turns_since_edit,
+                failed_edits: self.progress.failed_edits,
+                last_tool_error: self.progress.last_tool_error.clone(),
+            }),
             last_message: bounded_chars(last_message.trim(), MAX_NO_PROGRESS_MESSAGE_CHARS),
             iterations_completed: self.iterations,
             tool_calls_made: vec![],
@@ -729,11 +850,13 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             },
             AgentError::NoProgress {
                 nudges,
+                detail,
                 last_message,
                 iterations_completed,
                 ..
             } => AgentError::NoProgress {
                 nudges,
+                detail,
                 last_message,
                 iterations_completed,
                 tool_calls_made: tool_calls,
@@ -1355,6 +1478,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             self.conversation_history.push(choice.message);
 
             self.iterations += 1;
+            self.progress.turns_since_edit += 1;
             if let Some(ref counter) = self.progress_counter {
                 counter.fetch_add(1, Ordering::Relaxed);
             }
@@ -1368,7 +1492,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                         return Ok(self.complete_tool_loop(&context, total_usage).await)
                     }
                     StopVerdict::Nudge => continue,
-                    StopVerdict::GiveUp => return Err(self.no_progress_error(&stop_text)),
+                    StopVerdict::GiveUp => {
+                        return Err(self.no_progress_error(self.stop_limit(), &stop_text))
+                    }
                 }
             }
             if !is_tool_calls {
@@ -1457,10 +1583,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 Some(r) => r,
                 None => return Err(self.enrich_error(bare_state_error("No tool registry"))),
             };
-            let outcome = registry.execute(&name, args).await;
-            self.note_tool_call(&name, outcome.is_ok());
+            let outcome = registry.execute(&name, args.clone()).await;
             let escalated = is_escalation(&outcome);
-            let response_content = tool_output::render(&name, &outcome);
+            let response_content = self.answer_tool_call(&name, &args, &outcome);
             self.conversation_history
                 .push(ChatMessage::tool_response(call_id, response_content));
             if escalated {
@@ -1499,8 +1624,8 @@ impl<S: EntityStore + Send> AgentLoop<S> {
 
         self.start_perform_pass();
         loop {
-            if self.cutoff_reached() {
-                self.require_an_edit()?;
+            if let Some(limit) = self.cutoff() {
+                self.require_an_edit(limit)?;
                 self.progress.cut_off = true;
                 break;
             }
@@ -1516,7 +1641,7 @@ impl<S: EntityStore + Send> AgentLoop<S> {
             log_context_estimate(estimated_chars, &response);
 
             if response.choices.is_empty() {
-                self.require_an_edit()?;
+                self.require_an_edit(ProgressLimit::EmptyResponse)?;
                 break;
             }
             self.progress.turns_since_edit += 1;
@@ -1541,10 +1666,10 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                         .unwrap()
                         .execute(&tc.function.name, tc.function.arguments.clone())
                         .await;
-                    self.note_tool_call(&tc.function.name, result.is_ok());
                     let escalated = is_escalation(&result);
 
-                    let content = tool_output::render(&tc.function.name, &result);
+                    let content =
+                        self.answer_tool_call(&tc.function.name, &tc.function.arguments, &result);
 
                     self.conversation_history
                         .push(ChatMessage::tool_response(tc.id.clone(), content));
@@ -1563,7 +1688,9 @@ impl<S: EntityStore + Send> AgentLoop<S> {
                 match self.judge_stop(&stop_text) {
                     StopVerdict::Accept => break,
                     StopVerdict::Nudge => continue,
-                    StopVerdict::GiveUp => return Err(self.no_progress_error(&stop_text)),
+                    StopVerdict::GiveUp => {
+                        return Err(self.no_progress_error(self.stop_limit(), &stop_text))
+                    }
                 }
             }
         }
@@ -4313,6 +4440,259 @@ mod tests {
         let result = agent.run(progress_context()).await.unwrap();
         assert!(result.task_completed);
         assert!(nudge_messages(&agent).is_empty());
+    }
+
+    const REPEATED: &str = "Error: identical to a call that failed; change the arguments.";
+
+    fn tool_messages(agent: &AgentLoop) -> Vec<String> {
+        agent
+            .conversation_history
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .filter_map(|m| m.content.clone())
+            .collect()
+    }
+
+    async fn replies_to(state_machine: bool, calls: Vec<ChatResponse>) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut calls = calls;
+        calls.push(plain_response("CANNOT: enough."));
+        let responses = if state_machine {
+            wrap_with_state_machine_responses(calls)
+        } else {
+            calls
+        };
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let result = if state_machine {
+            agent.run(progress_context()).await
+        } else {
+            agent.run_tool_loop(progress_context()).await
+        };
+        let result = result.unwrap();
+        let replies = tool_messages(&agent);
+        let recorded: Vec<String> = result
+            .tool_calls_made
+            .iter()
+            .map(|c| c.result.clone())
+            .collect();
+        assert_eq!(recorded, replies);
+        replies
+    }
+
+    #[tokio::test]
+    async fn a_repeated_failing_call_is_answered_as_identical_with_the_original_error() {
+        for state_machine in [false, true] {
+            let calls = vec![
+                failing_edit_call(),
+                failing_edit_call(),
+                failing_edit_call(),
+            ];
+            let replies = replies_to(state_machine, calls).await;
+            assert_eq!(replies.len(), 3);
+            let original = replies[0].strip_prefix("Error: ").unwrap();
+            assert!(original.contains("matched 0 times"), "{original}");
+            for repeat in &replies[1..] {
+                assert_eq!(
+                    repeat,
+                    &format!("{REPEATED} The original error: {original}"),
+                    "state_machine={state_machine}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_different_call_or_a_changed_error_is_shown_as_it_is() {
+        let other = tool_call_response(
+            "edit_file",
+            serde_json::json!({"path": "t.txt", "old_string": "absent", "new_string": "beta"}),
+        );
+        let rewrite = tool_call_response(
+            "write_file",
+            serde_json::json!({"path": "t.txt", "content": "missing missing\n"}),
+        );
+        let calls = vec![
+            failing_edit_call(),
+            other,
+            rewrite,
+            failing_edit_call(),
+            failing_edit_call(),
+        ];
+        let replies = replies_to(false, calls).await;
+        assert!(
+            !replies[1].contains("identical to a call"),
+            "{}",
+            replies[1]
+        );
+        assert!(
+            replies[3].starts_with("Error: Invalid arguments"),
+            "{}",
+            replies[3]
+        );
+        assert!(replies[3].contains("matched 2 times"), "{}", replies[3]);
+        assert!(replies[4].starts_with(REPEATED), "{}", replies[4]);
+        assert!(replies[4].contains("matched 2 times"), "{}", replies[4]);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_successful_call_is_not_marked() {
+        let read = || tool_call_response("read_file", serde_json::json!({"path": "t.txt"}));
+        let replies = replies_to(false, vec![read(), read()]).await;
+        assert_eq!(replies[0], replies[1]);
+        assert!(
+            replies[1].starts_with("t.txt, lines 1-1 of 1:"),
+            "{}",
+            replies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_denied_call_is_still_refused_by_the_registry_and_marked() {
+        let workspace = tempfile::tempdir().unwrap();
+        let denied = || {
+            tool_call_response(
+                "write_file",
+                serde_json::json!({"path": "Cargo.toml", "content": "x"}),
+            )
+        };
+        let mut agent = progress_agent(
+            vec![denied(), denied(), plain_response("CANNOT: refused.")],
+            scoped_write_registry(workspace.path()),
+            2,
+        );
+        let result = agent.run_tool_loop(progress_context()).await.unwrap();
+        assert_eq!(result.denials.len(), 2);
+        let replies = tool_messages(&agent);
+        let original = replies[0].strip_prefix("Error: ").expect(&replies[0]);
+        assert_eq!(
+            replies[1],
+            format!("{REPEATED} The original error: {original}")
+        );
+    }
+
+    fn no_progress(err: &AgentError) -> (&NoProgressDetail, String) {
+        match err {
+            AgentError::NoProgress { detail, .. } => (detail, err.to_string()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_turn_limit_is_reported_with_failed_edits_and_the_last_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let responses = planned(vec![(0..40).map(|_| failing_edit_call()).collect()]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let err = agent.run(progress_context()).await.unwrap_err();
+        let (detail, message) = no_progress(&err);
+        assert_eq!(detail.limit, ProgressLimit::Turns);
+        assert_eq!(detail.turns, 32);
+        assert_eq!(detail.failed_edits, 32);
+        let last = detail.last_tool_error.as_deref().unwrap();
+        assert!(
+            last.starts_with("Invalid arguments: old_string matched 0 times"),
+            "{last}"
+        );
+        for part in [
+            "Ended by: 32 model turns passed without an edit.",
+            "Model turns used: 32.",
+            "Failed edits: 32.",
+            "Last tool error: Invalid arguments: old_string matched 0 times",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert!(message.chars().count() < 1000, "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_window_is_reported_and_an_empty_last_message_is_left_out() {
+        let dir = cutoff_dir();
+        std::fs::write(dir.path().join("t.txt"), "alpha\n").unwrap();
+        let mut responses = vec![plain_response("")];
+        responses.extend((0..8).map(|_| failing_edit_call()));
+        let mut agent = slow_agent(dir.path(), responses);
+        let err = agent.run(progress_context()).await.unwrap_err();
+        let (detail, message) = no_progress(&err);
+        assert_eq!(detail.limit, ProgressLimit::Window { secs: 2700 });
+        assert_eq!(detail.turns, 4);
+        assert_eq!(detail.failed_edits, 4);
+        assert!(
+            message.contains("Ended by: the 2700s inactivity window passed without an edit."),
+            "{message}"
+        );
+        assert!(!message.contains("Last message"), "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_after_the_window_closed_reports_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = slow_agent(
+            dir.path(),
+            (0..6).map(|_| plain_response("Soon.")).collect(),
+        );
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        let (detail, message) = no_progress(&err);
+        assert_eq!(detail.limit, ProgressLimit::Window { secs: 2700 });
+        assert_eq!(detail.turns, 5);
+        assert_eq!(detail.failed_edits, 0);
+        assert_eq!(detail.last_tool_error, None);
+        assert!(!message.contains("Last tool error"), "{message}");
+        assert!(message.ends_with("Last message: Soon."), "{message}");
+    }
+
+    #[tokio::test]
+    async fn the_reminder_limit_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = tool_call_response("read_file", serde_json::json!({"path": "none.txt"}));
+        let mut responses = vec![missing];
+        responses.extend((0..3).map(|_| plain_response("Soon.")));
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        let (detail, message) = no_progress(&err);
+        assert_eq!(detail.limit, ProgressLimit::Reminders);
+        assert_eq!(detail.turns, 4);
+        assert_eq!(detail.failed_edits, 0);
+        assert!(detail.last_tool_error.is_some());
+        assert!(
+            message.contains("Ended by: the model stopped again after the last reminder."),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_response_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = ChatResponse {
+            choices: vec![],
+            usage: None,
+        };
+        let responses = planned(vec![vec![empty]]);
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 2);
+        let err = agent.run(progress_context()).await.unwrap_err();
+        let (detail, message) = no_progress(&err);
+        assert_eq!(detail.limit, ProgressLimit::EmptyResponse);
+        assert!(
+            message.contains("Ended by: the model returned an empty response."),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_tool_error_is_bounded_in_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = tool_call_response(
+            "read_file",
+            serde_json::json!({"path": format!("{}.txt", "n".repeat(3000))}),
+        );
+        let unknown = tool_call_response(&"u".repeat(3000), serde_json::json!({}));
+        let mut responses = vec![long, unknown];
+        responses.push(plain_response("Soon."));
+        let mut agent = progress_agent(responses, write_capable_registry(dir.path()), 0);
+        let err = agent.run_tool_loop(progress_context()).await.unwrap_err();
+        let (detail, _) = no_progress(&err);
+        let kept = detail.last_tool_error.as_deref().unwrap();
+        assert_eq!(kept.chars().count(), 500, "{kept}");
     }
 }
 

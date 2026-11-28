@@ -32,6 +32,13 @@ pub(crate) fn render(tool: &str, outcome: &ToolResult<Value>) -> String {
     }
 }
 
+pub(crate) fn render_repeat(error: &str) -> String {
+    let text = format!(
+        "Error: identical to a call that failed; change the arguments. The original error: {error}"
+    );
+    head_tail(&text, OTHER_MAX_CHARS)
+}
+
 pub(crate) fn head_tail(text: &str, limit: usize) -> String {
     let total = text.chars().count();
     if total <= limit {

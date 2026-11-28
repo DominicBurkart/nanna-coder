@@ -9636,7 +9636,8 @@ mod identity_limit_tests {
         let (code, retryable, fix) = crate::mcp::results::classify_failure(error_type, &message);
         assert_eq!(code, "no_progress");
         assert!(retryable);
-        assert!(fix.contains("name the file"), "{fix}");
+        assert!(fix.contains("last tool error"), "{fix}");
+        assert!(message.contains("Ended by: "), "{message}");
         assert!(manager.get_result(&id).await.is_none());
     }
 
