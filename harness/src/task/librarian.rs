@@ -499,6 +499,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_librarian_task_carries_no_patch_no_files_and_no_blast_radius() {
+        let stub = Stub::new(Mode::Complete);
+        let manager = manager_with(&stub);
+        let allowed = librarian_allowed(QUERY).await;
+        let id = manager.submit_librarian(allowed, tools()).await.unwrap();
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        let completed = matches!(task.status, TaskStatus::Completed { .. });
+        assert!(completed, "{:?}", task.status);
+        if let TaskStatus::Completed { result, .. } = &task.status {
+            assert!(result.changes_patch.is_none());
+            assert!(result.format_patch.is_none());
+            assert!(result.files_modified.is_empty());
+            assert!(result.blast_radius.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn a_pi_failure_fails_the_librarian_task_and_never_falls_back() {
         let stub = Stub::new(Mode::Fail);
         let manager = manager_with(&stub);
