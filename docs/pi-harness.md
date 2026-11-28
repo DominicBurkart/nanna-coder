@@ -263,10 +263,10 @@ slice lands on its own.
 Slice 1 (this change, unwired): `harness_adapter::binding` and
 `harness_adapter::broker` as described above, with `LaunchPlan.agent`,
 `LaunchPlan.model` and `ScopeGrant.tools` so a broker can be matched to its
-plan. `isolation.rs` and `checked.rs` are protected paths and are untouched; the
+plan. `isolation.rs` and `checked.rs` are untouched; the
 broker checks agent and model itself in `Broker::arm`, so `IsolationPolicy` does
 not duplicate it (an `IsolationViolation::AgentChanged`/`ModelChanged` would be a
-defence in depth, a separate change that needs the protected-path reviewer).
+defence in depth, a separate change).
 
 Not yet done (in order):
 

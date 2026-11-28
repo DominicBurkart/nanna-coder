@@ -3905,7 +3905,7 @@ mod tests {
     }
 
     fn blocked(command: &str, needle: &str) {
-        let message = run(command).expect_err("expected the command to be refused");
+        let message = run(command).expect_err(&format!("expected refusal: {command}"));
         assert!(message.contains(needle), "{command}: {message}");
     }
 
@@ -5313,19 +5313,18 @@ mod tests {
     fn removing_or_moving_an_ancestor_of_a_protected_path_is_refused() {
         refuse_all(
             &[
-                "rm -rf docs",
-                "rm -rf .github",
-                "rm -rf .github/workflows",
-                "rm -rf .cargo",
-                "mv .github x",
-                "mv docs x",
-                "chmod -R 000 .github",
-                "chmod -R 000 .cargo",
+                "rm -rf .",
+                "rm -rf .nanna",
+                "mv .nanna x",
+                "chmod -R 000 .",
+                "chmod -R 000 .nanna",
             ],
             "protected path",
         );
         allow_all(&[
             "rm -rf target",
+            "rm -rf docs",
+            "rm -rf .github",
             "rm target/debug/x",
             "rm -rf build",
             "rm -rf harness",
@@ -5371,27 +5370,34 @@ mod tests {
         refuse_all(
             &[
                 "rm -rf .nanna",
-                "mv codecov.yml x",
-                "mv x codecov.yml",
-                "cp x windows.toml",
-                "tee codecov.yml",
-                "touch .github/workflows/x.yml",
-                "echo x > codecov.yml",
-                "echo x > windows.toml",
+                "mv .nanna/codecov.yml x",
+                "mv x .nanna/codecov.yml",
+                "cp x .nanna/windows.toml",
+                "tee .nanna/codecov.yml",
+                "touch .nanna/agents/x.yml",
+                "echo x > .nanna/codecov.yml",
+                "echo x > .nanna/windows.toml",
                 "echo x > .nanna/x",
-                "echo x > .github/workflows/ci.yml",
-                "echo x > .github/CODEOWNERS",
+                "echo x > .nanna/agents/ci.yml",
+                "echo x > .nanna/CODEOWNERS",
                 "mkdir .nanna/x",
-                "chmod 777 codecov.yml",
-                "echo x > ./codecov.yml",
-                "cd sub; echo x > ../codecov.yml",
+                "chmod 777 .nanna/codecov.yml",
+                "echo x > ./.nanna/codecov.yml",
+                "cd sub; echo x > ../.nanna/codecov.yml",
             ],
             "",
         );
-        blocked("rm -rf .github/workflows", "protected path");
+        blocked("rm -rf .nanna/agents", "protected path");
         blocked("rm -rf .nanna", "protected path");
         blocked("mv .nanna x", "protected path");
-        allow_all(&["echo x > src/codecov.yml", "cp codecov.yml backup.yml"]);
+        allow_all(&[
+            "echo x > src/codecov.yml",
+            "cp codecov.yml backup.yml",
+            "echo x > codecov.yml",
+            "echo x > .github/workflows/ci.yml",
+            "echo x > AGENTS.md",
+            "echo x > harness/src/tools.rs",
+        ]);
     }
 
     #[test]
@@ -6699,7 +6705,7 @@ mod tests {
             &[
                 "time cd /var/tmp/adv2/sb/outside; cat secret.txt",
                 "time -p cd /etc && cat passwd",
-                "time cd .github; echo x > workflows/ci.yml",
+                "time cd .nanna; echo x > agents/x.toml",
                 "time cd ..; ls",
                 "command cd /etc; cat passwd",
                 "builtin cd /etc; cat passwd",
@@ -6709,10 +6715,7 @@ mod tests {
         );
         blocked("time cd /etc && cat passwd", "outside the workspace");
         blocked("time -p cd /etc && cat passwd", "outside the workspace");
-        blocked(
-            "time cd .github; echo x > workflows/ci.yml",
-            "protected path",
-        );
+        blocked("time cd .nanna; echo x > agents/x.toml", "protected path");
         allow_all(&["time cd sub; ls", "time -p cd sub && ls", "time ls"]);
     }
 
@@ -6794,16 +6797,16 @@ mod tests {
     fn working_tree_rewrites_of_protected_paths_are_refused() {
         refuse_all(
             &[
-                "git checkout HEAD~5 -- .github/workflows",
-                "git checkout main -- codecov.yml",
-                "git checkout -- codecov.yml",
+                "git checkout HEAD~5 -- .nanna/agents",
+                "git checkout main -- .nanna/codecov.yml",
+                "git checkout -- .nanna/codecov.yml",
                 "git checkout -- .nanna",
                 "git checkout -- .",
-                "git restore --source HEAD~1 .github/workflows",
-                "git restore codecov.yml",
+                "git restore --source HEAD~1 .nanna/agents",
+                "git restore .nanna/codecov.yml",
                 "git restore --staged --worktree .",
                 "git restore .",
-                "git stash push -- codecov.yml",
+                "git stash push -- .nanna/codecov.yml",
                 "git stash -- .",
                 "git checkout HEAD~50",
                 "git checkout main",
@@ -6814,25 +6817,25 @@ mod tests {
                 "git switch -",
                 "git switch -c feat main",
                 "git switch --create feat main",
-                "time -o codecov.yml ls",
+                "time -o .nanna/codecov.yml ls",
                 "env time -o /etc/x ls",
-                "time --output=codecov.yml ls",
+                "time --output=.nanna/codecov.yml ls",
                 "time -o $X ls",
                 "time -o -x ls",
                 "chmod -R 000 .",
-                "chmod -R 000 .github",
+                "chmod -R 000 .nanna/agents",
                 "chmod 000 .nanna",
-                "chmod 644 codecov.yml",
-                "cp x codecov.yml",
+                "chmod 644 .nanna/codecov.yml",
+                "cp x .nanna/codecov.yml",
             ],
             "",
         );
         blocked("git checkout HEAD~50", "rewrites the working tree");
         blocked("git switch --detach HEAD~50", "rewrites the working tree");
-        blocked("git checkout main -- codecov.yml", "protected path");
-        blocked("git restore codecov.yml", "protected path");
-        blocked("time -o codecov.yml ls", "protected path");
-        blocked("time --output=codecov.yml ls", "protected path");
+        blocked("git checkout main -- .nanna/codecov.yml", "protected path");
+        blocked("git restore .nanna/codecov.yml", "protected path");
+        blocked("time -o .nanna/codecov.yml ls", "protected path");
+        blocked("time --output=.nanna/codecov.yml ls", "protected path");
         blocked("chmod -R 000 .", "protected path");
         blocked("chmod -R 000 .nanna", "protected path");
         allow_all(&[
@@ -7035,36 +7038,36 @@ mod tests {
         blocked("sed -n '/a\\/p' f", "not a plain print command");
         blocked("sleep -1", "at most 600 seconds");
         blocked(
-            "cargo build --target-dir .github/workflows/target",
+            "cargo build --target-dir .nanna/workflows/target",
             "dedicated `target` directory",
         );
         blocked(
             "X=curl; false && { true; X=ls; }; $X x",
             "cannot be resolved statically",
         );
-        blocked("(cd sub); echo x > codecov.yml", "protected path");
+        blocked("(cd sub); echo x > .nanna/x", "protected path");
         blocked("bash -- -c 'ls'", "script file or stdin");
         blocked("rg -e foo ../x", "escapes the workspace");
         blocked("rg --files ../x", "escapes the workspace");
         blocked("grep -e foo ../x", "escapes the workspace");
-        blocked("mv .github x", "protected path");
-        blocked("echo x > CODECOV.YML", "protected path");
-        blocked("echo x > flake.nix.", "protected path");
-        blocked("echo x > 'flake.nix '", "protected path");
-        blocked("echo x > FLAKEN~1.NIX", "protected path");
-        blocked("echo x > CODECO~1.YML", "protected path");
-        blocked("echo x > flake.nix:stream", "protected path");
-        blocked("echo x > .github./workflows/ci.yml", "protected path");
-        blocked("rm -rf GITHUB~1", "protected path");
-        blocked("rm -rf DEVCON~1", "protected path");
-        blocked("rm -rf DEVCON~1/x", "protected path");
-        blocked("rm -rf nix.", "protected path");
+        blocked("mv .nanna x", "protected path");
+        blocked("echo x > .NANNA/X", "protected path");
+        blocked("echo x > .nanna./x", "protected path");
+        blocked("echo x > '.nanna /x'", "protected path");
+        blocked("echo x > NANNA~1/x", "protected path");
+        blocked("echo x > sub/NANNA~1/x", "protected path");
+        blocked("echo x > .nanna/x:stream", "protected path");
+        blocked("echo x > .nanna./agents/x.toml", "protected path");
+        blocked("rm -rf NANNA~1", "protected path");
+        blocked("rm -rf .NANNA", "protected path");
+        blocked("rm -rf NANNA~1/x", "protected path");
+        blocked("rm -rf .nanna.", "protected path");
         blocked(
-            "rm -rf src/G~1/G~1/G~1/G~1/G~1/G~1/G~1/G~1/x",
+            "rm -rf src/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/GIT~1/x",
             "protected path",
         );
-        blocked("mv 'nix ' x", "protected path");
-        blocked("rm -rf docs.", "protected path");
-        blocked("rm -rf 'docs '", "protected path");
+        blocked("mv '.nanna ' x", "protected path");
+        blocked("rm -rf sub/.nanna.", "protected path");
+        blocked("rm -rf 'sub/.nanna '", "protected path");
     }
 }

@@ -21,7 +21,7 @@ use harness::container::{
     detect_runtime, start_container_with_fallback, ContainerConfig, ContainerHandle, NetworkPolicy,
     ReadOnlyMount,
 };
-use harness::protected::{ProtectedExtras, ProtectedPaths};
+use harness::protected::ProtectedPaths;
 use harness::tools::{create_container_tool_registry, ToolRegistry, CONTAINER_WORKSPACE_DIR};
 use harness::workspace::protected_mounts;
 use serde_json::{json, Value};
@@ -78,7 +78,8 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
     let config_dir = host.path().join("config").join("nanna");
     std::fs::create_dir_all(workspace.join(".nanna/agents")).unwrap();
     std::fs::write(workspace.join(".nanna/agents/x.toml"), "[identity]").unwrap();
-    std::fs::write(workspace.join("codecov.yml"), "coverage: {}").unwrap();
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::write(workspace.join(".git/config"), "coverage: {}").unwrap();
     std::fs::write(workspace.join("README.md"), "# repo").unwrap();
     std::fs::create_dir_all(config_dir.join("agents")).unwrap();
     std::fs::write(config_dir.join("agents/global.toml"), "[identity]").unwrap();
@@ -123,7 +124,7 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
     assert_refused(&registry, "echo tampered > /workspace/.nanna/agents/x.toml").await;
     assert_refused(&registry, "touch /workspace/.nanna/agents/new.toml").await;
     assert_refused(&registry, "rm /workspace/.nanna/agents/x.toml").await;
-    assert_refused(&registry, "echo tampered > /workspace/codecov.yml").await;
+    assert_refused(&registry, "echo tampered > /workspace/.git/config").await;
     let removed = run(&registry, "rm -rf /workspace/.nanna").await;
     assert_eq!(removed["success"], false, "{removed}");
     assert_eq!(
@@ -131,7 +132,7 @@ async fn protected_roots_are_read_only_and_the_config_dir_is_invisible_in_the_de
         "[identity]"
     );
     assert_eq!(
-        std::fs::read_to_string(workspace.join("codecov.yml")).unwrap(),
+        std::fs::read_to_string(workspace.join(".git/config")).unwrap(),
         "coverage: {}"
     );
     assert!(!workspace.join(".nanna/agents/new.toml").exists());
@@ -186,8 +187,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
     let gitlink = std::fs::read_to_string(workspace.join(".git")).unwrap();
     assert!(gitlink.starts_with("gitdir:"), "{gitlink}");
 
-    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\", \"tools/**\"]").unwrap();
-    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
+    let config = workspace.join("cfg/nanna");
+    let protected = ProtectedPaths::with_config_dir(&workspace, Some(&config));
     let shielded = protected_mounts(&protected, &workspace).unwrap();
 
     let handle = start(&workspace, shielded.mounts).await;
@@ -199,17 +200,8 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
 
     assert_refused(&registry, "mkdir -p /workspace/.nanna/agents").await;
     assert_refused(&registry, "echo x > /workspace/.nanna/new.toml").await;
-    assert_refused(&registry, "mkdir -p /workspace/.github/workflows/sub").await;
-    assert_refused(&registry, "echo x > /workspace/.github/dependabot.yml").await;
-    assert_refused(&registry, "mkdir -p /workspace/.github/actions/setup").await;
-    assert_refused(&registry, "echo x > /workspace/.envrc").await;
-    assert_refused(&registry, "echo x > /workspace/CLAUDE.md").await;
-    assert_refused(&registry, "mkdir -p /workspace/nix/sub").await;
-    assert_refused(&registry, "echo x > /workspace/codecov.yml").await;
-    assert_refused(&registry, "echo x > /workspace/windows.toml").await;
-    assert_refused(&registry, "echo x > /workspace/src/gate.rs").await;
-    assert_refused(&registry, "echo x > /workspace/tools/new.sh").await;
-    assert_refused(&registry, "mkdir /workspace/tools/sub").await;
+    assert_refused(&registry, "echo x > /workspace/cfg/nanna/new.toml").await;
+    assert_refused(&registry, "mkdir /workspace/cfg/nanna/sub").await;
     assert_blocked(&registry, "echo 'gitdir: /tmp/evil' > /workspace/.git").await;
     assert_blocked(&registry, "rm -f /workspace/.git").await;
     assert_blocked(&registry, "mkdir -p /workspace/.git/hooks").await;
@@ -224,24 +216,17 @@ async fn protected_roots_absent_at_container_start_cannot_be_created_from_the_sh
         std::fs::read_dir(workspace.join(".nanna")).unwrap().count(),
         0
     );
-    assert_eq!(
-        std::fs::read_dir(workspace.join(".github"))
-            .unwrap()
-            .count(),
-        0
-    );
-    for placeholder in ["codecov.yml", "windows.toml", ".envrc", "CLAUDE.md"] {
-        assert_eq!(
-            std::fs::metadata(workspace.join(placeholder))
-                .unwrap()
-                .len(),
-            0
-        );
-    }
     git(&workspace, &["status", "--porcelain"]);
 
-    let ordinary = run(&registry, "echo edited > /workspace/README.md").await;
-    assert_eq!(ordinary["success"], true, "{ordinary}");
+    for writable in [
+        "echo edited > /workspace/README.md",
+        "mkdir -p /workspace/.github/workflows && echo x > /workspace/.github/workflows/x.yml",
+        "echo x > /workspace/AGENTS.md",
+        "mkdir -p /workspace/harness/src && echo x > /workspace/harness/src/tools.rs",
+    ] {
+        let ordinary = run(&registry, writable).await;
+        assert_eq!(ordinary["success"], true, "{writable}: {ordinary}");
+    }
     assert_eq!(registry.denial_count(), 0);
 }
 
@@ -256,8 +241,7 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
-async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_declared_path_unseen(
-) {
+async fn moving_the_parent_of_a_protected_directory_and_recreating_it_never_changes_it_unseen() {
     if !detect_runtime().is_available() {
         eprintln!("SKIPPED: no container runtime available");
         return;
@@ -265,12 +249,12 @@ async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_
     let host = tempfile::tempdir().unwrap();
     let source = host.path().join("source");
     let workspace = host.path().join("worktree");
-    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::create_dir_all(source.join("src/cfg")).unwrap();
     git(&source, &["init", "-q"]);
     git(&source, &["config", "user.email", "t@t.com"]);
     git(&source, &["config", "user.name", "T"]);
     git(&source, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(source.join("src/gate.rs"), "original\n").unwrap();
+    std::fs::write(source.join("src/cfg/gate.rs"), "original\n").unwrap();
     std::fs::write(source.join("src/other.rs"), "other\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-q", "-m", "init"]);
@@ -279,8 +263,8 @@ async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_
         &["worktree", "add", "-q", workspace.to_str().unwrap(), "HEAD"],
     );
 
-    let extras = ProtectedExtras::parse("extra = [\"src/gate.rs\"]").unwrap();
-    let protected = ProtectedPaths::with_extras(&workspace, None, &extras);
+    let config = workspace.join("src/cfg");
+    let protected = ProtectedPaths::with_config_dir(&workspace, Some(&config));
     let shielded = protected_mounts(&protected, &workspace).unwrap();
     let handle = start(&workspace, shielded.mounts).await;
     let registry = support::allow_gated(create_container_tool_registry(
@@ -292,10 +276,10 @@ async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_
     let moved = run(&registry, "mv /workspace/src /workspace/moved").await;
     let recreated = run(
         &registry,
-        "mkdir -p /workspace/src && echo evil > /workspace/src/gate.rs",
+        "mkdir -p /workspace/src/cfg && echo evil > /workspace/src/cfg/gate.rs",
     )
     .await;
-    let overwritten = run(&registry, "echo evil > /workspace/src/gate.rs").await;
+    let overwritten = run(&registry, "echo evil > /workspace/src/cfg/gate.rs").await;
     eprintln!("mv parent: {moved}\nrecreate: {recreated}\noverwrite: {overwritten}");
 
     let status = git_out(
@@ -307,19 +291,19 @@ async fn moving_the_parent_of_a_declared_file_and_recreating_it_never_changes_a_
         .filter(|entry| entry.len() > 3)
         .map(|entry| &entry[3..])
         .collect();
-    let gate_on_host = std::fs::read_to_string(workspace.join("src/gate.rs")).ok();
+    let gate_on_host = std::fs::read_to_string(workspace.join("src/cfg/gate.rs")).ok();
     if gate_on_host.as_deref() != Some("original\n") {
         assert!(
-            changed.contains(&"src/gate.rs"),
-            "declared file changed but git does not report it: {changed:?}"
+            changed.contains(&"src/cfg/gate.rs"),
+            "protected file changed but git does not report it: {changed:?}"
         );
-        let violation = protected.check(Path::new("src/gate.rs")).unwrap_err();
-        assert_eq!(violation.rule, "src/gate.rs");
+        let violation = protected.check(Path::new("src/cfg/gate.rs")).unwrap_err();
+        assert_eq!(violation.rule, "src/cfg/**");
     }
     if moved["success"] == true {
         assert!(
-            changed.contains(&"src/gate.rs"),
-            "parent moved but the declared path is not reported: {changed:?}"
+            changed.contains(&"src/cfg/gate.rs"),
+            "parent moved but the protected path is not reported: {changed:?}"
         );
     }
     assert!(

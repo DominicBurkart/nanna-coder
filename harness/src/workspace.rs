@@ -12,8 +12,7 @@ use crate::onboarding::fullstack::{FullStackRust, CHECKS_FILE};
 use crate::onboarding::OnboardingError;
 use crate::policy::RepoPolicy;
 use crate::protected::{
-    AuditHook, NoopAuditHook, ProtectedConfigError, ProtectedExtras, ProtectedPathViolation,
-    ProtectedPaths,
+    AuditHook, NoopAuditHook, ProtectedConfigError, ProtectedPathViolation, ProtectedPaths,
 };
 use crate::qa::{
     persist_qa_artifacts, register_qa_tools, trunk_asset_roots, BrowserDriver, ChromiumDriver,
@@ -216,7 +215,6 @@ pub struct TaskWorkspace {
 
 impl TaskWorkspace {
     pub fn create(source_repo: &Path, task_id: &str, branch: &str) -> Result<Self, WorkspaceError> {
-        let extras = ProtectedExtras::load(source_repo)?;
         let policy = RepoPolicy::load(source_repo)?;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
         let output = git_cmd(source_repo)
@@ -231,7 +229,7 @@ impl TaskWorkspace {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WorkspaceError::GitWorktreeCreateFailed(stderr));
         }
-        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = ProtectedPaths::for_repo(&workspace_path);
         let protected = protected.with_policy(policy);
         Ok(Self {
             workspace_path,
@@ -399,7 +397,6 @@ impl TaskWorkspace {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "task_id must be alphanumeric+hyphen to avoid path traversal, got: {task_id:?}"
         );
-        let extras = ProtectedExtras::load(source_repo)?;
         let policy = RepoPolicy::load(source_repo)?;
         let tmp_dir = dev_container_paths()?.tmp_dir;
         let workspace_path = std::env::temp_dir().join(format!("nanna-task-{}", task_id));
@@ -437,7 +434,7 @@ impl TaskWorkspace {
             additional_args.extend(set.container_args());
             env_vars.extend(set.exports().iter().cloned());
         }
-        let protected = ProtectedPaths::for_repo_with_extras(&workspace_path, &extras);
+        let protected = ProtectedPaths::for_repo(&workspace_path);
         let protected = protected.with_policy(policy);
         let shielded = match protected_mounts(&protected, &workspace_path) {
             Ok(shielded) => shielded,
@@ -957,8 +954,9 @@ pub struct ProtectedMounts {
 /// let protected = ProtectedPaths::with_config_dir(workspace.path(), None);
 /// let shielded = protected_mounts(&protected, workspace.path()).unwrap();
 /// assert!(workspace.path().join(".nanna").is_dir());
-/// assert!(workspace.path().join("codecov.yml").is_file());
-/// assert!(shielded.placeholders.iter().any(|p| p.ends_with("codecov.yml")));
+/// assert!(workspace.path().join(".git").is_dir());
+/// assert!(!workspace.path().join(".github").exists());
+/// assert!(shielded.placeholders.is_empty());
 /// assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
 /// ```
 pub fn protected_mounts(
@@ -2193,15 +2191,11 @@ mod tests {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
         let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-fp"), "HEAD").unwrap();
-        std::fs::create_dir_all(ws.workspace_path.join(".github/workflows")).unwrap();
-        std::fs::write(
-            ws.workspace_path.join(".github/workflows/ci.yml"),
-            "on: push",
-        )
-        .unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna/agents")).unwrap();
+        std::fs::write(ws.workspace_path.join(".nanna/agents/ci.toml"), "on: push").unwrap();
 
         let violation = protected_violation(ws.format_patch().unwrap_err());
-        assert_eq!(violation.rule, ".github/workflows/**");
+        assert_eq!(violation.rule, ".nanna/**");
         assert_eq!(commit_count(&ws.workspace_path), 1);
         ws.cleanup().unwrap();
     }
@@ -2210,24 +2204,28 @@ mod tests {
     fn test_deleting_a_tracked_protected_file_is_refused() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        std::fs::write(source.path().join("codecov.yml"), "coverage: {}").unwrap();
+        std::fs::create_dir_all(source.path().join(".nanna")).unwrap();
+        std::fs::write(source.path().join(".nanna/codecov.yml"), "coverage: {}").unwrap();
         git_cmd(source.path()).args(["add", "."]).output().unwrap();
         git_cmd(source.path())
             .args(["commit", "-m", "add codecov"])
             .output()
             .unwrap();
         let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-del"), "HEAD").unwrap();
-        std::fs::remove_file(ws.workspace_path.join("codecov.yml")).unwrap();
+        std::fs::remove_file(ws.workspace_path.join(".nanna/codecov.yml")).unwrap();
         std::fs::rename(
             ws.workspace_path.join("README.md"),
-            ws.workspace_path.join("windows.toml"),
+            ws.workspace_path.join(".nanna/windows.toml"),
         )
         .unwrap();
 
         let violation = protected_violation(ws.extract_changes().unwrap_err());
-        assert_eq!(violation.path, "codecov.yml");
+        assert_eq!(violation.path, ".nanna/codecov.yml");
         let paths = ws.changed_paths().unwrap();
-        assert_eq!(paths, vec!["README.md", "codecov.yml", "windows.toml"]);
+        assert_eq!(
+            paths,
+            vec![".nanna/codecov.yml", ".nanna/windows.toml", "README.md"]
+        );
         ws.cleanup().unwrap();
     }
 
@@ -2258,28 +2256,41 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn link_declared_file(ws: &TaskWorkspace) -> std::io::Result<()> {
-        std::fs::create_dir_all(ws.workspace_path.join("src"))?;
-        std::fs::write(ws.workspace_path.join("src/gate.rs"), "original")?;
+    fn commit_config_file(source: &Path) {
+        std::fs::create_dir_all(source.join(".nanna")).unwrap();
+        std::fs::write(source.join(".nanna/gate.toml"), "original").unwrap();
+        for args in [
+            vec!["add", ".nanna/gate.toml"],
+            vec!["commit", "-m", "gate"],
+        ] {
+            let out = git_cmd(source).args(args).output().unwrap();
+            assert!(out.status.success());
+        }
+    }
+
+    #[cfg(unix)]
+    fn link_config_file(ws: &TaskWorkspace) -> std::io::Result<()> {
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna"))?;
+        std::fs::write(ws.workspace_path.join(".nanna/gate.toml"), "original")?;
         std::fs::hard_link(
-            ws.workspace_path.join("src/gate.rs"),
+            ws.workspace_path.join(".nanna/gate.toml"),
             ws.workspace_path.join("alias.txt"),
         )
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_a_hardlink_to_a_repo_declared_file_is_refused_when_a_patch_is_extracted() {
+    fn test_a_hardlink_to_a_nanna_config_file_is_refused_when_a_patch_is_extracted() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
+        commit_config_file(source.path());
         let hook = Arc::new(RecordingHook {
             seen: std::sync::Mutex::new(vec![]),
         });
         let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl"), "HEAD")
             .unwrap()
             .with_audit_hook(hook.clone());
-        link_declared_file(&ws).unwrap();
+        link_config_file(&ws).unwrap();
         let violation = protected_violation(ws.extract_changes().unwrap_err());
         assert_eq!(violation.path, "alias.txt");
         assert_eq!(violation.rule, crate::protected::HARDLINK_RULE);
@@ -2291,15 +2302,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_a_hardlink_to_a_repo_declared_file_cannot_be_written_through_by_either_registry()
-    {
+    async fn test_a_hardlink_to_a_nanna_config_file_cannot_be_written_through_by_either_registry() {
         use crate::effects::EffectClass;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
+        commit_config_file(source.path());
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-decl-hl-write"), "HEAD").unwrap();
-        link_declared_file(&ws).unwrap();
+        link_config_file(&ws).unwrap();
         let identity = workspace_identity(EffectClass::Workspace);
         let registries = [
             ws.build_tool_registry(),
@@ -2318,22 +2328,19 @@ mod tests {
                     if v.rule == crate::protected::HARDLINK_RULE),
                 "{err:?}"
             );
-            let original = std::fs::read_to_string(ws.workspace_path.join("src/gate.rs")).unwrap();
+            let original =
+                std::fs::read_to_string(ws.workspace_path.join(".nanna/gate.toml")).unwrap();
             assert_eq!(original, "original");
         }
         ws.cleanup().unwrap();
     }
 
     #[cfg(unix)]
-    const FOLDED_LINK_DECLARATION: &str =
-        "extra = [\"src/caf\u{e9}.rs\", \"ci/**\", \"tools/release-helper.sh\"]\n";
-
-    #[cfg(unix)]
     const FOLDED_LINK_CASES: [(&str, &str); 4] = [
         ("alias.txt", crate::protected::HARDLINK_RULE),
         ("cafe\u{301}-x.txt.", crate::protected::HARDLINK_RULE),
-        ("src/cafe\u{301}.rs.", "src/caf\u{e9}.rs"),
-        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
+        (".nanna./cafe\u{301}.rs", ".nanna/**"),
+        ("NANNA~1/helper.sh", ".nanna/**"),
     ];
 
     #[cfg(unix)]
@@ -2361,7 +2368,6 @@ mod tests {
         for (name, rule) in FOLDED_LINK_CASES {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
-            declare(source.path(), FOLDED_LINK_DECLARATION);
             commit_partner(source.path());
             let hook = Arc::new(RecordingHook {
                 seen: std::sync::Mutex::new(vec![]),
@@ -2387,7 +2393,6 @@ mod tests {
         for (name, rule) in FOLDED_LINK_CASES {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
-            declare(source.path(), FOLDED_LINK_DECLARATION);
             commit_partner(source.path());
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-fold-link-w"), "HEAD").unwrap();
@@ -2509,7 +2514,6 @@ mod tests {
             for (name, rule) in FOLDED_LINK_CASES {
                 let source = TempDir::new().unwrap();
                 init_git_repo(source.path());
-                declare(source.path(), FOLDED_LINK_DECLARATION);
                 commit_partner(source.path());
                 if solo {
                     declare_policy(source.path(), b"human_gate = \"solo\"\n");
@@ -2650,31 +2654,34 @@ mod tests {
 
     #[test]
     fn test_extract_changes_refuses_a_short_name_of_a_protected_file() {
-        assert_alias_refused("CODECO~1.YML", "codecov.yml");
+        assert_alias_refused("NANNA~1", ".nanna/**");
     }
 
     #[cfg(unix)]
     #[test]
     fn test_extract_changes_refuses_trailing_dot_and_space_aliases() {
-        assert_alias_refused("flake.nix.", "flake.nix");
-        assert_alias_refused("codecov.yml ", "codecov.yml");
+        assert_alias_refused(".nanna.", ".nanna/**");
+        assert_alias_refused(".nanna ", ".nanna/**");
     }
 
-    const ALIAS_DECLARATION: &str =
-        "extra = [\"tools/release-helper.sh\", \"gate/**\", \"src/lib.rs\"]\n";
-
     const ALIAS_SPELLINGS: [(&str, &str); 3] = [
-        ("tools/RELEAS~1.SH", "tools/release-helper.sh"),
-        ("gate~1/x.rs", "gate/**"),
-        ("tools/release-helper.sh.", "tools/release-helper.sh"),
+        ("NANNA~1/x.rs", ".nanna/**"),
+        (".nanna./x.sh", ".nanna/**"),
+        (
+            if cfg!(windows) {
+                "sub/.nanna./x.sh"
+            } else {
+                "sub/.nanna /x.sh"
+            },
+            "**/.nanna/**",
+        ),
     ];
 
     #[test]
-    fn test_windows_aliases_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+    fn test_windows_aliases_of_nanna_config_paths_are_refused_when_a_patch_is_extracted() {
         for (path, rule) in ALIAS_SPELLINGS {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
-            declare(source.path(), ALIAS_DECLARATION);
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias"), "HEAD").unwrap();
             let file = ws.workspace_path.join(path);
@@ -2689,11 +2696,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_windows_aliases_of_declared_paths_are_refused_by_both_registries() {
+    async fn test_windows_aliases_of_nanna_config_paths_are_refused_by_both_registries() {
         use crate::effects::EffectClass;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), ALIAS_DECLARATION);
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-decl-alias-write"), "HEAD")
                 .unwrap();
@@ -2725,23 +2731,26 @@ mod tests {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
         let mut ws = TaskWorkspace::create(source.path(), &unique_id("ws-nfc"), "HEAD").unwrap();
-        std::fs::write(ws.workspace_path.join("fla\u{212A}e.nix"), "evil").unwrap();
+        let nested = ws.workspace_path.join("cafe\u{301}/.nanna");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("x.toml"), "evil").unwrap();
         let violation = protected_violation(ws.extract_changes().unwrap_err());
-        assert_eq!(violation.rule, "flake.nix");
+        assert_eq!(violation.rule, "**/.nanna/**");
         ws.cleanup().unwrap();
     }
 
-    const COMBINED_DECLARATION: &str =
-        "extra = [\"docs/caf\u{e9}/**\", \"src/cafe\u{301}.rs\", \"docs/r\u{e9}sum\u{e9}-final.txt\"]\n";
-
     const COMBINED_SPELLINGS: [(&str, &str); 4] = [
-        ("docs/cafe\u{301}./x.md", "docs/caf\u{e9}/**"),
-        ("src/caf\u{e9}.rs.", "src/cafe\u{301}.rs"),
+        ("crates/cafe\u{301}/.nanna./x.md", "**/.nanna/**"),
+        ("crates/caf\u{e9}/NANNA~1/x.rs", "**/.nanna/**"),
         (
-            "docs/re\u{301}sume\u{301}~1.txt",
-            "docs/r\u{e9}sum\u{e9}-final.txt",
+            if cfg!(windows) {
+                "docs/re\u{301}sume\u{301}/.nanna./x.txt"
+            } else {
+                "docs/re\u{301}sume\u{301}/.nanna /x.txt"
+            },
+            "**/.nanna/**",
         ),
-        ("fla\u{212A}e.nix.", "flake.nix"),
+        (".NANNA./re\u{301}sume\u{301}.nix", ".nanna/**"),
     ];
 
     #[test]
@@ -2749,7 +2758,6 @@ mod tests {
         for (path, rule) in COMBINED_SPELLINGS {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
-            declare(source.path(), COMBINED_DECLARATION);
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-combined"), "HEAD").unwrap();
             let file = ws.workspace_path.join(path);
@@ -2768,7 +2776,6 @@ mod tests {
         use crate::effects::EffectClass;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), COMBINED_DECLARATION);
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-combined-write"), "HEAD").unwrap();
         let identity = workspace_identity(EffectClass::Workspace);
@@ -2811,13 +2818,6 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    const DECLARATION: &str = "extra = [\"src/gate.rs\", \"tools/**\"]\n";
-
-    fn declare(source: &Path, body: &str) {
-        std::fs::create_dir_all(source.join(".nanna")).unwrap();
-        std::fs::write(source.join(".nanna/protected.toml"), body).unwrap();
-    }
-
     fn worktree_count(dir: &Path) -> usize {
         let out = git_cmd(dir)
             .args(["worktree", "list", "--porcelain"])
@@ -2827,70 +2827,6 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("worktree "))
             .count()
-    }
-
-    const BAD_DECLARATIONS: [&str; 4] = [
-        "extra = [",
-        "extra = [\"a\"]\nremove = [\".git/**\"]",
-        "extra = [\"../outside\"]",
-        "extra = [\"src/*.rs\"]",
-    ];
-
-    #[test]
-    fn test_a_bad_declaration_refuses_to_start_the_task_and_adds_no_worktree() {
-        for body in BAD_DECLARATIONS {
-            let source = TempDir::new().unwrap();
-            init_git_repo(source.path());
-            declare(source.path(), body);
-            let id = unique_id("ws-bad-decl");
-            let err = TaskWorkspace::create(source.path(), &id, "HEAD")
-                .err()
-                .unwrap();
-            assert!(
-                matches!(err, WorkspaceError::ProtectedConfig(_)),
-                "{body}: {err:?}"
-            );
-            assert!(!std::env::temp_dir()
-                .join(format!("nanna-task-{id}"))
-                .exists());
-            assert_eq!(worktree_count(source.path()), 1, "{body}");
-        }
-    }
-
-    #[test]
-    fn test_an_unreadable_declaration_refuses_to_start_the_task() {
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        std::fs::create_dir_all(source.path().join(".nanna/protected.toml")).unwrap();
-        let err = TaskWorkspace::create(source.path(), &unique_id("ws-dir-decl"), "HEAD")
-            .err()
-            .unwrap();
-        assert!(
-            matches!(
-                err,
-                WorkspaceError::ProtectedConfig(ProtectedConfigError::Unreadable(_))
-            ),
-            "{err:?}"
-        );
-        assert_eq!(worktree_count(source.path()), 1);
-    }
-
-    #[tokio::test]
-    async fn test_a_bad_declaration_refuses_to_start_a_container_task_and_adds_no_worktree() {
-        for body in BAD_DECLARATIONS {
-            let source = TempDir::new().unwrap();
-            init_git_repo(source.path());
-            declare(source.path(), body);
-            let err = workspace_capturing_config(source.path(), "ws-bad-decl-c")
-                .await
-                .err()
-                .unwrap();
-            assert!(
-                matches!(err, WorkspaceError::ProtectedConfig(_)),
-                "{body}: {err:?}"
-            );
-            assert_eq!(worktree_count(source.path()), 1, "{body}");
-        }
     }
 
     fn declare_policy(source: &Path, body: &[u8]) {
@@ -3030,10 +2966,9 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_declared_paths_are_refused_when_a_patch_is_extracted() {
+    fn test_nanna_config_paths_are_refused_when_a_patch_is_extracted() {
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
         let hook = Arc::new(RecordingHook {
             seen: std::sync::Mutex::new(vec![]),
         });
@@ -3042,32 +2977,29 @@ mod tests {
             .unwrap()
             .with_audit_hook(hook.clone());
         assert!(!ws.workspace_path.join(".nanna").exists());
-        std::fs::create_dir_all(ws.workspace_path.join("src")).unwrap();
-        std::fs::write(ws.workspace_path.join("src/gate.rs"), "x").unwrap();
+        std::fs::create_dir_all(ws.workspace_path.join(".nanna")).unwrap();
+        std::fs::write(ws.workspace_path.join(".nanna/gate.toml"), "x").unwrap();
         let violation = protected_violation(ws.extract_changes().unwrap_err());
-        assert_eq!(violation.path, "src/gate.rs");
-        assert_eq!(violation.rule, "src/gate.rs");
+        assert_eq!(violation.path, ".nanna/gate.toml");
+        assert_eq!(violation.rule, ".nanna/**");
         let violation = protected_violation(ws.format_patch().unwrap_err());
-        assert_eq!(violation.rule, "src/gate.rs");
+        assert_eq!(violation.rule, ".nanna/**");
         assert_eq!(hook.seen.lock().unwrap().len(), 2);
         ws.cleanup().unwrap();
     }
 
-    const UNICODE_DECLARATION: &str =
-        "extra = [\"src/cafe\u{301}.rs\", \"docs/caf\u{e9}/**\", \"src/key.rs\"]\n";
-
     const UNICODE_SPELLINGS: [(&str, &str); 3] = [
-        ("src/caf\u{e9}.rs", "src/cafe\u{301}.rs"),
-        ("docs/cafe\u{301}/x.md", "docs/caf\u{e9}/**"),
-        ("src/\u{212A}ey.rs", "src/key.rs"),
+        ("crates/caf\u{e9}/.nanna/x.rs", "**/.nanna/**"),
+        ("docs/cafe\u{301}/.nanna/x.md", "**/.nanna/**"),
+        (".nanna/\u{212A}ey.rs", ".nanna/**"),
     ];
 
     #[test]
-    fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_when_a_patch_is_extracted() {
+    fn test_unicode_equivalent_spellings_of_nanna_config_paths_are_refused_when_a_patch_is_extracted(
+    ) {
         for (path, rule) in UNICODE_SPELLINGS {
             let source = TempDir::new().unwrap();
             init_git_repo(source.path());
-            declare(source.path(), UNICODE_DECLARATION);
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc"), "HEAD").unwrap();
             let file = ws.workspace_path.join(path);
@@ -3082,11 +3014,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unicode_equivalent_spellings_of_declared_paths_are_refused_by_both_registries() {
+    async fn test_unicode_equivalent_spellings_of_nanna_config_paths_are_refused_by_both_registries(
+    ) {
         use crate::effects::EffectClass;
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        declare(source.path(), UNICODE_DECLARATION);
         let mut ws =
             TaskWorkspace::create(source.path(), &unique_id("ws-decl-nfc-write"), "HEAD").unwrap();
         let identity = workspace_identity(EffectClass::Workspace);
@@ -3191,121 +3123,6 @@ mod tests {
         ws.cleanup().unwrap();
     }
 
-    #[test]
-    fn test_repo_declared_directories_are_refused_when_a_patch_is_extracted() {
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
-        let mut ws =
-            TaskWorkspace::create(source.path(), &unique_id("ws-decl-dir"), "HEAD").unwrap();
-        std::fs::create_dir_all(ws.workspace_path.join("tools/deep")).unwrap();
-        std::fs::write(ws.workspace_path.join("tools/deep/x.sh"), "x").unwrap();
-        let violation = protected_violation(ws.extract_changes().unwrap_err());
-        assert_eq!(violation.rule, "tools/**");
-        ws.cleanup().unwrap();
-    }
-
-    #[test]
-    fn test_without_a_declaration_the_same_paths_extract_normally() {
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        let mut ws =
-            TaskWorkspace::create(source.path(), &unique_id("ws-no-decl"), "HEAD").unwrap();
-        std::fs::create_dir_all(ws.workspace_path.join("src")).unwrap();
-        std::fs::write(ws.workspace_path.join("src/gate.rs"), "x").unwrap();
-        assert!(ws.extract_changes().unwrap().contains("src/gate.rs"));
-        ws.cleanup().unwrap();
-    }
-
-    #[test]
-    fn test_the_declaration_is_taken_from_the_base_checkout_before_the_task_runs() {
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
-        let mut ws =
-            TaskWorkspace::create(source.path(), &unique_id("ws-decl-base"), "HEAD").unwrap();
-        declare(&ws.workspace_path, "extra = []\n");
-        std::fs::remove_file(source.path().join(".nanna/protected.toml")).unwrap();
-        assert!(ws.protected().is_protected(Path::new("src/gate.rs")));
-        ws.cleanup().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_repo_declared_write_file_is_refused_by_both_registries() {
-        use crate::effects::EffectClass;
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
-        let mut ws =
-            TaskWorkspace::create(source.path(), &unique_id("ws-decl-write"), "HEAD").unwrap();
-        let identity = workspace_identity(EffectClass::Workspace);
-        let registries = [
-            ws.build_tool_registry(),
-            ws.build_tool_registry_for(&identity).unwrap(),
-        ];
-        for registry in registries {
-            for path in ["src/gate.rs", "tools/deep/x.sh"] {
-                let err = registry
-                    .execute(
-                        "write_file",
-                        serde_json::json!({ "path": path, "content": "x" }),
-                    )
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(err, crate::tools::ToolError::ProtectedPath(_)),
-                    "{path}: {err:?}"
-                );
-                assert!(!ws.workspace_path.join(path).exists(), "{path}");
-            }
-            let ok = registry
-                .execute(
-                    "write_file",
-                    serde_json::json!({ "path": "src/ok.rs", "content": "x" }),
-                )
-                .await
-                .unwrap();
-            assert_eq!(ok["success"], true);
-        }
-        ws.cleanup().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_repo_declared_write_file_is_refused_by_both_container_registries() {
-        use crate::container::{ContainerHandle, ContainerRuntime};
-        use crate::effects::EffectClass;
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
-        let mut ws =
-            TaskWorkspace::create(source.path(), &unique_id("ws-decl-write-c"), "HEAD").unwrap();
-        ws.container_handle = Some(Arc::new(ContainerHandle {
-            name: "test-handle".to_string(),
-            runtime: ContainerRuntime::None,
-            port: None,
-            needs_cleanup: false,
-        }));
-        let identity = workspace_identity(EffectClass::Workspace);
-        let registries = [
-            ws.build_tool_registry(),
-            ws.build_tool_registry_for(&identity).unwrap(),
-        ];
-        for registry in registries {
-            let err = registry
-                .execute(
-                    "write_file",
-                    serde_json::json!({ "path": "src/gate.rs", "content": "x" }),
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, crate::tools::ToolError::ProtectedPath(_)),
-                "{err:?}"
-            );
-        }
-        ws.cleanup().unwrap();
-    }
-
     #[tokio::test]
     async fn test_workspace_identity_registries_hand_the_policy_to_promote_and_push() {
         use crate::container::{ContainerHandle, ContainerRuntime};
@@ -3341,7 +3158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_workspace_identity_registries_hand_the_declared_set_to_commit_and_push() {
+    async fn test_workspace_identity_registries_hand_the_protected_set_to_commit_and_push() {
         use crate::container::{ContainerHandle, ContainerRuntime};
         use crate::effects::EffectClass;
         for container in [false, true] {
@@ -3365,7 +3182,6 @@ mod tests {
                 let out = git_cmd(source.path()).args(&args).output().unwrap();
                 assert!(out.status.success(), "{args:?}");
             }
-            declare(source.path(), "extra = [\"ci/**\"]\n");
             let mut ws =
                 TaskWorkspace::create(source.path(), &unique_id("ws-decl-git"), "HEAD").unwrap();
             git_cmd(&ws.workspace_path)
@@ -3386,8 +3202,8 @@ mod tests {
                 "git_push_branch".parse().unwrap(),
             ];
             let registry = ws.build_tool_registry_for(&identity).unwrap();
-            std::fs::create_dir_all(ws.workspace_path.join("ci")).unwrap();
-            std::fs::write(ws.workspace_path.join("ci/deploy.sh"), "x").unwrap();
+            std::fs::create_dir_all(ws.workspace_path.join(".nanna")).unwrap();
+            std::fs::write(ws.workspace_path.join(".nanna/deploy.sh"), "x").unwrap();
             std::fs::write(ws.workspace_path.join("ok.txt"), "ok").unwrap();
             let commit = registry.get_tool("git_commit").expect("git_commit granted");
             let result = commit
@@ -3396,10 +3212,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result["skipped_protected"],
-                serde_json::json!(["ci/deploy.sh"])
+                serde_json::json!([".nanna/deploy.sh"])
             );
             git_cmd(&ws.workspace_path)
-                .args(["add", "ci/deploy.sh"])
+                .args(["add", ".nanna/deploy.sh"])
                 .output()
                 .unwrap();
             git_cmd(&ws.workspace_path)
@@ -3417,88 +3233,18 @@ mod tests {
             let err = push.execute(serde_json::json!({})).await.unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("changes protected path 'ci/deploy.sh'"),
+                    .contains("changes protected path '.nanna/deploy.sh'"),
                 "container={container}: {err}"
             );
             ws.cleanup().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn test_repo_declared_roots_are_created_and_mounted_read_only() {
-        let source = TempDir::new().unwrap();
-        init_git_repo(source.path());
-        declare(source.path(), DECLARATION);
-        let (mut ws, config) = workspace_capturing_config(source.path(), "ws-decl-mounts")
-            .await
-            .unwrap();
-        let root = ws.workspace_path.clone();
-        for declared in ["src/gate.rs", "tools"] {
-            let host = root.join(declared);
-            assert!(
-                config.read_only_mounts.iter().any(|m| m.host == host),
-                "{declared} not mounted"
-            );
-        }
-        assert!(root.join("tools").is_dir());
-        let gate = std::fs::metadata(root.join("src/gate.rs")).unwrap();
-        assert!(gate.is_file() && gate.len() == 0);
-        assert!(ws.placeholders.contains(&PathBuf::from("src/gate.rs")));
-        assert_eq!(ws.extract_changes().unwrap(), "");
-        ws.cleanup().unwrap();
-    }
-
-    const PLACEHOLDER_FILES: [&str; 13] = [
-        "codecov.yml",
-        "windows.toml",
-        "tarpaulin.toml",
-        "deny.toml",
-        "flake.nix",
-        "flake.lock",
-        "AGENTS.md",
-        ".gitattributes",
-        ".gitmodules",
-        "CODEOWNERS",
-        "docs/CODEOWNERS",
-        ".envrc",
-        "CLAUDE.md",
-    ];
-
-    fn sorted_placeholder_files() -> Vec<PathBuf> {
-        let mut files: Vec<PathBuf> = PLACEHOLDER_FILES.iter().map(PathBuf::from).collect();
-        files.sort();
-        files
-    }
-
     fn every_protected_root_mount(root: &Path) -> Vec<ReadOnlyMount> {
-        [
-            ".nanna",
-            ".git",
-            "codecov.yml",
-            "windows.toml",
-            "tarpaulin.toml",
-            "deny.toml",
-            "flake.nix",
-            "flake.lock",
-            ".githooks",
-            ".cargo",
-            ".devcontainer",
-            "AGENTS.md",
-            ".gitattributes",
-            ".gitmodules",
-            "CODEOWNERS",
-            "docs/CODEOWNERS",
-            ".github",
-            ".cargo-husky",
-            ".envrc",
-            ".config",
-            ".claude",
-            "nix",
-            "CLAUDE.md",
-        ]
-        .iter()
-        .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
-        .collect()
+        [".nanna", ".git"]
+            .iter()
+            .map(|rel| ReadOnlyMount::new(root.join(rel), format!("/workspace/{rel}")))
+            .collect()
     }
 
     async fn workspace_capturing_config(
@@ -3542,26 +3288,10 @@ mod tests {
 
         assert_eq!(config.read_only_mounts, every_protected_root_mount(&root));
         assert!(root.join(".nanna").is_dir());
-        assert!(root.join(".github").is_dir());
-        for dir in [
-            ".github",
-            ".cargo-husky",
-            ".config",
-            ".claude",
-            "nix",
-            ".githooks",
-            ".cargo",
-            ".devcontainer",
-        ] {
-            assert!(root.join(dir).is_dir(), "{dir}");
+        for writable in [".github", "nix", "AGENTS.md", "codecov.yml", "flake.nix"] {
+            assert!(!root.join(writable).exists(), "{writable}");
         }
-        for file in PLACEHOLDER_FILES {
-            let meta = std::fs::metadata(root.join(file)).unwrap();
-            assert!(meta.is_file() && meta.len() == 0, "{file}");
-        }
-        let mut placeholders = ws.placeholders.clone();
-        placeholders.sort();
-        assert_eq!(placeholders, sorted_placeholder_files());
+        assert!(ws.placeholders.is_empty());
         ws.cleanup().unwrap();
     }
 
@@ -3600,17 +3330,41 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(nanna_config_dir_env)]
     async fn test_an_unpreparable_protected_root_fails_container_setup_and_removes_the_worktree() {
+        use crate::container::{ContainerHandle, ContainerRuntime};
+
         let source = TempDir::new().unwrap();
         init_git_repo(source.path());
-        std::fs::write(source.path().join("docs"), "not a directory").unwrap();
-        git_cmd(source.path()).args(["add", "."]).output().unwrap();
-        git_cmd(source.path())
-            .args(["commit", "-m", "docs is a file"])
-            .output()
-            .unwrap();
+        let task_id = unique_id("ws-unpreparable");
+        let blocked = std::env::temp_dir()
+            .join(format!("nanna-task-{task_id}"))
+            .join("README.md/nanna");
+        let saved = std::env::var_os("NANNA_CONFIG_DIR");
+        std::env::set_var("NANNA_CONFIG_DIR", &blocked);
 
-        let result = workspace_capturing_config(source.path(), "ws-unpreparable").await;
+        let result = TaskWorkspace::create_with_container_using(
+            source.path(),
+            &task_id,
+            "HEAD",
+            "mock-image:latest",
+            NetworkPolicy::Enabled,
+            None,
+            |_config: ContainerConfig| async {
+                Ok(ContainerHandle {
+                    name: "mock-container".to_string(),
+                    runtime: ContainerRuntime::None,
+                    port: None,
+                    needs_cleanup: false,
+                })
+            },
+        )
+        .await;
+
+        match saved {
+            Some(value) => std::env::set_var("NANNA_CONFIG_DIR", value),
+            None => std::env::remove_var("NANNA_CONFIG_DIR"),
+        }
         let err = result.err().expect("setup must fail");
         assert!(
             matches!(&err, WorkspaceError::ContainerSetupFailed(_)),
@@ -3641,15 +3395,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("codecov.yml")).unwrap(),
             "coverage: {}"
         );
-        let mut placeholders = shielded.placeholders.clone();
-        placeholders.sort();
-        assert_eq!(
-            placeholders,
-            sorted_placeholder_files()
-                .into_iter()
-                .filter(|path| path != Path::new("codecov.yml"))
-                .collect::<Vec<_>>()
-        );
+        assert!(shielded.placeholders.is_empty());
         assert_eq!(shielded.mounts.len(), protected.mount_roots().len());
     }
 
@@ -3657,7 +3403,8 @@ mod tests {
     fn test_protected_mounts_report_an_unwritable_parent() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("docs"), "file").unwrap();
-        let protected = ProtectedPaths::with_config_dir(dir.path(), None);
+        let config = dir.path().join("docs/nanna");
+        let protected = ProtectedPaths::with_config_dir(dir.path(), Some(&config));
         let err = protected_mounts(&protected, dir.path()).unwrap_err();
         assert!(matches!(err, WorkspaceError::Io(_)), "{err:?}");
     }
