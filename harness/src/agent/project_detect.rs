@@ -476,6 +476,52 @@ criterion = "0.5"
     }
 
     #[test]
+    fn package_json_malformed_still_flags_node() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", "this is not { valid json");
+        let signals = detect_package_json(dir.path());
+        assert_eq!(signals, vec![Signal::Language(Language::Node)]);
+    }
+
+    #[test]
+    fn package_json_detects_mocha_in_dev_deps() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"devDependencies": {"mocha": "^10"}}"#,
+        );
+        let signals = detect_package_json(dir.path());
+        assert!(signals.contains(&Signal::Framework(Framework::Mocha)));
+    }
+
+    #[test]
+    fn package_json_detects_mocha_in_regular_deps() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies": {"mocha": "^10"}}"#,
+        );
+        let signals = detect_package_json(dir.path());
+        assert!(signals.contains(&Signal::Framework(Framework::Mocha)));
+    }
+
+    #[test]
+    fn pyproject_toml_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(detect_pyproject_toml(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn pyproject_toml_malformed_still_flags_python() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "this = = not toml");
+        let signals = detect_pyproject_toml(dir.path());
+        assert_eq!(signals, vec![Signal::Language(Language::Python)]);
+    }
+
+    #[test]
     fn pyproject_toml_tool_tables() {
         let dir = tempdir().unwrap();
         write(
