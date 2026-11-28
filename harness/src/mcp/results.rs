@@ -151,7 +151,7 @@ pub fn classify_failure(error_type: &str, message: &str) -> (String, bool, Strin
         "NoProgress" => (
             "no_progress".to_string(),
             true,
-            "The agent did not edit any files after being prompted. Assign a more specific task: name the file, the function and the exact change.".to_string(),
+            "The agent changed no files. The message says which limit ended the task, how many edits failed and the last tool error; address that error before retrying, and call get_task_result with detail=full to see every call.".to_string(),
         ),
         "ProtectedPathViolation" => (
             error_type.to_string(),
@@ -587,7 +587,8 @@ mod tests {
         assert!(!code("MaxIterationsExceeded", "x").1);
         let (c, retryable, fix) = code("NoProgress", "Agent made no progress");
         assert_eq!((c.as_str(), retryable), ("no_progress", true));
-        assert!(fix.contains("name the file"), "{fix}");
+        assert!(fix.contains("last tool error"), "{fix}");
+        assert!(!fix.contains("name the file"), "{fix}");
         assert_eq!(code("SomethingNew", "x").0, "SomethingNew");
     }
 
@@ -1105,7 +1106,9 @@ mod tests {
         let view = body(&fetch(&server, "get_task_status", json!({"task_id": id.0})).await);
         assert_eq!(view["reason_code"], "no_progress");
         assert_eq!(view["retryable"], true);
-        assert!(view["fix"].as_str().unwrap().contains("name the file"));
+        let fix = view["fix"].as_str().unwrap();
+        assert!(fix.contains("last tool error"), "{fix}");
+        assert!(!fix.contains("name the file"), "{fix}");
         let result = body(&fetch(&server, "get_task_result", json!({"task_id": id.0})).await);
         assert_eq!(result["reason_code"], "no_progress");
         assert_eq!(result["retryable"], true);

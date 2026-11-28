@@ -309,13 +309,23 @@ impl OllamaProvider {
             .temperature
             .unwrap_or(self.config.default_temperature);
 
+        let num_ctx = self.config.num_ctx_for(&request.model);
+        if num_ctx > self.config.num_ctx {
+            info!(
+                model = %request.model,
+                configured = self.config.num_ctx,
+                num_ctx,
+                "raising the context window to the model's minimum"
+            );
+        }
+
         let mut payload = serde_json::json!({
             "model": request.model,
             "messages": messages,
             "stream": false,
             "options": {
                 "temperature": temperature,
-                "num_ctx": self.config.num_ctx
+                "num_ctx": num_ctx
             }
         });
 
@@ -1065,6 +1075,17 @@ mod tests {
         let provider = OllamaProvider::new(OllamaConfig::default().with_num_ctx(8_192)).unwrap();
         let request = ChatRequest::new("m", vec![ChatMessage::user("hello")]);
         assert_eq!(provider.chat_payload(&request)["options"]["num_ctx"], 8_192);
+    }
+
+    #[test]
+    fn one_provider_picks_the_window_from_each_request_model() {
+        let provider = OllamaProvider::new(OllamaConfig::default().with_num_ctx(8_192)).unwrap();
+        let window = |model: &str| {
+            let request = ChatRequest::new(model, vec![ChatMessage::user("hello")]);
+            provider.chat_payload(&request)["options"]["num_ctx"].clone()
+        };
+        assert_eq!(window("gemma4:e4b"), 65_536);
+        assert_eq!(window("qwen2.5:0.5b"), 8_192);
     }
 
     fn endpoint_of(base_url: &str) -> reqwest::Url {

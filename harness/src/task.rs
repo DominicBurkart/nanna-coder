@@ -100,6 +100,43 @@ fn build_task_system_prompt(
     }
 }
 
+fn task_prompt_preamble(identity: Option<&AgentIdentity>, tool_names: &[&str]) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    if let Some(identity) = identity {
+        match identity.system_prompt_text() {
+            Ok(text) if !text.trim().is_empty() => sections.push(text.trim().to_string()),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                error = %e,
+                "Failed to read the identity prompt for task; continuing without it"
+            ),
+        }
+    }
+    let mut names: Vec<&str> = tool_names.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    sections.push(format!(
+        "Tools you may call: {}. Never call a tool that is not listed; an unknown name is an error.\n\
+         File paths are relative to the repository root, which is your working directory. \
+         If you are unsure of a path, call list_directory on `.` first.\n\
+         read_file shows a header line, then the file's text exactly as it is, without line numbers. \
+         Copy old_string from that text, leaving out the header and any bracketed hint after it.\n\
+         Change one thing at a time and read the tool result: an `Error:` result means the change did not happen. \
+         When the task is done, reply with a short summary of what you changed. \
+         If it cannot be done, reply with one sentence starting with `CANNOT:` that says why.",
+        names.join(", ")
+    ));
+    sections.join("\n\n")
+}
+
+fn compose_task_system_prompt(preamble: &str, base: &str) -> String {
+    if preamble.is_empty() {
+        base.to_string()
+    } else {
+        format!("{preamble}\n\n{base}")
+    }
+}
+
 /// Per-repo-path build lock map: prevents concurrent image builds for the same repo.
 type BuildLocks = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>;
 
@@ -380,6 +417,7 @@ struct TaskRunner {
     /// Incident holds the tool registries of started tasks enforce.
     escalations: std::sync::RwLock<Arc<EscalationLog>>,
     action_gate: std::sync::RwLock<Arc<ActionGate>>,
+    inactivity: std::sync::RwLock<Option<std::time::Duration>>,
     escalator: std::sync::RwLock<Option<Arc<crate::escalation::Escalator>>>,
     sink: Arc<dyn crate::escalation::EscalationSink>,
     cost_accountant: std::sync::RwLock<Arc<CostAccountant>>,
@@ -913,6 +951,7 @@ impl TaskManager {
             intake: Mutex::new(()),
             escalations: std::sync::RwLock::new(escalations),
             action_gate: std::sync::RwLock::new(action_gate),
+            inactivity: std::sync::RwLock::new(None),
             escalator: std::sync::RwLock::new(None),
             sink,
             cost_accountant: std::sync::RwLock::new(cost_accountant),
@@ -954,6 +993,11 @@ impl TaskManager {
     /// acquires is released with the rest of a task's leases only when it
     /// shares the same store this manager's [`TaskManager::cancel`] and
     /// terminal-transition handling release from.
+    pub fn with_inactivity_window(self, window: Option<std::time::Duration>) -> Self {
+        *self.runner.inactivity.write().unwrap() = window;
+        self
+    }
+
     pub fn with_action_gate(self, gate: Arc<ActionGate>) -> Self {
         *self.runner.action_gate.write().unwrap() = gate;
         self
@@ -2212,14 +2256,19 @@ impl TaskRunner {
         let agent_config = AgentConfig {
             max_iterations: effective_max_iterations(queued.max_iterations, identity.as_ref()),
             verbose: false,
-            system_prompt: build_task_system_prompt(
-                &workspace.workspace_path,
-                workspace
-                    .sidecar_env()
-                    .iter()
-                    .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+            system_prompt: compose_task_system_prompt(
+                &task_prompt_preamble(identity.as_ref(), &tool_registry.list_tools()),
+                &build_task_system_prompt(
+                    &workspace.workspace_path,
+                    workspace
+                        .sidecar_env()
+                        .iter()
+                        .any(|(name, _)| name == crate::sidecar::DATABASE_URL_VAR),
+                ),
             ),
             model_name: queued.model.clone(),
+            max_inactivity: *self.inactivity.read().unwrap(),
+            context_budget_chars: Some(crate::agent::context_budget_chars_from_env(&queued.model)),
             ..Default::default()
         };
         let context = AgentContext {
@@ -3390,6 +3439,60 @@ max_concurrent = 1
         });
     }
 
+    #[tokio::test]
+    async fn test_the_inactivity_window_is_off_until_a_manager_sets_it() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        assert_eq!(*manager.runner.inactivity.read().unwrap(), None);
+        let window = std::time::Duration::from_secs(2700);
+        let manager = manager.with_inactivity_window(Some(window));
+        assert_eq!(*manager.runner.inactivity.read().unwrap(), Some(window));
+    }
+
+    #[test]
+    fn test_task_prompt_preamble_carries_the_card_prompt_tools_and_path_rules() {
+        let mut identity = crate::identity::example();
+        identity.identity.system_prompt =
+            crate::identity::SystemPrompt::Inline("Implement Rust changes carefully.".to_string());
+        let card_prompt = identity.system_prompt_text().unwrap();
+        let preamble = task_prompt_preamble(
+            Some(&identity),
+            &["write_file", "read_file", "edit_file", "list_directory"],
+        );
+        assert!(preamble.contains(card_prompt.trim()), "{preamble}");
+        assert!(
+            preamble.contains("edit_file, list_directory, read_file, write_file"),
+            "{preamble}"
+        );
+        assert!(
+            preamble.contains("relative to the repository root"),
+            "{preamble}"
+        );
+        assert!(preamble.contains("without line numbers"), "{preamble}");
+        assert!(!preamble.contains("prefixes each line"), "{preamble}");
+        assert!(preamble.contains("CANNOT:"), "{preamble}");
+        assert!(
+            preamble.contains("Never call a tool that is not listed"),
+            "{preamble}"
+        );
+    }
+
+    #[test]
+    fn test_task_prompt_preamble_without_an_identity_still_lists_tools_and_paths() {
+        let preamble = task_prompt_preamble(None, &["read_file"]);
+        assert!(preamble.contains("read_file"), "{preamble}");
+        assert!(
+            preamble.contains("relative to the repository root"),
+            "{preamble}"
+        );
+    }
+
+    #[test]
+    fn test_compose_task_system_prompt_puts_the_preamble_first() {
+        let composed = compose_task_system_prompt("PRE", "BASE");
+        assert_eq!(composed, "PRE\n\nBASE");
+        assert_eq!(compose_task_system_prompt("", "BASE"), "BASE");
+    }
+
     #[test]
     fn test_build_task_system_prompt_no_guidance_returns_default() {
         ensure_tracing_subscriber();
@@ -3563,6 +3666,84 @@ max_concurrent = 1
         }
     }
 
+    #[tokio::test]
+    async fn test_submit_fits_the_history_to_the_models_window() {
+        struct HistoryProvider {
+            inner: Arc<MockProvider>,
+            masked: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for HistoryProvider {
+            async fn chat(
+                &self,
+                request: model::types::ChatRequest,
+            ) -> model::provider::ModelResult<model::types::ChatResponse> {
+                if request.messages.iter().any(|message| {
+                    message
+                        .content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("removed to save context"))
+                }) {
+                    self.masked.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.inner.chat(request).await
+            }
+
+            async fn list_models(
+                &self,
+            ) -> model::provider::ModelResult<Vec<model::types::ModelInfo>> {
+                self.inner.list_models().await
+            }
+
+            async fn health_check(&self) -> model::provider::ModelResult<()> {
+                self.inner.health_check().await
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "history"
+            }
+        }
+
+        ensure_tracing_subscriber();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let rows = format!("{}\n", "x".repeat(40)).repeat(500);
+        std::fs::write(repo_dir.path().join("big.txt"), rows).unwrap();
+        init_test_git_repo(repo_dir.path());
+        let read = || {
+            super::identity_tests::tool_call_response(
+                "read_file",
+                serde_json::json!({"path": "big.txt"}),
+            )
+        };
+        let mut script: Vec<_> = (0..9).map(|_| read()).collect();
+        script.push(stop_response("CANNOT: nothing to change."));
+        let provider = Arc::new(HistoryProvider {
+            inner: MockProvider::new(wrap_with_state_machine_responses(script)),
+            masked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let task_id = manager
+            .submit(
+                "Test".to_string(),
+                repo_dir.path().to_path_buf(),
+                "HEAD".to_string(),
+                "mock".to_string(),
+                20,
+                provider.clone(),
+            )
+            .await;
+        let deadline = std::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        while !matches!(
+            manager.poll(&task_id).await.unwrap().status,
+            TaskStatus::Completed { .. } | TaskStatus::Failed { .. }
+        ) {
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(provider.masked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     async fn system_prompt_received_by_the_agent(repo: &std::path::Path) -> String {
         let recording = Arc::new(RecordingProvider {
             inner: MockProvider::new(wrap_with_state_machine_responses(vec![stop_response(
@@ -3611,7 +3792,7 @@ max_concurrent = 1
         copy_dir(&fullstack_fixture(), repo_dir.path());
         init_test_git_repo(repo_dir.path());
         let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
-        assert!(prompt.starts_with(DEFAULT_TASK_SYSTEM_PROMPT));
+        assert!(prompt.contains(DEFAULT_TASK_SYSTEM_PROMPT));
         assert!(prompt.contains("This repository is a full-stack Rust workspace."));
         assert!(prompt.contains("The `api` crate"));
         assert!(prompt.contains("so `DATABASE_URL` is not set"));
@@ -3628,7 +3809,8 @@ max_concurrent = 1
         .unwrap();
         init_test_git_repo(repo_dir.path());
         let prompt = system_prompt_received_by_the_agent(repo_dir.path()).await;
-        assert_eq!(prompt, DEFAULT_TASK_SYSTEM_PROMPT);
+        assert!(prompt.ends_with(DEFAULT_TASK_SYSTEM_PROMPT), "{prompt}");
+        assert!(!prompt.contains("full-stack"), "{prompt}");
     }
 
     #[tokio::test]
@@ -7929,6 +8111,28 @@ mod repo_override_tests {
         wait_for(manager, &id, |status| status.is_terminal()).await
     }
 
+    async fn submit_hinted_refused(
+        manager: &TaskManager,
+        repo: &Path,
+        hint: Option<&str>,
+        paths: &[&str],
+    ) -> Task {
+        let mut calls: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                tool_call_response(
+                    "write_file",
+                    serde_json::json!({"path": path, "content": "x"}),
+                )
+            })
+            .collect();
+        calls.push(stop_response("CANNOT: those paths are outside my scope."));
+        let provider = MockProvider::new(wrap_with_state_machine_responses(calls));
+        let hinted = queued(repo).with_identity_hint(hint.map(str::to_string));
+        let id = manager.submit_task(hinted, provider).await;
+        wait_for(manager, &id, |status| status.is_terminal()).await
+    }
+
     #[tokio::test]
     async fn test_a_hinted_task_resolves_to_the_catalog_card_narrowed_by_its_repo() {
         let repo = repo_with_origin();
@@ -8178,7 +8382,7 @@ mod repo_override_tests {
         install_override(repo.path(), "rust-implementer.toml", NARROWING);
         let widened = NARROWING.replace(r#"paths = ["api/**"]"#, r#"paths = ["**"]"#);
         let manager = manager().await;
-        let task = submit_hinted(
+        let task = submit_hinted_refused(
             &manager,
             repo.path(),
             Some("rust-implementer"),
@@ -9172,10 +9376,10 @@ mod impact_tests {
         let repo = repo_with(&[(".nanna/effects.toml", MANIFEST)]);
         let (_, task) = run(
             repo.path(),
-            vec![tool_call_response(
-                "write_file",
-                serde_json::json!({"path": 5, "content": "x"}),
-            )],
+            vec![
+                tool_call_response("write_file", serde_json::json!({"path": 5, "content": "x"})),
+                stop_response("CANNOT: the write arguments were rejected."),
+            ],
         )
         .await;
         let (error_type, error) = failure(&task);
@@ -9432,7 +9636,8 @@ mod identity_limit_tests {
         let (code, retryable, fix) = crate::mcp::results::classify_failure(error_type, &message);
         assert_eq!(code, "no_progress");
         assert!(retryable);
-        assert!(fix.contains("name the file"), "{fix}");
+        assert!(fix.contains("last tool error"), "{fix}");
+        assert!(message.contains("Ended by: "), "{message}");
         assert!(manager.get_result(&id).await.is_none());
     }
 

@@ -66,6 +66,30 @@ impl PlanningPrompt {
         )
     }
 
+    pub fn build_with_tools(
+        user_prompt: &str,
+        entity_count: usize,
+        rag_results: &str,
+        editors: &[String],
+        readers: &[String],
+        others: &[String],
+    ) -> String {
+        let prompt = Self::build(user_prompt, entity_count, rag_results);
+        let groups: String = [
+            ("FILE EDIT TOOLS", editors),
+            ("READ TOOLS", readers),
+            ("OTHER TOOLS", others),
+        ]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(label, names)| format!("{label}: {}\n", names.join(", ")))
+        .collect();
+        if groups.is_empty() {
+            return prompt;
+        }
+        format!("{prompt}\n\n{groups}Use only these tool names.")
+    }
+
     /// Build planning prompt from QueryResult vector
     ///
     /// # Arguments
@@ -295,6 +319,46 @@ mod tests {
         assert!(
             prompt.contains("Plan the next action"),
             "Should request action plan"
+        );
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn planning_prompt_lists_real_tool_names() {
+        let prompt = PlanningPrompt::build_with_tools(
+            "Fix it",
+            0,
+            "None",
+            &names(&["edit_file", "write_file"]),
+            &names(&["read_file", "search"]),
+            &names(&["cargo_check"]),
+        );
+        assert!(prompt.starts_with(&PlanningPrompt::build("Fix it", 0, "None")));
+        assert!(prompt.contains("FILE EDIT TOOLS: edit_file, write_file"));
+        assert!(prompt.contains("READ TOOLS: read_file, search"));
+        assert!(prompt.contains("OTHER TOOLS: cargo_check"));
+        assert!(prompt.contains("Use only these tool names."));
+    }
+
+    #[test]
+    fn planning_prompt_omits_empty_tool_groups() {
+        let read_only = PlanningPrompt::build_with_tools(
+            "Review it",
+            0,
+            "None",
+            &[],
+            &names(&["read_file"]),
+            &[],
+        );
+        assert!(read_only.contains("READ TOOLS: read_file"));
+        assert!(!read_only.contains("FILE EDIT TOOLS"));
+        assert!(!read_only.contains("OTHER TOOLS"));
+        assert_eq!(
+            PlanningPrompt::build_with_tools("Test", 0, "None", &[], &[], &[]),
+            PlanningPrompt::build("Test", 0, "None")
         );
     }
 

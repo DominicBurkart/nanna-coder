@@ -1961,7 +1961,8 @@ async fn build_mcp_task_manager_with_budget(
         &spawn_gate,
     )
     .await?
-    .with_durable_budget(budget_path);
+    .with_durable_budget(budget_path)
+    .with_inactivity_window(harness::agent::inactivity_window_from_env());
     let loaded = manager.attach_result_store(results).await;
     info!(loaded, "Loaded persisted task results");
     Ok(manager)
@@ -1981,6 +1982,7 @@ fn build_delegate_task_manager(
         model.map(|name| (provider, name.to_string())),
         harness::action_auditor::ActionAuditLog::in_memory(),
     )
+    .with_inactivity_window(harness::agent::inactivity_window_from_env())
 }
 
 const TELEMETRY_FILE: &str = "telemetry.jsonl";

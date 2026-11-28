@@ -1429,6 +1429,7 @@ fn the_task_runner_has_one_map_of_bound_identities_and_a_pinned_field_list() {
             "escalator",
             "identities",
             "image_cache",
+            "inactivity",
             "intake",
             "leases",
             "pending_audits",
