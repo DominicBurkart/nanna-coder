@@ -55,6 +55,7 @@ const TOOL_TABLE: &[(&str, Solo)] = &[
     ("CiTriggerTool", Solo::CiWorkflow),
     ("EchoTool", Solo::Local),
     ("GitCommitTool", Solo::Local),
+    ("KaniVerifyTool", Solo::Local),
     ("GitDiffTool", Solo::Local),
     ("GitHubPrStatusTool", Solo::Read),
     ("GitPushBranchTool", Solo::GuardedPush),
