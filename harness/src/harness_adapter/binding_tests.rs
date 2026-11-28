@@ -535,3 +535,175 @@ async fn a_hub_bound_task_is_refused_by_the_bind_so_the_pi_route_fails_closed() 
     );
     workspace.cleanup().unwrap();
 }
+
+fn registry_rig() -> (AgentIdentity, ResolvedAgent, String) {
+    let (identity, agent) = agent_for(&Card::new("\"*\"", "workspace"), REPO);
+    let task = unique_task("t-registry");
+    (identity, agent, task)
+}
+
+fn read_registry() -> ToolRegistry {
+    base_registry(read_only_tools()).0
+}
+
+#[test]
+fn a_workspace_free_registry_binds_to_the_agent_it_was_resolved_for() {
+    let (identity, agent, task) = registry_rig();
+    let layers = layers_allowing(&identity, &task).layers;
+    let id = crate::task::TaskId(task.clone());
+    let bound = agent
+        .bind_registry(
+            AuditedRef::for_test(&identity),
+            REPO,
+            &id,
+            read_registry(),
+            layers,
+        )
+        .unwrap();
+    assert_eq!(bound.task_id(), &id);
+    assert!(bound.agent_matches(&agent));
+    assert!(bound.capabilities_match(&agent));
+}
+
+#[test]
+fn a_workspace_free_bind_refuses_another_identity_or_repository() {
+    let (identity, agent, task) = registry_rig();
+    let id = crate::task::TaskId(task.clone());
+    let layers = layers_allowing(&identity, &task).layers;
+    let other_repo = "github.com/example/other";
+    let err = agent
+        .bind_registry(
+            AuditedRef::for_test(&identity),
+            other_repo,
+            &id,
+            read_registry(),
+            layers,
+        )
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::AgentMismatch));
+    let other = Card {
+        name: "other",
+        ..Card::new("\"*\"", "workspace")
+    }
+    .identity();
+    let layers = layers_allowing(&identity, &task).layers;
+    let err = agent
+        .bind_registry(
+            AuditedRef::for_test(&other),
+            REPO,
+            &id,
+            read_registry(),
+            layers,
+        )
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::AgentMismatch));
+}
+
+#[test]
+fn a_workspace_free_bind_refuses_layers_for_another_task_ceiling_or_scope() {
+    let (identity, agent, task) = registry_rig();
+    let id = crate::task::TaskId(task.clone());
+    let tampers: Vec<(&str, Tamper)> = vec![
+        (
+            "task id",
+            Box::new(|l| l.subject.task_id = crate::task::TaskId("other".into())),
+        ),
+        (
+            "effect ceiling",
+            Box::new(|l| l.subject.max_effect = EffectClass::Production),
+        ),
+        (
+            "path scope",
+            Box::new(|l| l.subject.paths = vec!["elsewhere/**".to_string()]),
+        ),
+    ];
+    for (field, tamper) in tampers {
+        let mut layers = layers_allowing(&identity, &task).layers;
+        tamper(&mut layers);
+        let err = agent
+            .bind_registry(
+                AuditedRef::for_test(&identity),
+                REPO,
+                &id,
+                read_registry(),
+                layers,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, BindError::LayersMismatch { field: f } if f == field),
+            "{field}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_workspace_free_bind_refuses_a_registry_that_differs_from_the_grant() {
+    let (identity, agent, task) = registry_rig();
+    let id = crate::task::TaskId(task.clone());
+    let wider = base_registry(vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        ),
+        (
+            "write_file",
+            EffectClass::Workspace,
+            ok_with(serde_json::json!(0)),
+        ),
+    ])
+    .0;
+    let layers = layers_allowing(&identity, &task).layers;
+    let err = agent
+        .bind_registry(AuditedRef::for_test(&identity), REPO, &id, wider, layers)
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "write_file"));
+    let layers = layers_allowing(&identity, &task).layers;
+    let hollow = base_registry(vec![]).0;
+    let err = agent
+        .bind_registry(AuditedRef::for_test(&identity), REPO, &id, hollow, layers)
+        .err()
+        .unwrap();
+    assert!(matches!(err, BindError::CapabilityMismatch { ref tool } if tool == "read_file"));
+}
+
+#[test]
+fn a_workspace_free_bind_keeps_the_runners_own_layers_and_scopes_the_registry() {
+    let task = unique_task("t-registry-layers");
+    let id = crate::task::TaskId(task.clone());
+    let (base, _) = base_registry(vec![
+        (
+            "read_file",
+            EffectClass::None,
+            ok_with(serde_json::json!(0)),
+        ),
+        ("bespoke", EffectClass::None, ok_with(serde_json::json!(0))),
+    ]);
+    let narrow = Card::new("\"read_file\"", "workspace").identity();
+    let grant = scoped(&narrow, &specs_of(&read_only_tools()));
+    let allowed = allowed_for(&narrow);
+    let agent =
+        ResolvedAgent::resolve(&allowed, &grant, gateway(), "nanna-agent:pi", SOCKET.into())
+            .unwrap();
+    let layered = layers_for(&narrow, &task, "example/repo", ActionVerdict::Allow);
+    let gate = Arc::clone(&layered.layers.action_gate);
+    let before = Arc::strong_count(&gate);
+    let audited = AuditedRef::for_test(&narrow);
+    let bound = agent
+        .bind_registry(audited, allowed.repo(), &id, base, layered.layers)
+        .unwrap();
+    assert_eq!(Arc::strong_count(&gate), before);
+    let registry = bound.into_registry();
+    let names: Vec<String> = registry
+        .get_definitions()
+        .into_iter()
+        .map(|def| def.function.name)
+        .collect();
+    assert_eq!(names, vec!["read_file"]);
+    drop(registry);
+    assert_eq!(Arc::strong_count(&gate), before - 1);
+}
