@@ -877,3 +877,14 @@ async fn arguments_with_copying_mistakes_are_never_repaired() {
     )
     .await;
 }
+
+#[test]
+fn the_read_file_description_does_not_promise_line_numbers() {
+    let definition = harness::tools::ReadFileTool::new(std::path::PathBuf::from(".")).definition();
+    let description = definition.function.description;
+    assert!(
+        description.contains("without line numbers"),
+        "{description}"
+    );
+    assert!(!description.contains("with line numbers"), "{description}");
+}

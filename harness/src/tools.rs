@@ -929,7 +929,7 @@ impl Tool for ReadFileTool {
             function: FunctionDefinition {
                 name: "read_file".to_string(),
                 description:
-                    "Read the contents of a file. Returns the file content with line numbers."
+                    "Read a file. The result is a header naming the lines shown, then the file's own text without line numbers."
                         .to_string(),
                 parameters: JsonSchema {
                     schema_type: SchemaType::Object,
