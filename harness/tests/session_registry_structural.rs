@@ -95,6 +95,7 @@ fn from_audited_is_called_only_from_the_audited_identity_in_task_rs() {
         found,
         BTreeMap::from([
             ("hub/lineage.rs".to_string(), 2),
+            ("hub/query_flow.rs".to_string(), 1),
             ("task.rs".to_string(), 1)
         ]),
         "SessionBinding::from_audited gained a production use; pin the new call site deliberately"

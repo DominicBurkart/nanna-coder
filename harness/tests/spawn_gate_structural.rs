@@ -581,6 +581,10 @@ fn every_use_of_a_submit_or_enqueue_name_is_counted_per_function() {
         ("task.rs: TaskManager::submit_task uses enqueue", 1),
         ("task.rs: TaskManager::submit_bound uses submit_task", 1),
         (
+            "task/librarian.rs: TaskLibrarian::answer uses submit_librarian",
+            1,
+        ),
+        (
             "task/librarian.rs: TaskManager::submit_librarian uses enqueue_ephemeral",
             1,
         ),

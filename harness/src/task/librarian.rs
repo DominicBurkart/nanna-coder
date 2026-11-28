@@ -7,7 +7,10 @@ use crate::harness_adapter::{
     pi_container_name, require_audited, PiContainerGuard, PiLaunch, PiRoute, ResolvedAgent,
     ScopedCapabilities,
 };
+use crate::hub::index::register_librarian;
+use crate::hub::librarian::{Librarian, LibrarianFailure, LibrarianReply, LibrarianRun};
 use crate::hub::lineage::LineageError;
+use crate::hub::query::RawLibrarianAnswer;
 use crate::identity::{AgentIdentity, LIBRARIAN_IDENTITY};
 use crate::scheduler::{LaunchTarget, QueuedTask, Side};
 use crate::tools::{ActionSubject, ToolRegistry};
@@ -267,6 +270,87 @@ impl TaskRunner {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+const UNAVAILABLE: &str = "LibrarianUnavailable";
+
+/// The task layer's implementation of the hub's librarian seam. It submits the run through
+/// [`TaskManager::submit_librarian`], so it runs only in the pi container route, and returns the
+/// finished task's reply for the hub's strict parser. A future dropped before the task finishes
+/// cancels the task.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TaskLibrarian {
+    manager: Arc<TaskManager>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl TaskLibrarian {
+    pub(crate) fn new(manager: Arc<TaskManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct CancelOnDrop {
+    manager: Arc<TaskManager>,
+    task: TaskId,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let handle = tokio::runtime::Handle::try_current();
+        if let (true, Ok(handle)) = (self.armed, handle) {
+            handle.spawn(cancel_task(Arc::clone(&self.manager), self.task.clone()));
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn cancel_task(manager: Arc<TaskManager>, task: TaskId) {
+    let _ = manager.cancel(&task).await;
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn reply_of(status: Option<TaskStatus>, task: TaskId) -> Result<LibrarianReply, LibrarianFailure> {
+    let none = LibrarianFailure::Unavailable;
+    let any = LibrarianFailure::Failed;
+    let mut failure = any;
+    if let Some(TaskStatus::Failed { diagnostics, .. }) = &status {
+        if diagnostics.error_type == UNAVAILABLE {
+            failure = none;
+        }
+    }
+    let done = if let Some(TaskStatus::Completed { result, .. }) = status {
+        Some(result.result_summary)
+    } else {
+        None
+    };
+    let text = done.ok_or(failure)?;
+    let raw = RawLibrarianAnswer::new(text).map_err(|_| any)?;
+    Ok(LibrarianReply { raw, task })
+}
+
+#[async_trait::async_trait]
+impl Librarian for TaskLibrarian {
+    async fn answer(&self, run: LibrarianRun) -> Result<LibrarianReply, LibrarianFailure> {
+        let (allowed, view) = run.unpack();
+        let tools: LibrarianTools = Arc::new(move |registry: &mut ToolRegistry| {
+            register_librarian(registry, Arc::clone(&view))
+        });
+        let launched = self.manager.submit_librarian(allowed, tools).await;
+        let task = launched.map_err(|_| LibrarianFailure::Failed)?;
+        let manager = Arc::clone(&self.manager);
+        let mut guard = CancelOnDrop {
+            manager,
+            task: task.clone(),
+            armed: true,
+        };
+        let status = self.manager.wait_terminal(&task).await;
+        guard.armed = false;
+        reply_of(status, task)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LibrarianRefused, LibrarianTools};
@@ -304,11 +388,13 @@ mod tests {
         repo: String,
         capability_names: Vec<String>,
         image: String,
+        model: String,
     }
 
     #[derive(Debug)]
     struct Stub {
         mode: Mode,
+        reply: String,
         seen: std::sync::Mutex<Vec<Seen>>,
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
@@ -316,8 +402,13 @@ mod tests {
 
     impl Stub {
         fn new(mode: Mode) -> Arc<Self> {
+            Self::replying(mode, REPLY)
+        }
+
+        fn replying(mode: Mode, reply: &str) -> Arc<Self> {
             Arc::new(Self {
                 mode,
+                reply: reply.to_string(),
                 seen: std::sync::Mutex::new(Vec::new()),
                 started: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
@@ -364,14 +455,15 @@ mod tests {
                 repo: agent.audited_repo().to_string(),
                 capability_names: names.into_iter().map(String::from).collect(),
                 image: launch.route().image().to_string(),
+                model: agent.model().to_string(),
             });
             self.started.notify_one();
             let result = match self.mode {
-                Mode::Complete => Ok(completed(REPLY)),
+                Mode::Complete => Ok(completed(&self.reply)),
                 Mode::Fail => Err(pi_failure()),
                 Mode::Wait => {
                     self.release.notified().await;
-                    Ok(completed(REPLY))
+                    Ok(completed(&self.reply))
                 }
             };
             PiRunOutcome {
@@ -807,5 +899,321 @@ mod tests {
         assert!(layers.subject.branch.is_none());
         assert!(layers.subject.paths.is_empty());
         assert!(layers.hub.is_none());
+    }
+
+    use super::TaskLibrarian;
+    use crate::hub::error::HubError;
+    use crate::hub::librarian::{
+        librarian_gate, Librarian, LibrarianFailure, LibrarianRun, QueryGate,
+    };
+    use crate::hub::limits::HubLimits;
+    use crate::hub::query_flow::QueryRequest;
+    use crate::hub::send::{AuditorProvider, MessageHub};
+    use crate::hub::store::InMemoryMessageStore;
+
+    fn seam_run_with(view: Arc<IndexView>, allowed: Allowed) -> LibrarianRun {
+        LibrarianRun::new(allowed, view)
+    }
+
+    async fn seam_run() -> LibrarianRun {
+        seam_run_with(empty_view(), librarian_allowed(QUERY).await)
+    }
+
+    fn seam(manager: TaskManager) -> (Arc<TaskManager>, TaskLibrarian) {
+        let shared = Arc::new(manager);
+        let seam = TaskLibrarian::new(Arc::clone(&shared));
+        (shared, seam)
+    }
+
+    #[tokio::test]
+    async fn the_seam_returns_the_finished_librarian_tasks_reply_and_its_task() {
+        let stub = Stub::replying(Mode::Complete, "{\"matches\": []}");
+        let (manager, librarian) = seam(manager_with(&stub));
+        let reply = librarian.answer(seam_run().await).await.unwrap();
+        let launches = stub.launches();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(reply.task.0, launches[0].task_id);
+        let known = std::collections::BTreeSet::new();
+        let parsed = crate::hub::query::parse_strict(&reply.raw, &known, 1).unwrap();
+        assert!(parsed.is_empty());
+        assert_eq!(manager.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_seam_without_a_pi_route_is_unavailable_and_runs_nothing() {
+        let manager = TaskManager::new(DEFAULT_MAX_CONCURRENT_TASKS);
+        let (_, librarian) = seam(manager);
+        let failure = librarian.answer(seam_run().await).await.unwrap_err();
+        assert_eq!(failure, LibrarianFailure::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn the_seam_reports_a_failed_container_run_as_failed() {
+        let stub = Stub::new(Mode::Fail);
+        let (_, librarian) = seam(manager_with(&stub));
+        let failure = librarian.answer(seam_run().await).await.unwrap_err();
+        assert_eq!(failure, LibrarianFailure::Failed);
+    }
+
+    #[tokio::test]
+    async fn the_seam_refuses_a_reply_over_the_size_cap() {
+        let big = "x".repeat(crate::hub::query::MAX_RAW_BYTES + 1);
+        let stub = Stub::replying(Mode::Complete, &big);
+        let (_, librarian) = seam(manager_with(&stub));
+        let failure = librarian.answer(seam_run().await).await.unwrap_err();
+        assert_eq!(failure, LibrarianFailure::Failed);
+    }
+
+    #[tokio::test]
+    async fn the_seam_refuses_an_identity_other_than_the_librarian() {
+        let stub = Stub::new(Mode::Complete);
+        let (_, librarian) = seam(manager_with(&stub));
+        let other = allowed_as("rust-implementer", "Add a test.", EffectClass::Workspace).await;
+        let run = seam_run_with(empty_view(), other);
+        let failure = librarian.answer(run).await.unwrap_err();
+        assert_eq!(failure, LibrarianFailure::Failed);
+        assert!(stub.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_seam_reports_a_session_registry_that_cannot_record_the_run_as_failed() {
+        let stub = Stub::new(Mode::Complete);
+        let flaky = Flaky::new();
+        flaky.writes.store(true, AtomicOrdering::SeqCst);
+        let registry = Arc::new(SessionRegistry::new(flaky));
+        let manager = manager_with(&stub).with_session_registry(registry);
+        let (_, librarian) = seam(manager);
+        let failure = librarian.answer(seam_run().await).await.unwrap_err();
+        assert_eq!(failure, LibrarianFailure::Failed);
+        assert!(stub.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_seam_future_cancels_the_librarian_task_and_closes_its_session() {
+        let stub = Stub::new(Mode::Wait);
+        let store = Arc::new(InMemorySessionStore::default());
+        let registry = Arc::new(SessionRegistry::new(store.clone()));
+        let manager = manager_with(&stub).with_session_registry(registry);
+        let (manager, librarian) = seam(manager);
+        let run = seam_run().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(300), librarian.answer(run));
+        assert!(waiting.await.is_err());
+        let launches = stub.launches();
+        assert_eq!(launches.len(), 1);
+        let id = TaskId(launches[0].task_id.clone());
+        let task = wait_for(&manager, &id, |status| status.is_terminal()).await;
+        assert!(
+            matches!(task.status, TaskStatus::Cancelled { .. }),
+            "{:?}",
+            task.status
+        );
+        let record = session_of(&store, &id);
+        assert_eq!(record.kind, SessionKind::Librarian);
+        assert!(!record.status.is_active(), "{:?}", record.status);
+    }
+
+    fn query_gate() -> QueryGate {
+        let auditor = base_catalog().get("auditor").unwrap().clone();
+        let rules: Box<dyn crate::auditor::Auditor> = Box::new(RuleAuditor::new());
+        librarian_gate(rules, AuditLog::in_memory(), auditor, "configured").unwrap()
+    }
+
+    const PEER: &str = "peer-task";
+    const PLANT: &str = "PLANTEDxq7Zk";
+
+    struct World {
+        store: Arc<dyn SessionStore>,
+        registry: Arc<SessionRegistry>,
+        hub: MessageHub,
+        stub: Arc<Stub>,
+        manager: Arc<TaskManager>,
+    }
+
+    fn peer_reply() -> String {
+        let why = "edits the parser";
+        format!("{{\"matches\":[{{\"id\":\"{PEER}\",\"relevance\":0.8,\"why\":\"{why}\"}}]}}")
+    }
+
+    fn world(store: Arc<dyn SessionStore>) -> World {
+        let stub = Stub::replying(Mode::Complete, &peer_reply());
+        let registry = Arc::new(SessionRegistry::new(store.clone()));
+        let manager = manager_with(&stub).with_session_registry(Arc::clone(&registry));
+        let (manager, librarian) = seam(manager);
+        let auditors: Arc<dyn crate::action_auditor::MessageAuditor> =
+            Arc::new(crate::action_auditor::RuleMessageAuditor::new());
+        let provider: Arc<dyn AuditorProvider> = Arc::new(auditors);
+        let hub = MessageHub::new(
+            store.clone(),
+            Arc::new(InMemoryMessageStore::new()),
+            provider,
+            Arc::new(crate::leases::SystemClock),
+            HubLimits::default(),
+            Arc::clone(&registry),
+        );
+        let hub = hub.with_librarian(query_gate(), Arc::new(librarian));
+        World {
+            store,
+            registry,
+            hub,
+            stub,
+            manager,
+        }
+    }
+
+    async fn task_caller(world: &World, root: &RootId) -> SessionBinding {
+        let lineage = Lineage::root_child(root.clone());
+        let queued = QueuedTask::new("caller work", PathBuf::new(), "", "m", 8)
+            .with_lineage(Some(lineage.clone()));
+        world.manager.runner.register(&queued, None).await;
+        let card = crate::identity::example();
+        let binding = SessionBinding::from_audited(&card, queued.id.clone(), lineage);
+        world
+            .registry
+            .register(&binding, "work", Utc::now())
+            .unwrap();
+        binding
+    }
+
+    fn add_peer(world: &World, root: &RootId) -> SessionBinding {
+        let lineage = Lineage::root_child(root.clone());
+        let card = crate::identity::example();
+        let binding = SessionBinding::from_audited(&card, TaskId(PEER.into()), lineage);
+        world
+            .registry
+            .register(&binding, "parser work", Utc::now())
+            .unwrap();
+        binding
+    }
+
+    fn librarian_id(world: &World) -> TaskId {
+        let launches = world.stub.launches();
+        assert_eq!(launches.len(), 1);
+        TaskId(launches[0].task_id.clone())
+    }
+
+    #[tokio::test]
+    async fn a_hub_query_runs_through_the_container_launch_and_leaves_a_finished_librarian_record()
+    {
+        let root = RootId::mcp(uuid::Uuid::from_u128(9));
+        let world = world(Arc::new(InMemorySessionStore::default()));
+        let me = task_caller(&world, &root).await;
+        let peer = add_peer(&world, &root);
+        let request = QueryRequest::new("who edits the parser", 3);
+        let answer = world.hub.query(&me, &request).await.unwrap();
+        assert_eq!(answer.matches.len(), 1);
+        assert_eq!(&answer.matches[0].id, peer.session());
+        let launches = world.stub.launches();
+        assert_eq!(
+            launches[0].capability_names,
+            vec!["index_read", "index_search"]
+        );
+        assert_eq!(launches[0].model, "configured");
+        let record = world
+            .store
+            .get(SessionId::from_task(librarian_id(&world)))
+            .unwrap();
+        let record = record.unwrap();
+        assert_eq!(record.kind, SessionKind::Librarian);
+        assert_eq!(record.status, SessionStatus::Completed);
+        assert!(record.subtask.starts_with("[query withheld;"));
+    }
+
+    #[tokio::test]
+    async fn the_librarian_of_a_task_caller_is_a_child_of_the_caller_in_the_callers_root() {
+        let root = RootId::mcp(uuid::Uuid::from_u128(9));
+        let world = world(Arc::new(InMemorySessionStore::default()));
+        let me = task_caller(&world, &root).await;
+        add_peer(&world, &root);
+        let request = QueryRequest::new("who edits the parser", 3);
+        world.hub.query(&me, &request).await.unwrap();
+        let record = world
+            .store
+            .get(SessionId::from_task(librarian_id(&world)))
+            .unwrap();
+        let expected = Lineage::child_of(me.session().clone(), me.lineage()).unwrap();
+        assert_eq!(record.unwrap().lineage, expected);
+    }
+
+    #[tokio::test]
+    async fn a_caller_unknown_to_the_task_manager_gets_a_librarian_outside_its_root_and_the_query_fails_closed(
+    ) {
+        let root = RootId::mcp(uuid::Uuid::from_u128(9));
+        let world = world(Arc::new(InMemorySessionStore::default()));
+        let lineage = Lineage::root_child(root.clone());
+        let card = crate::identity::example();
+        let me = SessionBinding::from_audited(&card, TaskId("loose".into()), lineage);
+        world.registry.register(&me, "work", Utc::now()).unwrap();
+        add_peer(&world, &root);
+        let request = QueryRequest::new("who edits the parser", 3);
+        let refused = world.hub.query(&me, &request).await.unwrap_err();
+        assert!(matches!(refused, HubError::LibrarianFailed), "{refused:?}");
+        let record = world
+            .store
+            .get(SessionId::from_task(librarian_id(&world)))
+            .unwrap();
+        let record = record.unwrap();
+        assert_ne!(record.lineage.root(), &root);
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_planted_query_token_reaches_no_journal_log_listing_or_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = crate::hub::store::HubLock::acquire(dir.path()).unwrap();
+        let path = dir.path().join("sessions.jsonl");
+        let jsonl = crate::hub::store::JsonlSessionStore::open(&path, &lock).unwrap();
+        let root = RootId::mcp(uuid::Uuid::from_u128(9));
+        let world = world(Arc::new(jsonl));
+        let me = task_caller(&world, &root).await;
+        add_peer(&world, &root);
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = QueryRequest::new(&format!("who edits {PLANT} code"), 3);
+        world.hub.query(&me, &request).await.unwrap();
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("[query withheld;"), "{file}");
+        assert!(!file.contains(PLANT), "{file}");
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains(PLANT), "{logged}");
+        let id = SessionId::from_task(librarian_id(&world));
+        let messages = InMemoryMessageStore::new();
+        let detail = crate::hub::view::session_describe(&*world.store, &messages, &me, &id);
+        let detail = detail.unwrap();
+        let shown = format!("{detail:?}{}", serde_json::to_string(&detail).unwrap());
+        assert!(
+            !shown.contains(PLANT) && shown.contains("query withheld;"),
+            "{shown}"
+        );
+        let cursors = crate::hub::view::CursorTable::new();
+        let mut request = crate::hub::view::ListRequest::default();
+        request.filter.include_completed = true;
+        let page =
+            crate::hub::view::sessions_list(&*world.store, &cursors, &me, &request, Utc::now());
+        let hidden = page.unwrap().items.iter().any(|item| item.id == id);
+        assert!(!hidden, "a librarian is listed by default");
+        request.filter.include_librarians = true;
+        let page =
+            crate::hub::view::sessions_list(&*world.store, &cursors, &me, &request, Utc::now());
+        let shown = page.unwrap().items.iter().any(|item| item.id == id);
+        assert!(shown, "include_librarians does not list the librarian");
     }
 }
