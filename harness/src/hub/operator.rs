@@ -1485,8 +1485,8 @@ mod resolve_tests {
         StoredMessage, VerdictRef,
     };
     use crate::hub::operator::{
-        available, send_checked, send_grant_available, send_with_test_grant, OperatorError,
-        OperatorGrant, ResolveAction,
+        available, send_checked, send_from_terminal, send_grant_available, send_with_test_grant,
+        OperatorError, OperatorGrant, ResolveAction,
     };
     use crate::hub::recv::{RecvPage, RecvRequest};
     use crate::hub::registry::SessionRegistry;
@@ -1628,6 +1628,15 @@ mod resolve_tests {
         }
         let inbox = rig.messages.inbox(seated.session().clone(), None, 10);
         assert!(inbox.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_send_from_the_terminal_follows_the_grant_of_this_process() {
+        let rig = Rig::memory();
+        let _seated = rig.seat("seat");
+        let hub = rig.hub();
+        let sent = send_from_terminal(&hub, &rig.root, operator_send("hello"));
+        assert_eq!(sent.is_ok(), send_grant_available());
     }
 
     #[test]
