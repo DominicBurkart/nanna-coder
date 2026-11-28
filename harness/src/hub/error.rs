@@ -35,8 +35,22 @@ pub enum HubError {
     Quarantined { recipients: usize },
     #[error("message review unavailable, nothing was delivered; try again later")]
     AuditUnavailable,
+    #[error("a session librarian cannot query")]
+    RecursiveQuery,
+    #[error("{}", refused_text(.0))]
+    QueryRefused(Vec<ReasonCode>),
+    #[error("the session librarian could not answer; nothing was found, try again later")]
+    LibrarianFailed,
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+fn refused_text(codes: &[ReasonCode]) -> String {
+    let mut text = String::from("query not run; you may rephrase and ask again.");
+    for code in codes {
+        let _ = write!(text, " [{}]", code.as_str());
+    }
+    text
 }
 
 fn advice(code: ReasonCode) -> &'static str {

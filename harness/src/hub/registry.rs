@@ -545,6 +545,7 @@ pub(crate) mod test_support {
         pub(crate) inner: InMemorySessionStore,
         pub(crate) reads: AtomicBool,
         pub(crate) writes: AtomicBool,
+        pub(crate) lists: AtomicBool,
     }
 
     impl Flaky {
@@ -553,6 +554,7 @@ pub(crate) mod test_support {
                 inner: InMemorySessionStore::new(),
                 reads: AtomicBool::new(false),
                 writes: AtomicBool::new(false),
+                lists: AtomicBool::new(false),
             })
         }
 
@@ -575,6 +577,7 @@ pub(crate) mod test_support {
             self.inner.get(id)
         }
         fn in_root(&self, root: &RootId) -> Result<Vec<SessionRecord>, StoreError> {
+            Self::gate(&self.lists)?;
             self.inner.in_root(root)
         }
         fn update(

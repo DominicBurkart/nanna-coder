@@ -178,6 +178,92 @@ impl Windows {
     }
 }
 
+/// The limits of `MessageHub::query`, separate from [`HubLimits`] so that a query flood cannot
+/// starve messaging and a message flood cannot starve queries.
+///
+/// ```
+/// use harness::hub::limits::QueryLimits;
+///
+/// let limits = QueryLimits::default();
+/// assert_eq!(limits.per_caller_per_10m, 6);
+/// assert_eq!(limits.concurrent_per_root, 2);
+/// assert_eq!(limits.deadline_secs, 60);
+/// assert_eq!(limits.query_max_chars, 500);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    pub per_caller_per_10m: u32,
+    pub concurrent_per_root: u32,
+    pub deadline_secs: u64,
+    pub query_max_chars: usize,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            per_caller_per_10m: 6,
+            concurrent_per_root: 2,
+            deadline_secs: 60,
+            query_max_chars: 500,
+        }
+    }
+}
+
+const CONCURRENT_RETRY_SECS: u64 = 5;
+
+#[derive(Default)]
+pub(crate) struct QueryWindows {
+    callers: HashMap<SessionId, VecDeque<DateTime<Utc>>>,
+    running: HashMap<RootId, u32>,
+}
+
+impl QueryWindows {
+    #[cfg(test)]
+    pub(crate) fn running(&self, root: &RootId) -> u32 {
+        self.running.get(root).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counted(&self, caller: &SessionId) -> usize {
+        self.callers.get(caller).map_or(0, VecDeque::len)
+    }
+
+    pub(crate) fn admit(
+        &mut self,
+        now: DateTime<Utc>,
+        caller: &SessionId,
+        root: &RootId,
+        limits: &QueryLimits,
+    ) -> Result<(), HubError> {
+        self.callers.retain(|_, times| {
+            prune(times, now, SENDER_WINDOW_SECS);
+            !times.is_empty()
+        });
+        let running = self.running.get(root).copied().unwrap_or(0);
+        let busy = std::time::Duration::from_secs(CONCURRENT_RETRY_SECS);
+        if running >= limits.concurrent_per_root {
+            return Err(HubError::RateLimited(busy));
+        }
+        let own = self.callers.entry(caller.clone()).or_default();
+        if own.len() >= limits.per_caller_per_10m as usize {
+            let wait = retry_after(own, now, SENDER_WINDOW_SECS);
+            return Err(HubError::RateLimited(wait));
+        }
+        own.push_back(now);
+        *self.running.entry(root.clone()).or_default() += 1;
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, root: &RootId) {
+        if let Some(count) = self.running.get_mut(root) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.running.remove(root);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +318,59 @@ mod tests {
         assert!(windows.check(at(599), &a, &root, &limits).is_err());
         assert!(windows.check(at(600), &a, &root, &limits).is_ok());
         assert_eq!(windows.sender_slots(&a), 1);
+    }
+
+    fn query_limits(per_caller: u32, concurrent: u32) -> QueryLimits {
+        QueryLimits {
+            per_caller_per_10m: per_caller,
+            concurrent_per_root: concurrent,
+            ..QueryLimits::default()
+        }
+    }
+
+    #[test]
+    fn a_query_window_counts_per_caller_and_slides_strictly() {
+        let root = RootId::mcp(uuid::Uuid::nil());
+        let limits = query_limits(2, 9);
+        let mut windows = QueryWindows::default();
+        windows.admit(at(0), &id("a"), &root, &limits).unwrap();
+        windows.admit(at(100), &id("a"), &root, &limits).unwrap();
+        let refused = windows.admit(at(599), &id("a"), &root, &limits);
+        assert!(
+            matches!(refused, Err(HubError::RateLimited(wait)) if wait == std::time::Duration::from_secs(1))
+        );
+        windows.admit(at(0), &id("b"), &root, &limits).unwrap();
+        windows.admit(at(600), &id("a"), &root, &limits).unwrap();
+    }
+
+    #[test]
+    fn a_refused_query_consumes_neither_a_window_slot_nor_a_running_slot() {
+        let root = RootId::mcp(uuid::Uuid::nil());
+        let limits = query_limits(5, 1);
+        let mut windows = QueryWindows::default();
+        windows.admit(at(0), &id("a"), &root, &limits).unwrap();
+        let busy = windows.admit(at(1), &id("b"), &root, &limits);
+        assert!(matches!(busy, Err(HubError::RateLimited(_))));
+        assert_eq!(windows.counted(&id("b")), 0);
+        assert_eq!(windows.running(&root), 1);
+        windows.release(&root);
+        assert_eq!(windows.running(&root), 0);
+        windows.admit(at(2), &id("b"), &root, &limits).unwrap();
+        windows.release(&root);
+        windows.release(&root);
+        assert_eq!(windows.running(&root), 0);
+    }
+
+    #[test]
+    fn running_slots_are_per_root() {
+        let (one, two) = (
+            RootId::mcp(uuid::Uuid::nil()),
+            RootId::mcp(uuid::Uuid::max()),
+        );
+        let limits = query_limits(5, 1);
+        let mut windows = QueryWindows::default();
+        windows.admit(at(0), &id("a"), &one, &limits).unwrap();
+        windows.admit(at(0), &id("b"), &two, &limits).unwrap();
     }
 
     #[test]

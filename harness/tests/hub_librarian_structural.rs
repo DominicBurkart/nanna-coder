@@ -172,14 +172,17 @@ fn counts(tree: &BTreeMap<String, Scan>, pick: impl Fn(&Scan) -> usize) -> BTree
 }
 
 #[test]
-fn register_librarian_is_defined_in_index_rs_and_called_from_nowhere_yet() {
+fn register_librarian_is_defined_in_index_rs_and_used_only_by_the_task_layer_seam() {
     let tree = scanned_tree();
     let found = counts(&tree, |scan| {
         scan.idents.get("register_librarian").copied().unwrap_or(0)
     });
     assert_eq!(
         found,
-        BTreeMap::from([(INDEX_FILE.to_string(), 1)]),
+        BTreeMap::from([
+            (INDEX_FILE.to_string(), 1),
+            ("task/librarian.rs".to_string(), 2)
+        ]),
         "register_librarian gained a production use; pin the new call site deliberately"
     );
 }

@@ -1,7 +1,8 @@
 use super::doorbell::{Doorbell, NoopDoorbell};
 use super::error::HubError;
 use super::idle::IdleBudget;
-use super::limits::{HubLimits, Windows};
+use super::librarian::{Librarian, QueryGate};
+use super::limits::{HubLimits, QueryLimits, QueryWindows, Windows};
 use super::lineage::{RootId, SessionBinding, SessionId};
 use super::mailbox::{MailboxId, OPERATOR_IDENTITY};
 use super::message::{
@@ -13,7 +14,7 @@ use super::oracle::HubIdOracle;
 use super::reach::{resolve_target, Target};
 use super::registry::{RegistryError, SessionRegistry};
 use super::session::SessionRecord;
-use super::store::{MessageStore, SessionStore};
+use super::store::{ActivityStore, MessageStore, SessionStore};
 use super::summary::Summary;
 use super::view::CursorTable;
 use super::waiting::Waiters;
@@ -113,6 +114,10 @@ pub struct MessageHub {
     pub(super) clock: Arc<dyn Clock>,
     pub(super) limits: HubLimits,
     windows: Mutex<Windows>,
+    query_windows: Mutex<QueryWindows>,
+    pub(super) query_limits: QueryLimits,
+    pub(super) librarian: Option<(QueryGate, Arc<dyn Librarian>)>,
+    pub(super) activity: Option<Arc<dyn ActivityStore>>,
     pub(super) registry: Arc<SessionRegistry>,
     pub(super) waiters: Waiters,
     pub(super) idle: IdleBudget,
@@ -337,6 +342,10 @@ impl MessageHub {
             clock,
             limits,
             windows: Mutex::new(Windows::default()),
+            query_windows: Mutex::new(QueryWindows::default()),
+            query_limits: QueryLimits::default(),
+            librarian: None,
+            activity: None,
             registry,
             waiters: Waiters::default(),
             idle: IdleBudget::default(),
@@ -407,6 +416,11 @@ impl MessageHub {
         if let (Ok(count), false) = (unread, waiting) {
             self.doorbell.ring(id, count);
         }
+    }
+
+    pub(super) fn query_windows(&self) -> std::sync::MutexGuard<'_, QueryWindows> {
+        let windows = &self.query_windows;
+        windows.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn windows(&self) -> std::sync::MutexGuard<'_, Windows> {
