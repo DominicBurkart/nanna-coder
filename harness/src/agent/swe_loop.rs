@@ -1,6 +1,7 @@
 use super::{is_refusal, DEFAULT_MODEL, FILE_EDIT_TOOLS};
 use crate::action_auditor::ActionDenied;
 use crate::agent::context_window::{fit_context, DEFAULT_CONTEXT_CHARS};
+use crate::agent::render::render_for_model;
 use crate::effects::EffectRecord;
 use crate::entities::context::types::ToolCallRecord;
 use crate::tool_contract::{EditObserver, ErrorCode, FinishClaim, FinishSlot, ToolOutcome};
@@ -445,7 +446,7 @@ impl SweLoop {
                 .unwrap_or_else(|| serde_json::to_string(&entry.outcome).unwrap_or_default());
             conversation.push(ChatMessage::tool_response(
                 entry.call.id.clone(),
-                content.clone(),
+                render_for_model(&entry.outcome),
             ));
             let effect = self
                 .registry
@@ -702,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_error_becomes_a_synthesized_outcome_and_compact_json_for_the_model() {
+    async fn a_legacy_error_becomes_a_synthesized_outcome_and_compact_json_in_the_ledger() {
         let legacy = ScriptedTool::new(
             "legacy",
             EffectClass::None,
@@ -730,7 +731,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_success_keeps_its_raw_json_for_the_model() {
+    async fn the_model_reads_plain_text_while_the_ledger_keeps_json() {
+        let source = "let s = \"a\\n\";\nlet t = 1;";
+        let finish = slot();
+        let registry = scripted_registry(vec![
+            ScriptedTool::new(
+                "read_file",
+                EffectClass::None,
+                vec![ok_outcome(json!({"content": source}))],
+            ),
+            finish_tool(&finish),
+        ]);
+        let provider = MockProvider::new(vec![
+            tool_call_response("read_file", json!({"path": "a.rs"})),
+            tool_call_response("finish", json!({})),
+        ]);
+        let mut swe = SweLoop::new(provider.clone(), registry, "", finish, limits());
+
+        let run = swe.run("do it").await.unwrap();
+
+        let sent = &provider.requests()[1].messages;
+        let shown = sent.last().unwrap().content.as_deref().unwrap();
+        assert!(shown.ends_with(source), "{shown}");
+        let stored: ToolOutcome = serde_json::from_str(&run.ledger[0].result).unwrap();
+        assert_eq!(stored.data["content"], source);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_success_keeps_its_raw_json_in_the_ledger() {
         let legacy = ScriptedTool::new(
             "legacy",
             EffectClass::None,

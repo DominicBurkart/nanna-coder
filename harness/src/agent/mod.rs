@@ -21,6 +21,7 @@ pub mod project_prompt;
 pub mod prompt;
 pub mod prompts;
 pub mod rag;
+pub mod render;
 pub mod report;
 pub mod swe_loop;
 #[cfg(test)]
