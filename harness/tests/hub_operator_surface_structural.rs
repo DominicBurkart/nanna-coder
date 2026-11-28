@@ -256,7 +256,44 @@ fn the_root_mailbox_read_and_the_operator_send_have_production_callers_only_in_t
     };
     let strangers: Vec<&String> = found.iter().filter(|hit| !homes(hit)).collect();
     assert!(strangers.is_empty(), "{strangers:?}");
-    assert_eq!(found, ["mcp/hub_tools.rs: read_inbox: root_inbox"]);
+    assert_eq!(
+        found,
+        [
+            "hub/operator.rs: send_with_grant: send_as_operator",
+            "mcp/hub_tools.rs: read_inbox: root_inbox"
+        ]
+    );
+}
+
+#[test]
+fn the_mcp_handlers_take_the_root_from_the_host_resolver_and_never_build_one() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/hub_tools.rs");
+    let text = read(&path);
+    assert_eq!(
+        callers_of(&text, &["resolve_root"]),
+        ["read_inbox: resolve_root", "send_message: resolve_root"]
+    );
+    assert!(callers_of(&text, &["RootId", "from_environment"]).is_empty());
+}
+
+#[test]
+fn no_mcp_file_names_the_operator_send_and_the_mcp_send_goes_through_the_operator_module() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src.join("mcp"), &mut files);
+    for path in files {
+        let found = mentions(&read(&path), &["send_as_operator", "OperatorGrant"]);
+        assert!(found.is_empty(), "{}: {found:?}", path.display());
+    }
+    let tools = read(&src.join("mcp/hub_tools.rs"));
+    let named = callers_of(&tools, &["send_grant_available", "send_from_terminal"]);
+    assert_eq!(
+        named,
+        [
+            "from_terminal: path send_from_terminal",
+            "from_terminal: path send_grant_available"
+        ]
+    );
 }
 
 #[test]

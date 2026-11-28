@@ -171,7 +171,7 @@ fn grant_is_sealed(text: &str) -> bool {
     let traits_ok = found.traits.is_subset(&names(TRAIT_ALLOWED));
     let derives_ok = found.derives.is_subset(&names(DERIVE_ALLOWED));
     let built_once = found.constructors == names(&["check"]);
-    let checked_once = found.check_callers == names(&["from_environment"]);
+    let checked_once = found.check_callers == names(&["available", "from_environment"]);
     traits_ok && derives_ok && built_once && checked_once
 }
 
@@ -182,6 +182,7 @@ impl OperatorGrant {
     pub(crate) fn check(a: bool, b: bool) -> Result<Self, E> { Ok(Self(())) }
     pub fn from_environment() -> Result<Self, E> { Self::check(true, false) }
 }
+fn available(a: bool, b: bool) -> bool { OperatorGrant::check(a, b).is_ok() }
 impl fmt::Debug for OperatorGrant { fn fmt(&self, f: &mut F) -> R { f.write_str(\"x\") } }
 #[cfg(test)]
 mod tests { fn forge() -> OperatorGrant { OperatorGrant(()) } }
@@ -210,7 +211,7 @@ fn the_grant_has_one_constructor_one_checker_and_no_forging_traits() {
 #[test]
 fn the_scanner_accepts_the_good_shape() {
     assert!(grant_is_sealed(GOOD));
-    assert_eq!(facts(GOOD).mentions, 3);
+    assert_eq!(facts(GOOD).mentions, 4);
 }
 
 #[test]

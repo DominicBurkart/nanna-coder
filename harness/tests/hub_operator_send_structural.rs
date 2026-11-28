@@ -275,7 +275,11 @@ fn the_operator_send_is_named_only_in_the_send_module_of_the_hub() {
     for name in OPERATOR_NAMES {
         let holding = holders(&all, name).into_iter();
         let hub_files: BTreeSet<String> = holding.filter(|f| f.starts_with("hub/")).collect();
-        assert_eq!(hub_files, names(&["hub/send.rs"]), "{name}");
+        let homes = match *name {
+            "send_as_operator" | "OperatorSend" => names(&["hub/operator.rs", "hub/send.rs"]),
+            _ => names(&["hub/send.rs"]),
+        };
+        assert_eq!(hub_files, homes, "{name}");
     }
 }
 

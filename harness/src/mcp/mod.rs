@@ -21,6 +21,7 @@ pub struct NannaMcpServer {
     planner_model: Option<String>,
     plans: Arc<plan::PlanRegistry>,
     hub: Option<Arc<MessageHub>>,
+    send_gate: hub_tools::SendGate,
 }
 
 impl NannaMcpServer {
@@ -41,6 +42,7 @@ impl NannaMcpServer {
             planner_model: None,
             plans: Arc::new(plan::PlanRegistry::default()),
             hub: None,
+            send_gate: hub_tools::SendGate::from_terminal(),
         }
     }
 
@@ -59,8 +61,16 @@ impl NannaMcpServer {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_send_gate(mut self, available: fn() -> bool) -> Self {
+        self.send_gate = hub_tools::SendGate::for_test(available);
+        self
+    }
+
     /// Offer the `hub_inbox` tool, the operator's read of the root mailbox, over `hub`. Without
-    /// this call the server lists no hub tool and `hub_inbox` is an unknown tool.
+    /// this call the server lists no hub tool and `hub_inbox` is an unknown tool. `hub_send` is
+    /// offered besides it only while the terminal operator grant is available to the process
+    /// (never under a stdio server), and is otherwise an unknown tool like any unlisted name.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -247,7 +257,7 @@ impl NannaMcpServer {
             list.push(plan::tool_definition());
         }
         if let (Some(_), Some(list)) = (&self.hub, tools.as_array_mut()) {
-            list.push(hub_tools::tool_definition());
+            list.extend(hub_tools::tool_definitions(&self.send_gate));
         }
         tools
     }
@@ -336,9 +346,11 @@ impl NannaMcpServer {
         let hub = self
             .hub
             .as_ref()
-            .filter(|_| tool_name == hub_tools::HUB_INBOX);
+            .filter(|_| hub_tools::is_hub_tool(&tool_name, &self.send_gate));
         if let Some(hub) = hub {
-            return hub_tools::call_hub_inbox(id, &tool_params, task_field.is_some(), hub);
+            let augmented = task_field.is_some();
+            let gate = &self.send_gate;
+            return hub_tools::call_hub_tool(id, &tool_name, &tool_params, augmented, hub, gate);
         }
 
         match tool_name.as_str() {
