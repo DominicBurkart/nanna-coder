@@ -138,3 +138,17 @@ async fn test_discover_and_run_all_cases() {
         }
     }
 }
+
+#[test]
+fn harness_score_defaults_to_swebench_verified() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_harness-score"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("[default: princeton-nlp/SWE-bench_Verified]"),
+        "{help}"
+    );
+}
