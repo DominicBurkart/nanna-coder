@@ -711,6 +711,20 @@ mod tests {
         assert!(launcher.started().is_empty());
     }
 
+    #[tokio::test]
+    async fn open_still_drops_a_stored_librarian_entry_when_the_store_cannot_remove_it() {
+        let inner = InMemoryQueueStore::default();
+        let librarian = task("").with_launch(crate::scheduler::LaunchTarget::Librarian);
+        let repo = task("/r");
+        inner.insert(&librarian).unwrap();
+        inner.insert(&repo).unwrap();
+        let (dispatcher, launcher) = dispatcher(0, Box::new(RemoveFailsStore(inner)));
+        let queued = dispatcher.queued().await;
+        let ids: Vec<&TaskId> = queued.iter().map(|t| &t.id).collect();
+        assert_eq!(ids, vec![&repo.id]);
+        assert!(launcher.started().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_ephemeral_entry_runs_and_cancels_without_a_single_store_call() {
         let (dispatcher, launcher) =
