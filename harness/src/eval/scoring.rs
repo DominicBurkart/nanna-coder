@@ -107,7 +107,7 @@ pub enum InstanceStatus {
     CompletedDiff,
     /// Agent error or timeout. Diff is `None`.
     AgentError,
-    /// Materialize failed (clone or `git apply`). Diff is `None`.
+    /// Materialize failed (clone or checkout). Diff is `None`.
     MaterializeError,
     /// Diff was passed to the upstream harness and a verdict was returned.
     Verified,

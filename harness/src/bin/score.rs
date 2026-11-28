@@ -74,7 +74,7 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     max_iterations: usize,
 
-    #[arg(long, default_value = "princeton-nlp/SWE-bench_Lite")]
+    #[arg(long, default_value = "princeton-nlp/SWE-bench_Verified")]
     dataset_name: String,
 
     #[arg(long)]

@@ -21,9 +21,7 @@
 //! # Ok::<(), harness::eval::swebench::SWEBenchError>(())
 //! ```
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Deserializer};
 
@@ -71,14 +69,6 @@ pub enum SWEBenchError {
     Git(#[from] git2::Error),
     #[error("invalid base_commit oid: {0}")]
     InvalidOid(String),
-    #[error("git apply failed to apply test_patch: {0}")]
-    PatchApply(String),
-}
-
-impl From<std::io::Error> for SWEBenchError {
-    fn from(e: std::io::Error) -> Self {
-        SWEBenchError::PatchApply(format!("io error during git apply: {e}"))
-    }
 }
 
 /// Load a SWE-bench dataset from a JSONL file.
@@ -120,18 +110,6 @@ pub fn adapt_to_eval_case(task: &SWEBenchTask) -> EvalCase {
         .to_string();
     let files_changed = extract_changed_files(&task.patch);
 
-    let prompt = if task.hints_text.is_empty() {
-        task.problem_statement.clone()
-    } else {
-        format!(
-            "{}
-
-Hints:
-{}",
-            task.problem_statement, task.hints_text
-        )
-    };
-
     EvalCase {
         case: CaseInfo {
             id: task.instance_id.clone(),
@@ -139,7 +117,7 @@ Hints:
             description: task.problem_statement.clone(),
         },
         task: TaskSpec {
-            prompt,
+            prompt: task.problem_statement.clone(),
             language: "python".to_string(),
         },
         expected: ExpectedResult {
@@ -179,8 +157,6 @@ pub(crate) fn extract_changed_files(patch: &str) -> Vec<String> {
 ///
 /// 1. Clones the upstream GitHub repo (`https://github.com/{repo}.git`).
 /// 2. Checks out `base_commit` as a detached HEAD.
-/// 3. Applies `test_patch` against the working directory so failing tests
-///    are present when the agent starts.
 ///
 /// Network required. For tests, call `materialize_from_url` with a local
 /// file:// URL instead.
@@ -193,7 +169,7 @@ pub fn materialize(task: &SWEBenchTask, workspace: &Path) -> Result<(), SWEBench
         Ok(u) if !u.is_empty() => u,
         _ => format!("https://github.com/{}.git", task.repo),
     };
-    materialize_from_url(&url, &task.base_commit, &task.test_patch, workspace)
+    materialize_from_url(&url, &task.base_commit, workspace)
 }
 
 /// Internal core of [`materialize`] — accepts an arbitrary git URL so unit
@@ -201,7 +177,6 @@ pub fn materialize(task: &SWEBenchTask, workspace: &Path) -> Result<(), SWEBench
 pub(crate) fn materialize_from_url(
     url: &str,
     base_commit: &str,
-    test_patch: &str,
     workspace: &Path,
 ) -> Result<(), SWEBenchError> {
     let repo = git2::Repository::clone(url, workspace)?;
@@ -214,41 +189,6 @@ pub(crate) fn materialize_from_url(
     repo.checkout_tree(&obj, Some(&mut checkout))?;
     repo.set_head_detached(oid)?;
 
-    if !test_patch.trim().is_empty() {
-        apply_patch(workspace, test_patch)?;
-    }
-
-    Ok(())
-}
-
-/// Apply a unified diff to `workspace` by piping it into `git apply`.
-///
-/// Shells out to `git apply --whitespace=nowarn` rather than going through
-/// `git2::Repository::apply`. The libgit2 implementation is stricter than
-/// upstream `git apply` and rejects hunks that the porcelain accepts (e.g.
-/// when the patch's context lines have shifted by a few rows or when binary
-/// patch sections are present). The SWE-bench dataset's `test_patch` fields
-/// are produced by upstream `git`, so they round-trip cleanly through the
-/// porcelain but trip libgit2's hunk matcher.
-fn apply_patch(workspace: &Path, patch: &str) -> Result<(), SWEBenchError> {
-    let mut child = Command::new("git")
-        .args(["apply", "--whitespace=nowarn"])
-        .current_dir(workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin was set to Stdio::piped")
-        .write_all(patch.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(SWEBenchError::PatchApply(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -450,19 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn adapt_to_eval_case_appends_hints_to_prompt() {
+    fn adapt_to_eval_case_excludes_hints_from_prompt() {
         let mut task = sample_task();
         task.hints_text = "Check the regex anchors.".to_string();
         let case = adapt_to_eval_case(&task);
-        assert!(case.task.prompt.contains("Hints:"));
-        assert!(case.task.prompt.contains("regex anchors"));
+        assert_eq!(case.task.prompt, task.problem_statement);
     }
 
-    #[test]
-    fn adapt_to_eval_case_omits_hints_section_when_empty() {
-        let task = sample_task();
-        let case = adapt_to_eval_case(&task);
-        assert!(!case.task.prompt.contains("Hints:"));
+    proptest::proptest! {
+        #[test]
+        fn prompt_is_exactly_the_problem_statement(statement in ".*", hints in ".*") {
+            let mut task = sample_task();
+            task.problem_statement = statement.clone();
+            task.hints_text = hints;
+            proptest::prop_assert_eq!(adapt_to_eval_case(&task).task.prompt, statement);
+        }
     }
 
     #[test]
@@ -539,6 +481,14 @@ mod tests {
         }
     }
 
+    fn scrub_git_env(cmd: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(key);
+            }
+        }
+    }
+
     /// Build a tiny local bare git repo at `bare_path` with one file and a
     /// single commit. Returns the commit OID as hex.
     fn init_local_fixture(work_path: &Path, bare_path: &Path) -> String {
@@ -551,6 +501,7 @@ mod tests {
         {
             let mut cmd = Command::new("git");
             cmd.args(args).current_dir(cwd);
+            scrub_git_env(&mut cmd);
             // Isolate from any system/global git config (e.g. commit signing)
             // so the fixture works in both developer sandboxes and Nix CI.
             cmd.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -587,6 +538,7 @@ mod tests {
         );
 
         let mut cmd = Command::new("git");
+        scrub_git_env(&mut cmd);
         cmd.args(["rev-parse", "HEAD"])
             .current_dir(work_path)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -627,10 +579,12 @@ mod tests {
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
         let url = path_to_file_url(bare.path());
-        materialize_from_url(&url, &oid, "", &target).unwrap();
+        materialize_from_url(&url, &oid, &target).unwrap();
 
         assert!(target.join("hello.py").is_file());
-        let head = Command::new("git")
+        let mut head_cmd = Command::new("git");
+        scrub_git_env(&mut head_cmd);
+        let head = head_cmd
             .args(["-C"])
             .arg(&target)
             .args(["rev-parse", "HEAD"])
@@ -640,16 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn materialize_from_url_applies_test_patch() {
+    #[serial_test::serial(nanna_swebench_dataset_env)]
+    fn materialize_leaves_the_checkout_at_base_commit_without_the_test_patch() {
         let seed = tempdir().unwrap();
         let bare = tempdir().unwrap();
         let oid = init_local_fixture(seed.path(), bare.path());
-
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
-        let url = path_to_file_url(bare.path());
-
-        let test_patch = concat!(
+        let mut task = sample_task();
+        task.base_commit = oid;
+        task.test_patch = concat!(
             "diff --git a/test_new.py b/test_new.py\n",
             "new file mode 100644\n",
             "--- /dev/null\n",
@@ -657,52 +611,29 @@ mod tests {
             "@@ -0,0 +1,2 @@\n",
             "+def test_stub():\n",
             "+    assert False\n",
-        );
-        materialize_from_url(&url, &oid, test_patch, &target).unwrap();
+        )
+        .to_string();
 
-        let added = target.join("test_new.py");
-        assert!(
-            added.is_file(),
-            "test_patch should have created test_new.py"
-        );
-        let content = std::fs::read_to_string(&added).unwrap();
-        assert!(content.contains("test_stub"));
-    }
+        let key = "NANNA_SWEBENCH_TEST_REPO_URL";
+        let prior = std::env::var_os(key);
+        std::env::set_var(key, path_to_file_url(bare.path()));
+        let outcome = materialize(&task, &target);
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        outcome.unwrap();
 
-    #[test]
-    fn materialize_from_url_rejects_unappliable_patch_with_patch_apply_error() {
-        let seed = tempdir().unwrap();
-        let bare = tempdir().unwrap();
-        let oid = init_local_fixture(seed.path(), bare.path());
-
-        let workspace = tempdir().unwrap();
-        let target = workspace.path().join("repo");
-        let url = path_to_file_url(bare.path());
-
-        // Patch references a file that does not exist in the fixture, so
-        // `git apply` must reject it. The fix path returns PatchApply rather
-        // than the old git2-flavoured Git error.
-        let bogus_patch = concat!(
-            "diff --git a/does_not_exist.py b/does_not_exist.py\n",
-            "--- a/does_not_exist.py\n",
-            "+++ b/does_not_exist.py\n",
-            "@@ -1,1 +1,1 @@\n",
-            "-foo\n",
-            "+bar\n",
-        );
-        let err = materialize_from_url(&url, &oid, bogus_patch, &target).unwrap_err();
-        assert!(
-            matches!(err, SWEBenchError::PatchApply(_)),
-            "expected PatchApply, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_io_error_maps_to_patch_apply() {
-        let io_err = std::io::Error::other("boom");
-        let err: SWEBenchError = io_err.into();
-        assert!(matches!(err, SWEBenchError::PatchApply(_)));
-        assert!(err.to_string().contains("boom"));
+        assert!(!target.join("test_new.py").exists());
+        let mut status = Command::new("git");
+        scrub_git_env(&mut status);
+        let out = status
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     }
 
     #[test]
@@ -743,7 +674,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         let target = workspace.path().join("repo");
         let url = path_to_file_url(bare.path());
-        let err = materialize_from_url(&url, "not-a-real-oid", "", &target).unwrap_err();
+        let err = materialize_from_url(&url, "not-a-real-oid", &target).unwrap_err();
         assert!(matches!(err, SWEBenchError::InvalidOid(_)));
     }
 }

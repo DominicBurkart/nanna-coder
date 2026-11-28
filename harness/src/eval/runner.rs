@@ -456,7 +456,8 @@ async fn run_agent_subprocess(
     timeout: Duration,
 ) -> Result<Result<AgentOutcome, String>, EvalRunnerError> {
     let bin = locate_nanna_binary()?;
-    let report_path = work_dir.join("__nanna_agent_report.json");
+    let report_dir = tempfile::TempDir::new()?;
+    let report_path = report_dir.path().join("__nanna_agent_report.json");
     let max_iter = config.max_iterations.to_string();
 
     let mut cmd = tokio::process::Command::new(&bin);
@@ -522,10 +523,6 @@ async fn run_agent_subprocess(
 
     let report = AgentRunReport::read_from_path(&report_path)
         .map_err(|e| EvalRunnerError::SubprocessNoOutput(report_path.clone(), e.to_string()))?;
-    // Remove the report from work_dir before capture_swebench_patch runs
-    // `git add -A`; leaving it would include this harness artefact in the
-    // SWE-bench patch. `let _` silently tolerates races / already-missing.
-    let _ = std::fs::remove_file(&report_path);
     Ok(Ok(AgentOutcome::Subprocess(report)))
 }
 
@@ -610,31 +607,126 @@ async fn capture_swebench_patch(
     work_dir: &Path,
     base_commit: &str,
 ) -> Result<String, EvalRunnerError> {
-    let add = tokio::process::Command::new("git")
-        .args(["add", "-A"])
+    git_in_checkout(work_dir, &["add", "-A"]).await?;
+    let listing = git_in_checkout(
+        work_dir,
+        &[
+            "diff",
+            "--cached",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            base_commit,
+        ],
+    )
+    .await?;
+    let listing = String::from_utf8_lossy(&listing);
+    let mut fields = listing.split_terminator('\0');
+    let mut artifacts = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if is_run_artifact(path, status == "A") {
+            artifacts.push(path);
+        }
+    }
+    if !artifacts.is_empty() {
+        let mut args = vec!["--literal-pathspecs", "reset", "-q", base_commit, "--"];
+        args.extend(artifacts);
+        git_in_checkout(work_dir, &args).await?;
+    }
+    let diff = git_in_checkout(
+        work_dir,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base_commit,
+        ],
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&diff).into_owned())
+}
+
+async fn git_in_checkout(work_dir: &Path, args: &[&str]) -> Result<Vec<u8>, EvalRunnerError> {
+    let mut cmd = tokio::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
+    }
+    let output = cmd
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+        ])
+        .args(args)
         .current_dir(work_dir)
         .output()
         .await
-        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git add: {e}")))?;
-    if !add.status.success() {
+        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git {args:?}: {e}")))?;
+    if !output.status.success() {
         return Err(EvalRunnerError::GitDiff(format!(
-            "git add -A failed: {}",
-            String::from_utf8_lossy(&add.stderr)
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let diff = tokio::process::Command::new("git")
-        .args(["diff", base_commit, "--binary"])
-        .current_dir(work_dir)
-        .output()
-        .await
-        .map_err(|e| EvalRunnerError::GitDiff(format!("spawn git diff: {e}")))?;
-    if !diff.status.success() {
-        return Err(EvalRunnerError::GitDiff(format!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&diff.stderr)
-        )));
+    Ok(output.stdout)
+}
+
+fn is_run_artifact(path: &str, added: bool) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    let name = parts.last().copied().unwrap_or_default();
+    let extension = name.rsplit_once('.').map_or("", |(_, e)| e);
+    if parts.contains(&"__pycache__") || matches!(extension, "pyc" | "pyo" | "pyd") {
+        return true;
     }
-    Ok(String::from_utf8_lossy(&diff.stdout).into_owned())
+    if !added {
+        return false;
+    }
+    let in_tool_directory = parts.iter().any(|part| {
+        part.ends_with(".egg-info")
+            || matches!(
+                *part,
+                ".eggs"
+                    | ".pytest_cache"
+                    | ".mypy_cache"
+                    | ".ruff_cache"
+                    | ".hypothesis"
+                    | ".tox"
+                    | ".nox"
+                    | "node_modules"
+                    | "htmlcov"
+            )
+    });
+    let in_build_output = match parts.as_slice() {
+        ["build", kind, _, ..] => {
+            kind.starts_with("lib") || kind.starts_with("temp.") || kind.starts_with("bdist.")
+        }
+        ["dist", _] => [".whl", ".tar.gz", ".egg"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix)),
+        _ => false,
+    };
+    in_tool_directory
+        || in_build_output
+        || matches!(
+            extension,
+            "so" | "o" | "a" | "dll" | "dylib" | "class" | "orig" | "rej" | "swp"
+        )
+        || matches!(name, ".coverage" | "coverage.xml" | ".DS_Store")
+        || name.starts_with(".coverage.")
+        || name.ends_with('~')
+        || path.starts_with("__nanna_")
 }
 
 async fn finish_swebench(
@@ -1501,6 +1593,16 @@ echo "this is not json" > "$out"
         assert!(matches!(result.unwrap_err(), EvalRunnerError::Timeout(_)));
     }
 
+    fn scrubbed_git() -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(key);
+            }
+        }
+        cmd
+    }
+
     /// Build a tiny local bare git repo + return (bare_path, head_oid).
     /// Mirrors the pattern in `eval::swebench::tests::init_local_fixture`
     /// so we can exercise `materialize` without a network round-trip.
@@ -1511,7 +1613,7 @@ echo "this is not json" > "$out"
             I: IntoIterator<Item = S>,
             S: AsRef<std::ffi::OsStr>,
         {
-            let mut cmd = std::process::Command::new("git");
+            let mut cmd = scrubbed_git();
             cmd.args(args)
                 .current_dir(cwd)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1530,7 +1632,7 @@ echo "this is not json" > "$out"
         git_must(["config", "commit.gpgsign", "false"], seed);
         std::fs::write(seed.join("hello.py"), "print('hi')\n").unwrap();
         git_must(["add", "hello.py"], seed);
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = scrubbed_git();
         cmd.args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"])
             .current_dir(seed)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1542,7 +1644,7 @@ echo "this is not json" > "$out"
             .env("GIT_COMMITTER_EMAIL", "t@t");
         assert!(cmd.output().unwrap().status.success());
         let oid = String::from_utf8(
-            std::process::Command::new("git")
+            scrubbed_git()
                 .args(["rev-parse", "HEAD"])
                 .current_dir(seed)
                 .output()
@@ -1625,7 +1727,7 @@ JSON
             "repo": "fake-owner/fake-repo",
             "base_commit": oid,
             "patch": "",
-            "test_patch": "",
+            "test_patch": "diff --git a/test_new.py b/test_new.py\nnew file mode 100644\n--- /dev/null\n+++ b/test_new.py\n@@ -0,0 +1,1 @@\n+def test_stub(): assert False\n",
             "problem_statement": "irrelevant for this test",
             "FAIL_TO_PASS": [],
             "PASS_TO_PASS": [],
@@ -1706,10 +1808,206 @@ tags = ["{tag}"]
             !patch.contains("__nanna_agent_report"),
             "swebench_patch leaked the report JSON file:\n{patch}"
         );
+        assert!(
+            !patch.contains("test_new.py"),
+            "test_patch content reached the model patch:\n{patch}"
+        );
         // Iteration count from the fake report.
         assert_eq!(result.iterations, 2);
         // Token usage flowed through.
         assert_eq!(result.token_usage.total_tokens, 12);
+    }
+
+    #[cfg(unix)]
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = scrubbed_git()
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(unix)]
+    fn write_file_at(root: &std::path::Path, relative: &str, bytes: &[u8]) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn patch_fixture(root: &std::path::Path) -> String {
+        git_ok(root, &["init", "--quiet"]);
+        write_file_at(root, "hello.py", b"print('hi')\n");
+        write_file_at(root, "obsolete.py", b"old = 1\n");
+        write_file_at(root, "build/tracked.cfg", b"a=1\n");
+        git_ok(root, &["add", "-A"]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+        git_ok(root, &["rev-parse", "HEAD"])
+    }
+
+    #[cfg(unix)]
+    const RUN_ARTIFACTS: &[&str] = &[
+        "pkg/__pycache__/mod.cpython-311.pyc",
+        "pkg/__pycache__/notes.txt",
+        "stray.pyc",
+        "stray.pyo",
+        ".pytest_cache/v/cache/lastfailed",
+        ".mypy_cache/meta.json",
+        ".ruff_cache/entry",
+        ".hypothesis/examples/e",
+        ".tox/log",
+        "foo.egg-info/PKG-INFO",
+        "src/bar.egg-info/SOURCES.txt",
+        ".eggs/x",
+        "build/lib/pkg/mod.py",
+        "build/temp.linux-x86_64/mod.txt",
+        "dist/foo-1.0.tar.gz",
+        "pkg/ext.so",
+        "pkg/ext.o",
+        ".coverage",
+        ".coverage.host.1",
+        "coverage.xml",
+        "hello.py.orig",
+        "hello.py.rej",
+        "__nanna_agent_report.json",
+    ];
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_swebench_patch_keeps_agent_changes_and_drops_run_artifacts() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = patch_fixture(repo.path());
+        let fresh_parent = tempfile::tempdir().unwrap();
+        let fresh = fresh_parent.path().join("fresh");
+        git_ok(
+            fresh_parent.path(),
+            &[
+                "clone",
+                "--quiet",
+                repo.path().to_str().unwrap(),
+                fresh.to_str().unwrap(),
+            ],
+        );
+
+        let kept: &[(&str, &[u8])] = &[
+            ("hello.py", b"print('fixed')\n"),
+            ("pkg/new module.py", b"value = 2\n"),
+            ("pkg/data.bin", &[0, 159, 146, 150, 0, 1]),
+            ("docs/build/index.rst", b"title\n"),
+            ("build/tracked.cfg", b"a=2\n"),
+            ("dist/README.md", b"notes\n"),
+        ];
+        for (path, bytes) in kept {
+            write_file_at(repo.path(), path, bytes);
+        }
+        std::fs::remove_file(repo.path().join("obsolete.py")).unwrap();
+        for path in RUN_ARTIFACTS {
+            write_file_at(repo.path(), path, &[0, 1, 2, 3]);
+        }
+
+        let patch = capture_swebench_patch(repo.path(), &base).await.unwrap();
+
+        for path in RUN_ARTIFACTS {
+            assert!(
+                !patch.contains(&format!(" b/{path}\n")),
+                "run artifact {path} is in the patch:\n{patch}"
+            );
+        }
+        let patch_file = fresh_parent.path().join("model.patch");
+        std::fs::write(&patch_file, &patch).unwrap();
+        git_ok(&fresh, &["apply", patch_file.to_str().unwrap()]);
+        for (path, bytes) in kept {
+            assert_eq!(&std::fs::read(fresh.join(path)).unwrap(), bytes, "{path}");
+        }
+        assert!(!fresh.join("obsolete.py").exists());
+        let status = git_ok(&fresh, &["status", "--porcelain", "--untracked-files=all"]);
+        assert_eq!(status.lines().count(), kept.len() + 1, "{status}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_swebench_patch_is_empty_when_only_run_artifacts_changed() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = patch_fixture(repo.path());
+        for path in RUN_ARTIFACTS {
+            write_file_at(repo.path(), path, b"junk\n");
+        }
+        let patch = capture_swebench_patch(repo.path(), &base).await.unwrap();
+        assert_eq!(patch, "");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_swebench_patch_ignores_diff_and_exclude_configuration() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = patch_fixture(repo.path());
+        let excludes = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(excludes.path(), "new.py\n").unwrap();
+        for (key, value) in [
+            ("diff.noprefix", "true"),
+            ("diff.context", "0"),
+            ("diff.external", "false"),
+            ("color.diff", "always"),
+            ("core.excludesFile", excludes.path().to_str().unwrap()),
+        ] {
+            git_ok(repo.path(), &["config", key, value]);
+        }
+        write_file_at(repo.path(), "hello.py", b"print('fixed')\n");
+        write_file_at(repo.path(), "new.py", b"value = 2\n");
+
+        let patch = capture_swebench_patch(repo.path(), &base).await.unwrap();
+
+        assert!(
+            patch.contains("diff --git a/hello.py b/hello.py\n"),
+            "{patch}"
+        );
+        assert!(patch.contains("diff --git a/new.py b/new.py\n"), "{patch}");
+        assert!(!patch.contains('\u{1b}'), "{patch}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(nanna_harness_bin_env)]
+    async fn run_agent_subprocess_keeps_its_report_outside_the_checkout() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let script = fake_nanna_that_writes_changes().replace(
+            "echo \"fake-nanna-was-here\" > \"$work_dir/__fake_marker\"",
+            "echo \"$out\" > \"$work_dir/report_path\"",
+        );
+        let bin = write_fake_nanna(bin_dir.path(), &script);
+        let work_dir = tempfile::tempdir().unwrap();
+        let case = make_swebench_case("swebench-report-location");
+        let config = EvalRunnerConfig::default();
+
+        let result = with_nanna_bin(&bin, || {
+            run_agent_subprocess(work_dir.path(), &case, &config, Duration::from_secs(30))
+        })
+        .await;
+
+        result.unwrap().unwrap();
+        let reported = std::fs::read_to_string(work_dir.path().join("report_path")).unwrap();
+        assert!(
+            !std::path::Path::new(reported.trim()).starts_with(work_dir.path()),
+            "report was written inside the checkout: {reported}"
+        );
     }
 
     #[test]
@@ -1875,13 +2173,8 @@ tags = ["{}"]
         let oid = init_local_bare_repo(seed.path(), bare.path());
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "wrapper-001".to_string(),
@@ -1926,13 +2219,8 @@ tags = ["{}"]
 
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "verifier-fake-001".to_string(),
@@ -1982,13 +2270,8 @@ tags = ["{}"]
         let oid = init_local_bare_repo(seed.path(), bare.path());
         let work_dir = tempfile::tempdir().unwrap();
         let repo_dir = work_dir.path().join("repo");
-        crate::eval::swebench::materialize_from_url(
-            bare.path().to_str().unwrap(),
-            &oid,
-            "",
-            &repo_dir,
-        )
-        .unwrap();
+        crate::eval::swebench::materialize_from_url(bare.path().to_str().unwrap(), &oid, &repo_dir)
+            .unwrap();
 
         let task = SWEBenchTask {
             instance_id: "verifier-fake-002".to_string(),

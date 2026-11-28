@@ -8,10 +8,7 @@ In SymPy 1.6 Symbol instances had no __dict__ attribute because Symbol inherits 
 [task]
 prompt = """
 Symbol instances have __dict__ since SymPy 1.7
-In SymPy 1.6 Symbol instances had no __dict__ attribute because Symbol inherits from AtomicExpr which defines __slots__. In 1.7 an ancestor class lost __slots__, so now Symbol instances carry __dict__. Restore the no-__dict__ invariant.
-
-Hints:
-Likely caused by a missing __slots__ on an intermediate class in the MRO."""
+In SymPy 1.6 Symbol instances had no __dict__ attribute because Symbol inherits from AtomicExpr which defines __slots__. In 1.7 an ancestor class lost __slots__, so now Symbol instances carry __dict__. Restore the no-__dict__ invariant."""
 language = "python"
 
 [expected]
