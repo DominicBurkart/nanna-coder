@@ -110,18 +110,6 @@ pub fn adapt_to_eval_case(task: &SWEBenchTask) -> EvalCase {
         .to_string();
     let files_changed = extract_changed_files(&task.patch);
 
-    let prompt = if task.hints_text.is_empty() {
-        task.problem_statement.clone()
-    } else {
-        format!(
-            "{}
-
-Hints:
-{}",
-            task.problem_statement, task.hints_text
-        )
-    };
-
     EvalCase {
         case: CaseInfo {
             id: task.instance_id.clone(),
@@ -129,7 +117,7 @@ Hints:
             description: task.problem_statement.clone(),
         },
         task: TaskSpec {
-            prompt,
+            prompt: task.problem_statement.clone(),
             language: "python".to_string(),
         },
         expected: ExpectedResult {
@@ -402,19 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn adapt_to_eval_case_appends_hints_to_prompt() {
+    fn adapt_to_eval_case_excludes_hints_from_prompt() {
         let mut task = sample_task();
         task.hints_text = "Check the regex anchors.".to_string();
         let case = adapt_to_eval_case(&task);
-        assert!(case.task.prompt.contains("Hints:"));
-        assert!(case.task.prompt.contains("regex anchors"));
+        assert_eq!(case.task.prompt, task.problem_statement);
     }
 
-    #[test]
-    fn adapt_to_eval_case_omits_hints_section_when_empty() {
-        let task = sample_task();
-        let case = adapt_to_eval_case(&task);
-        assert!(!case.task.prompt.contains("Hints:"));
+    proptest::proptest! {
+        #[test]
+        fn prompt_is_exactly_the_problem_statement(statement in ".*", hints in ".*") {
+            let mut task = sample_task();
+            task.problem_statement = statement.clone();
+            task.hints_text = hints;
+            proptest::prop_assert_eq!(adapt_to_eval_case(&task).task.prompt, statement);
+        }
     }
 
     #[test]
